@@ -27,6 +27,8 @@
  *    it in the license file.
  */
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/service_context_d_test_fixture.h"
@@ -36,14 +38,18 @@
 #include "mongo/base/checked_cast.h"
 #include "mongo/db/catalog/catalog_control.h"
 #include "mongo/db/catalog/collection_catalog.h"
+#include "mongo/db/catalog/collection_impl.h"
 #include "mongo/db/catalog/database_holder_impl.h"
 #include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/index/index_access_method_factory_impl.h"
 #include "mongo/db/index_builds_coordinator_mongod.h"
-#include "mongo/db/logical_clock.h"
 #include "mongo/db/op_observer_registry.h"
+#include "mongo/db/s/collection_sharding_state_factory_shard.h"
 #include "mongo/db/service_entry_point_mongod.h"
+#include "mongo/db/storage/control/storage_control.h"
 #include "mongo/db/storage/storage_engine_init.h"
 #include "mongo/db/storage/storage_options.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/periodic_runner_factory.h"
 
@@ -63,27 +69,47 @@ ServiceContextMongoDTest::ServiceContextMongoDTest(std::string engine, RepairAct
         std::exchange(storageGlobalParams.engineSetByUser, true);
     _stashedStorageParams.repair =
         std::exchange(storageGlobalParams.repair, (repair == RepairAction::kRepair));
+    _stashedServerParams.enableMajorityReadConcern = serverGlobalParams.enableMajorityReadConcern;
+
+    if (storageGlobalParams.engine == "ephemeralForTest" ||
+        storageGlobalParams.engine == "devnull") {
+        // The ephemeralForTest and devnull storage engines do not support majority read concern.
+        LOGV2(4939201,
+              "Disabling majority read concern as it isn't supported by the storage engine",
+              "storageEngine"_attr = storageGlobalParams.engine);
+        serverGlobalParams.enableMajorityReadConcern = false;
+    }
 
     auto const serviceContext = getServiceContext();
     serviceContext->setServiceEntryPoint(std::make_unique<ServiceEntryPointMongod>(serviceContext));
-    auto logicalClock = std::make_unique<LogicalClock>(serviceContext);
-    LogicalClock::set(serviceContext, std::move(logicalClock));
 
     // Set up the periodic runner to allow background job execution for tests that require it.
     auto runner = makePeriodicRunner(getServiceContext());
-    runner->startup();
     getServiceContext()->setPeriodicRunner(std::move(runner));
 
     storageGlobalParams.dbpath = _tempDir.path();
 
-    initializeStorageEngine(serviceContext, StorageEngineInitFlags::kNone);
+    // Since unit tests start in their own directories, skip lock file and metadata file for faster
+    // startup.
+    auto opCtx = serviceContext->makeOperationContext(getClient());
+    initializeStorageEngine(opCtx.get(),
+                            StorageEngineInitFlags::kAllowNoLockFile |
+                                StorageEngineInitFlags::kSkipMetadataFile);
+    StorageControl::startStorageControls(serviceContext, true /*forTestOnly*/);
 
     DatabaseHolder::set(serviceContext, std::make_unique<DatabaseHolderImpl>());
-
+    IndexAccessMethodFactory::set(serviceContext, std::make_unique<IndexAccessMethodFactoryImpl>());
+    Collection::Factory::set(serviceContext, std::make_unique<CollectionImpl::FactoryImpl>());
     IndexBuildsCoordinator::set(serviceContext, std::make_unique<IndexBuildsCoordinatorMongod>());
+    CollectionShardingStateFactory::set(
+        getServiceContext(),
+        std::make_unique<CollectionShardingStateFactoryShard>(getServiceContext()));
+    getServiceContext()->getStorageEngine()->notifyStartupComplete();
 }
 
 ServiceContextMongoDTest::~ServiceContextMongoDTest() {
+    CollectionShardingStateFactory::clear(getServiceContext());
+
     {
         auto opCtx = getClient()->makeOperationContext();
         Lock::GlobalLock glk(opCtx.get(), MODE_X);
@@ -91,13 +117,28 @@ ServiceContextMongoDTest::~ServiceContextMongoDTest() {
         databaseHolder->closeAll(opCtx.get());
     }
 
-    IndexBuildsCoordinator::get(getServiceContext())->shutdown();
-
     shutdownGlobalStorageEngineCleanly(getServiceContext());
 
     std::swap(storageGlobalParams.engine, _stashedStorageParams.engine);
     std::swap(storageGlobalParams.engineSetByUser, _stashedStorageParams.engineSetByUser);
     std::swap(storageGlobalParams.repair, _stashedStorageParams.repair);
+    std::swap(serverGlobalParams.enableMajorityReadConcern,
+              _stashedServerParams.enableMajorityReadConcern);
+}
+
+void ServiceContextMongoDTest::tearDown() {
+    {
+        // Some tests set the current OperationContext but do not release it until destruction.
+        ServiceContext::UniqueOperationContext uniqueOpCtx;
+        auto opCtx = getClient()->getOperationContext();
+        if (!opCtx) {
+            uniqueOpCtx = getClient()->makeOperationContext();
+            opCtx = uniqueOpCtx.get();
+        }
+        IndexBuildsCoordinator::get(opCtx)->shutdown(opCtx);
+    }
+
+    ServiceContextTest::tearDown();
 }
 
 }  // namespace mongo

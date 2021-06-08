@@ -31,12 +31,20 @@
 
 #include "mongo/db/curop.h"
 #include "mongo/db/pipeline/document_source_check_resume_token.h"
+#include "mongo/db/query/query_feature_flags_gen.h"
+#include "mongo/db/repl/oplog_entry.h"
 
 using boost::intrusive_ptr;
 namespace mongo {
 namespace {
 
-using ResumeStatus = DocumentSourceEnsureResumeTokenPresent::ResumeStatus;
+REGISTER_INTERNAL_DOCUMENT_SOURCE(
+    _internalChangeStreamCheckResumability,
+    LiteParsedDocumentSourceChangeStreamInternal::parse,
+    DocumentSourceCheckResumability::createFromBson,
+    feature_flags::gFeatureFlagChangeStreamsOptimization.isEnabledAndIgnoreFCV());
+
+using ResumeStatus = DocumentSourceCheckResumability::ResumeStatus;
 
 // Returns ResumeStatus::kFoundToken if the document retrieved from the resumed pipeline satisfies
 // the client's resume token, ResumeStatus::kCheckNextDoc if it is older than the client's token,
@@ -78,16 +86,20 @@ ResumeStatus compareAgainstClientResumeToken(const intrusive_ptr<ExpressionConte
             : ResumeStatus::kCheckNextDoc;
     }
 
+    // If the document's 'txnIndex' sorts before that of the client token, we must keep looking.
     if (tokenDataFromResumedStream.txnOpIndex < tokenDataFromClient.txnOpIndex) {
         return ResumeStatus::kCheckNextDoc;
     } else if (tokenDataFromResumedStream.txnOpIndex > tokenDataFromClient.txnOpIndex) {
         // This could happen if the client provided a txnOpIndex of 0, yet the 0th document in the
         // applyOps was irrelevant (meaning it was an operation on a collection or DB not being
-        // watched). If we are looking for the resume token on a shard then this simply means that
-        // the resume token may be on a different shard; otherwise, it indicates a corrupt token.
-        uassert(50792, "Invalid resumeToken: txnOpIndex was skipped", expCtx->needsMerge);
-        // We are running on a merging shard. Signal that we have read beyond the resume token.
+        // watched). Signal that we have read beyond the resume token.
         return ResumeStatus::kSurpassedToken;
+    }
+
+    // If 'fromInvalidate' exceeds the client's token value, then we have passed the resume point.
+    if (tokenDataFromResumedStream.fromInvalidate != tokenDataFromClient.fromInvalidate) {
+        return tokenDataFromResumedStream.fromInvalidate ? ResumeStatus::kSurpassedToken
+                                                         : ResumeStatus::kCheckNextDoc;
     }
 
     // It is acceptable for the stream UUID to differ from the client's, if this is a whole-database
@@ -146,7 +158,8 @@ ResumeStatus compareAgainstClientResumeToken(const intrusive_ptr<ExpressionConte
 
     // In order for the relaxed comparison to be applicable, the client token must have a single _id
     // field, and the resumed stream token must have additional fields beyond _id.
-    if (!(documentKeyFromClient.size() == 1 && documentKeyFromResumedStream.size() > 1)) {
+    if (!(documentKeyFromClient.computeSize() == 1 &&
+          documentKeyFromResumedStream.computeSize() > 1)) {
         return defaultResumeStatus;
     }
 
@@ -160,153 +173,77 @@ ResumeStatus compareAgainstClientResumeToken(const intrusive_ptr<ExpressionConte
 }
 }  // namespace
 
-const char* DocumentSourceEnsureResumeTokenPresent::getSourceName() const {
-    return "$_ensureResumeTokenPresent";
-}
-
-Value DocumentSourceEnsureResumeTokenPresent::serialize(
-    boost::optional<ExplainOptions::Verbosity> explain) const {
-    // This stage is created by the DocumentSourceChangeStream stage, so serializing it here
-    // would result in it being created twice.
-    return Value();
-}
-
-intrusive_ptr<DocumentSourceEnsureResumeTokenPresent>
-DocumentSourceEnsureResumeTokenPresent::create(const intrusive_ptr<ExpressionContext>& expCtx,
-                                               ResumeTokenData token) {
-    return new DocumentSourceEnsureResumeTokenPresent(expCtx, std::move(token));
-}
-
-DocumentSourceEnsureResumeTokenPresent::DocumentSourceEnsureResumeTokenPresent(
+DocumentSourceCheckResumability::DocumentSourceCheckResumability(
     const intrusive_ptr<ExpressionContext>& expCtx, ResumeTokenData token)
-    : DocumentSource(expCtx), _tokenFromClient(std::move(token)) {}
+    : DocumentSource(getSourceName(), expCtx), _tokenFromClient(std::move(token)) {}
 
-DocumentSource::GetNextResult DocumentSourceEnsureResumeTokenPresent::getNext() {
-    pExpCtx->checkForInterrupt();
-
-    if (_resumeStatus == ResumeStatus::kFoundToken) {
-        // We've already verified the resume token is present.
-        return pSource->getNext();
-    }
-
-    Document documentFromResumedStream;
-
-    // Keep iterating the stream until we see either the resume token we're looking for,
-    // or a change with a higher timestamp than our resume token.
-    while (_resumeStatus == ResumeStatus::kCheckNextDoc) {
-        auto nextInput = pSource->getNext();
-
-        if (!nextInput.isAdvanced())
-            return nextInput;
-
-        // The incoming documents are sorted on clusterTime, uuid, documentKey. We examine a range
-        // of documents that have the same prefix (i.e. clusterTime and uuid). If the user provided
-        // token would sort before this received document we cannot resume the change stream.
-        _resumeStatus = compareAgainstClientResumeToken(
-            pExpCtx, (documentFromResumedStream = nextInput.getDocument()), _tokenFromClient);
-    }
-
-    uassert(40585,
-            str::stream()
-                << "resume of change stream was not possible, as the resume token was not found. "
-                << documentFromResumedStream["_id"].getDocument().toString(),
-            _resumeStatus != ResumeStatus::kSurpassedToken);
-
-    // If we reach this point, then we've seen the resume token.
-    invariant(_resumeStatus == ResumeStatus::kFoundToken);
-
-    // Don't return the document which has the token; the user has already seen it.
-    return pSource->getNext();
-}
-
-const char* DocumentSourceShardCheckResumability::getSourceName() const {
-    return "$_checkShardResumability";
-}
-
-Value DocumentSourceShardCheckResumability::serialize(
-    boost::optional<ExplainOptions::Verbosity> explain) const {
-    // This stage is created by the DocumentSourceChangeStream stage, so serializing it here
-    // would result in it being created twice.
-    return Value();
-}
-
-intrusive_ptr<DocumentSourceShardCheckResumability> DocumentSourceShardCheckResumability::create(
+intrusive_ptr<DocumentSourceCheckResumability> DocumentSourceCheckResumability::create(
     const intrusive_ptr<ExpressionContext>& expCtx, Timestamp ts) {
     // We are resuming from a point in time, not an event. Seed the stage with a high water mark.
     return create(expCtx, ResumeToken::makeHighWaterMarkToken(ts).getData());
 }
 
-intrusive_ptr<DocumentSourceShardCheckResumability> DocumentSourceShardCheckResumability::create(
+intrusive_ptr<DocumentSourceCheckResumability> DocumentSourceCheckResumability::create(
     const intrusive_ptr<ExpressionContext>& expCtx, ResumeTokenData token) {
-    return new DocumentSourceShardCheckResumability(expCtx, std::move(token));
+    return new DocumentSourceCheckResumability(expCtx, std::move(token));
 }
 
-DocumentSourceShardCheckResumability::DocumentSourceShardCheckResumability(
-    const intrusive_ptr<ExpressionContext>& expCtx, ResumeTokenData token)
-    : DocumentSource(expCtx), _tokenFromClient(std::move(token)) {}
+const char* DocumentSourceCheckResumability::getSourceName() const {
+    return kStageName.rawData();
+}
 
-DocumentSource::GetNextResult DocumentSourceShardCheckResumability::getNext() {
-    pExpCtx->checkForInterrupt();
-
-    if (_surpassedResumeToken)
+DocumentSource::GetNextResult DocumentSourceCheckResumability::doGetNext() {
+    if (_resumeStatus == ResumeStatus::kSurpassedToken) {
         return pSource->getNext();
+    }
 
-    while (!_surpassedResumeToken) {
-        auto nextInput = pSource->getNext();
+    while (_resumeStatus != ResumeStatus::kSurpassedToken) {
+        // The underlying oplog scan will throw OplogQueryMinTsMissing if the minTs in the change
+        // stream filter has fallen off the oplog. Catch this and throw a more explanatory error.
+        auto nextInput = [this]() {
+            try {
+                return pSource->getNext();
+            } catch (const ExceptionFor<ErrorCodes::OplogQueryMinTsMissing>&) {
+                uasserted(ErrorCodes::ChangeStreamHistoryLost,
+                          "Resume of change stream was not possible, as the resume point may no "
+                          "longer be in the oplog.");
+            }
+        }();
 
-        // If we hit EOF, check the oplog to make sure that we are able to resume. This prevents us
-        // from continually returning EOF in cases where the resume point has fallen off the oplog.
+        // If we hit EOF, return it immediately.
         if (!nextInput.isAdvanced()) {
-            _assertOplogHasEnoughHistory(nextInput);
             return nextInput;
         }
+
         // Determine whether the current event sorts before, equal to or after the resume token.
-        auto resumeStatus =
+        _resumeStatus =
             compareAgainstClientResumeToken(pExpCtx, nextInput.getDocument(), _tokenFromClient);
-        switch (resumeStatus) {
+        switch (_resumeStatus) {
             case ResumeStatus::kCheckNextDoc:
                 // If the result was kCheckNextDoc, we are resumable but must swallow this event.
-                _verifiedOplogHasEnoughHistory = true;
                 continue;
             case ResumeStatus::kSurpassedToken:
-                // In this case the resume token wasn't found; it must be on another shard. We must
-                // examine the oplog to ensure that its history reaches back to before the resume
-                // token, otherwise we may have missed events that fell off the oplog. If we can
-                // resume, fall through into the following case and set _surpassedResumeToken.
-                _assertOplogHasEnoughHistory(nextInput);
+                // In this case the resume token wasn't found; it may be on another shard. However,
+                // since the oplog scan did not throw, we know that we are resumable. Fall through
+                // into the following case and return the document.
             case ResumeStatus::kFoundToken:
-                // We found the actual token! Set _surpassedResumeToken and return the result.
-                _surpassedResumeToken = true;
+                // We found the actual token! Return the doc so DSEnsureResumeTokenPresent sees it.
                 return nextInput;
         }
     }
     MONGO_UNREACHABLE;
 }
 
-void DocumentSourceShardCheckResumability::_assertOplogHasEnoughHistory(
-    const GetNextResult& nextInput) {
-    // If we have already verified that this stream is resumable, return immediately.
-    if (_verifiedOplogHasEnoughHistory) {
-        return;
-    }
-    // Look up the first document in the oplog and compare it with the resume token's clusterTime.
-    auto firstEntryExpCtx = pExpCtx->copyWith(NamespaceString::kRsOplogNamespace);
-    auto matchSpec = BSON("$match" << BSONObj());
-    auto pipeline = pExpCtx->mongoProcessInterface->makePipeline({matchSpec}, firstEntryExpCtx);
-    if (auto first = pipeline->getNext()) {
-        auto firstOplogEntry = Value(*first);
-        uassert(40576,
-                "Resume of change stream was not possible, as the resume point may no longer "
-                "be in the oplog. ",
-                firstOplogEntry["ts"].getTimestamp() < _tokenFromClient.clusterTime);
-    } else {
-        // Very unusual case: the oplog is empty.  We can always resume. However, it should never be
-        // possible to have obtained a document that matched the filter if the oplog is empty.
-        uassert(51087,
-                "Oplog was empty but found an event in the change stream pipeline. It should not "
-                "be possible for this to happen",
-                nextInput.isEOF());
-    }
-    _verifiedOplogHasEnoughHistory = true;
+Value DocumentSourceCheckResumability::serializeLatest(
+    boost::optional<ExplainOptions::Verbosity> explain) const {
+    return explain
+        ? Value(DOC(DocumentSourceChangeStream::kStageName
+                    << DOC("stage"
+                           << "internalCheckResumability"_sd
+                           << "resumeToken" << ResumeToken(_tokenFromClient).toDocument())))
+        : Value(Document{
+              {DocumentSourceCheckResumability::kStageName,
+               DocumentSourceChangeStreamCheckResumabilitySpec(ResumeToken(_tokenFromClient))
+                   .toBSON()}});
 }
 }  // namespace mongo

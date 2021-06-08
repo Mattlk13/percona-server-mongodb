@@ -43,6 +43,7 @@
 namespace mongo {
 
 class User;
+class BSONObjBuilder;
 
 /**
  * The set of attributes SASL mechanisms may possess.
@@ -145,6 +146,12 @@ public:
     }
 
     /**
+     * Appends mechanism specific info in BSON form. The schema of this BSON will vary by mechanism
+     * implementation, thus this info is entirely diagnostic/for records.
+     */
+    virtual void appendExtraInfo(BSONObjBuilder*) const {}
+
+    /**
      * Standard method in mongodb for determining if "authenticatedUser" may act as "requestedUser."
      *
      * The standard rule in MongoDB is simple.  The authenticated user name must be the same as the
@@ -153,6 +160,15 @@ public:
     virtual bool isAuthorizedToActAs(StringData requestedUser, StringData authenticatedUser) {
         return requestedUser == authenticatedUser;
     }
+
+    /**
+     * Provides logic for determining if a user is a cluster member or an actual client for SASL
+     * authentication mechanisms
+     */
+    bool isClusterMember() const {
+        return _principalName == internalSecurity.user->getName().getUser().toString() &&
+            getAuthenticationDatabase() == internalSecurity.user->getName().getDB();
+    };
 
     /**
      * Performs a single step of a SASL exchange. Takes an input provided by a client,
@@ -179,16 +195,14 @@ public:
     }
 
     /** Returns which database contains the user which authentication is being performed against. */
-    StringData getAuthenticationDatabase() const {
-        if (getTestCommandsEnabled() && _authenticationDatabase == "admin" &&
-            getPrincipalName() == internalSecurity.user->getName().getUser()) {
-            // Allows authenticating as the internal user against the admin database.  This is to
-            // support the auth passthrough test framework on mongos (since you can't use the local
-            // database on a mongos, so you can't auth as the internal user without this).
-            return internalSecurity.user->getName().getDB();
-        } else {
-            return _authenticationDatabase;
-        }
+    StringData getAuthenticationDatabase() const;
+
+    /**
+     * Flexible bag of options for a saslStart command.
+     */
+    virtual Status setOptions(BSONObj options) {
+        // Be default, ignore any options provided.
+        return Status::OK();
     }
 
 protected:
@@ -209,6 +223,9 @@ protected:
 /** Base class for server mechanism factories. */
 class ServerFactoryBase : public SaslServerCommonBase {
 public:
+    explicit ServerFactoryBase(ServiceContext*) {}
+    ServerFactoryBase() = default;
+
     /**
      * Returns if the factory is capable of producing a server mechanism object which could
      * authenticate the provided user.
@@ -266,6 +283,9 @@ public:
     using mechanism_type = ServerMechanism;
     using policy_type = typename ServerMechanism::policy_type;
 
+    explicit MakeServerFactory(ServiceContext*) {}
+    MakeServerFactory() = default;
+
     virtual ServerMechanism* createImpl(std::string authenticationDatabase) override {
         return new ServerMechanism(std::move(authenticationDatabase));
     }
@@ -301,7 +321,8 @@ public:
     /**
      * Intialize the registry with a list of enabled mechanisms.
      */
-    explicit SASLServerMechanismRegistry(std::vector<std::string> enabledMechanisms);
+    explicit SASLServerMechanismRegistry(ServiceContext* svcCtx,
+                                         std::vector<std::string> enabledMechanisms);
 
     /**
      * Sets a new list of enabled mechanisms - used in testing.
@@ -310,12 +331,11 @@ public:
 
     /**
      * Produces a list of SASL mechanisms which can be used to authenticate as a user.
-     * If isMasterCmd contains a field with a username called 'saslSupportedMechs',
-     * will populate 'builder' with an Array called saslSupportedMechs containing each mechanism the
-     * user supports.
+     * This will populate 'builder' with an Array called saslSupportedMechs containing each
+     * mechanism the user supports.
      */
     void advertiseMechanismNamesForUser(OperationContext* opCtx,
-                                        const BSONObj& isMasterCmd,
+                                        UserName userName,
                                         BSONObjBuilder* builder);
 
     /**
@@ -349,13 +369,15 @@ public:
         }
 
         auto& list = _getMapRef(T::isInternal);
-        list.emplace_back(std::make_unique<T>());
+        list.emplace_back(std::make_unique<T>(_svcCtx));
         std::stable_sort(list.begin(), list.end(), [](const auto& a, const auto& b) {
             return (a->securityLevel() > b->securityLevel());
         });
 
         return true;
     }
+
+    std::vector<std::string> getMechanismNames() const;
 
 private:
     using MechList = std::vector<std::unique_ptr<ServerFactoryBase>>;
@@ -372,6 +394,8 @@ private:
     }
 
     bool _mechanismSupportedByConfig(StringData mechName) const;
+
+    ServiceContext* _svcCtx = nullptr;
 
     // Stores factories which make mechanisms for all databases other than $external
     MechList _internalMechs;
@@ -390,6 +414,7 @@ public:
     GlobalSASLMechanismRegisterer() {
         registerer.emplace(std::string(typeid(Factory).name()),
                            std::vector<std::string>{"CreateSASLServerMechanismRegistry"},
+                           std::vector<std::string>{"ValidateSASLServerMechanismRegistry"},
                            [](ServiceContext* service) {
                                SASLServerMechanismRegistry::get(service).registerFactory<Factory>();
                            });

@@ -52,13 +52,7 @@ public:
         verify(src.hasRecordId());
         verify(dest->recordId == src.recordId);
 
-        // Merge computed data.
-        typedef WorkingSetComputedDataType WSCD;
-        for (WSCD i = WSCD(0); i < WSM_COMPUTED_NUM_TYPES; i = WSCD(i + 1)) {
-            if (!dest->hasComputed(i) && src.hasComputed(i)) {
-                dest->addComputed(src.getComputed(i)->clone());
-            }
-        }
+        dest->metadata().mergeWith(src.metadata());
 
         if (dest->hasObj()) {
             // The merged WSM that we're creating already has the full document, so there's
@@ -70,7 +64,7 @@ public:
             invariant(src.getState() == WorkingSetMember::RID_AND_OBJ);
 
             // 'src' has the full document but 'dest' doesn't so we need to copy it over.
-            dest->obj = src.obj;
+            dest->doc = src.doc;
             dest->makeObjOwnedIfNeeded();
 
             // We have an object so we don't need key data.
@@ -99,9 +93,6 @@ public:
                 dest->keyData.push_back(src.keyData[i]);
             }
         }
-
-        if (src.isSuspicious)
-            dest->isSuspicious = true;
     }
 };
 

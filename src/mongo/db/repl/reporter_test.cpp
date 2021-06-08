@@ -29,11 +29,12 @@
 
 #include "mongo/platform/basic.h"
 
+#include <memory>
+
 #include "mongo/db/repl/reporter.h"
 #include "mongo/db/repl/update_position_args.h"
 #include "mongo/executor/network_interface_mock.h"
 #include "mongo/executor/thread_pool_task_executor_test_fixture.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/task_executor_proxy.h"
 #include "mongo/unittest/unittest.h"
 
@@ -73,11 +74,11 @@ public:
             itr.second.lastDurableOpTime.append(&entry,
                                                 UpdatePositionArgs::kDurableOpTimeFieldName);
             entry.appendDate(UpdatePositionArgs::kDurableWallTimeFieldName,
-                             Date_t::min() + Seconds(itr.second.lastDurableOpTime.getSecs()));
+                             Date_t() + Seconds(itr.second.lastDurableOpTime.getSecs()));
             itr.second.lastAppliedOpTime.append(&entry,
                                                 UpdatePositionArgs::kAppliedOpTimeFieldName);
             entry.appendDate(UpdatePositionArgs::kAppliedWallTimeFieldName,
-                             Date_t::min() + Seconds(itr.second.lastAppliedOpTime.getSecs()));
+                             Date_t() + Seconds(itr.second.lastAppliedOpTime.getSecs()));
             entry.append(UpdatePositionArgs::kMemberIdFieldName, itr.first);
             if (_configVersion != -1) {
                 entry.append(UpdatePositionArgs::kConfigVersionFieldName, _configVersion);
@@ -93,9 +94,9 @@ private:
         ProgressInfo(const OpTime& lastDurableOpTime, const OpTime& lastAppliedOpTime)
             : lastDurableOpTime(lastDurableOpTime), lastAppliedOpTime(lastAppliedOpTime) {}
 
-        // Our last known OpTime that this slave has applied and journaled to.
+        // Our last known OpTime that this secondary has applied and journaled to.
         OpTime lastDurableOpTime;
-        // Our last known OpTime that this slave has applied, whether journaled or unjournaled.
+        // Our last known OpTime that this secondary has applied, whether journaled or unjournaled.
         OpTime lastAppliedOpTime;
     };
 
@@ -113,7 +114,7 @@ public:
      */
     BSONObj processNetworkResponse(const BSONObj& obj,
                                    bool expectReadyRequestsAfterProcessing = false);
-    BSONObj processNetworkResponse(const RemoteCommandResponse rs,
+    BSONObj processNetworkResponse(RemoteCommandResponse rs,
                                    bool expectReadyRequestsAfterProcessing = false);
 
     void runUntil(Date_t when, bool expectReadyRequestsAfterAdvancingClock = false);
@@ -146,9 +147,9 @@ ReporterTest::ReporterTest() {}
 void ReporterTest::setUp() {
     executor::ThreadPoolExecutorTest::setUp();
 
-    _executorProxy = stdx::make_unique<unittest::TaskExecutorProxy>(&getExecutor());
+    _executorProxy = std::make_unique<unittest::TaskExecutorProxy>(&getExecutor());
 
-    posUpdater = stdx::make_unique<MockProgressManager>();
+    posUpdater = std::make_unique<MockProgressManager>();
     posUpdater->updateMap(0, OpTime({3, 0}, 1), OpTime({3, 0}, 1));
 
     prepareReplSetUpdatePositionCommandFn = [updater = posUpdater.get()] {
@@ -156,11 +157,11 @@ void ReporterTest::setUp() {
     };
 
     reporter =
-        stdx::make_unique<Reporter>(_executorProxy.get(),
-                                    [this]() { return prepareReplSetUpdatePositionCommandFn(); },
-                                    HostAndPort("h1"),
-                                    Milliseconds(1000),
-                                    Milliseconds(5000));
+        std::make_unique<Reporter>(_executorProxy.get(),
+                                   [this]() { return prepareReplSetUpdatePositionCommandFn(); },
+                                   HostAndPort("h1"),
+                                   Milliseconds(1000),
+                                   Milliseconds(5000));
     launchExecutorThread();
 
     if (triggerAtSetUp()) {
@@ -201,7 +202,7 @@ BSONObj ReporterTest::processNetworkResponse(const BSONObj& obj,
     return cmdObj;
 }
 
-BSONObj ReporterTest::processNetworkResponse(const RemoteCommandResponse rs,
+BSONObj ReporterTest::processNetworkResponse(RemoteCommandResponse rs,
                                              bool expectReadyRequestsAfterProcessing) {
     auto net = getNet();
     net->enterNetwork();
@@ -231,6 +232,44 @@ void ReporterTest::assertReporterDone() {
     ASSERT_FALSE(reporter->isWaitingToSendReport());
     ASSERT_EQUALS(Date_t(), reporter->getKeepAliveTimeoutWhen_forTest());
     ASSERT_EQUALS(reporter->join(), reporter->trigger());
+}
+
+TEST(UpdatePositionArgs, AcceptsUnknownField) {
+    UpdatePositionArgs updatePositionArgs;
+    BSONObjBuilder bob;
+    bob.append(UpdatePositionArgs::kCommandFieldName, 1);
+    bob.append(UpdatePositionArgs::kUpdateArrayFieldName, BSONArray());
+    bob.append("unknownField", 1);  // append an unknown field.
+    BSONObj cmdObj = bob.obj();
+    ASSERT_OK(updatePositionArgs.initialize(cmdObj));
+}
+TEST(UpdatePositionArgs, AcceptsUnknownFieldInUpdateInfo) {
+    UpdatePositionArgs updatePositionArgs;
+    BSONObjBuilder bob;
+    bob.append(UpdatePositionArgs::kCommandFieldName, 1);
+    auto now = Date_t();
+    auto updateInfo =
+        BSON(UpdatePositionArgs::kConfigVersionFieldName
+             << 1 << UpdatePositionArgs::kMemberIdFieldName << 1
+             << UpdatePositionArgs::kDurableOpTimeFieldName << OpTime()
+             << UpdatePositionArgs::kAppliedOpTimeFieldName << OpTime()
+             << UpdatePositionArgs::kAppliedWallTimeFieldName << now
+             << UpdatePositionArgs::kDurableWallTimeFieldName << now << "unknownField" << 1);
+    bob.append(UpdatePositionArgs::kUpdateArrayFieldName, BSON_ARRAY(updateInfo));
+    BSONObj cmdObj = bob.obj();
+    ASSERT_OK(updatePositionArgs.initialize(cmdObj));
+
+    // The serialized object should be the same as the original except for the unknown field.
+    BSONObjBuilder bob2;
+    auto updateArgsObj = updatePositionArgs.toBSON();
+    auto updatesArr =
+        BSONArray(updateArgsObj.getObjectField(UpdatePositionArgs::kUpdateArrayFieldName));
+    ASSERT_EQ(updatesArr.nFields(), 1);
+    bob2.appendElements(updatesArr[0].Obj());
+    bob2.append(UpdatePositionArgs::kAppliedWallTimeFieldName, now);
+    bob2.append(UpdatePositionArgs::kDurableWallTimeFieldName, now);
+    bob2.append("unknownField", 1);
+    ASSERT_EQ(bob2.obj().woCompare(updateInfo), 0);
 }
 
 TEST_F(ReporterTestNoTriggerAtSetUp, InvalidConstruction) {
@@ -368,58 +407,6 @@ TEST_F(ReporterTest, UnsuccessfulCommandResponseStopsTheReporter) {
 
     ASSERT_EQUALS(Status(ErrorCodes::UnknownError, "unknown error"), reporter->join());
     assertReporterDone();
-}
-
-TEST_F(ReporterTestNoTriggerAtSetUp,
-       InvalidReplicaSetResponseToARequestWithoutConfigVersionStopsTheReporter) {
-    posUpdater->setConfigVersion(-1);
-    ASSERT_OK(reporter->trigger());
-    ASSERT_TRUE(reporter->isActive());
-
-    processNetworkResponse(BSON("ok" << 0 << "code" << int(ErrorCodes::InvalidReplicaSetConfig)
-                                     << "errmsg"
-                                     << "newer config"
-                                     << "configVersion"
-                                     << 100));
-
-    ASSERT_EQUALS(Status(ErrorCodes::InvalidReplicaSetConfig, "invalid config"), reporter->join());
-    assertReporterDone();
-}
-
-TEST_F(ReporterTest, InvalidReplicaSetResponseWithoutConfigVersionOnSyncTargetStopsTheReporter) {
-    processNetworkResponse(BSON("ok" << 0 << "code" << int(ErrorCodes::InvalidReplicaSetConfig)
-                                     << "errmsg"
-                                     << "invalid config"));
-
-    ASSERT_EQUALS(Status(ErrorCodes::InvalidReplicaSetConfig, "invalid config"), reporter->join());
-    assertReporterDone();
-}
-
-TEST_F(ReporterTest, InvalidReplicaSetResponseWithSameConfigVersionOnSyncTargetStopsTheReporter) {
-    processNetworkResponse(BSON("ok" << 0 << "code" << int(ErrorCodes::InvalidReplicaSetConfig)
-                                     << "errmsg"
-                                     << "invalid config"
-                                     << "configVersion"
-                                     << posUpdater->getConfigVersion()));
-
-    ASSERT_EQUALS(Status(ErrorCodes::InvalidReplicaSetConfig, "invalid config"), reporter->join());
-    assertReporterDone();
-}
-
-TEST_F(ReporterTest,
-       InvalidReplicaSetResponseWithNewerConfigVersionOnSyncTargetDoesNotStopTheReporter) {
-    // Reporter should not retry update command on sync source immediately after seeing newer
-    // configuration.
-    ASSERT_OK(reporter->trigger());
-    ASSERT_TRUE(reporter->isWaitingToSendReport());
-
-    processNetworkResponse(BSON("ok" << 0 << "code" << int(ErrorCodes::InvalidReplicaSetConfig)
-                                     << "errmsg"
-                                     << "newer config"
-                                     << "configVersion"
-                                     << posUpdater->getConfigVersion() + 1));
-
-    ASSERT_TRUE(reporter->isActive());
 }
 
 // Schedule while we are already scheduled, it should set "isWaitingToSendReport", then
@@ -604,9 +591,9 @@ TEST_F(ReporterTestNoTriggerAtSetUp, FailingToScheduleRemoteCommandTaskShouldMak
     public:
         TaskExecutorWithFailureInScheduleRemoteCommand(executor::TaskExecutor* executor)
             : unittest::TaskExecutorProxy(executor) {}
-        virtual StatusWith<executor::TaskExecutor::CallbackHandle> scheduleRemoteCommand(
-            const executor::RemoteCommandRequest& request,
-            const RemoteCommandCallbackFn& cb,
+        virtual StatusWith<executor::TaskExecutor::CallbackHandle> scheduleRemoteCommandOnAny(
+            const executor::RemoteCommandRequestOnAny& request,
+            const RemoteCommandOnAnyCallbackFn& cb,
             const BatonHandle& baton = nullptr) override {
             // Any error status other than ShutdownInProgress will cause the reporter to fassert.
             return Status(ErrorCodes::ShutdownInProgress,

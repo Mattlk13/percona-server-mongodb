@@ -33,11 +33,10 @@ Represents the derived IDL specification after type resolution in the binding pa
 This is a lossy translation from the IDL Syntax tree as the IDL AST only contains information about
 the enums and structs that need code generated for them, and just enough information to do that.
 """
+from abc import ABCMeta, abstractmethod
+from typing import List, Optional
 
-from typing import List, Union, Any, Optional, Tuple
-
-from . import common
-from . import errors
+from . import common, errors
 
 
 class IDLBoundSpec(object):
@@ -55,6 +54,8 @@ class IDLBoundSpec(object):
 class IDLAST(object):
     """The in-memory representation of an IDL file."""
 
+    # pylint: disable=too-many-instance-attributes
+
     def __init__(self):
         # type: () -> None
         """Construct an IDLAST."""
@@ -63,7 +64,8 @@ class IDLAST(object):
         self.commands = []  # type: List[Command]
         self.enums = []  # type: List[Enum]
         self.structs = []  # type: List[Struct]
-
+        self.generic_argument_lists = []  # type: List[GenericArgumentList]
+        self.generic_reply_field_lists = []  # type: List[GenericReplyFieldList]
         self.server_parameters = []  # type: List[ServerParameter]
         self.configs = []  # type: List[ConfigOption]
 
@@ -85,11 +87,44 @@ class Global(common.SourceLocation):
         super(Global, self).__init__(file_name, line, column)
 
 
+class Type(common.SourceLocation):
+    """
+    IDL type information.
+
+    The type of a struct field or command field, for the sake of C++ code generation.
+    """
+
+    # pylint: disable=too-many-instance-attributes
+
+    def __init__(self, file_name, line, column):
+        # type: (str, int, int) -> None
+        """Construct a Type."""
+        self.name = None  # type: str
+        self.cpp_type = None  # type: str
+        self.bson_serialization_type = None  # type: List[str]
+        self.bindata_subtype = None  # type: str
+        self.serializer = None  # type: str
+        self.deserializer = None  # type: str
+        self.is_enum = False  # type: bool
+        self.is_array = False  # type: bool
+        self.is_variant = False  # type: bool
+        self.is_struct = False  # type: bool
+        self.variant_types = []  # type: List[Type]
+        # A variant can have at most one alternative type which is a struct. Otherwise, if we saw
+        # a sub-object while parsing BSON, we wouldn't know which struct to interpret it as.
+        self.variant_struct_type = None  # type: Type
+        super(Type, self).__init__(file_name, line, column)
+
+
 class Struct(common.SourceLocation):
     """
     IDL struct information.
 
     All fields are either required or have a non-None default.
+
+    NOTE: We use this class to generate a struct's C++ class and method definitions. When a field
+    has a struct type (or a field is an array of structs or a variant that can be a struct), we
+    represent that struct type using ast.Type with is_struct=True.
     """
 
     # pylint: disable=too-many-instance-attributes
@@ -99,12 +134,15 @@ class Struct(common.SourceLocation):
         """Construct a struct."""
         self.name = None  # type: str
         self.cpp_name = None  # type: str
+        self.qualified_cpp_name = None  # type: str
         self.description = None  # type: str
         self.strict = True  # type: bool
         self.immutable = False  # type: bool
         self.inline_chained_structs = False  # type: bool
         self.generate_comparison_operators = False  # type: bool
         self.fields = []  # type: List[Field]
+        self.allow_global_collection_name = False  # type: bool
+        self.non_const_getter = False  # type: bool
         super(Struct, self).__init__(file_name, line, column)
 
 
@@ -150,7 +188,6 @@ class Field(common.SourceLocation):
     An instance of a field in a struct.
 
     Name is always populated.
-    A field will either have a struct_type or a cpp_type, but not both.
     Not all fields are set, it depends on the input document.
     """
 
@@ -166,24 +203,14 @@ class Field(common.SourceLocation):
         self.ignore = False  # type: bool
         self.chained = False  # type: bool
         self.comparison_order = -1  # type: int
-
-        # Properties specific to fields which are types.
-        self.cpp_type = None  # type: str
-        self.bson_serialization_type = None  # type: List[str]
-        self.serializer = None  # type: str
-        self.deserializer = None  # type: str
-        self.bindata_subtype = None  # type: str
+        self.non_const_getter = False  # type: bool
+        self.unstable = False  # type: bool
         self.default = None  # type: str
-
-        # Properties specific to fields which are structs.
-        self.struct_type = None  # type: str
+        self.type = None  # type: Type
+        self.always_serialize = False  # type: bool
 
         # Properties specific to fields which are arrays.
-        self.array = False  # type: bool
         self.supports_doc_sequence = False  # type: bool
-
-        # Properties specific to fields which are enums.
-        self.enum_type = False  # type: bool
 
         # Properties specific to fields inlined from chained_structs
         self.chained_struct_field = None  # type: Field
@@ -198,6 +225,32 @@ class Field(common.SourceLocation):
         super(Field, self).__init__(file_name, line, column)
 
 
+class Privilege(common.SourceLocation):
+    """IDL privilege information."""
+
+    def __init__(self, file_name, line, column):
+        # type: (str, int, int) -> None
+        """Construct an Privilege."""
+
+        self.resource_pattern = None  # type: str
+        self.action_type = None  # type: List[str]
+
+        super(Privilege, self).__init__(file_name, line, column)
+
+
+class AccessCheck(common.SourceLocation):
+    """IDL commmand access check information."""
+
+    def __init__(self, file_name, line, column):
+        # type: (str, int, int) -> None
+        """Construct an AccessCheck."""
+
+        self.check = None  # type: str
+        self.privilege = None  # type: Privilege
+
+        super(AccessCheck, self).__init__(file_name, line, column)
+
+
 class Command(Struct):
     """
     IDL commmand information.
@@ -205,12 +258,76 @@ class Command(Struct):
     All fields are either required or have a non-None default.
     """
 
+    # pylint: disable=too-many-instance-attributes
+
     def __init__(self, file_name, line, column):
         # type: (str, int, int) -> None
         """Construct a command."""
         self.namespace = None  # type: str
+        self.command_name = None  # type: str
+        self.command_alias = None  # type: str
         self.command_field = None  # type: Field
+        self.reply_type = None  # type: Field
+        self.api_version = ""  # type: str
+        self.is_deprecated = False  # type: bool
+        self.access_checks = None  # type: List[AccessCheck]
         super(Command, self).__init__(file_name, line, column)
+
+
+class FieldListBase(common.SourceLocation, metaclass=ABCMeta):
+    """Base class for generic argument or reply field lists."""
+
+    def __init__(self, file_name, line, column):
+        # type: (str, int, int) -> None
+        """Construct a field list."""
+        self.name = None  # type: str
+        self.cpp_name = None  # type: str
+        self.description = None  # type: str
+        self.fields = []  # type: List[FieldListEntry]
+        super(FieldListBase, self).__init__(file_name, line, column)
+
+    @abstractmethod
+    def get_should_forward_name(self):
+        # type: () -> str
+        """Get the name of the shard-forwarding rule for this generic argument or reply field."""
+        pass
+
+
+class GenericArgumentList(FieldListBase):
+    """IDL generic argument list."""
+
+    def get_should_forward_name(self):
+        # type: () -> str
+        """Get the name of the shard-forwarding rule for a generic argument."""
+        return "shouldForwardToShards"
+
+
+class GenericReplyFieldList(FieldListBase):
+    """IDL generic reply field list."""
+
+    def get_should_forward_name(self):
+        # type: () -> str
+        """Get the name of the shard-forwarding rule for a generic reply field."""
+        return "shouldForwardFromShards"
+
+
+class FieldListEntry(common.SourceLocation):
+    """Options for a field in a field list."""
+
+    def __init__(self, file_name, line, column):
+        # type: (str, int, int) -> None
+        """Construct a FieldListEntry."""
+        self.name = None  # type: str
+        self.forward_to_shards = False  # type: bool
+        self.forward_from_shards = False  # type: bool
+        super(FieldListEntry, self).__init__(file_name, line, column)
+
+    def get_should_forward(self):
+        """Get the shard-forwarding rule for a generic argument or reply field."""
+        assert not (self.forward_to_shards and self.forward_from_shards), \
+            "Only FieldListEntry.forward_to_shards or forward_from_shards should be set"
+
+        return self.forward_to_shards or self.forward_from_shards
 
 
 class EnumValue(common.SourceLocation):
@@ -295,6 +412,7 @@ class ServerParameter(common.SourceLocation):
         self.test_only = False  # type: bool
         self.deprecated_name = []  # type: List[str]
         self.default = None  # type: Expression
+        self.feature_flag = False  # type: bool
 
         # Only valid if cpp_varname is specified.
         self.validator = None  # type: Validator

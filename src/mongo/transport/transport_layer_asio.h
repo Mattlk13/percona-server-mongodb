@@ -30,18 +30,19 @@
 #pragma once
 
 #include <functional>
+#include <memory>
 #include <string>
 
 #include "mongo/base/status_with.h"
 #include "mongo/config.h"
 #include "mongo/db/server_options.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/transport/transport_layer.h"
 #include "mongo/transport/transport_mode.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/hierarchical_acquisition.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/net/ssl_options.h"
 #include "mongo/util/net/ssl_types.h"
@@ -69,11 +70,11 @@ class ServiceEntryPoint;
 namespace transport {
 
 // This fail point simulates reads and writes that always return 1 byte and fail with EAGAIN
-MONGO_FAIL_POINT_DECLARE(transportLayerASIOshortOpportunisticReadWrite);
+extern FailPoint transportLayerASIOshortOpportunisticReadWrite;
 
 // This fail point will cause an asyncConnect to timeout after it's successfully connected
 // to the remote peer
-MONGO_FAIL_POINT_DECLARE(transportLayerASIOasyncConnectTimesOut);
+extern FailPoint transportLayerASIOasyncConnectTimesOut;
 
 /**
  * A TransportLayer implementation based on ASIO networking primitives.
@@ -83,6 +84,8 @@ class TransportLayerASIO final : public TransportLayer {
     TransportLayerASIO& operator=(const TransportLayerASIO&) = delete;
 
 public:
+    constexpr static auto kSlowOperationThreshold = Seconds(1);
+
     struct Options {
         constexpr static auto kIngress = 0x1;
         constexpr static auto kEgress = 0x10;
@@ -111,18 +114,23 @@ public:
         size_t maxConns = DEFAULT_MAX_CONN;       // maximum number of active connections
     };
 
-    TransportLayerASIO(const Options& opts, ServiceEntryPoint* sep);
+    TransportLayerASIO(const Options& opts,
+                       ServiceEntryPoint* sep,
+                       const WireSpec& wireSpec = WireSpec::instance());
 
     virtual ~TransportLayerASIO();
 
     StatusWith<SessionHandle> connect(HostAndPort peer,
                                       ConnectSSLMode sslMode,
-                                      Milliseconds timeout) final;
+                                      Milliseconds timeout,
+                                      boost::optional<TransientSSLParams> transientSSLParams) final;
 
-    Future<SessionHandle> asyncConnect(HostAndPort peer,
-                                       ConnectSSLMode sslMode,
-                                       const ReactorHandle& reactor,
-                                       Milliseconds timeout) final;
+    Future<SessionHandle> asyncConnect(
+        HostAndPort peer,
+        ConnectSSLMode sslMode,
+        const ReactorHandle& reactor,
+        Milliseconds timeout,
+        std::shared_ptr<const SSLConnectionContext> transientSSLContext = nullptr) final;
 
     Status setup() final;
 
@@ -140,6 +148,20 @@ public:
     BatonHandle makeBaton(OperationContext* opCtx) const override;
 #endif
 
+#ifdef MONGO_CONFIG_SSL
+    Status rotateCertificates(std::shared_ptr<SSLManagerInterface> manager,
+                              bool asyncOCSPStaple) override;
+
+    /**
+     * Creates a transient SSL context using targeted (non default) SSL params.
+     * @param transientSSLParams overrides any value in stored SSLConnectionContext.
+     * @param optionalManager provides an optional SSL manager, otherwise the default one will be
+     * used.
+     */
+    StatusWith<std::shared_ptr<const transport::SSLConnectionContext>> createTransientSSLContext(
+        const TransientSSLParams& transientSSLParams) override;
+#endif
+
 private:
     class BatonASIO;
     class ASIOSession;
@@ -152,15 +174,24 @@ private:
     void _acceptConnection(GenericAcceptor& acceptor);
 
     template <typename Endpoint>
-    StatusWith<ASIOSessionHandle> _doSyncConnect(Endpoint endpoint,
-                                                 const HostAndPort& peer,
-                                                 const Milliseconds& timeout);
+    StatusWith<ASIOSessionHandle> _doSyncConnect(
+        Endpoint endpoint,
+        const HostAndPort& peer,
+        const Milliseconds& timeout,
+        boost::optional<TransientSSLParams> transientSSLParams);
+
+    StatusWith<std::shared_ptr<const transport::SSLConnectionContext>> _createSSLContext(
+        std::shared_ptr<SSLManagerInterface>& manager,
+        SSLParams::SSLModes sslMode,
+        bool asyncOCSPStaple) const;
+
+    void _runListener() noexcept;
 
 #ifdef MONGO_CONFIG_SSL
     SSLParams::SSLModes _sslMode() const;
 #endif
 
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH(HierarchicalAcquisitionLevel(0), "TransportLayerASIO::_mutex");
 
     // There are three reactors that are used by TransportLayerASIO. The _ingressReactor contains
     // all the accepted sockets and all ingress networking activity. The _acceptorReactor contains
@@ -189,20 +220,26 @@ private:
     std::shared_ptr<ASIOReactor> _acceptorReactor;
 
 #ifdef MONGO_CONFIG_SSL
-    std::unique_ptr<asio::ssl::context> _ingressSSLContext;
-    std::unique_ptr<asio::ssl::context> _egressSSLContext;
+    synchronized_value<std::shared_ptr<const SSLConnectionContext>> _sslContext;
 #endif
 
     std::vector<std::pair<SockAddr, GenericAcceptor>> _acceptors;
 
     // Only used if _listenerOptions.async is false.
-    stdx::thread _listenerThread;
+    struct Listener {
+        stdx::thread thread;
+        stdx::condition_variable cv;
+        bool active = false;
+    };
+    Listener _listener;
 
     ServiceEntryPoint* const _sep = nullptr;
-    AtomicWord<bool> _running{false};
+
     Options _listenerOptions;
     // The real incoming port in case of _listenerOptions.port==0 (ephemeral).
     int _listenerPort = 0;
+
+    bool _isShutdown = false;
 };
 
 }  // namespace transport

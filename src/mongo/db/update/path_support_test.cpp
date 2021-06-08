@@ -50,7 +50,6 @@
 #include "mongo/db/matcher/expression_leaf.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/str.h"
 
@@ -58,10 +57,10 @@ namespace {
 
 using namespace mongo;
 using namespace pathsupport;
-using str::stream;
 using mutablebson::Element;
-using std::unique_ptr;
 using std::string;
+using std::unique_ptr;
+using str::stream;
 
 class EmptyDoc : public mongo::unittest::Test {
 public:
@@ -91,7 +90,7 @@ private:
 TEST_F(EmptyDoc, EmptyPath) {
     setField("");
 
-    size_t idxFound;
+    FieldIndex idxFound;
     Element elemFound = root();
     Status status = findLongestPrefix(field(), root(), &idxFound, &elemFound);
     ASSERT_EQUALS(status, ErrorCodes::NonExistentPath);
@@ -100,7 +99,7 @@ TEST_F(EmptyDoc, EmptyPath) {
 TEST_F(EmptyDoc, NewField) {
     setField("a");
 
-    size_t idxFound;
+    FieldIndex idxFound;
     Element elemFound = root();
     Status status = findLongestPrefix(field(), root(), &idxFound, &elemFound);
     ASSERT_EQUALS(status, ErrorCodes::NonExistentPath);
@@ -116,7 +115,7 @@ TEST_F(EmptyDoc, NewField) {
 TEST_F(EmptyDoc, NewPath) {
     setField("a.b.c");
 
-    size_t idxFound;
+    FieldIndex idxFound;
     Element elemFound = root();
     Status status = findLongestPrefix(field(), root(), &idxFound, &elemFound);
     ASSERT_EQUALS(status, ErrorCodes::NonExistentPath);
@@ -161,7 +160,7 @@ private:
 TEST_F(SimpleDoc, EmptyPath) {
     setField("");
 
-    size_t idxFound;
+    FieldIndex idxFound;
     Element elemFound = root();
     Status status = findLongestPrefix(field(), root(), &idxFound, &elemFound);
     ASSERT_EQUALS(status, ErrorCodes::NonExistentPath);
@@ -170,7 +169,7 @@ TEST_F(SimpleDoc, EmptyPath) {
 TEST_F(SimpleDoc, SimplePath) {
     setField("a");
 
-    size_t idxFound;
+    FieldIndex idxFound;
     Element elemFound = root();
     ASSERT_OK(findLongestPrefix(field(), root(), &idxFound, &elemFound));
     ASSERT_TRUE(elemFound.ok());
@@ -181,7 +180,7 @@ TEST_F(SimpleDoc, SimplePath) {
 TEST_F(SimpleDoc, LongerPath) {
     setField("a.b");
 
-    size_t idxFound;
+    FieldIndex idxFound;
     Element elemFound = root();
     Status status = findLongestPrefix(field(), root(), &idxFound, &elemFound);
     ASSERT_EQUALS(status, ErrorCodes::PathNotViable);
@@ -193,7 +192,7 @@ TEST_F(SimpleDoc, LongerPath) {
 TEST_F(SimpleDoc, NotCommonPrefix) {
     setField("b");
 
-    size_t idxFound;
+    FieldIndex idxFound;
     Element elemFound = root();
     Status status = findLongestPrefix(field(), root(), &idxFound, &elemFound);
     ASSERT_EQUALS(status, ErrorCodes::NonExistentPath);
@@ -272,7 +271,7 @@ private:
 TEST_F(NestedDoc, SimplePath) {
     setField("a");
 
-    size_t idxFound;
+    FieldIndex idxFound;
     Element elemFound = root();
     ASSERT_OK(findLongestPrefix(field(), root(), &idxFound, &elemFound));
     ASSERT_TRUE(elemFound.ok());
@@ -283,7 +282,7 @@ TEST_F(NestedDoc, SimplePath) {
 TEST_F(NestedDoc, ShorterPath) {
     setField("a.b");
 
-    size_t idxFound;
+    FieldIndex idxFound;
     Element elemFound = root();
     ASSERT_OK(findLongestPrefix(field(), root(), &idxFound, &elemFound));
     ASSERT_EQUALS(idxFound, 1U);
@@ -293,7 +292,7 @@ TEST_F(NestedDoc, ShorterPath) {
 TEST_F(NestedDoc, ExactPath) {
     setField("a.b.c");
 
-    size_t idxFound;
+    FieldIndex idxFound;
     Element elemFound = root();
     ASSERT_OK(findLongestPrefix(field(), root(), &idxFound, &elemFound));
     ASSERT_TRUE(elemFound.ok());
@@ -305,7 +304,7 @@ TEST_F(NestedDoc, LongerPath) {
     //  This would for 'c' to change from NumberInt to Object, which is invalid.
     setField("a.b.c.d");
 
-    size_t idxFound;
+    FieldIndex idxFound;
     Element elemFound = root();
     Status status = findLongestPrefix(field(), root(), &idxFound, &elemFound);
     ASSERT_EQUALS(status.code(), ErrorCodes::PathNotViable);
@@ -317,7 +316,7 @@ TEST_F(NestedDoc, LongerPath) {
 TEST_F(NestedDoc, NewFieldNested) {
     setField("a.b.d");
 
-    size_t idxFound;
+    FieldIndex idxFound;
     Element elemFound = root();
     ASSERT_OK(findLongestPrefix(field(), root(), &idxFound, &elemFound));
     ASSERT_EQUALS(idxFound, 1U);
@@ -337,7 +336,7 @@ TEST_F(NestedDoc, NewFieldNested) {
 TEST_F(NestedDoc, NotStartingFromRoot) {
     setField("b.c");
 
-    size_t idxFound;
+    FieldIndex idxFound;
     Element elemFound = root();
     ASSERT_OK(findLongestPrefix(field(), root()["a"], &idxFound, &elemFound));
     ASSERT_EQUALS(idxFound, 1U);
@@ -388,7 +387,7 @@ private:
 TEST_F(ArrayDoc, PathOnEmptyArray) {
     setField("a.0");
 
-    size_t idxFound;
+    FieldIndex idxFound;
     Element elemFound = root();
     ASSERT_OK(findLongestPrefix(field(), root(), &idxFound, &elemFound));
     ASSERT_TRUE(elemFound.ok());
@@ -399,7 +398,7 @@ TEST_F(ArrayDoc, PathOnEmptyArray) {
 TEST_F(ArrayDoc, PathOnPopulatedArray) {
     setField("b.0");
 
-    size_t idxFound;
+    FieldIndex idxFound;
     Element elemFound = root();
     ASSERT_OK(findLongestPrefix(field(), root(), &idxFound, &elemFound));
     ASSERT_TRUE(elemFound.ok());
@@ -410,7 +409,7 @@ TEST_F(ArrayDoc, PathOnPopulatedArray) {
 TEST_F(ArrayDoc, MixedArrayAndObjectPath) {
     setField("b.0.c");
 
-    size_t idxFound;
+    FieldIndex idxFound;
     Element elemFound = root();
     ASSERT_OK(findLongestPrefix(field(), root(), &idxFound, &elemFound));
     ASSERT_TRUE(elemFound.ok());
@@ -421,7 +420,7 @@ TEST_F(ArrayDoc, MixedArrayAndObjectPath) {
 TEST_F(ArrayDoc, ExtendingExistingObject) {
     setField("b.0.d");
 
-    size_t idxFound;
+    FieldIndex idxFound;
     Element elemFound = root();
     ASSERT_OK(findLongestPrefix(field(), root(), &idxFound, &elemFound));
     ASSERT_TRUE(elemFound.ok());
@@ -443,7 +442,7 @@ TEST_F(ArrayDoc, ExtendingExistingObject) {
 TEST_F(ArrayDoc, NewObjectInsideArray) {
     setField("b.1.c");
 
-    size_t idxFound;
+    FieldIndex idxFound;
     Element elemFound = root();
     ASSERT_OK(findLongestPrefix(field(), root(), &idxFound, &elemFound));
     ASSERT_TRUE(elemFound.ok());
@@ -465,7 +464,7 @@ TEST_F(ArrayDoc, NewObjectInsideArray) {
 TEST_F(ArrayDoc, NewNestedObjectInsideArray) {
     setField("b.1.c.d");
 
-    size_t idxFound;
+    FieldIndex idxFound;
     Element elemFound = root();
     ASSERT_OK(findLongestPrefix(field(), root(), &idxFound, &elemFound));
     ASSERT_TRUE(elemFound.ok());
@@ -487,7 +486,7 @@ TEST_F(ArrayDoc, NewNestedObjectInsideArray) {
 TEST_F(ArrayDoc, ArrayPaddingNecessary) {
     setField("b.5");
 
-    size_t idxFound;
+    FieldIndex idxFound;
     Element elemFound = root();
     ASSERT_OK(findLongestPrefix(field(), root(), &idxFound, &elemFound));
     ASSERT_TRUE(elemFound.ok());
@@ -512,7 +511,7 @@ TEST_F(ArrayDoc, ExcessivePaddingRequested) {
     string paddedField = stream() << "b." << mongo::pathsupport::kMaxPaddingAllowed + 2;
     setField(paddedField);
 
-    size_t idxFound;
+    FieldIndex idxFound;
     Element elemFound = root();
     ASSERT_OK(findLongestPrefix(field(), root(), &idxFound, &elemFound));
 
@@ -538,7 +537,7 @@ TEST_F(ArrayDoc, ExcessivePaddingNotRequestedIfArrayAlreadyPadded) {
         arrayA.appendInt("", 1).transitional_ignore();
     }
 
-    size_t idxFound;
+    FieldIndex idxFound;
     Element elemFound = root();
     ASSERT_OK(findLongestPrefix(field(), root(), &idxFound, &elemFound));
     ASSERT_TRUE(elemFound.ok());
@@ -563,7 +562,7 @@ TEST_F(ArrayDoc, ExcessivePaddingNotRequestedIfArrayAlreadyPadded) {
 TEST_F(ArrayDoc, NonNumericPathInArray) {
     setField("b.z");
 
-    size_t idxFound;
+    FieldIndex idxFound;
     Element elemFound = root();
     Status status = findLongestPrefix(field(), root(), &idxFound, &elemFound);
     ASSERT_EQUALS(status.code(), ErrorCodes::PathNotViable);
@@ -607,9 +606,7 @@ static void assertContains(const EqualityMatches& equalities, const BSONObj& wra
                                  &SimpleStringDataComparator::kInstance);
     if (eltCmp.evaluate(it->second->getData() != value)) {
         FAIL(stream() << "Equality match at path \"" << path << "\" contains value "
-                      << it->second->getData()
-                      << ", not value "
-                      << value);
+                      << it->second->getData() << ", not value " << value);
     }
 }
 
@@ -724,8 +721,8 @@ public:
     ImmutablePaths() {}
 
     void addPath(const string& path) {
-        _ownedPaths.push_back(stdx::make_unique<FieldRef>(path));
-        FieldRef const* conflictPath = NULL;
+        _ownedPaths.push_back(std::make_unique<FieldRef>(path));
+        FieldRef const* conflictPath = nullptr;
         ASSERT(_immutablePathSet.insert(_ownedPaths.back().get(), &conflictPath));
     }
 
@@ -899,19 +896,14 @@ static void assertParent(const EqualityMatches& equalities,
     StringData foundParentPath = path.dottedSubstring(0, parentPathPart);
     if (foundParentPath != parentPath) {
         FAIL(stream() << "Equality match parent at path \"" << foundParentPath
-                      << "\" does not match \""
-                      << parentPath
-                      << "\"");
+                      << "\" does not match \"" << parentPath << "\"");
     }
 
     BSONElementComparator eltCmp(BSONElementComparator::FieldNamesMode::kIgnore,
                                  &SimpleStringDataComparator::kInstance);
     if (eltCmp.evaluate(parentEl != value)) {
         FAIL(stream() << "Equality match parent for \"" << pathStr << "\" at path \"" << parentPath
-                      << "\" contains value "
-                      << parentEl
-                      << ", not value "
-                      << value);
+                      << "\" contains value " << parentEl << ", not value " << value);
     }
 }
 
@@ -931,8 +923,7 @@ static void assertNoParent(const EqualityMatches& equalities, StringData pathStr
     if (!parentEl.eoo()) {
         StringData foundParentPath = path.dottedSubstring(0, parentPathPart);
         FAIL(stream() << "Equality matches contained parent for \"" << pathStr << "\" at \""
-                      << foundParentPath
-                      << "\"");
+                      << foundParentPath << "\"");
     }
 }
 

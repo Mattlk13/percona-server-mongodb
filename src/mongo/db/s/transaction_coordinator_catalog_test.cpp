@@ -57,7 +57,7 @@ protected:
                                     LogicalSessionId lsid,
                                     TxnNumber txnNumber) {
         auto newCoordinator = std::make_shared<TransactionCoordinator>(
-            getServiceContext(),
+            operationContext(),
             lsid,
             txnNumber,
             std::make_unique<txn::AsyncWorkScheduler>(getServiceContext()),
@@ -142,6 +142,10 @@ TEST_F(TransactionCoordinatorCatalogTest, CoordinatorsRemoveThemselvesFromCatalo
     coordinator->cancelIfCommitNotYetStarted();
     coordinator->onCompletion().wait();
 
+    // Wait for the coordinator to be removed before attempting to call getLatestOnSession() since
+    // the coordinator is removed from the catalog asynchronously.
+    _coordinatorCatalog->join();
+
     auto latestTxnNumAndCoordinator =
         _coordinatorCatalog->getLatestOnSession(operationContext(), lsid);
     ASSERT_FALSE(latestTxnNumAndCoordinator);
@@ -168,7 +172,7 @@ TEST_F(TransactionCoordinatorCatalogTest, StepDownBeforeCoordinatorInsertedIntoC
     TransactionCoordinatorCatalog catalog;
     catalog.exitStepUp(Status::OK());
 
-    auto coordinator = std::make_shared<TransactionCoordinator>(getServiceContext(),
+    auto coordinator = std::make_shared<TransactionCoordinator>(operationContext(),
                                                                 lsid,
                                                                 txnNumber,
                                                                 aws.makeChildScheduler(),

@@ -41,7 +41,7 @@ import tempfile
 import time
 
 # The MongoDB names for the architectures we support.
-ARCH_CHOICES = ["x86_64", "arm64", "s390x"]
+ARCH_CHOICES = ["x86_64", "arm64", "aarch64", "s390x"]
 
 # Made up names for the flavors of distribution we package for.
 DISTROS = ["suse", "debian", "redhat", "ubuntu", "amazon", "amazon2"]
@@ -70,7 +70,7 @@ class Spec(object):
 
     def is_rc(self):
         """Return True if rc."""
-        return bool(re.search(r"-rc\d+$", self.version()))
+        return bool(re.search(r"(-rc|-alpha)\d+$", self.version()))
 
     def is_pre_release(self):
         """Return True if pre-release."""
@@ -103,7 +103,10 @@ class Spec(object):
 
     def suffix(self):
         """Return suffix."""
-        return "-org" if int(self.ver.split(".")[1]) % 2 == 0 else "-org-unstable"
+        if int(self.ver.split(".")[0]) >= 5:
+            return "-org" if int(self.ver.split(".")[1]) == 0 else "-org-unstable"
+        else:
+            return "-org" if int(self.ver.split(".")[1]) % 2 == 0 else "-org-unstable"
 
     def prelease(self):
         """Return pre-release verison suffix."""
@@ -207,6 +210,10 @@ class Distro(object):
                 return "s390x"
             elif arch.endswith("86"):
                 return "i686"
+            elif arch == "arm64":
+                return "arm64"
+            elif arch == "aarch64":
+                return "aarch64"
             return "x86_64"
         else:
             raise Exception("BUG: unsupported platform?")
@@ -293,6 +300,8 @@ class Distro(object):
                 return "xenial"
             elif build_os == 'ubuntu1804':
                 return "bionic"
+            elif build_os == 'ubuntu2004':
+                return "focal"
             else:
                 raise Exception("unsupported build_os: %s" % build_os)
         elif self.dname == 'debian':
@@ -300,6 +309,8 @@ class Distro(object):
                 return 'jessie'
             elif build_os == 'debian92':
                 return 'stretch'
+            elif build_os == 'debian10':
+                return 'buster'
             else:
                 raise Exception("unsupported build_os: %s" % build_os)
         else:
@@ -322,13 +333,13 @@ class Distro(object):
         "suse11" for suse, etc.
         """
         # Community builds only support amd64
-        if arch not in ['x86_64', 'ppc64le', 's390x', 'arm64']:
+        if arch not in ['x86_64', 'ppc64le', 's390x', 'arm64', 'aarch64']:
             raise Exception("BUG: unsupported architecture (%s)" % arch)
 
         if re.search("(suse)", self.dname):
             return ["suse11", "suse12", "suse15"]
         elif re.search("(redhat|fedora|centos)", self.dname):
-            return ["rhel70", "rhel71", "rhel72", "rhel62", "rhel55", "rhel67"]
+            return ["rhel82", "rhel80", "rhel70", "rhel71", "rhel72", "rhel62", "rhel55", "rhel67"]
         elif self.dname in ['amazon', 'amazon2']:
             return [self.dname]
         elif self.dname == 'ubuntu':
@@ -337,9 +348,10 @@ class Distro(object):
                 "ubuntu1404",
                 "ubuntu1604",
                 "ubuntu1804",
+                "ubuntu2004",
             ]
         elif self.dname == 'debian':
-            return ["debian81", "debian92"]
+            return ["debian81", "debian92", "debian10"]
         else:
             raise Exception("BUG: unsupported platform?")
 
@@ -489,7 +501,7 @@ def unpack_binaries_into(build_os, arch, spec, where):
     try:
         sysassert(["tar", "xvzf", rootdir + "/" + tarfile(build_os, arch, spec)])
         release_dir = glob('mongodb-linux-*')[0]
-        for releasefile in "bin", "LICENSE-Community.txt", "README", "THIRD-PARTY-NOTICES", "THIRD-PARTY-NOTICES.gotools", "MPL-2":
+        for releasefile in "bin", "LICENSE-Community.txt", "README", "THIRD-PARTY-NOTICES", "MPL-2":
             print("moving file: %s/%s" % (release_dir, releasefile))
             os.rename("%s/%s" % (release_dir, releasefile), releasefile)
         os.rmdir(release_dir)
@@ -522,10 +534,7 @@ def make_package(distro, build_os, arch, spec, srcdir):
     # packaging infrastructure will move the files to wherever they
     # need to go.
     unpack_binaries_into(build_os, arch, spec, sdir)
-    # Remove the mongoreplay binary due to libpcap dynamic
-    # linkage.
-    if os.path.exists(sdir + "bin/mongoreplay"):
-        os.unlink(sdir + "bin/mongoreplay")
+
     return distro.make_pkg(build_os, arch, spec, srcdir)
 
 
@@ -769,50 +778,7 @@ def make_rpm(distro, build_os, arch, spec, srcdir):  # pylint: disable=too-many-
     for subdir in ["BUILD", "RPMS", "SOURCES", "SPECS", "SRPMS"]:
         ensure_dir("%s/%s/" % (topdir, subdir))
     distro_arch = distro.archname(arch)
-    # RPM tools take these macro files that define variables in
-    # RPMland.  Unfortunately, there's no way to tell RPM tools to use
-    # a given file *in addition* to the files that it would already
-    # load, so we have to figure out what it would normally load,
-    # augment that list, and tell RPM to use the augmented list.  To
-    # figure out what macrofiles ordinarily get loaded, older RPM
-    # versions had a parameter called "macrofiles" that could be
-    # extracted from "rpm --showrc".  But newer RPM versions don't
-    # have this.  To tell RPM what macros to use, older versions of
-    # RPM have a --macros option that doesn't work; on these versions,
-    # you can put a "macrofiles" parameter into an rpmrc file.  But
-    # that "macrofiles" setting doesn't do anything for newer RPM
-    # versions, where you have to use the --macros flag instead.  And
-    # all of this is to let us do our work with some guarantee that
-    # we're not clobbering anything that doesn't belong to us.
-    #
-    # On RHEL systems, --rcfile will generally be used and
-    # --macros will be used in Ubuntu.
-    #
-    macrofiles = [
-        l for l in backtick(["rpm", "--showrc"]).decode('utf-8').split("\n")
-        if l.startswith("macrofiles")
-    ]
-    flags = []
-    macropath = os.getcwd() + "/macros"
 
-    write_rpm_macros_file(macropath, topdir, distro.release_dist(build_os))
-    if macrofiles:
-        macrofiles = macrofiles[0] + ":" + macropath
-        rcfile = os.getcwd() + "/rpmrc"
-        write_rpmrc_file(rcfile, macrofiles)
-        flags = ["--rcfile", rcfile]
-    else:
-        # This hard-coded hooey came from some box running RPM
-        # 4.4.2.3.  It may not work over time, but RPM isn't sanely
-        # configurable.
-        flags = [
-            "--macros",
-            "/usr/lib/rpm/macros:/usr/lib/rpm/%s-linux/macros:/usr/lib/rpm/suse/macros:/etc/rpm/macros.*:/etc/rpm/macros:/etc/rpm/%s-linux/macros:~/.rpmmacros:%s"
-            % (distro_arch, distro_arch, macropath)
-        ]
-    # Put the specfile and the tar'd up binaries and stuff in
-    # place.
-    #
     # The version of rpm and rpm tools in RHEL 5.5 can't interpolate the
     # %{dynamic_version} macro, so do it manually
     with open(specfile, "r") as spec_source:
@@ -834,19 +800,23 @@ def make_rpm(distro, build_os, arch, spec, srcdir):  # pylint: disable=too-many-
         os.chdir(oldcwd)
     # Do the build.
 
-    flags.extend([
-        "-D", "dynamic_version " + spec.pversion(distro), "-D",
-        "dynamic_release " + spec.prelease(), "-D", "_topdir " + topdir
-    ])
+    flags = [
+        "-D",
+        f"_topdir {topdir}",
+        "-D",
+        f"dist .{distro.release_dist(build_os)}",
+        "-D",
+        "_use_internal_dependency_generator 0",
+        "-D",
+        f"dynamic_version {spec.pversion(distro)}",
+        "-D",
+        f"dynamic_release {spec.prelease()}",
+    ]
 
     # Versions of RPM after 4.4 ignore our BuildRoot tag so we need to
     # specify it on the command line args to rpmbuild
-    #
-    # Current versions of RHEL at the time of this writing (RHEL < 8) patch in
-    # the old behavior so that our BuildRoot tag still works on these versions.
-    #
-    # Probably need to add RHEL 8 to this when we start building for it
-    if distro.name() == "suse" and distro.repo_os_version(build_os) == "15":
+    if ((distro.name() == "suse" and distro.repo_os_version(build_os) == "15")
+            or (distro.name() == "redhat" and distro.repo_os_version(build_os) == "8")):
         flags.extend([
             "--buildroot",
             os.path.join(topdir, "BUILDROOT"),
@@ -870,20 +840,6 @@ def make_rpm_repo(repo):
         sysassert(["createrepo", "."])
     finally:
         os.chdir(oldpwd)
-
-
-def write_rpmrc_file(path, string):
-    """Write the RPM rc file."""
-    with open(path, 'w') as fh:
-        fh.write(string)
-
-
-def write_rpm_macros_file(path, topdir, release_dist):
-    """Write the RPM macros file."""
-    with open(path, 'w') as fh:
-        fh.write("%%_topdir	%s\n" % topdir)
-        fh.write("%%dist	.%s\n" % release_dist)
-        fh.write("%_use_internal_dependency_generator 0\n")
 
 
 def ensure_dir(filename):

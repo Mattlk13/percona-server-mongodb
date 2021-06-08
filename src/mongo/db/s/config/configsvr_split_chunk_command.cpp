@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -41,7 +41,6 @@
 #include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/split_chunk_request_type.h"
-#include "mongo/util/log.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -112,14 +111,14 @@ public:
 
         auto parsedRequest = uassertStatusOK(SplitChunkRequest::parseFromConfigCommand(cmdObj));
 
-        Status splitChunkResult =
+        auto shardAndCollVers = uassertStatusOK(
             ShardingCatalogManager::get(opCtx)->commitChunkSplit(opCtx,
                                                                  parsedRequest.getNamespace(),
                                                                  parsedRequest.getEpoch(),
                                                                  parsedRequest.getChunkRange(),
                                                                  parsedRequest.getSplitPoints(),
-                                                                 parsedRequest.getShardName());
-        uassertStatusOK(splitChunkResult);
+                                                                 parsedRequest.getShardName()));
+        result.appendElements(shardAndCollVers);
 
         return true;
     }

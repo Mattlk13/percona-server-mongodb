@@ -46,6 +46,9 @@ class Environment;
 namespace moe = mongo::optionenvironment;
 
 struct MongosGlobalParams {
+    bool scriptingEnabled = true;  // Use "security.javascriptEnabled" to set this variable. Or use
+                                   // --noscripting which will set it to false.
+
     // The config server connection string
     ConnectionString configdbs;
 };
@@ -78,4 +81,4 @@ Status validateMongosOptions(const moe::Environment& params);
 Status canonicalizeMongosOptions(moe::Environment* params);
 
 Status storeMongosOptions(const moe::Environment& params);
-}
+}  // namespace mongo

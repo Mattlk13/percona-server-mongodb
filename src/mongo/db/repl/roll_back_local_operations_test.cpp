@@ -27,6 +27,8 @@
  *    it in the license file.
  */
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
 #include "mongo/platform/basic.h"
 
 #include <iterator>
@@ -39,6 +41,7 @@
 #include "mongo/db/repl/oplog_interface_mock.h"
 #include "mongo/db/repl/oplog_interface_remote.h"
 #include "mongo/db/repl/roll_back_local_operations.h"
+#include "mongo/logv2/log.h"
 #include "mongo/unittest/unittest.h"
 
 namespace {
@@ -46,21 +49,20 @@ namespace {
 using namespace mongo;
 using namespace mongo::repl;
 
-BSONObj makeOp(long long seconds, long long term = 1LL) {
+BSONObj makeOp(long long seconds, long long term = 1LL, long wallClockMillis = 0) {
     auto uuid = unittest::assertGet(UUID::parse("b4c66a44-c1ca-4d86-8d25-12e82fa2de5b"));
     return BSON("ts" << Timestamp(seconds, seconds) << "t" << term << "op"
                      << "n"
-                     << "o"
-                     << BSONObj()
-                     << "ns"
+                     << "o" << BSONObj() << "ns"
                      << "roll_back_local_operations.test"
-                     << "ui"
-                     << uuid);
+                     << "ui" << uuid << "wall" << Date_t::fromMillisSinceEpoch(wallClockMillis));
 }
 
 int recordId = 0;
-OplogInterfaceMock::Operation makeOpAndRecordId(long long seconds, long long term = 1LL) {
-    return std::make_pair(makeOp(seconds), RecordId(++recordId));
+OplogInterfaceMock::Operation makeOpAndRecordId(long long seconds,
+                                                long long term = 1LL,
+                                                long long wallClockMillis = 0) {
+    return std::make_pair(makeOp(seconds, term, wallClockMillis), RecordId(++recordId));
 }
 
 TEST(RollBackLocalOperationsTest, InvalidLocalOplogIterator) {
@@ -131,7 +133,8 @@ TEST(RollBackLocalOperationsTest, RollbackMultipleLocalOperations) {
 TEST(RollBackLocalOperationsTest, RollbackOperationFailed) {
     auto commonOperation = makeOpAndRecordId(1);
     OplogInterfaceMock::Operations localOperations({
-        makeOpAndRecordId(2), commonOperation,
+        makeOpAndRecordId(2),
+        commonOperation,
     });
     OplogInterfaceMock localOplog(localOperations);
     auto rollbackOperation = [&](const BSONObj& operation) {
@@ -156,7 +159,10 @@ TEST(RollBackLocalOperationsTest, EndOfLocalOplog) {
 TEST(RollBackLocalOperationsTest, SkipRemoteOperations) {
     auto commonOperation = makeOpAndRecordId(1);
     OplogInterfaceMock::Operations localOperations({
-        makeOpAndRecordId(5), makeOpAndRecordId(4), makeOpAndRecordId(2), commonOperation,
+        makeOpAndRecordId(5),
+        makeOpAndRecordId(4),
+        makeOpAndRecordId(2),
+        commonOperation,
     });
     OplogInterfaceMock localOplog(localOperations);
     auto i = localOperations.cbegin();
@@ -190,7 +196,8 @@ TEST(RollBackLocalOperationsTest, SkipRemoteOperations) {
 TEST(RollBackLocalOperationsTest, SameTimestampDifferentTermsRollbackNoSuchKey) {
     auto commonOperation = makeOpAndRecordId(1, 1);
     OplogInterfaceMock::Operations localOperations({
-        makeOpAndRecordId(2, 3), commonOperation,
+        makeOpAndRecordId(2, 3),
+        commonOperation,
     });
     OplogInterfaceMock localOplog(localOperations);
     auto rollbackOperation = [&](const BSONObj& operation) {
@@ -220,9 +227,12 @@ TEST(SyncRollBackLocalOperationsTest, RemoteOplogMissing) {
 }
 
 TEST(SyncRollBackLocalOperationsTest, RollbackTwoOperations) {
-    auto commonOperation = makeOpAndRecordId(1);
+    auto commonOperation = makeOpAndRecordId(1, 1LL, 1 * 5000);
+    auto firstOpAfterCommonPoint = makeOpAndRecordId(2, 1LL, 2 * 60 * 60 * 24 * 1000);
     OplogInterfaceMock::Operations localOperations({
-        makeOpAndRecordId(3), makeOpAndRecordId(2), commonOperation,
+        makeOpAndRecordId(3),
+        firstOpAfterCommonPoint,
+        commonOperation,
     });
     auto i = localOperations.cbegin();
     auto result = syncRollBackLocalOperations(OplogInterfaceMock(localOperations),
@@ -238,6 +248,10 @@ TEST(SyncRollBackLocalOperationsTest, RollbackTwoOperations) {
     ASSERT_EQUALS(commonOperation.second, result.getValue().getRecordId());
     ASSERT_FALSE(i == localOperations.cend());
     ASSERT_BSONOBJ_EQ(commonOperation.first, i->first);
+    auto firstOplogEntryAfterCommonPoint =
+        uassertStatusOK(OplogEntry::parse(firstOpAfterCommonPoint.first));
+    ASSERT_EQUALS(result.getValue().getFirstOpWallClockTimeAfterCommonPoint(),
+                  firstOplogEntryAfterCommonPoint.getWallClockTime());
     i++;
     ASSERT_TRUE(i == localOperations.cend());
 }
@@ -312,17 +326,19 @@ public:
                                           int nToSkip,
                                           const BSONObj* fieldsToReturn,
                                           int queryOptions,
-                                          int batchSize) override {
+                                          int batchSize,
+                                          boost::optional<BSONObj> readConcernObj) override {
         if (_initFailuresLeft > 0) {
             _initFailuresLeft--;
-            unittest::log()
-                << "Throwing DBException on DBClientCursorForTest::query(). Failures left: "
-                << _initFailuresLeft;
+            LOGV2(21657,
+                  "Throwing DBException on DBClientCursorForTest::query(). Failures left: "
+                  "{initFailuresLeft}",
+                  "initFailuresLeft"_attr = _initFailuresLeft);
             uasserted(50852, "Simulated network error");
             MONGO_UNREACHABLE;
         }
 
-        unittest::log() << "Returning success on DBClientCursorForTest::query()";
+        LOGV2(21658, "Returning success on DBClientCursorForTest::query()");
 
         BSONArrayBuilder builder;
         builder.append(makeOp(1));

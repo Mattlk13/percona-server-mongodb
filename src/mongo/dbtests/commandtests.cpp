@@ -27,6 +27,8 @@
  *    it in the license file.
  */
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
 #include "mongo/platform/basic.h"
 
 #include <unordered_set>
@@ -37,6 +39,7 @@
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/dbtests/dbtests.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/op_msg.h"
 
 using namespace mongo;
@@ -50,7 +53,7 @@ TEST(CommandTests, InputDocumentSequeceWorksEndToEnd) {
     NamespaceString nss("test", "doc_seq");
     DBDirectClient db(opCtx);
     db.dropCollection(nss.ns());
-    ASSERT_EQ(db.count(nss.ns()), 0u);
+    ASSERT_EQ(db.count(nss), 0u);
 
     OpMsgRequest request;
     request.body = BSON("insert" << nss.coll() << "$db" << nss.db());
@@ -66,7 +69,7 @@ TEST(CommandTests, InputDocumentSequeceWorksEndToEnd) {
     const auto reply = db.runCommand(std::move(request));
     ASSERT_EQ(int(reply->getProtocol()), int(rpc::Protocol::kOpMsg));
     ASSERT_BSONOBJ_EQ(reply->getCommandReply(), BSON("n" << 5 << "ok" << 1.0));
-    ASSERT_EQ(db.count(nss.ns()), 5u);
+    ASSERT_EQ(db.count(nss), 5u);
 }
 
 using std::string;
@@ -159,7 +162,7 @@ struct Type2 : Base {
         ASSERT_EQUALS(string("5eb63bbbe01eeed093cb22bb8f5acdc3"), result["md5"].valuestr());
     }
 };
-}
+}  // namespace FileMD5
 
 namespace SymbolArgument {
 // SERVER-16260
@@ -177,7 +180,7 @@ public:
 
             BSONObj result;
             bool ok = db.runCommand(nsDb(), cmd.obj(), result);
-            log() << result.jsonString();
+            LOGV2(24181, "{result_jsonString}", "result_jsonString"_attr = result.jsonString());
             ASSERT(ok);
         }
     }
@@ -194,7 +197,7 @@ public:
 
         BSONObj result;
         bool ok = db.runCommand(nsDb(), cmd.obj(), result);
-        log() << result.jsonString();
+        LOGV2(24182, "{result_jsonString}", "result_jsonString"_attr = result.jsonString());
         ASSERT(ok);
     }
 };
@@ -215,7 +218,7 @@ public:
 
         BSONObj result;
         bool ok = db.runCommand(nsDb(), cmd.obj(), result);
-        log() << result.jsonString();
+        LOGV2(24183, "{result_jsonString}", "result_jsonString"_attr = result.jsonString());
         ASSERT(!ok);
     }
 };
@@ -237,7 +240,32 @@ public:
 
         BSONObj result;
         bool ok = db.runCommand(nsDb(), cmd.obj(), result);
-        log() << result.jsonString();
+        LOGV2(24184, "{result_jsonString}", "result_jsonString"_attr = result.jsonString());
+        ASSERT(!ok);
+    }
+};
+
+
+class CreateIndexWithEmptyStringAsValue : Base {
+public:
+    void run() {
+        ASSERT(db.createCollection(nss().ns()));
+
+        BSONObjBuilder indexSpec;
+        indexSpec.append("key",
+                         BSON("a"
+                              << ""));
+
+        BSONArrayBuilder indexes;
+        indexes.append(indexSpec.obj());
+
+        BSONObjBuilder cmd;
+        cmd.append("createIndexes", nsColl());
+        cmd.append("indexes", indexes.arr());
+
+        BSONObj result;
+        bool ok = db.runCommand(nsDb(), cmd.obj(), result);
+        LOGV2(24185, "{result_jsonString}", "result_jsonString"_attr = result.jsonString());
         ASSERT(!ok);
     }
 };
@@ -261,82 +289,11 @@ public:
 
         BSONObj result;
         bool ok = db.runCommand(nsDb(), cmd.obj(), result);
-        log() << result.jsonString();
+        LOGV2(24186, "{result_jsonString}", "result_jsonString"_attr = result.jsonString());
         ASSERT(ok);
         // TODO(kangas) test that Tom's score is 1
     }
 };
-
-class GeoSearch : Base {
-public:
-    void run() {
-        // Subset of geo_haystack1.js
-
-        int n = 0;
-        for (int x = 0; x < 20; x++) {
-            for (int y = 0; y < 20; y++) {
-                db.insert(nss().ns(),
-                          BSON("_id" << n << "loc" << BSON_ARRAY(x << y) << "z" << n % 5));
-                n++;
-            }
-        }
-
-        // Build geoHaystack index. Can's use db.ensureIndex, no way to pass "bucketSize".
-        // So run createIndexes command instead.
-        //
-        // Shell example:
-        // t.ensureIndex( { loc : "geoHaystack" , z : 1 }, { bucketSize : .7 } );
-
-        {
-            BSONObjBuilder cmd;
-            cmd.append("createIndexes", nsColl());
-            cmd.append("indexes",
-                       BSON_ARRAY(BSON("key" << BSON("loc"
-                                                     << "geoHaystack"
-                                                     << "z"
-                                                     << 1.0)
-                                             << "name"
-                                             << "loc_geoHaystack_z_1"
-                                             << "bucketSize"
-                                             << static_cast<double>(0.7))));
-
-            BSONObj result;
-            ASSERT(db.runCommand(nsDb(), cmd.obj(), result));
-        }
-
-        {
-            BSONObjBuilder cmd;
-            cmd.appendSymbol("geoSearch", nsColl());  // Use Symbol for SERVER-16260
-            cmd.append("near", BSON_ARRAY(7 << 8));
-            cmd.append("maxDistance", 3);
-            cmd.append("search", BSON("z" << 3));
-
-            BSONObj result;
-            bool ok = db.runCommand(nsDb(), cmd.obj(), result);
-            log() << result.jsonString();
-            ASSERT(ok);
-        }
-    }
-};
-
-class Touch : Base {
-public:
-    void run() {
-        ASSERT(db.createCollection(nss().ns()));
-        {
-            BSONObjBuilder cmd;
-            cmd.appendSymbol("touch", nsColl());  // Use Symbol for SERVER-16260
-            cmd.append("data", true);
-            cmd.append("index", true);
-
-            BSONObj result;
-            bool ok = db.runCommand(nsDb(), cmd.obj(), result);
-            log() << result.jsonString();
-            ASSERT(ok || result["code"].Int() == ErrorCodes::CommandNotSupported);
-        }
-    }
-};
-
 }  // namespace SymbolArgument
 
 /**
@@ -357,9 +314,9 @@ public:
     }
 };
 
-class All : public Suite {
+class All : public OldStyleSuiteSpecification {
 public:
-    All() : Suite("commands") {}
+    All() : OldStyleSuiteSpecification("commands") {}
 
     void setupTests() {
         add<FileMD5::Type0>();
@@ -367,14 +324,13 @@ public:
         add<FileMD5::Type2>();
         add<SymbolArgument::DropIndexes>();
         add<SymbolArgument::FindAndModify>();
-        add<SymbolArgument::Touch>();
         add<SymbolArgument::Drop>();
-        add<SymbolArgument::GeoSearch>();
         add<SymbolArgument::CreateIndexWithNoKey>();
         add<SymbolArgument::CreateIndexWithDuplicateKey>();
+        add<SymbolArgument::CreateIndexWithEmptyStringAsValue>();
         add<RolesInfoShouldNotReturnDuplicateFieldNames>();
     }
 };
 
-SuiteInstance<All> all;
-}
+OldStyleSuiteInitializer<All> all;
+}  // namespace CommandTests

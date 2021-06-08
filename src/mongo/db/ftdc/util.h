@@ -39,29 +39,31 @@
 
 namespace mongo {
 
+constexpr StringData kFTDCThreadName = "ftdc"_sd;
+
 /**
  * Utilities for inflating and deflating BSON documents and metric arrays
  */
 namespace FTDCBSONUtil {
 
 /**
-* Type of FTDC document.
-*
-* NOTE: Persisted to disk via BSON Objects.
-*/
+ * Type of FTDC document.
+ *
+ * NOTE: Persisted to disk via BSON Objects.
+ */
 enum class FTDCType : std::int32_t {
     /**
-    * A metadata document is composed of a header + an array of bson documents
-    *
-    * See createBSONMetadataChunkDocument
-    */
+     * A metadata document is composed of a header + an array of bson documents
+     *
+     * See createBSONMetadataChunkDocument
+     */
     kMetadata = 0,
 
     /**
-    * A metrics chunk is composed of a header + a compressed metric chunk.
-    *
-    * See createBSONMetricChunkDocument
-    */
+     * A metrics chunk is composed of a header + a compressed metric chunk.
+     *
+     * See createBSONMetricChunkDocument
+     */
     kMetricChunk = 1,
 };
 

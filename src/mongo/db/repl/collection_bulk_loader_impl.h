@@ -84,14 +84,27 @@ private:
     Status _runTaskReleaseResourcesOnFailure(const F& task) noexcept;
 
     /**
+     * For capped collections, each document will be inserted in its own WriteUnitOfWork.
+     */
+    Status _insertDocumentsForCappedCollection(const std::vector<BSONObj>::const_iterator begin,
+                                               const std::vector<BSONObj>::const_iterator end);
+
+    /**
+     * For uncapped collections, we will insert documents in batches of size
+     * collectionBulkLoaderBatchSizeInBytes or up to one document size greater. All insertions in a
+     * given batch will be inserted in one WriteUnitOfWork.
+     */
+    Status _insertDocumentsForUncappedCollection(const std::vector<BSONObj>::const_iterator begin,
+                                                 const std::vector<BSONObj>::const_iterator end);
+
+    /**
      * Adds document and associated RecordId to index blocks after inserting into RecordStore.
      */
     Status _addDocumentToIndexBlocks(const BSONObj& doc, const RecordId& loc);
 
     ServiceContext::UniqueClient _client;
     ServiceContext::UniqueOperationContext _opCtx;
-    std::unique_ptr<AutoGetCollection> _autoColl;
-    Collection* _collection;
+    std::unique_ptr<AutoGetCollection> _collection;
     NamespaceString _nss;
     std::unique_ptr<MultiIndexBlock> _idIndexBlock;
     std::unique_ptr<MultiIndexBlock> _secondaryIndexesBlock;

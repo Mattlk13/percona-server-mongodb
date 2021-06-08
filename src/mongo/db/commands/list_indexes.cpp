@@ -27,11 +27,16 @@
  *    it in the license file.
  */
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
 #include "mongo/platform/basic.h"
+
+#include <memory>
+#include <utility>
 
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/catalog/collection_catalog_entry.h"
+#include "mongo/db/catalog/list_indexes.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
@@ -42,26 +47,59 @@
 #include "mongo/db/exec/queued_data_stage.h"
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/list_indexes_gen.h"
 #include "mongo/db/query/cursor_request.h"
 #include "mongo/db/query/cursor_response.h"
 #include "mongo/db/query/find_common.h"
+#include "mongo/db/query/plan_executor_factory.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/storage/storage_engine.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/db/timeseries/timeseries_index_schema_conversion_functions.h"
+#include "mongo/db/timeseries/timeseries_lookup.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/uuid.h"
 
 namespace mongo {
-
-using std::string;
-using std::stringstream;
-using std::unique_ptr;
-using std::vector;
-using stdx::make_unique;
-
 namespace {
 
-// Failpoint which causes to hang "listIndexes" cmd after acquiring the DB lock.
-MONGO_FAIL_POINT_DEFINE(hangBeforeListIndexes);
+/**
+ * Returns index specs, with resolved namespace, from the catalog for this listIndexes request.
+ */
+using IndexSpecsWithNamespaceString = std::pair<std::list<BSONObj>, NamespaceString>;
+IndexSpecsWithNamespaceString getIndexSpecsWithNamespaceString(OperationContext* opCtx,
+                                                               const ListIndexes& cmd) {
+    const auto& origNssOrUUID = cmd.getNamespaceOrUUID();
+
+    // Since time-series collections don't have UUIDs, we skip the time-series lookup
+    // if the target collection is specified as a UUID.
+    if (const auto& origNss = origNssOrUUID.nss()) {
+        if (auto timeseriesOptions = timeseries::getTimeseriesOptions(opCtx, *origNss)) {
+            auto bucketsNss = origNss->makeTimeseriesBucketsNamespace();
+            AutoGetCollectionForReadCommandMaybeLockFree autoColl(opCtx, bucketsNss);
+
+            const CollectionPtr& coll = autoColl.getCollection();
+            uassert(ErrorCodes::NamespaceNotFound,
+                    str::stream() << "ns does not exist: " << bucketsNss,
+                    coll);
+
+            return std::make_pair(
+                timeseries::createTimeseriesIndexesFromBucketsIndexes(
+                    *timeseriesOptions,
+                    listIndexesInLock(opCtx, coll, bucketsNss, cmd.getIncludeBuildUUIDs())),
+                *origNss);
+        }
+    }
+
+    AutoGetCollectionForReadCommandMaybeLockFree autoColl(opCtx, origNssOrUUID);
+
+    const auto& nss = autoColl.getNss();
+    const CollectionPtr& coll = autoColl.getCollection();
+    uassert(
+        ErrorCodes::NamespaceNotFound, str::stream() << "ns does not exist: " << nss.ns(), coll);
+
+    return std::make_pair(listIndexesInLock(opCtx, coll, nss, cmd.getIncludeBuildUUIDs()), nss);
+}
 
 /**
  * Lists the indexes for a given collection.
@@ -90,157 +128,169 @@ MONGO_FAIL_POINT_DEFINE(hangBeforeListIndexes);
  *   buildUUID: <index build uuid>
  * }
  */
-class CmdListIndexes : public BasicCommand {
-public:
-    CmdListIndexes() : BasicCommand("listIndexes") {}
 
-    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+class CmdListIndexes final : public ListIndexesCmdVersion1Gen<CmdListIndexes> {
+public:
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const final {
         return AllowedOnSecondary::kOptIn;
     }
-
-    virtual bool adminOnly() const {
+    bool maintenanceOk() const final {
         return false;
     }
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+    bool adminOnly() const final {
         return false;
     }
 
-    std::string help() const override {
+    bool collectsResourceConsumptionMetrics() const final {
+        return true;
+    }
+
+    std::string help() const final {
         return "list indexes for a collection";
     }
 
-    Status checkAuthForOperation(OperationContext* opCtx,
-                                 const std::string& dbname,
-                                 const BSONObj& cmdObj) const override {
-        AuthorizationSession* authzSession = AuthorizationSession::get(opCtx->getClient());
+    class Invocation final : public InvocationBaseGen {
+    public:
+        using InvocationBaseGen::InvocationBaseGen;
 
-        if (!authzSession->isAuthorizedToParseNamespaceElement(cmdObj.firstElement())) {
-            return Status(ErrorCodes::Unauthorized, "Unauthorized");
+        bool supportsWriteConcern() const final {
+            return false;
         }
 
-        // Check for the listIndexes ActionType on the database.
-        const auto nss = AutoGetCollection::resolveNamespaceStringOrUUID(
-            opCtx, CommandHelpers::parseNsOrUUID(dbname, cmdObj));
-        if (authzSession->isAuthorizedForActionsOnResource(ResourcePattern::forExactNamespace(nss),
-                                                           ActionType::listIndexes)) {
-            return Status::OK();
+        NamespaceString ns() const final {
+            auto nss = request().getNamespaceOrUUID();
+            if (nss.uuid()) {
+                // UUID requires opCtx to resolve, settle on just the dbname.
+                return NamespaceString(request().getDbName(), "");
+            }
+            invariant(nss.nss());
+            return nss.nss().get();
         }
 
-        return Status(ErrorCodes::Unauthorized,
-                      str::stream() << "Not authorized to list indexes on collection: "
-                                    << nss.ns());
-    }
+        void doCheckAuthorization(OperationContext* opCtx) const final {
+            AuthorizationSession* authzSession = AuthorizationSession::get(opCtx->getClient());
 
-    bool run(OperationContext* opCtx,
-             const string& dbname,
-             const BSONObj& cmdObj,
-             BSONObjBuilder& result) {
-        CommandHelpers::handleMarkKillOnClientDisconnect(opCtx);
-        const long long defaultBatchSize = std::numeric_limits<long long>::max();
-        long long batchSize;
-        uassertStatusOK(
-            CursorRequest::parseCommandCursorOptions(cmdObj, defaultBatchSize, &batchSize));
+            auto& cmd = request();
+            uassert(
+                ErrorCodes::Unauthorized,
+                "Unauthorized",
+                authzSession->isAuthorizedToParseNamespaceElement(request().getNamespaceOrUUID()));
 
-        auto includeBuildUUIDs = cmdObj["includeBuildUUIDs"].trueValue();
+            const auto nss = CollectionCatalog::get(opCtx)->resolveNamespaceStringOrUUID(
+                opCtx, cmd.getNamespaceOrUUID());
 
-        NamespaceString nss;
-        std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec;
-        BSONArrayBuilder firstBatch;
-        {
-            AutoGetCollectionForReadCommand ctx(opCtx,
-                                                CommandHelpers::parseNsOrUUID(dbname, cmdObj));
-            Collection* collection = ctx.getCollection();
-            uassert(ErrorCodes::NamespaceNotFound,
-                    str::stream() << "ns does not exist: " << ctx.getNss().ns(),
-                    collection);
+            uassert(ErrorCodes::Unauthorized,
+                    str::stream() << "Not authorized to list indexes on collection:" << nss.ns(),
+                    authzSession->isAuthorizedForActionsOnResource(
+                        ResourcePattern::forExactNamespace(nss), ActionType::listIndexes));
+        }
 
-            const CollectionCatalogEntry* cce = collection->getCatalogEntry();
-            invariant(cce);
+        ListIndexesReply typedRun(OperationContext* opCtx) final {
+            CommandHelpers::handleMarkKillOnClientDisconnect(opCtx);
+            auto indexSpecsWithNss = getIndexSpecsWithNamespaceString(opCtx, request());
+            const auto& indexList = indexSpecsWithNss.first;
+            const auto& nss = indexSpecsWithNss.second;
+            return ListIndexesReply(_makeCursor(opCtx, indexList, nss));
+        }
 
-            nss = ctx.getNss();
+    private:
+        /**
+         * Constructs a cursor that iterates the index specs found in 'indexSpecsWithNss'.
+         * This function does not hold any locks because it does not access in-memory
+         * or on-disk data.
+         */
+        ListIndexesReplyCursor _makeCursor(OperationContext* opCtx,
+                                           const std::list<BSONObj>& indexList,
+                                           const NamespaceString& nss) {
+            auto& cmd = request();
 
-            CurOpFailpointHelpers::waitWhileFailPointEnabled(
-                &hangBeforeListIndexes, opCtx, "hangBeforeListIndexes", []() {}, false, nss);
+            long long batchSize = std::numeric_limits<long long>::max();
+            if (cmd.getCursor() && cmd.getCursor()->getBatchSize()) {
+                batchSize = *cmd.getCursor()->getBatchSize();
+            }
 
-            vector<string> indexNames;
-            writeConflictRetry(opCtx, "listIndexes", nss.ns(), [&] {
-                indexNames.clear();
-                cce->getAllIndexes(opCtx, &indexNames);
-            });
+            auto expCtx = make_intrusive<ExpressionContext>(
+                opCtx, std::unique_ptr<CollatorInterface>(nullptr), nss);
 
-            auto ws = make_unique<WorkingSet>();
-            auto root = make_unique<QueuedDataStage>(opCtx, ws.get());
+            auto ws = std::make_unique<WorkingSet>();
+            auto root = std::make_unique<QueuedDataStage>(expCtx.get(), ws.get());
 
-            for (size_t i = 0; i < indexNames.size(); i++) {
-                auto indexSpec = writeConflictRetry(opCtx, "listIndexes", nss.ns(), [&] {
-                    if (includeBuildUUIDs && !cce->isIndexReady(opCtx, indexNames[i])) {
-                        BSONObjBuilder builder;
-                        builder.append("spec"_sd, cce->getIndexSpec(opCtx, indexNames[i]));
-
-                        // TODO(SERVER-37980): Replace with index build UUID.
-                        auto indexBuildUUID = UUID::gen();
-                        indexBuildUUID.appendToBuilder(&builder, "buildUUID"_sd);
-                        return builder.obj();
-                    }
-                    return cce->getIndexSpec(opCtx, indexNames[i]);
-                });
-
+            for (auto&& indexSpec : indexList) {
                 WorkingSetID id = ws->allocate();
                 WorkingSetMember* member = ws->get(id);
                 member->keyData.clear();
                 member->recordId = RecordId();
-                member->obj = Snapshotted<BSONObj>(SnapshotId(), indexSpec.getOwned());
+                member->resetDocument(SnapshotId(), indexSpec.getOwned());
                 member->transitionToOwnedObj();
                 root->pushBack(id);
             }
 
-            exec = uassertStatusOK(PlanExecutor::make(
-                opCtx, std::move(ws), std::move(root), nss, PlanExecutor::NO_YIELD));
+            auto exec = uassertStatusOK(
+                plan_executor_factory::make(expCtx,
+                                            std::move(ws),
+                                            std::move(root),
+                                            &CollectionPtr::null,
+                                            PlanYieldPolicy::YieldPolicy::NO_YIELD,
+                                            false, /* whether returned BSON must be owned */
+                                            nss));
 
+            std::vector<mongo::ListIndexesReplyItem> firstBatch;
+            int bytesBuffered = 0;
             for (long long objCount = 0; objCount < batchSize; objCount++) {
-                BSONObj next;
-                PlanExecutor::ExecState state = exec->getNext(&next, NULL);
+                BSONObj nextDoc;
+                PlanExecutor::ExecState state = exec->getNext(&nextDoc, nullptr);
                 if (state == PlanExecutor::IS_EOF) {
                     break;
                 }
                 invariant(state == PlanExecutor::ADVANCED);
 
-                // If we can't fit this result inside the current batch, then we stash it for later.
-                if (!FindCommon::haveSpaceForNext(next, objCount, firstBatch.len())) {
-                    exec->enqueue(next);
+                // If we can't fit this result inside the current batch, then we stash it for
+                // later.
+                if (!FindCommon::haveSpaceForNext(nextDoc, objCount, bytesBuffered)) {
+                    exec->enqueue(nextDoc);
                     break;
                 }
 
-                firstBatch.append(next);
+                try {
+                    firstBatch.push_back(ListIndexesReplyItem::parse(
+                        IDLParserErrorContext("ListIndexesReplyItem"), nextDoc));
+                } catch (const DBException& exc) {
+                    LOGV2_ERROR(5254500,
+                                "Could not parse catalog entry while replying to listIndexes",
+                                "entry"_attr = nextDoc,
+                                "error"_attr = exc);
+                    uasserted(5254501,
+                              "Could not parse catalog entry while replying to listIndexes");
+                }
+                bytesBuffered += nextDoc.objsize();
             }
 
             if (exec->isEOF()) {
-                appendCursorResponseObject(0LL, nss.ns(), firstBatch.arr(), &result);
-                return true;
+                return ListIndexesReplyCursor(0 /* cursorId */, nss, std::move(firstBatch));
             }
 
             exec->saveState();
             exec->detachFromOperationContext();
-        }  // Drop collection lock. Global cursor registration must be done without holding any
-           // locks.
 
-        const auto pinnedCursor = CursorManager::get(opCtx)->registerCursor(
-            opCtx,
-            {std::move(exec),
-             nss,
-             AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames(),
-             opCtx->getWriteConcern(),
-             repl::ReadConcernArgs::get(opCtx),
-             cmdObj,
-             ClientCursorParams::LockPolicy::kLocksInternally,
-             {Privilege(ResourcePattern::forExactNamespace(nss), ActionType::listIndexes)}});
+            // Global cursor registration must be done without holding any locks.
+            auto pinnedCursor = CursorManager::get(opCtx)->registerCursor(
+                opCtx,
+                {std::move(exec),
+                 nss,
+                 AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames(),
+                 APIParameters::get(opCtx),
+                 opCtx->getWriteConcern(),
+                 repl::ReadConcernArgs::get(opCtx),
+                 cmd.toBSON({}),
+                 {Privilege(ResourcePattern::forExactNamespace(nss), ActionType::listIndexes)}});
 
-        appendCursorResponseObject(
-            pinnedCursor.getCursor()->cursorid(), nss.ns(), firstBatch.arr(), &result);
+            pinnedCursor->incNBatches();
+            pinnedCursor->incNReturnedSoFar(firstBatch.size());
 
-        return true;
-    }
-
+            return ListIndexesReplyCursor(
+                pinnedCursor.getCursor()->cursorid(), nss, std::move(firstBatch));
+        }
+    };
 } cmdListIndexes;
 
 }  // namespace

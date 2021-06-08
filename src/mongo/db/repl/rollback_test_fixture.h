@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include "mongo/db/read_write_concern_defaults_cache_lookup_mock.h"
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
 #include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/repl/oplog_interface.h"
@@ -39,6 +40,10 @@
 #include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_context_d_test_fixture.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/log_severity.h"
+#include "mongo/unittest/log_test.h"
+#include "mongo/unittest/unittest.h"
 
 namespace mongo {
 namespace repl {
@@ -70,6 +75,11 @@ public:
                                          const CollectionOptions& options);
 
     /**
+     * Inserts a single document into the collection namespace 'nss'.
+     */
+    void _insertDocument(OperationContext* opCtx, const NamespaceString& nss, const BSONObj& doc);
+
+    /**
      * Inserts a document into the oplog.
      */
     Status _insertOplogEntry(const BSONObj& doc);
@@ -96,6 +106,17 @@ public:
                                                       int recordId,
                                                       boost::optional<BSONObj> o2 = boost::none);
 
+    /**
+     * Creates an oplog entry with a recordId for a command operation. The oplog entry will not have
+     * a "ts" or "wall" field. This is used for creating inner ops for applyOps entries.
+     */
+    static std::pair<BSONObj, RecordId> makeCommandOpForApplyOps(
+        OptionalCollectionUUID uuid,
+        StringData nss,
+        BSONObj cmdObj,
+        int recordId,
+        boost::optional<BSONObj> o2 = boost::none);
+
 protected:
     // OperationContext provided to test cases for storage layer operations.
     ServiceContext::UniqueOperationContext _opCtx;
@@ -114,28 +135,36 @@ protected:
 
     // DropPendingCollectionReaper used to clean up and roll back dropped collections.
     DropPendingCollectionReaper* _dropPendingCollectionReaper = nullptr;
+
+    ReadWriteConcernDefaultsLookupMock _lookupMock;
+
+    // Increase rollback log component verbosity for unit tests.
+    unittest::MinimumLoggedSeverityGuard severityGuard{logv2::LogComponent::kReplicationRollback,
+                                                       logv2::LogSeverity::Debug(2)};
 };
 
 class RollbackTest::StorageInterfaceRollback : public StorageInterfaceImpl {
 public:
-    void setStableTimestamp(ServiceContext* serviceCtx, Timestamp snapshotName) override {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+    void setStableTimestamp(ServiceContext* serviceCtx,
+                            Timestamp snapshotName,
+                            bool force = false) override {
+        stdx::lock_guard<Latch> lock(_mutex);
         _stableTimestamp = snapshotName;
     }
 
     /**
-     * If '_recoverToTimestampStatus' is non-empty, returns it. If '_recoverToTimestampStatus' is
+     * If '_recoverToTimestampStatus' is non-empty, fasserts. If '_recoverToTimestampStatus' is
      * empty, updates '_currTimestamp' to be equal to '_stableTimestamp' and returns the new value
      * of '_currTimestamp'.
      */
-    StatusWith<Timestamp> recoverToStableTimestamp(OperationContext* opCtx) override {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+    Timestamp recoverToStableTimestamp(OperationContext* opCtx) override {
+        stdx::lock_guard<Latch> lock(_mutex);
         if (_recoverToTimestampStatus) {
-            return _recoverToTimestampStatus.get();
-        } else {
-            _currTimestamp = _stableTimestamp;
-            return _currTimestamp;
+            fassert(4584700, _recoverToTimestampStatus.get());
         }
+
+        _currTimestamp = _stableTimestamp;
+        return _currTimestamp;
     }
 
     bool supportsRecoverToStableTimestamp(ServiceContext* serviceCtx) const override {
@@ -152,17 +181,17 @@ public:
     }
 
     void setRecoverToTimestampStatus(Status status) {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        stdx::lock_guard<Latch> lock(_mutex);
         _recoverToTimestampStatus = status;
     }
 
     void setCurrentTimestamp(Timestamp ts) {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        stdx::lock_guard<Latch> lock(_mutex);
         _currTimestamp = ts;
     }
 
     Timestamp getCurrentTimestamp() {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        stdx::lock_guard<Latch> lock(_mutex);
         return _currTimestamp;
     }
 
@@ -172,28 +201,28 @@ public:
     Status setCollectionCount(OperationContext* opCtx,
                               const NamespaceStringOrUUID& nsOrUUID,
                               long long newCount) {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        stdx::lock_guard<Latch> lock(_mutex);
         if (_setCollectionCountStatus && _setCollectionCountStatusUUID &&
             nsOrUUID.uuid() == _setCollectionCountStatusUUID) {
             return *_setCollectionCountStatus;
         }
-        _newCounts[nsOrUUID.uuid().get()] = newCount;
+        _newCounts[*nsOrUUID.uuid()] = newCount;
         return Status::OK();
     }
 
     void setSetCollectionCountStatus(UUID uuid, Status status) {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        stdx::lock_guard<Latch> lock(_mutex);
         _setCollectionCountStatus = status;
         _setCollectionCountStatusUUID = uuid;
     }
 
     long long getFinalCollectionCount(const UUID& uuid) {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        stdx::lock_guard<Latch> lock(_mutex);
         return _newCounts[uuid];
     }
 
 private:
-    mutable stdx::mutex _mutex;
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("StorageInterfaceRollback::_mutex");
 
     Timestamp _stableTimestamp;
 
@@ -228,7 +257,7 @@ public:
      */
     Status setFollowerMode(const MemberState& newState) override;
 
-    Status setFollowerModeStrict(OperationContext* opCtx, const MemberState& newState) override;
+    Status setFollowerModeRollback(OperationContext* opCtx) override;
 
     /**
      * Set this to make transitioning to the given follower mode fail with the given error code.
@@ -256,8 +285,6 @@ public:
                                                       UUID uuid,
                                                       const BSONObj& filter) const override;
 
-    void copyCollectionFromRemote(OperationContext* opCtx,
-                                  const NamespaceString& nss) const override;
     StatusWith<BSONObj> getCollectionInfoByUUID(const std::string& db,
                                                 const UUID& uuid) const override;
     StatusWith<BSONObj> getCollectionInfo(const NamespaceString& nss) const override;

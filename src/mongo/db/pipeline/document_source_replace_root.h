@@ -29,9 +29,61 @@
 
 #pragma once
 
+#include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/pipeline/document_source_single_document_transformation.h"
+#include "mongo/db/pipeline/expression.h"
 
 namespace mongo {
+
+/**
+ * This class implements the transformation logic for the $replaceRoot and $replaceWith stages.
+ */
+class ReplaceRootTransformation final : public TransformerInterface {
+public:
+    enum class UserSpecifiedName { kReplaceRoot, kReplaceWith };
+
+    ReplaceRootTransformation(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                              boost::intrusive_ptr<Expression> newRootExpression,
+                              UserSpecifiedName specifiedName)
+        : _expCtx(expCtx), _newRoot(std::move(newRootExpression)), _specifiedName(specifiedName) {}
+
+    TransformerType getType() const final {
+        return TransformerType::kReplaceRoot;
+    }
+
+    Document applyTransformation(const Document& input) final;
+
+    // Optimize the newRoot expression.
+    void optimize() final {
+        _newRoot->optimize();
+    }
+
+    Document serializeTransformation(
+        boost::optional<ExplainOptions::Verbosity> explain) const final {
+        return Document{{"newRoot", _newRoot->serialize(static_cast<bool>(explain))}};
+    }
+
+    DepsTracker::State addDependencies(DepsTracker* deps) const final {
+        _newRoot->addDependencies(deps);
+        // This stage will replace the entire document with a new document, so any existing fields
+        // will be replaced and cannot be required as dependencies.
+        return DepsTracker::State::EXHAUSTIVE_FIELDS;
+    }
+
+    DocumentSource::GetModPathsReturn getModifiedPaths() const final {
+        // Replaces the entire root, so all paths are modified.
+        return {DocumentSource::GetModPathsReturn::Type::kAllPaths, std::set<std::string>{}, {}};
+    }
+
+    const boost::intrusive_ptr<Expression>& getExpression() const {
+        return _newRoot;
+    }
+
+private:
+    const boost::intrusive_ptr<ExpressionContext> _expCtx;
+    boost::intrusive_ptr<Expression> _newRoot;
+    UserSpecifiedName _specifiedName;
+};
 
 /*
  * $replaceRoot takes an object containing only an expression in the newRoot field, and replaces

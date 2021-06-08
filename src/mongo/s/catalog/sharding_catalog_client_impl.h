@@ -31,9 +31,9 @@
 
 #include "mongo/client/connection_string.h"
 #include "mongo/db/repl/optime.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/stdx/mutex.h"
 
 namespace mongo {
 
@@ -51,6 +51,9 @@ class TaskExecutor;
 class ShardingCatalogClientImpl final : public ShardingCatalogClient {
 
 public:
+    ShardingCatalogClientImpl();
+    virtual ~ShardingCatalogClientImpl();
+
     /*
      * Updates (or if "upsert" is true, creates) catalog data for the sharded collection "collNs" by
      * writing a document to the "config.collections" collection with the catalog information
@@ -61,35 +64,20 @@ public:
                                                           const CollectionType& coll,
                                                           const bool upsert);
 
-    explicit ShardingCatalogClientImpl(std::unique_ptr<DistLockManager> distLockManager);
-    virtual ~ShardingCatalogClientImpl();
+    DatabaseType getDatabase(OperationContext* opCtx,
+                             StringData db,
+                             repl::ReadConcernLevel readConcernLevel) override;
 
-    /**
-     * Safe to call multiple times as long as the calls are externally synchronized to be
-     * non-overlapping.
-     */
-    void startup() override;
+    std::vector<DatabaseType> getAllDBs(OperationContext* opCtx,
+                                        repl::ReadConcernLevel readConcern) override;
 
-    void shutDown(OperationContext* opCtx) override;
+    CollectionType getCollection(OperationContext* opCtx,
+                                 const NamespaceString& nss,
+                                 repl::ReadConcernLevel readConcernLevel) override;
 
-    StatusWith<repl::OpTimeWith<DatabaseType>> getDatabase(
-        OperationContext* opCtx,
-        const std::string& dbName,
-        repl::ReadConcernLevel readConcernLevel) override;
-
-    StatusWith<repl::OpTimeWith<std::vector<DatabaseType>>> getAllDBs(
-        OperationContext* opCtx, repl::ReadConcernLevel readConcern) override;
-
-    StatusWith<repl::OpTimeWith<CollectionType>> getCollection(
-        OperationContext* opCtx,
-        const NamespaceString& nss,
-        repl::ReadConcernLevel readConcernLevel) override;
-
-    StatusWith<std::vector<CollectionType>> getCollections(
-        OperationContext* opCtx,
-        const std::string* dbName,
-        repl::OpTime* optime,
-        repl::ReadConcernLevel readConcernLevel) override;
+    std::vector<CollectionType> getCollections(OperationContext* opCtx,
+                                               StringData db,
+                                               repl::ReadConcernLevel readConcernLevel) override;
 
     std::vector<NamespaceString> getAllShardedCollectionsForDb(
         OperationContext* opCtx, StringData dbName, repl::ReadConcernLevel readConcern) override;
@@ -97,12 +85,20 @@ public:
     StatusWith<std::vector<std::string>> getDatabasesForShard(OperationContext* opCtx,
                                                               const ShardId& shardName) override;
 
-    StatusWith<std::vector<ChunkType>> getChunks(OperationContext* opCtx,
-                                                 const BSONObj& query,
-                                                 const BSONObj& sort,
-                                                 boost::optional<int> limit,
-                                                 repl::OpTime* opTime,
-                                                 repl::ReadConcernLevel readConcern) override;
+    StatusWith<std::vector<ChunkType>> getChunks(
+        OperationContext* opCtx,
+        const BSONObj& query,
+        const BSONObj& sort,
+        boost::optional<int> limit,
+        repl::OpTime* opTime,
+        repl::ReadConcernLevel readConcern,
+        const boost::optional<BSONObj>& hint = boost::none) override;
+
+    std::pair<CollectionType, std::vector<ChunkType>> getCollectionAndChunks(
+        OperationContext* opCtx,
+        const NamespaceString& nss,
+        const ChunkVersion& sinceVersion,
+        const repl::ReadConcernArgs& readConcern) override;
 
     StatusWith<std::vector<TagsType>> getTagsForCollection(OperationContext* opCtx,
                                                            const NamespaceString& nss) override;
@@ -110,11 +106,11 @@ public:
     StatusWith<repl::OpTimeWith<std::vector<ShardType>>> getAllShards(
         OperationContext* opCtx, repl::ReadConcernLevel readConcern) override;
 
-    bool runUserManagementWriteCommand(OperationContext* opCtx,
-                                       const std::string& commandName,
-                                       const std::string& dbname,
-                                       const BSONObj& cmdObj,
-                                       BSONObjBuilder* result) override;
+    Status runUserManagementWriteCommand(OperationContext* opCtx,
+                                         StringData commandName,
+                                         StringData dbname,
+                                         const BSONObj& cmdObj,
+                                         BSONObjBuilder* result) override;
 
     bool runUserManagementReadCommand(OperationContext* opCtx,
                                       const std::string& dbname,
@@ -133,10 +129,6 @@ public:
 
     StatusWith<VersionType> getConfigVersion(OperationContext* opCtx,
                                              repl::ReadConcernLevel readConcern) override;
-
-    void writeConfigServerDirect(OperationContext* opCtx,
-                                 const BatchedCommandRequest& request,
-                                 BatchedCommandResponse* response) override;
 
     Status insertConfigDocument(OperationContext* opCtx,
                                 const NamespaceString& nss,
@@ -160,8 +152,6 @@ public:
                                  const BSONObj& query,
                                  const WriteConcernOptions& writeConcern) override;
 
-    DistLockManager* getDistLockManager() override;
-
     StatusWith<std::vector<KeysCollectionDocument>> getNewKeys(
         OperationContext* opCtx,
         StringData purpose,
@@ -170,10 +160,11 @@ public:
 
 private:
     /**
-     * Updates a single document in the specified namespace on the config server. The document must
-     * have an _id index. Must only be used for updates to the 'config' database.
+     * Updates a single document (if useMultiUpdate is false) or multiple documents (if
+     * useMultiUpdate is true) in the specified namespace on the config server. Must only be used
+     * for updates to the 'config' database.
      *
-     * This method retries the operation on NotMaster or network errors, so it should only be used
+     * This method retries the operation on NotPrimary or network errors, so it should only be used
      * with modifications which are idempotent.
      *
      * Returns non-OK status if the command failed to run for some reason. If the command was
@@ -195,7 +186,8 @@ private:
         const NamespaceString& nss,
         const BSONObj& query,
         const BSONObj& sort,
-        boost::optional<long long> limit) override;
+        boost::optional<long long> limit,
+        const boost::optional<BSONObj>& hint = boost::none) override;
 
     /**
      * Queries the config servers for the database metadata for the given database, using the
@@ -206,25 +198,6 @@ private:
         const std::string& dbName,
         const ReadPreferenceSetting& readPref,
         repl::ReadConcernLevel readConcernLevel);
-
-    //
-    // All member variables are labeled with one of the following codes indicating the
-    // synchronization rules for accessing them.
-    //
-    // (M) Must hold _mutex for access.
-    // (R) Read only, can only be written during initialization.
-    //
-
-    stdx::mutex _mutex;
-
-    // Distributed lock manager singleton.
-    std::unique_ptr<DistLockManager> _distLockManager;  // (R)
-
-    // True if shutDown() has been called. False, otherwise.
-    bool _inShutdown = false;  // (M)
-
-    // True if startup() has been called.
-    bool _started = false;  // (M)
 };
 
 }  // namespace mongo

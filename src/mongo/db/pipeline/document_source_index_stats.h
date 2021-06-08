@@ -40,20 +40,24 @@ namespace mongo {
  */
 class DocumentSourceIndexStats final : public DocumentSource {
 public:
+    static constexpr StringData kStageName = "$indexStats"_sd;
+
     class LiteParsed final : public LiteParsedDocumentSource {
     public:
-        static std::unique_ptr<LiteParsed> parse(const AggregationRequest& request,
+        static std::unique_ptr<LiteParsed> parse(const NamespaceString& nss,
                                                  const BSONElement& spec) {
-            return stdx::make_unique<LiteParsed>(request.getNamespaceString());
+            return std::make_unique<LiteParsed>(spec.fieldName(), nss);
         }
 
-        explicit LiteParsed(NamespaceString nss) : _nss(std::move(nss)) {}
+        explicit LiteParsed(std::string parseTimeName, NamespaceString nss)
+            : LiteParsedDocumentSource(std::move(parseTimeName)), _nss(std::move(nss)) {}
 
         stdx::unordered_set<NamespaceString> getInvolvedNamespaces() const final {
             return stdx::unordered_set<NamespaceString>();
         }
 
-        PrivilegeVector requiredPrivileges(bool isMongos) const final {
+        PrivilegeVector requiredPrivileges(bool isMongos,
+                                           bool bypassDocumentValidation) const final {
             return {Privilege(ResourcePattern::forExactNamespace(_nss), ActionType::indexStats)};
         }
 
@@ -66,7 +70,6 @@ public:
     };
 
     // virtuals from DocumentSource
-    GetNextResult getNext() final;
     const char* getSourceName() const final;
     Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
 
@@ -77,7 +80,8 @@ public:
                                      DiskUseRequirement::kNoDiskUse,
                                      FacetRequirement::kNotAllowed,
                                      TransactionRequirement::kNotAllowed,
-                                     LookupRequirement::kAllowed);
+                                     LookupRequirement::kAllowed,
+                                     UnionRequirement::kAllowed);
 
         constraints.requiresInputDocSource = false;
         return constraints;
@@ -92,9 +96,10 @@ public:
 
 private:
     DocumentSourceIndexStats(const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
+    GetNextResult doGetNext() final;
 
-    CollectionIndexUsageMap _indexStatsMap;
-    CollectionIndexUsageMap::const_iterator _indexStatsIter;
+    std::vector<Document> _indexStats;
+    std::vector<Document>::const_iterator _indexStatsIter;
     std::string _processName;
 };
 

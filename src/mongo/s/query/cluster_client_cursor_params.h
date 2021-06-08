@@ -36,6 +36,7 @@
 
 #include "mongo/bson/bsonobj.h"
 #include "mongo/client/read_preference.h"
+#include "mongo/db/api_parameters.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/auth/user_name.h"
 #include "mongo/db/cursor_id.h"
@@ -43,6 +44,7 @@
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/query/cursor_response.h"
 #include "mongo/db/query/tailable_mode.h"
+#include "mongo/db/repl/read_concern_args.h"
 #include "mongo/s/client/shard.h"
 #include "mongo/s/query/async_results_merger_params_gen.h"
 #include "mongo/util/net/hostandport.h"
@@ -55,6 +57,8 @@ class TaskExecutor;
 class OperationContext;
 class RouterExecStage;
 
+using repl::ReadConcernArgs;
+
 /**
  * The resulting ClusterClientCursor will take ownership of the existing remote cursor, generating
  * results based on the cursor's current state.
@@ -65,10 +69,15 @@ class RouterExecStage;
  */
 struct ClusterClientCursorParams {
     ClusterClientCursorParams(NamespaceString nss,
-                              boost::optional<ReadPreferenceSetting> readPref = boost::none)
-        : nsString(std::move(nss)) {
+                              APIParameters apiParameters,
+                              boost::optional<ReadPreferenceSetting> readPref = boost::none,
+                              boost::optional<ReadConcernArgs> readConcernArgs = boost::none)
+        : nsString(std::move(nss)), apiParameters(std::move(apiParameters)) {
         if (readPref) {
             readPreference = std::move(readPref.get());
+        }
+        if (readConcernArgs) {
+            readConcern = std::move(readConcernArgs.get());
         }
     }
 
@@ -78,10 +87,10 @@ struct ClusterClientCursorParams {
      */
     AsyncResultsMergerParams extractARMParams() {
         AsyncResultsMergerParams armParams;
-        if (!sort.isEmpty()) {
-            armParams.setSort(sort);
+        if (!sortToApplyOnRouter.isEmpty()) {
+            armParams.setSort(sortToApplyOnRouter);
         }
-        armParams.setCompareWholeSortKey(compareWholeSortKey);
+        armParams.setCompareWholeSortKey(compareWholeSortKeyOnRouter);
         armParams.setRemotes(std::move(remotes));
         armParams.setTailableMode(tailableMode);
         armParams.setBatchSize(batchSize);
@@ -116,17 +125,17 @@ struct ClusterClientCursorParams {
     // Per-remote node data.
     std::vector<RemoteCursor> remotes;
 
-    // The sort specification. Leave empty if there is no sort.
-    BSONObj sort;
+    // The sort specification to be applied on router. Leave empty if there is no sort.
+    BSONObj sortToApplyOnRouter;
 
-    // When 'compareWholeSortKey' is true, $sortKey is a scalar value, rather than an object. We
-    // extract the sort key {$sortKey: <value>}. The sort key pattern is verified to be {$sortKey:
-    // 1}.
-    bool compareWholeSortKey = false;
+    // When 'compareWholeSortKeyOnRouter' is true, $sortKey is a scalar value, rather than an
+    // object. We extract the sort key {$sortKey: <value>}. The sort key pattern is verified to be
+    // {$sortKey: 1}.
+    bool compareWholeSortKeyOnRouter = false;
 
-    // The number of results to skip. Optional. Should not be forwarded to the remote hosts in
-    // 'cmdObj'.
-    boost::optional<long long> skip;
+    // The number of results to skip on the router. Optional. Should not be forwarded to the remote
+    // hosts in 'cmdObj'.
+    boost::optional<long long> skipToApplyOnRouter;
 
     // The number of results per batch. Optional. If specified, will be specified as the batch for
     // each getMore.
@@ -140,8 +149,14 @@ struct ClusterClientCursorParams {
     // set.
     TailableModeEnum tailableMode = TailableModeEnum::kNormal;
 
+    // The API parameters associated with the cursor.
+    APIParameters apiParameters;
+
     // Set if a readPreference must be respected throughout the lifetime of the cursor.
     boost::optional<ReadPreferenceSetting> readPreference;
+
+    // Set if a readConcern must be respected throughout the lifetime of the cursor.
+    boost::optional<ReadConcernArgs> readConcern;
 
     // Whether the client indicated that it is willing to receive partial results in the case of an
     // unreachable host.
@@ -157,4 +172,4 @@ struct ClusterClientCursorParams {
     boost::optional<bool> isAutoCommit;
 };
 
-}  // mongo
+}  // namespace mongo

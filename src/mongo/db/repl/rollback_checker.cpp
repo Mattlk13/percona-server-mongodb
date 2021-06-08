@@ -27,20 +27,18 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/repl/rollback_checker.h"
 
-#include "mongo/stdx/mutex.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace repl {
 
 using RemoteCommandCallbackArgs = executor::TaskExecutor::RemoteCommandCallbackArgs;
-using UniqueLock = stdx::unique_lock<stdx::mutex>;
+using UniqueLock = stdx::unique_lock<Latch>;
 
 RollbackChecker::RollbackChecker(executor::TaskExecutor* executor, HostAndPort syncSource)
     : _executor(executor), _syncSource(syncSource), _baseRBID(-1), _lastRBID(-1) {
@@ -113,7 +111,7 @@ Status RollbackChecker::reset_sync() {
 
     if (!cbh.isOK()) {
         return Status(ErrorCodes::CallbackCanceled,
-                      "RollbackChecker reset failed due to callback cancelation");
+                      "RollbackChecker reset failed due to callback cancellation");
     }
 
     _executor->wait(cbh.getValue());
@@ -121,12 +119,12 @@ Status RollbackChecker::reset_sync() {
 }
 
 int RollbackChecker::getBaseRBID() {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     return _baseRBID;
 }
 
 int RollbackChecker::getLastRBID_forTest() {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     return _lastRBID;
 }
 

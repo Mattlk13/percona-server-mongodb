@@ -35,6 +35,7 @@
 #include "mongo/db/pipeline/accumulation_statement.h"
 #include "mongo/db/pipeline/accumulator.h"
 #include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/memory_usage_tracker.h"
 #include "mongo/db/pipeline/transformer_interface.h"
 #include "mongo/db/sorter/sorter.h"
 
@@ -88,7 +89,7 @@ private:
 
 class DocumentSourceGroup final : public DocumentSource {
 public:
-    using Accumulators = std::vector<boost::intrusive_ptr<Accumulator>>;
+    using Accumulators = std::vector<boost::intrusive_ptr<AccumulatorState>>;
     using GroupsMap = ValueUnorderedMap<Accumulators>;
 
     static constexpr StringData kStageName = "$group"_sd;
@@ -96,9 +97,10 @@ public:
     boost::intrusive_ptr<DocumentSource> optimize() final;
     DepsTracker::State getDependencies(DepsTracker* deps) const final;
     Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
-    GetNextResult getNext() final;
     const char* getSourceName() const final;
     GetModPathsReturn getModifiedPaths() const final;
+    StringMap<boost::intrusive_ptr<Expression>> getIdFields() const;
+    const std::vector<AccumulationStatement>& getAccumulatedFields() const;
 
     /**
      * Convenience method for creating a new $group stage. If maxMemoryUsageBytes is boost::none,
@@ -115,16 +117,19 @@ public:
      * specification.
      */
     static boost::intrusive_ptr<DocumentSource> createFromBson(
-        BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
+        BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& expCtx);
 
     StageConstraints constraints(Pipeline::SplitState pipeState) const final {
-        return {StreamType::kBlocking,
-                PositionRequirement::kNone,
-                HostTypeRequirement::kNone,
-                DiskUseRequirement::kWritesTmpData,
-                FacetRequirement::kAllowed,
-                TransactionRequirement::kAllowed,
-                LookupRequirement::kAllowed};
+        StageConstraints constraints(StreamType::kBlocking,
+                                     PositionRequirement::kNone,
+                                     HostTypeRequirement::kNone,
+                                     DiskUseRequirement::kWritesTmpData,
+                                     FacetRequirement::kAllowed,
+                                     TransactionRequirement::kAllowed,
+                                     LookupRequirement::kAllowed,
+                                     UnionRequirement::kAllowed);
+        constraints.canSwapWithMatch = true;
+        return constraints;
     }
 
     /**
@@ -155,7 +160,13 @@ public:
     /**
      * Returns true if this $group stage used disk during execution and false otherwise.
      */
-    bool usedDisk() final;
+    bool usedDisk() final {
+        return _stats.usedDisk;
+    }
+
+    const SpecificStats* getSpecificStats() const final {
+        return &_stats;
+    }
 
     boost::optional<DistributedPlanLogic> distributedPlanLogic() final;
     bool canRunInParallelBeforeWriteStage(
@@ -173,11 +184,17 @@ public:
     std::unique_ptr<GroupFromFirstDocumentTransformation> rewriteGroupAsTransformOnFirstDocument()
         const;
 
+    /**
+     * Returns maximum allowed memory footprint.
+     */
+    size_t getMaxMemoryUsageBytes() const;
+
 protected:
+    GetNextResult doGetNext() final;
     void doDispose() final;
 
 private:
-    explicit DocumentSourceGroup(const boost::intrusive_ptr<ExpressionContext>& pExpCtx,
+    explicit DocumentSourceGroup(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                  boost::optional<size_t> maxMemoryUsageBytes = boost::none);
 
     ~DocumentSourceGroup();
@@ -209,6 +226,12 @@ private:
      */
     std::shared_ptr<Sorter<Value, Value>::Iterator> spill();
 
+    /**
+     * If we ran out of memory, finish all the pending operations so that some memory
+     * can be freed.
+     */
+    void freeMemory();
+
     Document makeDocument(const Value& id, const Accumulators& accums, bool mergeableOutput);
 
     /**
@@ -227,14 +250,24 @@ private:
      */
     bool pathIncludedInGroupKeys(const std::string& dottedPath) const;
 
+    /**
+     * Cleans up any pending memory usage. Throws error, if memory usage is above
+     * 'maxMemoryUsageBytes' and cannot spill to disk.
+     *
+     * Returns true, if the caller should spill to disk, false otherwise.
+     */
+    bool shouldSpillWithAttemptToSaveMemory();
+
     std::vector<AccumulationStatement> _accumulatedFields;
 
-    bool _usedDisk;  // Keeps track of whether this $group spilled to disk.
     bool _doingMerge;
-    size_t _memoryUsageBytes = 0;
-    size_t _maxMemoryUsageBytes;
+
+    MemoryUsageTracker _memoryTracker;
+
+    GroupStats _stats;
+
     std::string _fileName;
-    unsigned int _nextSortedFileWriterOffset = 0;
+    std::streampos _nextSortedFileWriterOffset = 0;
     bool _ownsFileDeletion = true;  // unless a MergeIterator is made that takes over.
 
     std::vector<std::string> _idFieldNames;  // used when id is a document
@@ -258,7 +291,6 @@ private:
 
     // Only used when '_spilled' is true.
     std::unique_ptr<Sorter<Value, Value>::Iterator> _sorterIterator;
-    const bool _allowDiskUse;
 
     std::pair<Value, Value> _firstPartOfNextGroup;
 };

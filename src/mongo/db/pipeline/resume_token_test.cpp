@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/db/pipeline/resume_token.h"
 
@@ -35,11 +35,10 @@
 #include <boost/optional/optional_io.hpp>
 #include <random>
 
-#include "mongo/db/pipeline/document.h"
+#include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/pipeline/document_source_change_stream.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/hex.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -161,17 +160,17 @@ TEST(ResumeToken, FailsToDecodeInvalidKeyString) {
     const unsigned char nonsense[] = {165, 85, 77, 86, 255};
 
     // Data of correct type, but empty.
-    const auto emptyToken = ResumeToken::parse(Document{{"_data"_sd, toHex(zeroes, 0)}});
+    const auto emptyToken = ResumeToken::parse(Document{{"_data"_sd, hexblob::encode(zeroes, 0)}});
     ASSERT_THROWS_CODE(emptyToken.getData(), AssertionException, 40649);
 
     // Data of correct type with a bunch of zeros.
     const auto zeroesToken =
-        ResumeToken::parse(Document{{"_data"_sd, toHex(zeroes, sizeof(zeroes))}});
+        ResumeToken::parse(Document{{"_data"_sd, hexblob::encode(zeroes, sizeof(zeroes))}});
     ASSERT_THROWS_CODE(zeroesToken.getData(), AssertionException, 50811);
 
     // Data of correct type with a bunch of nonsense.
     const auto nonsenseToken =
-        ResumeToken::parse(Document{{"_data"_sd, toHex(nonsense, sizeof(nonsense))}});
+        ResumeToken::parse(Document{{"_data"_sd, hexblob::encode(nonsense, sizeof(nonsense))}});
     ASSERT_THROWS_CODE(nonsenseToken.getData(), AssertionException, 50811);
 
     // Valid data, bad typeBits; note that an all-zeros typebits is valid so it is not tested here.
@@ -184,8 +183,8 @@ TEST(ResumeToken, FailsToDecodeInvalidKeyString) {
         60,  // CType::kStringLike
         55,  // Non-null terminated
     };
-    auto invalidStringToken =
-        ResumeToken::parse(Document{{"_data"_sd, toHex(invalidString, sizeof(invalidString))}});
+    auto invalidStringToken = ResumeToken::parse(
+        Document{{"_data"_sd, hexblob::encode(invalidString, sizeof(invalidString))}});
     // invalidStringToken.getData();
     ASSERT_THROWS_WITH_CHECK(
         invalidStringToken.getData(), AssertionException, [](const AssertionException& exception) {
@@ -360,5 +359,5 @@ TEST(ResumeToken, StringEncodingSortsCorrectly) {
              {ts10_4, 0, 0, lower_uuid, Value(Document{{"_id", 0}})});
 }
 
-}  // namspace
-}  // namspace mongo
+}  // namespace
+}  // namespace mongo

@@ -157,19 +157,18 @@ TEST_F(ResultsMergerTestFixture, ShouldBeAbleToBlockUntilNextResultIsReadyWithDe
     future.default_timed_get();
 
     // Used for synchronizing the background thread with this thread.
-    stdx::mutex mutex;
-    stdx::unique_lock<stdx::mutex> lk(mutex);
+    auto mutex = MONGO_MAKE_LATCH();
+    stdx::unique_lock<Latch> lk(mutex);
 
     // Issue a blocking wait for the next result asynchronously on a different thread.
     future = launchAsync([&]() {
         // Block until the main thread has responded to the getMore.
-        stdx::unique_lock<stdx::mutex> lk(mutex);
+        stdx::unique_lock<Latch> lk(mutex);
 
         auto next = unittest::assertGet(blockingMerger.next(
             operationContext(), RouterExecStage::ExecContext::kGetMoreNoResultsYet));
         ASSERT_FALSE(next.isEOF());
         ASSERT_BSONOBJ_EQ(*next.getResult(), BSON("x" << 1));
-
     });
 
     // Schedule the response to the getMore which will return the next result and mark the cursor as
@@ -186,7 +185,7 @@ TEST_F(ResultsMergerTestFixture, ShouldBeAbleToBlockUntilNextResultIsReadyWithDe
     future.default_timed_get();
 }
 
-TEST_F(ResultsMergerTestFixture, ShouldBeInterruptableDuringBlockingNext) {
+TEST_F(ResultsMergerTestFixture, ShouldBeInterruptibleDuringBlockingNext) {
     std::vector<RemoteCursor> cursors;
     cursors.emplace_back(
         makeRemoteCursor(kTestShardIds[0], kTestShardHosts[0], CursorResponse(kTestNss, 1, {})));

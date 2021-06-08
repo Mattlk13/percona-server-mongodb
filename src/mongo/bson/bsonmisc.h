@@ -137,42 +137,47 @@ private:
 
 // Utility class to allow adding a std::string to BSON as a Symbol
 struct BSONSymbol {
+    BSONSymbol() = default;
     explicit BSONSymbol(StringData sym) : symbol(sym) {}
-    StringData symbol;
+    StringData symbol = "";
 };
 
 // Utility class to allow adding a std::string to BSON as Code
 struct BSONCode {
+    BSONCode() = default;
     explicit BSONCode(StringData str) : code(str) {}
-    StringData code;
+    StringData code = "";
 };
 
 // Utility class to allow adding CodeWScope to BSON
 struct BSONCodeWScope {
+    BSONCodeWScope() = default;
     explicit BSONCodeWScope(StringData str, const BSONObj& obj) : code(str), scope(obj) {}
-    StringData code;
-    BSONObj scope;
+    StringData code = "";
+    BSONObj scope = {};
 };
 
 // Utility class to allow adding a RegEx to BSON
 struct BSONRegEx {
-    explicit BSONRegEx(StringData pat, StringData f = "") : pattern(pat), flags(f) {}
+    explicit BSONRegEx(StringData pat = "", StringData f = "") : pattern(pat), flags(f) {}
     StringData pattern;
     StringData flags;
 };
 
 // Utility class to allow adding binary data to BSON
 struct BSONBinData {
+    BSONBinData() = default;
     BSONBinData(const void* d, int l, BinDataType t) : data(d), length(l), type(t) {}
-    const void* data;
-    int length;
-    BinDataType type;
+    const void* data = nullptr;
+    int length = 0;
+    BinDataType type = BinDataGeneral;
 };
 
 // Utility class to allow adding deprecated DBRef type to BSON
 struct BSONDBRef {
+    BSONDBRef() = default;
     BSONDBRef(StringData nameSpace, const OID& o) : ns(nameSpace), oid(o) {}
-    StringData ns;
+    StringData ns = "";
     OID oid;
 };
 
@@ -212,7 +217,7 @@ public:
 
     void endField(StringData nextFieldName = StringData());
     bool subobjStarted() const {
-        return _fieldName != 0;
+        return _fieldName != nullptr;
     }
 
     // The following methods provide API compatibility with BSONArrayBuilder
@@ -236,7 +241,7 @@ private:
     BSONObjBuilder* _builder;
 
     bool haveSubobj() const {
-        return _subobj.get() != 0;
+        return _subobj.get() != nullptr;
     }
     BSONObjBuilder* subobj();
     std::unique_ptr<BSONObjBuilder> _subobj;
@@ -281,4 +286,4 @@ private:
 
 // considers order
 bool fieldsMatch(const BSONObj& lhs, const BSONObj& rhs);
-}
+}  // namespace mongo

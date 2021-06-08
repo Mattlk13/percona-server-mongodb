@@ -27,40 +27,19 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
-#include <list>
-#include <set>
-#include <vector>
-
-#include "mongo/bson/simple_bsonelement_comparator.h"
-#include "mongo/bson/simple_bsonobj_comparator.h"
-#include "mongo/bson/util/bson_extract.h"
-#include "mongo/client/connpool.h"
 #include "mongo/db/audit.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/hasher.h"
-#include "mongo/db/index/index_descriptor.h"
-#include "mongo/db/operation_context.h"
-#include "mongo/db/query/collation/collator_factory_interface.h"
-#include "mongo/db/write_concern_options.h"
-#include "mongo/s/balancer_configuration.h"
-#include "mongo/s/catalog/sharding_catalog_client.h"
-#include "mongo/s/catalog_cache.h"
-#include "mongo/s/client/shard_registry.h"
-#include "mongo/s/cluster_commands_helpers.h"
-#include "mongo/s/config_server_client.h"
-#include "mongo/s/grid.h"
-#include "mongo/s/request_types/migration_secondary_throttle_options.h"
-#include "mongo/s/request_types/shard_collection_gen.h"
-#include "mongo/util/log.h"
-#include "mongo/util/scopeguard.h"
+#include "mongo/logv2/log.h"
+#include "mongo/s/cluster_ddl.h"
+#include "mongo/s/commands/cluster_commands_gen.h"
 
 namespace mongo {
 namespace {
@@ -111,28 +90,21 @@ public:
         auto shardCollRequest =
             ShardCollection::parse(IDLParserErrorContext("ShardCollection"), cmdObj);
 
-        ConfigsvrShardCollectionRequest configShardCollRequest;
-        configShardCollRequest.set_configsvrShardCollection(nss);
-        configShardCollRequest.setKey(shardCollRequest.getKey());
-        configShardCollRequest.setUnique(shardCollRequest.getUnique());
-        configShardCollRequest.setNumInitialChunks(shardCollRequest.getNumInitialChunks());
-        configShardCollRequest.setCollation(shardCollRequest.getCollation());
+        ShardsvrCreateCollection shardsvrCollRequest(nss);
+        CreateCollectionRequest requestParamsObj;
+        requestParamsObj.setShardKey(shardCollRequest.getKey());
+        requestParamsObj.setUnique(shardCollRequest.getUnique());
+        requestParamsObj.setNumInitialChunks(shardCollRequest.getNumInitialChunks());
+        requestParamsObj.setPresplitHashedZones(shardCollRequest.getPresplitHashedZones());
+        requestParamsObj.setCollation(shardCollRequest.getCollation());
+        shardsvrCollRequest.setCreateCollectionRequest(std::move(requestParamsObj));
+        shardsvrCollRequest.setDbName(nss.db());
 
-        // Invalidate the routing table cache entry for this collection so that we reload the
-        // collection the next time it's accessed, even if we receive a failure, e.g. NetworkError.
-        ON_BLOCK_EXIT(
-            [opCtx, nss] { Grid::get(opCtx)->catalogCache()->invalidateShardedCollection(nss); });
+        cluster::createCollection(opCtx, shardsvrCollRequest);
 
-        auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
-        auto cmdResponse = uassertStatusOK(configShard->runCommandWithFixedRetryAttempts(
-            opCtx,
-            ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-            "admin",
-            CommandHelpers::appendMajorityWriteConcern(
-                CommandHelpers::appendPassthroughFields(cmdObj, configShardCollRequest.toBSON())),
-            Shard::RetryPolicy::kIdempotent));
-
-        CommandHelpers::filterCommandReplyForPassthrough(cmdResponse.response, &result);
+        // Add only collectionsharded as a response parameter and remove the version to maintain the
+        // same format as before.
+        result.append("collectionsharded", nss.toString());
         return true;
     }
 

@@ -16,8 +16,8 @@ executor:
       global_vars:
         TestData:
           runningWithCausalConsistency: true
-          usingReplicaSetShards: true
   hooks:
+  - class: FuzzerRestoreSettings
   - class: CheckReplDBHash
     shell_options:
       global_vars:
@@ -28,7 +28,7 @@ executor:
       global_vars:
         TestData:
           skipValidationOnInvalidViewDefinitions: true
-          forceValidationWithFeatureCompatibilityVersion: "4.2"
+          forceValidationWithFeatureCompatibilityVersion: latestFCV
   fixture:
     class: ShardedClusterFixture
     mongos_options:
@@ -42,8 +42,3 @@ executor:
         writePeriodicNoops: 1
     num_rs_nodes_per_shard: 2
     num_shards: 2
-    # TODO SERVER-32572 remove voting_secondaries: true
-    shard_options:
-      voting_secondaries: true
-    configsvr_options:
-      voting_secondaries: true

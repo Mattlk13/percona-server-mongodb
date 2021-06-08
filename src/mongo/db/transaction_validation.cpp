@@ -35,6 +35,7 @@
 
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/txn_cmds_gen.h"
+#include "mongo/db/commands/txn_two_phase_commit_cmds_gen.h"
 #include "mongo/db/logical_session_id.h"
 #include "mongo/db/write_concern_options.h"
 
@@ -44,11 +45,21 @@ using namespace fmt::literals;
 
 namespace {
 
-const StringMap<int> retryableWriteCommands = {
-    {"delete", 1}, {"findandmodify", 1}, {"findAndModify", 1}, {"insert", 1}, {"update", 1}};
+const StringMap<int> retryableWriteCommands = {{"delete", 1},
+                                               {"findandmodify", 1},
+                                               {"findAndModify", 1},
+                                               {"insert", 1},
+                                               {"update", 1},
+                                               {"_recvChunkStart", 1}};
 
 // Commands that can be sent with session info but should not check out a session.
-const StringMap<int> skipSessionCheckoutList = {{"coordinateCommitTransaction", 1}};
+const StringMap<int> skipSessionCheckoutList = {
+    {"coordinateCommitTransaction", 1}, {"_recvChunkStart", 1}, {"replSetStepDown", 1}};
+
+const StringMap<int> transactionCommands = {{"commitTransaction", 1},
+                                            {"coordinateCommitTransaction", 1},
+                                            {"abortTransaction", 1},
+                                            {"prepareTransaction", 1}};
 
 bool isRetryableWriteCommand(StringData cmdName) {
     return retryableWriteCommands.find(cmdName) != retryableWriteCommands.cend();
@@ -56,12 +67,20 @@ bool isRetryableWriteCommand(StringData cmdName) {
 
 }  // namespace
 
+bool isTransactionCommand(StringData cmdName) {
+    return transactionCommands.find(cmdName) != transactionCommands.cend();
+}
+
 void validateWriteConcernForTransaction(const WriteConcernOptions& wcResult, StringData cmdName) {
     uassert(ErrorCodes::InvalidOptions,
             "writeConcern is not allowed within a multi-statement transaction",
-            wcResult.usedDefault || cmdName == "commitTransaction" ||
-                cmdName == "coordinateCommitTransaction" || cmdName == "abortTransaction" ||
-                cmdName == "prepareTransaction" || cmdName == "doTxn");
+            wcResult.usedDefault || isTransactionCommand(cmdName));
+}
+
+bool isReadConcernLevelAllowedInTransaction(repl::ReadConcernLevel readConcernLevel) {
+    return readConcernLevel == repl::ReadConcernLevel::kSnapshotReadConcern ||
+        readConcernLevel == repl::ReadConcernLevel::kMajorityReadConcern ||
+        readConcernLevel == repl::ReadConcernLevel::kLocalReadConcern;
 }
 
 bool shouldCommandSkipSessionCheckout(StringData cmdName) {
@@ -70,9 +89,10 @@ bool shouldCommandSkipSessionCheckout(StringData cmdName) {
 
 void validateSessionOptions(const OperationSessionInfoFromClient& sessionOptions,
                             StringData cmdName,
-                            StringData dbname) {
+                            const NamespaceString& nss,
+                            bool allowTransactionsOnConfigDatabase) {
     if (sessionOptions.getAutocommit()) {
-        uassertStatusOK(CommandHelpers::canUseTransactions(dbname, cmdName));
+        CommandHelpers::canUseTransactions(nss, cmdName, allowTransactionsOnConfigDatabase);
     }
 
     if (!sessionOptions.getAutocommit() && sessionOptions.getTxnNumber()) {
@@ -87,6 +107,10 @@ void validateSessionOptions(const OperationSessionInfoFromClient& sessionOptions
         uassert(ErrorCodes::OperationNotSupportedInTransaction,
                 "Cannot run killCursors as the first operation in a multi-document transaction.",
                 cmdName != "killCursors");
+
+        uassert(ErrorCodes::OperationNotSupportedInTransaction,
+                "Cannot start a transaction with a prepare",
+                cmdName != PrepareTransaction::kCommandName);
 
         uassert(ErrorCodes::OperationNotSupportedInTransaction,
                 "Cannot start a transaction with a commit",

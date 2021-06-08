@@ -27,11 +27,14 @@
  *    it in the license file.
  */
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
 #include "mongo/platform/basic.h"
 
 #include <algorithm>
 #include <boost/filesystem.hpp>
 #include <iostream>
+#include <memory>
 #include <string>
 
 #include "mongo/base/init.h"
@@ -45,7 +48,7 @@
 #include "mongo/db/ftdc/file_writer.h"
 #include "mongo/db/ftdc/ftdc_test.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/logv2/log.h"
 #include "mongo/unittest/temp_dir.h"
 #include "mongo/unittest/unittest.h"
 
@@ -72,45 +75,34 @@ TEST_F(FTDCFileManagerTest, TestFull) {
 
     // Test a large numbers of zeros, and incremental numbers in a full buffer
     for (int j = 0; j < 10; j++) {
-        ASSERT_OK(mgr->writeSampleAndRotateIfNeeded(client,
-                                                    BSON("name"
-                                                         << "joe"
-                                                         << "key1"
-                                                         << 3230792343LL
-                                                         << "key2"
-                                                         << 235135),
-                                                    Date_t()));
+        ASSERT_OK(
+            mgr->writeSampleAndRotateIfNeeded(client,
+                                              BSON("name"
+                                                   << "joe"
+                                                   << "key1" << 3230792343LL << "key2" << 235135),
+                                              Date_t()));
 
         for (size_t i = 0; i <= FTDCConfig::kMaxSamplesPerArchiveMetricChunkDefault - 2; i++) {
-            ASSERT_OK(
-                mgr->writeSampleAndRotateIfNeeded(client,
-                                                  BSON("name"
-                                                       << "joe"
-                                                       << "key1"
-                                                       << static_cast<long long int>(i * j * 37)
-                                                       << "key2"
-                                                       << static_cast<long long int>(i *
-                                                                                     (645 << j))),
-                                                  Date_t()));
+            ASSERT_OK(mgr->writeSampleAndRotateIfNeeded(
+                client,
+                BSON("name"
+                     << "joe"
+                     << "key1" << static_cast<long long int>(i * j * 37) << "key2"
+                     << static_cast<long long int>(i * (645 << j))),
+                Date_t()));
         }
 
         ASSERT_OK(mgr->writeSampleAndRotateIfNeeded(client,
                                                     BSON("name"
                                                          << "joe"
-                                                         << "key1"
-                                                         << 34
-                                                         << "key2"
-                                                         << 45),
+                                                         << "key1" << 34 << "key2" << 45),
                                                     Date_t()));
 
         // Add Value
         ASSERT_OK(mgr->writeSampleAndRotateIfNeeded(client,
                                                     BSON("name"
                                                          << "joe"
-                                                         << "key1"
-                                                         << 34
-                                                         << "key2"
-                                                         << 45),
+                                                         << "key1" << 34 << "key2" << 45),
                                                     Date_t()));
     }
 
@@ -122,7 +114,11 @@ TEST_F(FTDCFileManagerTest, TestFull) {
     for (auto& file : files) {
         int fs = boost::filesystem::file_size(file);
         ASSERT_TRUE(fs < c.maxFileSizeBytes * 1.10);
-        unittest::log() << "File " << file.generic_string() << " has size " << fs;
+        LOGV2(20632,
+              "File {fileName} has size {fileSize}",
+              "File size",
+              "fileName"_attr = file.generic_string(),
+              "fileSize"_attr = fs);
         if (file.generic_string().find("interim") == std::string::npos) {
             sum += fs;
         }
@@ -175,9 +171,7 @@ TEST_F(FTDCFileManagerTest, TestNormalRestart) {
             ASSERT_OK(mgr->writeSampleAndRotateIfNeeded(client,
                                                         BSON("name"
                                                              << "joe"
-                                                             << "key1"
-                                                             << 3230792343LL
-                                                             << "key2"
+                                                             << "key1" << 3230792343LL << "key2"
                                                              << 235135),
                                                         Date_t()));
 
@@ -187,9 +181,7 @@ TEST_F(FTDCFileManagerTest, TestNormalRestart) {
                         client,
                         BSON("name"
                              << "joe"
-                             << "key1"
-                             << static_cast<long long int>(i * j * 37)
-                             << "key2"
+                             << "key1" << static_cast<long long int>(i * j * 37) << "key2"
                              << static_cast<long long int>(i * (645 << j))),
                         Date_t()));
             }
@@ -197,20 +189,14 @@ TEST_F(FTDCFileManagerTest, TestNormalRestart) {
             ASSERT_OK(mgr->writeSampleAndRotateIfNeeded(client,
                                                         BSON("name"
                                                              << "joe"
-                                                             << "key1"
-                                                             << 34
-                                                             << "key2"
-                                                             << 45),
+                                                             << "key1" << 34 << "key2" << 45),
                                                         Date_t()));
 
             // Add Value
             ASSERT_OK(mgr->writeSampleAndRotateIfNeeded(client,
                                                         BSON("name"
                                                              << "joe"
-                                                             << "key1"
-                                                             << 34
-                                                             << "key2"
-                                                             << 45),
+                                                             << "key1" << 34 << "key2" << 45),
                                                         Date_t()));
         }
 
@@ -245,9 +231,7 @@ TEST_F(FTDCFileManagerTest, TestCorruptCrashRestart) {
             ASSERT_OK(mgr->writeSampleAndRotateIfNeeded(client,
                                                         BSON("name"
                                                              << "joe"
-                                                             << "key1"
-                                                             << 3230792343LL
-                                                             << "key2"
+                                                             << "key1" << 3230792343LL << "key2"
                                                              << 235135),
                                                         Date_t()));
 
@@ -257,9 +241,7 @@ TEST_F(FTDCFileManagerTest, TestCorruptCrashRestart) {
                         client,
                         BSON("name"
                              << "joe"
-                             << "key1"
-                             << static_cast<long long int>(i * j * 37)
-                             << "key2"
+                             << "key1" << static_cast<long long int>(i * j * 37) << "key2"
                              << static_cast<long long int>(i * (645 << j))),
                         Date_t()));
             }
@@ -267,20 +249,14 @@ TEST_F(FTDCFileManagerTest, TestCorruptCrashRestart) {
             ASSERT_OK(mgr->writeSampleAndRotateIfNeeded(client,
                                                         BSON("name"
                                                              << "joe"
-                                                             << "key1"
-                                                             << 34
-                                                             << "key2"
-                                                             << 45),
+                                                             << "key1" << 34 << "key2" << 45),
                                                         Date_t()));
 
             // Add Value
             ASSERT_OK(mgr->writeSampleAndRotateIfNeeded(client,
                                                         BSON("name"
                                                              << "joe"
-                                                             << "key1"
-                                                             << 34
-                                                             << "key2"
-                                                             << 45),
+                                                             << "key1" << 34 << "key2" << 45),
                                                         Date_t()));
         }
 
@@ -311,23 +287,14 @@ TEST_F(FTDCFileManagerTest, TestNormalCrashInterim) {
 
     BSONObj mdoc1 = BSON("name"
                          << "some_metadata"
-                         << "key1"
-                         << 34
-                         << "something"
-                         << 98);
+                         << "key1" << 34 << "something" << 98);
 
     BSONObj sdoc1 = BSON("name"
                          << "joe"
-                         << "key1"
-                         << 34
-                         << "key2"
-                         << 45);
+                         << "key1" << 34 << "key2" << 45);
     BSONObj sdoc2 = BSON("name"
                          << "joe"
-                         << "key3"
-                         << 34
-                         << "key5"
-                         << 45);
+                         << "key3" << 34 << "key5" << 45);
 
     boost::filesystem::path fileOut;
 

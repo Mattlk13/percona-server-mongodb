@@ -31,9 +31,10 @@
 
 #include "mongo/db/query/collation/collator_factory_icu.h"
 
+#include <memory>
+
 #include "mongo/base/init.h"
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/unittest.h"
 
 namespace {
@@ -45,7 +46,7 @@ TEST(CollatorFactoryICUTest, LocaleStringParsesSuccessfully) {
     auto collator = factory.makeFromBSON(BSON("locale"
                                               << "en_US"));
     ASSERT_OK(collator.getStatus());
-    ASSERT_EQ("en_US", collator.getValue()->getSpec().localeID);
+    ASSERT_EQ("en_US", collator.getValue()->getSpec().getLocale());
 }
 
 TEST(CollatorFactoryICUTest, SimpleLocaleReturnsNullPointer) {
@@ -54,16 +55,6 @@ TEST(CollatorFactoryICUTest, SimpleLocaleReturnsNullPointer) {
                                               << "simple"));
     ASSERT_OK(collator.getStatus());
     ASSERT_TRUE(collator.getValue() == nullptr);
-}
-
-TEST(CollatorFactoryICUTest, SimpleLocaleWithOtherFieldsFailsToParse) {
-    CollatorFactoryICU factory;
-    auto collator = factory.makeFromBSON(BSON("locale"
-                                              << "simple"
-                                              << "caseLevel"
-                                              << true));
-    ASSERT_NOT_OK(collator.getStatus());
-    ASSERT_EQ(collator.getStatus(), ErrorCodes::FailedToParse);
 }
 
 TEST(CollatorFactoryICUTest, LocaleFieldNotAStringFailsToParse) {
@@ -398,7 +389,7 @@ TEST(CollatorFactoryICUTest, MissingLocaleStringFailsToParse) {
     CollatorFactoryICU factory;
     auto collator = factory.makeFromBSON(BSONObj());
     ASSERT_NOT_OK(collator.getStatus());
-    ASSERT_EQ(collator.getStatus(), ErrorCodes::NoSuchKey);
+    ASSERT_EQ(collator.getStatus().code(), 40414);
 }
 
 TEST(CollatorFactoryICUTest, UnknownSpecFieldFailsToParse) {
@@ -409,7 +400,6 @@ TEST(CollatorFactoryICUTest, UnknownSpecFieldFailsToParse) {
     CollatorFactoryICU factory;
     auto collator = factory.makeFromBSON(spec);
     ASSERT_NOT_OK(collator.getStatus());
-    ASSERT_EQ(collator.getStatus(), ErrorCodes::FailedToParse);
 }
 
 TEST(CollatorFactoryICUTest, DefaultsSetSuccessfully) {
@@ -417,18 +407,18 @@ TEST(CollatorFactoryICUTest, DefaultsSetSuccessfully) {
     auto collator = factory.makeFromBSON(BSON("locale"
                                               << "en_US"));
     ASSERT_OK(collator.getStatus());
-    ASSERT_FALSE(collator.getValue()->getSpec().caseLevel);
-    ASSERT_EQ(static_cast<int>(CollationSpec::CaseFirstType::kOff),
-              static_cast<int>(collator.getValue()->getSpec().caseFirst));
-    ASSERT_EQ(static_cast<int>(CollationSpec::StrengthType::kTertiary),
-              static_cast<int>(collator.getValue()->getSpec().strength));
-    ASSERT_FALSE(collator.getValue()->getSpec().numericOrdering);
-    ASSERT_EQ(static_cast<int>(CollationSpec::AlternateType::kNonIgnorable),
-              static_cast<int>(collator.getValue()->getSpec().alternate));
-    ASSERT_EQ(static_cast<int>(CollationSpec::MaxVariableType::kPunct),
-              static_cast<int>(collator.getValue()->getSpec().maxVariable));
-    ASSERT_FALSE(collator.getValue()->getSpec().normalization);
-    ASSERT_FALSE(collator.getValue()->getSpec().backwards);
+    ASSERT_FALSE(collator.getValue()->getSpec().getCaseLevel());
+    ASSERT_EQ(static_cast<int>(CollationCaseFirstEnum::kOff),
+              static_cast<int>(collator.getValue()->getSpec().getCaseFirst()));
+    ASSERT_EQ(static_cast<int>(CollationStrength::kTertiary),
+              collator.getValue()->getSpec().getStrength());
+    ASSERT_FALSE(collator.getValue()->getSpec().getNumericOrdering());
+    ASSERT_EQ(static_cast<int>(CollationAlternateEnum::kNonIgnorable),
+              static_cast<int>(collator.getValue()->getSpec().getAlternate()));
+    ASSERT_EQ(static_cast<int>(CollationMaxVariableEnum::kPunct),
+              static_cast<int>(collator.getValue()->getSpec().getMaxVariable()));
+    ASSERT_FALSE(collator.getValue()->getSpec().getNormalization());
+    ASSERT_FALSE(collator.getValue()->getSpec().getBackwards());
 }
 
 TEST(CollatorFactoryICUTest, LanguageDependentDefaultsSetSuccessfully) {
@@ -436,27 +426,25 @@ TEST(CollatorFactoryICUTest, LanguageDependentDefaultsSetSuccessfully) {
     auto collator = factory.makeFromBSON(BSON("locale"
                                               << "fr_CA"));
     ASSERT_OK(collator.getStatus());
-    ASSERT_TRUE(collator.getValue()->getSpec().backwards);
+    ASSERT_TRUE(collator.getValue()->getSpec().getBackwards());
 }
 
 TEST(CollatorFactoryICUTest, CaseLevelFalseParsesSuccessfully) {
     CollatorFactoryICU factory;
     auto collator = factory.makeFromBSON(BSON("locale"
                                               << "en_US"
-                                              << "caseLevel"
-                                              << false));
+                                              << "caseLevel" << false));
     ASSERT_OK(collator.getStatus());
-    ASSERT_FALSE(collator.getValue()->getSpec().caseLevel);
+    ASSERT_FALSE(collator.getValue()->getSpec().getCaseLevel());
 }
 
 TEST(CollatorFactoryICUTest, CaseLevelTrueParsesSuccessfully) {
     CollatorFactoryICU factory;
     auto collator = factory.makeFromBSON(BSON("locale"
                                               << "en_US"
-                                              << "caseLevel"
-                                              << true));
+                                              << "caseLevel" << true));
     ASSERT_OK(collator.getStatus());
-    ASSERT_TRUE(collator.getValue()->getSpec().caseLevel);
+    ASSERT_TRUE(collator.getValue()->getSpec().getCaseLevel());
 }
 
 TEST(CollatorFactoryICUTest, CaseFirstOffParsesSuccessfully) {
@@ -466,8 +454,8 @@ TEST(CollatorFactoryICUTest, CaseFirstOffParsesSuccessfully) {
                                               << "caseFirst"
                                               << "off"));
     ASSERT_OK(collator.getStatus());
-    ASSERT_EQ(static_cast<int>(CollationSpec::CaseFirstType::kOff),
-              static_cast<int>(collator.getValue()->getSpec().caseFirst));
+    ASSERT_EQ(static_cast<int>(CollationCaseFirstEnum::kOff),
+              static_cast<int>(collator.getValue()->getSpec().getCaseFirst()));
 }
 
 TEST(CollatorFactoryICUTest, CaseFirstUpperParsesSuccessfully) {
@@ -477,8 +465,8 @@ TEST(CollatorFactoryICUTest, CaseFirstUpperParsesSuccessfully) {
                                               << "caseFirst"
                                               << "upper"));
     ASSERT_OK(collator.getStatus());
-    ASSERT_EQ(static_cast<int>(CollationSpec::CaseFirstType::kUpper),
-              static_cast<int>(collator.getValue()->getSpec().caseFirst));
+    ASSERT_EQ(static_cast<int>(CollationCaseFirstEnum::kUpper),
+              static_cast<int>(collator.getValue()->getSpec().getCaseFirst()));
 }
 
 TEST(CollatorFactoryICUTest, CaseFirstLowerParsesSuccessfully) {
@@ -488,83 +476,76 @@ TEST(CollatorFactoryICUTest, CaseFirstLowerParsesSuccessfully) {
                                               << "caseFirst"
                                               << "lower"));
     ASSERT_OK(collator.getStatus());
-    ASSERT_EQ(static_cast<int>(CollationSpec::CaseFirstType::kLower),
-              static_cast<int>(collator.getValue()->getSpec().caseFirst));
+    ASSERT_EQ(static_cast<int>(CollationCaseFirstEnum::kLower),
+              static_cast<int>(collator.getValue()->getSpec().getCaseFirst()));
 }
 
 TEST(CollatorFactoryICUTest, PrimaryStrengthParsesSuccessfully) {
     CollatorFactoryICU factory;
     auto collator = factory.makeFromBSON(BSON("locale"
                                               << "en_US"
-                                              << "strength"
-                                              << 1));
+                                              << "strength" << 1));
     ASSERT_OK(collator.getStatus());
-    ASSERT_EQ(static_cast<int>(CollationSpec::StrengthType::kPrimary),
-              static_cast<int>(collator.getValue()->getSpec().strength));
+    ASSERT_EQ(static_cast<int>(CollationStrength::kPrimary),
+              collator.getValue()->getSpec().getStrength());
 }
 
 TEST(CollatorFactoryICUTest, SecondaryStrengthParsesSuccessfully) {
     CollatorFactoryICU factory;
     auto collator = factory.makeFromBSON(BSON("locale"
                                               << "en_US"
-                                              << "strength"
-                                              << 2));
+                                              << "strength" << 2));
     ASSERT_OK(collator.getStatus());
-    ASSERT_EQ(static_cast<int>(CollationSpec::StrengthType::kSecondary),
-              static_cast<int>(collator.getValue()->getSpec().strength));
+    ASSERT_EQ(static_cast<int>(CollationStrength::kSecondary),
+              collator.getValue()->getSpec().getStrength());
 }
 
 TEST(CollatorFactoryICUTest, TertiaryStrengthParsesSuccessfully) {
     CollatorFactoryICU factory;
     auto collator = factory.makeFromBSON(BSON("locale"
                                               << "en_US"
-                                              << "strength"
-                                              << 3));
+                                              << "strength" << 3));
     ASSERT_OK(collator.getStatus());
-    ASSERT_EQ(static_cast<int>(CollationSpec::StrengthType::kTertiary),
-              static_cast<int>(collator.getValue()->getSpec().strength));
+    ASSERT_EQ(static_cast<int>(CollationStrength::kTertiary),
+              collator.getValue()->getSpec().getStrength());
 }
 
 TEST(CollatorFactoryICUTest, QuaternaryStrengthParsesSuccessfully) {
     CollatorFactoryICU factory;
     auto collator = factory.makeFromBSON(BSON("locale"
                                               << "en_US"
-                                              << "strength"
-                                              << 4));
+                                              << "strength" << 4));
     ASSERT_OK(collator.getStatus());
-    ASSERT_EQ(static_cast<int>(CollationSpec::StrengthType::kQuaternary),
-              static_cast<int>(collator.getValue()->getSpec().strength));
+    ASSERT_EQ(static_cast<int>(CollationStrength::kQuaternary),
+              collator.getValue()->getSpec().getStrength());
 }
 
 TEST(CollatorFactoryICUTest, IdenticalStrengthParsesSuccessfully) {
     CollatorFactoryICU factory;
     auto collator = factory.makeFromBSON(BSON("locale"
                                               << "en_US"
-                                              << "strength"
-                                              << 5));
+                                              << "strength" << 5));
     ASSERT_OK(collator.getStatus());
-    ASSERT_EQ(static_cast<int>(CollationSpec::StrengthType::kIdentical),
-              static_cast<int>(collator.getValue()->getSpec().strength));
+    ASSERT_EQ(static_cast<int>(CollationStrength::kIdentical),
+              collator.getValue()->getSpec().getStrength());
 }
 
 TEST(CollatorFactoryICUTest, NumericOrderingFalseParsesSuccessfully) {
     CollatorFactoryICU factory;
     auto collator = factory.makeFromBSON(BSON("locale"
                                               << "en_US"
-                                              << "numericOrdering"
-                                              << false));
+                                              << "numericOrdering" << false));
     ASSERT_OK(collator.getStatus());
-    ASSERT_FALSE(collator.getValue()->getSpec().numericOrdering);
+    ASSERT_FALSE(collator.getValue()->getSpec().getNumericOrdering());
 }
 
 TEST(CollatorFactoryICUTest, NumericOrderingTrueParsesSuccessfully) {
     CollatorFactoryICU factory;
     auto collator = factory.makeFromBSON(BSON("locale"
                                               << "en_US"
-                                              << "numericOrdering"
-                                              << true));
+                                              << "numericOrdering" << true));
     ASSERT_OK(collator.getStatus());
-    ASSERT_TRUE(collator.getValue()->getSpec().numericOrdering);
+    ASSERT_TRUE(collator.getValue()->getSpec().getNumericOrdering());
 }
 
 TEST(CollatorFactoryICUTest, AlternateNonIgnorableParsesSuccessfully) {
@@ -574,8 +555,8 @@ TEST(CollatorFactoryICUTest, AlternateNonIgnorableParsesSuccessfully) {
                                               << "alternate"
                                               << "non-ignorable"));
     ASSERT_OK(collator.getStatus());
-    ASSERT_EQ(static_cast<int>(CollationSpec::AlternateType::kNonIgnorable),
-              static_cast<int>(collator.getValue()->getSpec().alternate));
+    ASSERT_EQ(static_cast<int>(CollationAlternateEnum::kNonIgnorable),
+              static_cast<int>(collator.getValue()->getSpec().getAlternate()));
 }
 
 TEST(CollatorFactoryICUTest, AlternateShiftedParsesSuccessfully) {
@@ -585,8 +566,8 @@ TEST(CollatorFactoryICUTest, AlternateShiftedParsesSuccessfully) {
                                               << "alternate"
                                               << "shifted"));
     ASSERT_OK(collator.getStatus());
-    ASSERT_EQ(static_cast<int>(CollationSpec::AlternateType::kShifted),
-              static_cast<int>(collator.getValue()->getSpec().alternate));
+    ASSERT_EQ(static_cast<int>(CollationAlternateEnum::kShifted),
+              static_cast<int>(collator.getValue()->getSpec().getAlternate()));
 }
 
 TEST(CollatorFactoryICUTest, MaxVariablePunctParsesSuccessfully) {
@@ -596,8 +577,8 @@ TEST(CollatorFactoryICUTest, MaxVariablePunctParsesSuccessfully) {
                                               << "maxVariable"
                                               << "punct"));
     ASSERT_OK(collator.getStatus());
-    ASSERT_EQ(static_cast<int>(CollationSpec::MaxVariableType::kPunct),
-              static_cast<int>(collator.getValue()->getSpec().maxVariable));
+    ASSERT_EQ(static_cast<int>(CollationMaxVariableEnum::kPunct),
+              static_cast<int>(collator.getValue()->getSpec().getMaxVariable()));
 }
 
 TEST(CollatorFactoryICUTest, MaxVariableSpaceParsesSuccessfully) {
@@ -607,70 +588,64 @@ TEST(CollatorFactoryICUTest, MaxVariableSpaceParsesSuccessfully) {
                                               << "maxVariable"
                                               << "space"));
     ASSERT_OK(collator.getStatus());
-    ASSERT_EQ(static_cast<int>(CollationSpec::MaxVariableType::kSpace),
-              static_cast<int>(collator.getValue()->getSpec().maxVariable));
+    ASSERT_EQ(static_cast<int>(CollationMaxVariableEnum::kSpace),
+              static_cast<int>(collator.getValue()->getSpec().getMaxVariable()));
 }
 
 TEST(CollatorFactoryICUTest, NormalizationFalseParsesSuccessfully) {
     CollatorFactoryICU factory;
     auto collator = factory.makeFromBSON(BSON("locale"
                                               << "en_US"
-                                              << "normalization"
-                                              << false));
+                                              << "normalization" << false));
     ASSERT_OK(collator.getStatus());
-    ASSERT_FALSE(collator.getValue()->getSpec().normalization);
+    ASSERT_FALSE(collator.getValue()->getSpec().getNormalization());
 }
 
 TEST(CollatorFactoryICUTest, NormalizationTrueParsesSuccessfully) {
     CollatorFactoryICU factory;
     auto collator = factory.makeFromBSON(BSON("locale"
                                               << "en_US"
-                                              << "normalization"
-                                              << true));
+                                              << "normalization" << true));
     ASSERT_OK(collator.getStatus());
-    ASSERT_TRUE(collator.getValue()->getSpec().normalization);
+    ASSERT_TRUE(collator.getValue()->getSpec().getNormalization());
 }
 
 TEST(CollatorFactoryICUTest, BackwardsFalseParsesSuccessfully) {
     CollatorFactoryICU factory;
     auto collator = factory.makeFromBSON(BSON("locale"
                                               << "en_US"
-                                              << "backwards"
-                                              << false));
+                                              << "backwards" << false));
     ASSERT_OK(collator.getStatus());
-    ASSERT_FALSE(collator.getValue()->getSpec().backwards);
+    ASSERT_FALSE(collator.getValue()->getSpec().getBackwards());
 }
 
 TEST(CollatorFactoryICUTest, BackwardsTrueParsesSuccessfully) {
     CollatorFactoryICU factory;
     auto collator = factory.makeFromBSON(BSON("locale"
                                               << "en_US"
-                                              << "backwards"
-                                              << true));
+                                              << "backwards" << true));
     ASSERT_OK(collator.getStatus());
-    ASSERT_TRUE(collator.getValue()->getSpec().backwards);
+    ASSERT_TRUE(collator.getValue()->getSpec().getBackwards());
 }
 
 TEST(CollatorFactoryICUTest, LongStrengthFieldParsesSuccessfully) {
     CollatorFactoryICU factory;
     auto collator = factory.makeFromBSON(BSON("locale"
                                               << "en_US"
-                                              << "strength"
-                                              << 1LL));
+                                              << "strength" << 1LL));
     ASSERT_OK(collator.getStatus());
-    ASSERT_EQ(static_cast<int>(CollationSpec::StrengthType::kPrimary),
-              static_cast<int>(collator.getValue()->getSpec().strength));
+    ASSERT_EQ(static_cast<int>(CollationStrength::kPrimary),
+              collator.getValue()->getSpec().getStrength());
 }
 
 TEST(CollatorFactoryICUTest, DoubleStrengthFieldParsesSuccessfully) {
     CollatorFactoryICU factory;
     auto collator = factory.makeFromBSON(BSON("locale"
                                               << "en_US"
-                                              << "strength"
-                                              << 1.0));
+                                              << "strength" << 1.0));
     ASSERT_OK(collator.getStatus());
-    ASSERT_EQ(static_cast<int>(CollationSpec::StrengthType::kPrimary),
-              static_cast<int>(collator.getValue()->getSpec().strength));
+    ASSERT_EQ(static_cast<int>(CollationStrength::kPrimary),
+              collator.getValue()->getSpec().getStrength());
 }
 
 TEST(CollatorFactoryICUTest, NonBooleanCaseLevelFieldFailsToParse) {
@@ -687,8 +662,7 @@ TEST(CollatorFactoryICUTest, NonStringCaseFirstFieldFailsToParse) {
     CollatorFactoryICU factory;
     auto collator = factory.makeFromBSON(BSON("locale"
                                               << "en_US"
-                                              << "caseFirst"
-                                              << 1));
+                                              << "caseFirst" << 1));
     ASSERT_NOT_OK(collator.getStatus());
     ASSERT_EQ(collator.getStatus(), ErrorCodes::TypeMismatch);
 }
@@ -700,7 +674,7 @@ TEST(CollatorFactoryICUTest, InvalidStringCaseFirstFieldFailsToParse) {
                                               << "caseFirst"
                                               << "invalid"));
     ASSERT_NOT_OK(collator.getStatus());
-    ASSERT_EQ(collator.getStatus(), ErrorCodes::FailedToParse);
+    ASSERT_EQ(collator.getStatus(), ErrorCodes::BadValue);
 }
 
 TEST(CollatorFactoryICUTest, NonNumberStrengthFieldFailsToParse) {
@@ -717,18 +691,16 @@ TEST(CollatorFactoryICUTest, TooLargeStrengthFieldFailsToParse) {
     CollatorFactoryICU factory;
     auto collator = factory.makeFromBSON(BSON("locale"
                                               << "en_US"
-                                              << "strength"
-                                              << 2147483648LL));
+                                              << "strength" << 2147483648LL));
     ASSERT_NOT_OK(collator.getStatus());
-    ASSERT_EQ(collator.getStatus(), ErrorCodes::FailedToParse);
+    ASSERT_EQ(collator.getStatus().code(), 51024);
 }
 
 TEST(CollatorFactoryICUTest, FractionalStrengthFieldFailsToParse) {
     CollatorFactoryICU factory;
     auto collator = factory.makeFromBSON(BSON("locale"
                                               << "en_US"
-                                              << "strength"
-                                              << 0.5));
+                                              << "strength" << 0.5));
     ASSERT_NOT_OK(collator.getStatus());
     ASSERT_EQ(collator.getStatus(), ErrorCodes::BadValue);
 }
@@ -737,20 +709,18 @@ TEST(CollatorFactoryICUTest, NegativeStrengthFieldFailsToParse) {
     CollatorFactoryICU factory;
     auto collator = factory.makeFromBSON(BSON("locale"
                                               << "en_US"
-                                              << "strength"
-                                              << -1));
+                                              << "strength" << -1));
     ASSERT_NOT_OK(collator.getStatus());
-    ASSERT_EQ(collator.getStatus(), ErrorCodes::FailedToParse);
+    ASSERT_EQ(collator.getStatus().code(), 51024);
 }
 
 TEST(CollatorFactoryICUTest, InvalidIntegerStrengthFieldFailsToParse) {
     CollatorFactoryICU factory;
     auto collator = factory.makeFromBSON(BSON("locale"
                                               << "en_US"
-                                              << "strength"
-                                              << 6));
+                                              << "strength" << 6));
     ASSERT_NOT_OK(collator.getStatus());
-    ASSERT_EQ(collator.getStatus(), ErrorCodes::FailedToParse);
+    ASSERT_EQ(collator.getStatus().code(), 51024);
 }
 
 TEST(CollatorFactoryICUTest, NonBoolNumericOrderingFieldFailsToParse) {
@@ -767,8 +737,7 @@ TEST(CollatorFactoryICUTest, NonStringAlternateFieldFailsToParse) {
     CollatorFactoryICU factory;
     auto collator = factory.makeFromBSON(BSON("locale"
                                               << "en_US"
-                                              << "alternate"
-                                              << 1));
+                                              << "alternate" << 1));
     ASSERT_NOT_OK(collator.getStatus());
     ASSERT_EQ(collator.getStatus(), ErrorCodes::TypeMismatch);
 }
@@ -780,15 +749,14 @@ TEST(CollatorFactoryICUTest, InvalidStringAlternateFieldFailsToParse) {
                                               << "alternate"
                                               << "invalid"));
     ASSERT_NOT_OK(collator.getStatus());
-    ASSERT_EQ(collator.getStatus(), ErrorCodes::FailedToParse);
+    ASSERT_EQ(collator.getStatus(), ErrorCodes::BadValue);
 }
 
 TEST(CollatorFactoryICUTest, NonStringMaxVariableFieldFailsToParse) {
     CollatorFactoryICU factory;
     auto collator = factory.makeFromBSON(BSON("locale"
                                               << "en_US"
-                                              << "maxVariable"
-                                              << 1));
+                                              << "maxVariable" << 1));
     ASSERT_NOT_OK(collator.getStatus());
     ASSERT_EQ(collator.getStatus(), ErrorCodes::TypeMismatch);
 }
@@ -800,7 +768,7 @@ TEST(CollatorFactoryICUTest, InvalidStringMaxVariableFieldFailsToParse) {
                                               << "maxVariable"
                                               << "invalid"));
     ASSERT_NOT_OK(collator.getStatus());
-    ASSERT_EQ(collator.getStatus(), ErrorCodes::FailedToParse);
+    ASSERT_EQ(collator.getStatus(), ErrorCodes::BadValue);
 }
 
 TEST(CollatorFactoryICUTest, NonBoolNormalizationFieldFailsToParse) {
@@ -830,7 +798,7 @@ TEST(CollatorFactoryICUTest, VersionFieldParsesSuccessfully) {
                                               << "version"
                                               << "57.1"));
     ASSERT_OK(collator.getStatus());
-    ASSERT_EQ("57.1", collator.getValue()->getSpec().version);
+    ASSERT_EQ("57.1", *collator.getValue()->getSpec().getVersion());
 }
 
 TEST(CollatorFactoryICUTest, VersionFieldPopulatedWhenOmitted) {
@@ -838,15 +806,14 @@ TEST(CollatorFactoryICUTest, VersionFieldPopulatedWhenOmitted) {
     auto collator = factory.makeFromBSON(BSON("locale"
                                               << "en_US"));
     ASSERT_OK(collator.getStatus());
-    ASSERT_EQ("57.1", collator.getValue()->getSpec().version);
+    ASSERT_EQ("57.1", *collator.getValue()->getSpec().getVersion());
 }
 
 TEST(CollatorFactoryICUTest, NonStringVersionFieldFailsToParse) {
     CollatorFactoryICU factory;
     auto collator = factory.makeFromBSON(BSON("locale"
                                               << "en_US"
-                                              << "version"
-                                              << 3));
+                                              << "version" << 3));
     ASSERT_NOT_OK(collator.getStatus());
     ASSERT_EQ(collator.getStatus(), ErrorCodes::TypeMismatch);
 }
@@ -878,8 +845,7 @@ TEST(CollatorFactoryICUTest, PrimaryStrengthCollatorIgnoresCaseAndAccents) {
     CollatorFactoryICU factory;
     auto collator = factory.makeFromBSON(BSON("locale"
                                               << "en_US"
-                                              << "strength"
-                                              << 1));
+                                              << "strength" << 1));
     ASSERT_OK(collator.getStatus());
 
     // u8"\u00E1" is latin small letter a with acute.
@@ -891,8 +857,7 @@ TEST(CollatorFactoryICUTest, SecondaryStrengthCollatorsIgnoresCaseButNotAccents)
     CollatorFactoryICU factory;
     auto collator = factory.makeFromBSON(BSON("locale"
                                               << "en_US"
-                                              << "strength"
-                                              << 2));
+                                              << "strength" << 2));
     ASSERT_OK(collator.getStatus());
 
     // u8"\u00E1" is latin small letter a with acute.
@@ -904,8 +869,7 @@ TEST(CollatorFactoryICUTest, TertiaryStrengthCollatorConsidersCaseAndAccents) {
     CollatorFactoryICU factory;
     auto collator = factory.makeFromBSON(BSON("locale"
                                               << "en_US"
-                                              << "strength"
-                                              << 3));
+                                              << "strength" << 3));
     ASSERT_OK(collator.getStatus());
 
     // u8"\u00E1" is latin small letter a with acute.
@@ -917,10 +881,7 @@ TEST(CollatorFactoryICUTest, PrimaryStrengthCaseLevelTrue) {
     CollatorFactoryICU factory;
     auto collator = factory.makeFromBSON(BSON("locale"
                                               << "en_US"
-                                              << "strength"
-                                              << 1
-                                              << "caseLevel"
-                                              << true));
+                                              << "strength" << 1 << "caseLevel" << true));
     ASSERT_OK(collator.getStatus());
 
     // u8"\u00E1" is latin small letter a with acute.
@@ -930,14 +891,11 @@ TEST(CollatorFactoryICUTest, PrimaryStrengthCaseLevelTrue) {
 
 TEST(CollatorFactoryICUTest, PrimaryStrengthCaseLevelTrueCaseFirstUpper) {
     CollatorFactoryICU factory;
-    auto collator = factory.makeFromBSON(BSON("locale"
-                                              << "en_US"
-                                              << "strength"
-                                              << 1
-                                              << "caseLevel"
-                                              << true
-                                              << "caseFirst"
-                                              << "upper"));
+    auto collator =
+        factory.makeFromBSON(BSON("locale"
+                                  << "en_US"
+                                  << "strength" << 1 << "caseLevel" << true << "caseFirst"
+                                  << "upper"));
     ASSERT_OK(collator.getStatus());
 
     // u8"\u00E1" is latin small letter a with acute.
@@ -947,14 +905,11 @@ TEST(CollatorFactoryICUTest, PrimaryStrengthCaseLevelTrueCaseFirstUpper) {
 
 TEST(CollatorFactoryICUTest, TertiaryStrengthCaseLevelTrueCaseFirstUpper) {
     CollatorFactoryICU factory;
-    auto collator = factory.makeFromBSON(BSON("locale"
-                                              << "en_US"
-                                              << "strength"
-                                              << 3
-                                              << "caseLevel"
-                                              << true
-                                              << "caseFirst"
-                                              << "upper"));
+    auto collator =
+        factory.makeFromBSON(BSON("locale"
+                                  << "en_US"
+                                  << "strength" << 3 << "caseLevel" << true << "caseFirst"
+                                  << "upper"));
     ASSERT_OK(collator.getStatus());
     ASSERT_LT(collator.getValue()->compare("A", "a"), 0);
 }
@@ -971,8 +926,7 @@ TEST(CollatorFactoryICUTest, NumericOrderingTrue) {
     CollatorFactoryICU factory;
     auto collator = factory.makeFromBSON(BSON("locale"
                                               << "en_US"
-                                              << "numericOrdering"
-                                              << true));
+                                              << "numericOrdering" << true));
     ASSERT_OK(collator.getStatus());
     ASSERT_LT(collator.getValue()->compare("2", "10"), 0);
 }
@@ -981,9 +935,7 @@ TEST(CollatorFactoryICUTest, PrimaryStrengthAlternateShifted) {
     CollatorFactoryICU factory;
     auto collator = factory.makeFromBSON(BSON("locale"
                                               << "en_US"
-                                              << "strength"
-                                              << 1
-                                              << "alternate"
+                                              << "strength" << 1 << "alternate"
                                               << "shifted"));
     ASSERT_OK(collator.getStatus());
     ASSERT_EQ(collator.getValue()->compare("a b", "ab"), 0);
@@ -994,9 +946,7 @@ TEST(CollatorFactoryICUTest, QuaternaryStrengthAlternateShifted) {
     CollatorFactoryICU factory;
     auto collator = factory.makeFromBSON(BSON("locale"
                                               << "en_US"
-                                              << "strength"
-                                              << 4
-                                              << "alternate"
+                                              << "strength" << 4 << "alternate"
                                               << "shifted"));
     ASSERT_OK(collator.getStatus());
     ASSERT_LT(collator.getValue()->compare("a b", "ab"), 0);
@@ -1007,9 +957,7 @@ TEST(CollatorFactoryICUTest, PrimaryStrengthAlternateShiftedMaxVariableSpace) {
     CollatorFactoryICU factory;
     auto collator = factory.makeFromBSON(BSON("locale"
                                               << "en_US"
-                                              << "strength"
-                                              << 1
-                                              << "alternate"
+                                              << "strength" << 1 << "alternate"
                                               << "shifted"
                                               << "maxVariable"
                                               << "space"));
@@ -1022,8 +970,7 @@ TEST(CollatorFactoryICUTest, SecondaryStrengthBackwardsFalse) {
     CollatorFactoryICU factory;
     auto collator = factory.makeFromBSON(BSON("locale"
                                               << "en_US"
-                                              << "strength"
-                                              << 2));
+                                              << "strength" << 2));
     ASSERT_OK(collator.getStatus());
 
     // u8"\u00E1" is latin small letter a with acute.
@@ -1034,10 +981,7 @@ TEST(CollatorFactoryICUTest, SecondaryStrengthBackwardsTrue) {
     CollatorFactoryICU factory;
     auto collator = factory.makeFromBSON(BSON("locale"
                                               << "en_US"
-                                              << "strength"
-                                              << 2
-                                              << "backwards"
-                                              << true));
+                                              << "strength" << 2 << "backwards" << true));
     ASSERT_OK(collator.getStatus());
 
     // u8"\u00E1" is latin small letter a with acute.
@@ -1068,10 +1012,7 @@ TEST(CollatorFactoryICUTest, BackwardsTrueWithStrengthOneFails) {
     CollatorFactoryICU factory;
     auto collator = factory.makeFromBSON(BSON("locale"
                                               << "en_US"
-                                              << "backwards"
-                                              << true
-                                              << "strength"
-                                              << 1));
+                                              << "backwards" << true << "strength" << 1));
     ASSERT_NOT_OK(collator.getStatus());
 }
 
@@ -1079,10 +1020,7 @@ TEST(CollatorFactoryICUTest, BackwardsTrueWithStrengthTwoSucceeds) {
     CollatorFactoryICU factory;
     auto collator = factory.makeFromBSON(BSON("locale"
                                               << "en_US"
-                                              << "backwards"
-                                              << true
-                                              << "strength"
-                                              << 2));
+                                              << "backwards" << true << "strength" << 2));
     ASSERT_OK(collator.getStatus());
 }
 
@@ -1092,8 +1030,7 @@ TEST(CollatorFactoryICUTest, CaseFirstLowerWithStrengthThreeSucceeds) {
                                               << "en_US"
                                               << "caseFirst"
                                               << "lower"
-                                              << "strength"
-                                              << 3));
+                                              << "strength" << 3));
     ASSERT_OK(collator.getStatus());
 }
 
@@ -1103,8 +1040,7 @@ TEST(CollatorFactoryICUTest, CaseFirstUpperWithStrengthThreeSucceeds) {
                                               << "en_US"
                                               << "caseFirst"
                                               << "upper"
-                                              << "strength"
-                                              << 3));
+                                              << "strength" << 3));
     ASSERT_OK(collator.getStatus());
 }
 
@@ -1114,10 +1050,7 @@ TEST(CollatorFactoryICUTest, CaseFirstLowerWithCaseLevelSucceeds) {
                                               << "en_US"
                                               << "caseFirst"
                                               << "lower"
-                                              << "caseLevel"
-                                              << true
-                                              << "strength"
-                                              << 1));
+                                              << "caseLevel" << true << "strength" << 1));
     ASSERT_OK(collator.getStatus());
 }
 
@@ -1127,10 +1060,7 @@ TEST(CollatorFactoryICUTest, CaseFirstUpperWithCaseLevelSucceeds) {
                                               << "en_US"
                                               << "caseFirst"
                                               << "upper"
-                                              << "caseLevel"
-                                              << true
-                                              << "strength"
-                                              << 1));
+                                              << "caseLevel" << true << "strength" << 1));
     ASSERT_OK(collator.getStatus());
 }
 
@@ -1140,8 +1070,7 @@ TEST(CollatorFactoryICUTest, CaseFirstOffWithStrengthOneSucceeds) {
                                               << "en_US"
                                               << "caseFirst"
                                               << "off"
-                                              << "strength"
-                                              << 1));
+                                              << "strength" << 1));
     ASSERT_OK(collator.getStatus());
 }
 
@@ -1151,8 +1080,7 @@ TEST(CollatorFactoryICUTest, CaseFirstLowerWithStrengthOneFails) {
                                               << "en_US"
                                               << "caseFirst"
                                               << "lower"
-                                              << "strength"
-                                              << 1));
+                                              << "strength" << 1));
     ASSERT_NOT_OK(collator.getStatus());
 }
 
@@ -1162,8 +1090,7 @@ TEST(CollatorFactoryICUTest, CaseFirstLowerWithStrengthTwoFails) {
                                               << "en_US"
                                               << "caseFirst"
                                               << "lower"
-                                              << "strength"
-                                              << 2));
+                                              << "strength" << 2));
     ASSERT_NOT_OK(collator.getStatus());
 }
 
@@ -1173,8 +1100,7 @@ TEST(CollatorFactoryICUTest, CaseFirstUpperWithStrengthOneFails) {
                                               << "en_US"
                                               << "caseFirst"
                                               << "upper"
-                                              << "strength"
-                                              << 1));
+                                              << "strength" << 1));
     ASSERT_NOT_OK(collator.getStatus());
 }
 
@@ -1184,8 +1110,7 @@ TEST(CollatorFactoryICUTest, CaseFirstUpperWithStrengthTwoFails) {
                                               << "en_US"
                                               << "caseFirst"
                                               << "upper"
-                                              << "strength"
-                                              << 2));
+                                              << "strength" << 2));
     ASSERT_NOT_OK(collator.getStatus());
 }
 

@@ -47,16 +47,28 @@ void registerMongoDCollectors(FTDCController* controller) {
     if (repl::ReplicationCoordinator::get(getGlobalServiceContext())->getReplicationMode() !=
         repl::ReplicationCoordinator::modeNone) {
         // CmdReplSetGetStatus
-        controller->addPeriodicCollector(stdx::make_unique<FTDCSimpleInternalCommandCollector>(
-            "replSetGetStatus", "replSetGetStatus", "", BSON("replSetGetStatus" << 1)));
+        controller->addPeriodicCollector(std::make_unique<FTDCSimpleInternalCommandCollector>(
+            "replSetGetStatus",
+            "replSetGetStatus",
+            "",
+            BSON("replSetGetStatus" << 1 << "initialSync" << 0)));
 
         // CollectionStats
         controller->addPeriodicCollector(
-            stdx::make_unique<FTDCSimpleInternalCommandCollector>("collStats",
-                                                                  "local.oplog.rs.stats",
-                                                                  "local",
-                                                                  BSON("collStats"
-                                                                       << "oplog.rs")));
+            std::make_unique<FTDCSimpleInternalCommandCollector>("collStats",
+                                                                 "local.oplog.rs.stats",
+                                                                 "local",
+                                                                 BSON("collStats"
+                                                                      << "oplog.rs"
+                                                                      << "waitForLock" << false)));
+        if (serverGlobalParams.clusterRole != ClusterRole::ShardServer) {
+            // GetDefaultRWConcern
+            controller->addOnRotateCollector(std::make_unique<FTDCSimpleInternalCommandCollector>(
+                "getDefaultRWConcern",
+                "getDefaultRWConcern",
+                "",
+                BSON("getDefaultRWConcern" << 1 << "inMemory" << true)));
+        }
     }
 }
 

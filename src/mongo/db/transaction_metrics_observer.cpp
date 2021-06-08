@@ -92,9 +92,12 @@ void TransactionMetricsObserver::onUnstash(ServerTransactionsMetrics* serverTran
     serverTransactionsMetrics->decrementCurrentInactive();
 }
 
-void TransactionMetricsObserver::onCommit(ServerTransactionsMetrics* serverTransactionsMetrics,
+void TransactionMetricsObserver::onCommit(OperationContext* opCtx,
+                                          ServerTransactionsMetrics* serverTransactionsMetrics,
                                           TickSource* tickSource,
-                                          Top* top) {
+                                          Top* top,
+                                          size_t operationCount,
+                                          size_t oplogOperationBytes) {
     //
     // Per transaction metrics.
     //
@@ -118,6 +121,11 @@ void TransactionMetricsObserver::onCommit(ServerTransactionsMetrics* serverTrans
         serverTransactionsMetrics->decrementCurrentPrepared();
     }
 
+    serverTransactionsMetrics->updateLastTransaction(
+        operationCount,
+        oplogOperationBytes,
+        opCtx->getWriteConcern().usedDefault ? BSONObj() : opCtx->getWriteConcern().toBSON());
+
     auto duration =
         durationCount<Microseconds>(_singleTransactionStats.getDuration(tickSource, curTick));
     top->incrementGlobalTransactionLatencyStats(static_cast<uint64_t>(duration));
@@ -138,18 +146,12 @@ void TransactionMetricsObserver::_onAbortActive(
     // Server wide transactions metrics.
     //
     serverTransactionsMetrics->decrementCurrentActive();
-
-    if (_singleTransactionStats.isPrepared()) {
-        serverTransactionsMetrics->incrementTotalPreparedThenAborted();
-        serverTransactionsMetrics->decrementCurrentPrepared();
-    }
 }
 
 void TransactionMetricsObserver::_onAbortInactive(
     ServerTransactionsMetrics* serverTransactionsMetrics, TickSource* tickSource, Top* top) {
     auto curTick = tickSource->getTicks();
     invariant(!_singleTransactionStats.isActive());
-    invariant(!_singleTransactionStats.isPrepared());
     _onAbort(serverTransactionsMetrics, curTick, tickSource, top);
 
     //
@@ -212,6 +214,11 @@ void TransactionMetricsObserver::_onAbort(ServerTransactionsMetrics* serverTrans
     //
     serverTransactionsMetrics->incrementTotalAborted();
     serverTransactionsMetrics->decrementCurrentOpen();
+
+    if (_singleTransactionStats.isPrepared()) {
+        serverTransactionsMetrics->incrementTotalPreparedThenAborted();
+        serverTransactionsMetrics->decrementCurrentPrepared();
+    }
 
     auto latency =
         durationCount<Microseconds>(_singleTransactionStats.getDuration(tickSource, curTick));

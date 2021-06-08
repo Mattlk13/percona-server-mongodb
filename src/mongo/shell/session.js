@@ -5,7 +5,11 @@
  * https://github.com/mongodb/specifications/blob/master/source/sessions/driver-sessions.rst#abstract
  */
 var {
-    DriverSession, SessionOptions, _DummyDriverSession, _DelegatingDriverSession, _ServerSession,
+    DriverSession,
+    SessionOptions,
+    _DummyDriverSession,
+    _DelegatingDriverSession,
+    _ServerSession,
 } = (function() {
     "use strict";
 
@@ -144,22 +148,19 @@ var {
                 wireVersion <= client.getMaxWireVersion();
         }
 
-        // TODO: Update this whitelist, or convert it to a blacklist depending on the outcome of
+        // TODO: Update this allowlist, or convert it to a denylist depending on the outcome of
         // SERVER-31743.
         const kCommandsThatSupportReadConcern = new Set([
             "aggregate",
             "count",
             "distinct",
-            "explain",
             "find",
+            "explain",
             "geoNear",
-            "geoSearch",
             "group",
-            "mapReduce",
-            "mapreduce",
         ]);
 
-        function canUseReadConcern(driverSession, cmdObj) {
+        this.canUseReadConcern = function(driverSession, cmdObj) {
             // Always attach the readConcern to the first statement of the transaction, whether it
             // is a read or a write.
             if (driverSession._serverSession.isTxnActive()) {
@@ -185,7 +186,7 @@ var {
             }
 
             return true;
-        }
+        };
 
         function gossipClusterTime(cmdObj, clusterTime) {
             cmdObj = Object.assign({}, cmdObj);
@@ -207,10 +208,18 @@ var {
             return cmdObj;
         }
 
-        function injectAfterClusterTime(cmdObj, operationTime) {
-            cmdObj = Object.assign({}, cmdObj);
+        function establishSessionReadConcern(cmdObj, driverSession) {
+            // `driverSession.getOperationTime()` is the smallest time needed for performing a
+            // causally consistent read using the current session. Note that
+            // `client.getClusterTime()` is no smaller than the operation time and would
+            // therefore only be less efficient to wait until.
+            const operationTime = driverSession.getOperationTime();
+            if (operationTime === undefined) {
+                return cmdObj;
+            }
 
-            const cmdName = Object.keys(cmdObj)[0];
+            cmdObj = Object.assign({}, cmdObj);
+            let cmdName = Object.keys(cmdObj)[0];
 
             // If the command is in a wrapped form, then we look for the actual command object
             // inside the query/$query object.
@@ -220,7 +229,17 @@ var {
                 cmdObjUnwrapped = cmdObj[cmdName];
             }
 
-            cmdObjUnwrapped.readConcern = Object.assign({}, cmdObjUnwrapped.readConcern);
+            // Explain read concerns are on the inner command (possibly inside query/$query).
+            cmdName = Object.keys(cmdObjUnwrapped)[0];
+            if (cmdName === "explain") {
+                cmdObjUnwrapped[cmdName] = Object.assign({}, cmdObjUnwrapped[cmdName]);
+                cmdObjUnwrapped = cmdObjUnwrapped[cmdName];
+            }
+
+            // Transaction read concerns are handled later in assignTxnInfo().
+            const sessionReadConcern = driverSession.getOptions().getReadConcern();
+            cmdObjUnwrapped.readConcern =
+                Object.assign({}, sessionReadConcern, cmdObjUnwrapped.readConcern);
             const readConcern = cmdObjUnwrapped.readConcern;
 
             if (!readConcern.hasOwnProperty("afterClusterTime")) {
@@ -230,7 +249,7 @@ var {
             return cmdObj;
         }
 
-        function prepareCommandRequest(driverSession, cmdObj) {
+        this.prepareCommandRequest = function(driverSession, cmdObj) {
             if (driverSession._isExplicit && !isAcknowledged(cmdObj)) {
                 throw new Error("Unacknowledged writes are prohibited with sessions");
             }
@@ -282,24 +301,12 @@ var {
                 }
             }
 
-            // TODO SERVER-31868: A user should get back an error if they attempt to advance the
-            // DriverSession's operationTime manually when talking to a stand-alone mongod. Removing
-            // the `(client.isReplicaSetMember() || client.isMongos())` condition will also involve
-            // calling resetOperationTime_forTesting() in JavaScript tests that start different
-            // cluster types.
             if (serverSupports(kWireVersionSupportingCausalConsistency) &&
                 (client.isReplicaSetMember() || client.isMongos()) &&
                 (driverSession.getOptions().isCausalConsistency() ||
                  client.isCausalConsistency()) &&
-                canUseReadConcern(driverSession, cmdObj)) {
-                // `driverSession.getOperationTime()` is the smallest time needed for performing a
-                // causally consistent read using the current session. Note that
-                // `client.getClusterTime()` is no smaller than the operation time and would
-                // therefore only be less efficient to wait until.
-                const operationTime = driverSession.getOperationTime();
-                if (operationTime !== undefined) {
-                    cmdObj = injectAfterClusterTime(cmdObj, driverSession.getOperationTime());
-                }
+                this.canUseReadConcern(driverSession, cmdObj)) {
+                cmdObj = establishSessionReadConcern(cmdObj, driverSession);
             }
 
             // All commands go through transaction code, which will determine if the command is a
@@ -315,20 +322,20 @@ var {
             }
 
             return cmdObj;
-        }
+        };
 
         /**
          * Returns true if the error code is retryable, assuming the command is idempotent.
          *
-         * The Retryable Writes specification defines a RetryableError as any network error, any of
-         * the following error codes, or an error response with a different code containing the
-         * phrase "not master" or "node is recovering".
+         * The Retryable Writes specification defines a RetryableError as any network error,
+         * any of the following error codes, or an error response with a different code
+         * containing the phrase "not master" or "node is recovering".
          *
          * https://github.com/mongodb/specifications/blob/5b53e0baca18ba111364d479a37fa9195ef801a6/
          * source/retryable-writes/retryable-writes.rst#terms
          */
         function isRetryableCode(code) {
-            return ErrorCodes.isNetworkError(code) || ErrorCodes.isNotMasterError(code) ||
+            return ErrorCodes.isNetworkError(code) || ErrorCodes.isNotPrimaryError(code) ||
                 ErrorCodes.isShutdownError(code) || ErrorCodes.WriteConcernFailed === code;
         }
 
@@ -336,15 +343,15 @@ var {
             driverSession, cmdObj, clientFunction, clientFunctionArguments) {
             let cmdName = Object.keys(cmdObj)[0];
 
-            // If the command is in a wrapped form, then we look for the actual command object
-            // inside the query/$query object.
+            // If the command is in a wrapped form, then we look for the actual command
+            // object inside the query/$query object.
             if (cmdName === "query" || cmdName === "$query") {
                 cmdObj = cmdObj[cmdName];
                 cmdName = Object.keys(cmdObj)[0];
             }
 
-            // TODO SERVER-33921: Revisit how the mongo shell decides whether it should retry a
-            // command or not.
+            // TODO SERVER-33921: Revisit how the mongo shell decides whether it should
+            // retry a command or not.
             const sessionOptions = driverSession.getOptions();
             let numRetries =
                 (sessionOptions.shouldRetryWrites() && cmdObj.hasOwnProperty("txnNumber") &&
@@ -367,16 +374,17 @@ var {
                         throw e;
                     }
 
-                    // We run an "isMaster" command explicitly to force the underlying DBClient to
-                    // reconnect to the server.
-                    const res = client.adminCommand({isMaster: 1});
+                    // We run a "hello" command explicitly to force the underlying
+                    // DBClient to reconnect to the server.
+                    const res = client.getDB('admin')._helloOrLegacyHello();
                     if (res.ok !== 1) {
                         throw e;
                     }
 
-                    // It's possible that the server we're connected with after re-establishing our
-                    // connection doesn't support retryable writes. If that happens, then we just
-                    // return the original network error back to the user.
+                    // It's possible that the server we're connected with after
+                    // re-establishing our connection doesn't support retryable writes. If
+                    // that happens, then we just return the original network error back to
+                    // the user.
                     const serverSupportsRetryableWrites = res.hasOwnProperty("minWireVersion") &&
                         res.hasOwnProperty("maxWireVersion") &&
                         res.minWireVersion <= kWireVersionSupportingRetryableWrites &&
@@ -411,17 +419,17 @@ var {
                     }
 
                     if (Array.isArray(res.writeErrors)) {
-                        // If any of the write operations in the batch fails with a retryable error,
-                        // then we retry the entire batch.
+                        // If any of the write operations in the batch fails with a
+                        // retryable error, then we retry the entire batch.
                         const writeError =
                             res.writeErrors.find((writeError) => isRetryableCode(writeError.code));
 
                         if (writeError !== undefined) {
                             if (jsTest.options().logRetryAttempts) {
-                                jsTest.log("Retrying " + cmdName +
-                                           " due to retryable write error (code=" +
-                                           writeError.code + "), subsequent retries remaining: " +
-                                           numRetries);
+                                jsTest.log(
+                                    "Retrying " + cmdName +
+                                    " due to retryable write error (code=" + writeError.code +
+                                    "), subsequent retries remaining: " + numRetries);
                             }
                             if (client.isReplicaSetConnection()) {
                                 client._markNodeAsFailed(
@@ -453,7 +461,7 @@ var {
         }
 
         this.runCommand = function runCommand(driverSession, dbName, cmdObj, options) {
-            cmdObj = prepareCommandRequest(driverSession, cmdObj);
+            cmdObj = this.prepareCommandRequest(driverSession, cmdObj);
 
             const res = runClientFunctionWithRetries(
                 driverSession, cmdObj, client.runCommand, [dbName, cmdObj, options]);
@@ -464,7 +472,7 @@ var {
 
         this.runCommandWithMetadata = function runCommandWithMetadata(
             driverSession, dbName, metadata, cmdObj) {
-            cmdObj = prepareCommandRequest(driverSession, cmdObj);
+            cmdObj = this.prepareCommandRequest(driverSession, cmdObj);
 
             const res = runClientFunctionWithRetries(
                 driverSession, cmdObj, client.runCommandWithMetadata, [dbName, metadata, cmdObj]);
@@ -716,6 +724,20 @@ var {
             return endTransaction("abortTransaction", driverSession);
         };
 
+        this.getTxnWriteConcern = function getTxnWriteConcern(driverSession) {
+            // If a writeConcern is not specified from the default transaction options, it will be
+            // inherited from the session.
+            let writeConcern = undefined;
+            const sessionAwareClient = driverSession._getSessionAwareClient();
+            if (sessionAwareClient.getWriteConcern(driverSession) !== undefined) {
+                writeConcern = sessionAwareClient.getWriteConcern(driverSession);
+            }
+            if (_txnOptions.getTxnWriteConcern() !== undefined) {
+                writeConcern = _txnOptions.getTxnWriteConcern();
+            }
+            return writeConcern;
+        };
+
         const endTransaction = (commandName, driverSession) => {
             // If commitTransaction or abortTransaction is the first statement in a
             // transaction, it should not send a command to the server and should mark the
@@ -730,22 +752,18 @@ var {
             }
 
             let cmd = {[commandName]: 1, txnNumber: this.handle.getTxnNumber()};
-            // writeConcern should only be specified on commit or abort. If a writeConcern is
-            // not specified from the default transaction options, it will be inherited from
-            // the session.
-            const sessionAwareClient = driverSession._getSessionAwareClient();
-            if (sessionAwareClient.getWriteConcern(driverSession) !== undefined) {
-                cmd.writeConcern = sessionAwareClient.getWriteConcern(driverSession);
-            }
-            if (_txnOptions.getTxnWriteConcern() !== undefined) {
-                cmd.writeConcern = _txnOptions.getTxnWriteConcern();
+            // writeConcern should only be specified on commit or abort.
+            const writeConcern = driverSession._serverSession.getTxnWriteConcern(driverSession);
+            if (writeConcern !== undefined) {
+                cmd.writeConcern = writeConcern;
             }
 
             // If commit or abort raises an error, the transaction's state should still change.
             let res;
             try {
                 // run command against the admin database.
-                res = sessionAwareClient.runCommand(driverSession, "admin", cmd, 0);
+                res = driverSession._getSessionAwareClient().runCommand(
+                    driverSession, "admin", cmd, 0);
             } finally {
                 if (commandName === "commitTransaction") {
                     setTxnState("committed");
@@ -870,6 +888,10 @@ var {
 
             this.getTxnNumber_forTesting = function getTxnNumber_forTesting() {
                 return this._serverSession.getTxnNumber();
+            };
+
+            this.getTxnWriteConcern_forTesting = function getTxnWriteConcern_forTesting() {
+                return this._serverSession.getTxnWriteConcern(this);
             };
 
             this.setTxnNumber_forTesting = function setTxnNumber_forTesting(newTxnNumber) {
@@ -1037,54 +1059,54 @@ var {
     const DummyDriverSession =
         makeDriverSessionConstructor(  // Force clang-format to break this line.
             {
-              createServerSession: function createServerSession(client) {
-                  return {
-                      injectSessionId: function injectSessionId(cmdObj) {
-                          return cmdObj;
-                      },
+                createServerSession: function createServerSession(client) {
+                    return {
+                        injectSessionId: function injectSessionId(cmdObj) {
+                            return cmdObj;
+                        },
 
-                      assignTransactionNumber: function assignTransactionNumber(cmdObj) {
-                          return cmdObj;
-                      },
+                        assignTransactionNumber: function assignTransactionNumber(cmdObj) {
+                            return cmdObj;
+                        },
 
-                      canRetryWrites: function canRetryWrites(cmdObj) {
-                          return false;
-                      },
+                        canRetryWrites: function canRetryWrites(cmdObj) {
+                            return false;
+                        },
 
-                      assignTxnInfo: function assignTxnInfo(cmdObj) {
-                          return cmdObj;
-                      },
+                        assignTxnInfo: function assignTxnInfo(cmdObj) {
+                            return cmdObj;
+                        },
 
-                      isTxnActive: function isTxnActive() {
-                          return false;
-                      },
+                        isTxnActive: function isTxnActive() {
+                            return false;
+                        },
 
-                      isFirstStatement: function isFirstStatement() {
-                          return false;
-                      },
+                        isFirstStatement: function isFirstStatement() {
+                            return false;
+                        },
 
-                      getTxnOptions: function getTxnOptions() {
-                          return {};
-                      },
+                        getTxnOptions: function getTxnOptions() {
+                            return {};
+                        },
 
-                      startTransaction: function startTransaction() {
-                          throw new Error("Must call startSession() on the Mongo connection " +
-                                          "object before starting a transaction.");
-                      },
+                        startTransaction: function startTransaction() {
+                            throw new Error("Must call startSession() on the Mongo connection " +
+                                            "object before starting a transaction.");
+                        },
 
-                      commitTransaction: function commitTransaction() {
-                          throw new Error("Must call startSession() on the Mongo connection " +
-                                          "object before committing a transaction.");
-                      },
+                        commitTransaction: function commitTransaction() {
+                            throw new Error("Must call startSession() on the Mongo connection " +
+                                            "object before committing a transaction.");
+                        },
 
-                      abortTransaction: function abortTransaction() {
-                          throw new Error("Must call startSession() on the Mongo connection " +
-                                          "object before aborting a transaction.");
-                      },
-                  };
-              },
+                        abortTransaction: function abortTransaction() {
+                            throw new Error("Must call startSession() on the Mongo connection " +
+                                            "object before aborting a transaction.");
+                        },
+                    };
+                },
 
-              endSession: function endSession(serverSession) {},
+                endSession: function endSession(serverSession) {},
             },
             {causalConsistency: false, retryWrites: false});
 

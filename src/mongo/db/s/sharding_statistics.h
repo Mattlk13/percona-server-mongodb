@@ -91,6 +91,14 @@ struct ShardingStatistics {
     // after timing out waiting to acquire a lock.
     AtomicWord<long long> countDonorMoveChunkLockTimeout{0};
 
+    // Cumulative, always-increasing counter of the number of migrations aborted on this node
+    // due to concurrent index operations.
+    AtomicWord<long long> countDonorMoveChunkAbortConflictingIndexOperation{0};
+
+    // Total number of migrations leftover from previous primaries that needs to be run to
+    // completion. Valid only when this process is the repl set primary.
+    AtomicWord<long long> unfinishedMigrationFromPreviousPrimary{0};
+
     /**
      * Obtains the per-process instance of the sharding statistics object.
      */

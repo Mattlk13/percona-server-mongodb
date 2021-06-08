@@ -1,5 +1,8 @@
 // Check proper covered index handling when query and processGetMore yield.
 // SERVER-4975
+// @tags: [
+//   uses_parallel_shell,
+// ]
 
 if (0) {  // SERVER-4975
 
@@ -12,20 +15,22 @@ if (0) {  // SERVER-4975
         // Insert an array, which will make the { a:1 } index multikey and should disable covered
         // index
         // matching.
-        p1 = startParallelShell('for( i = 0; i < 60; ++i ) { \
+        p1 = startParallelShell(
+            'for( i = 0; i < 60; ++i ) { \
                                db.jstests_coveredIndex3.save( { a:[ 2000, 2001 ] } ); \
                                sleep( 300 ); \
                            }');
 
         // Frequent writes cause the find operation to yield.
-        p2 = startParallelShell('for( i = 0; i < 1800; ++i ) { \
+        p2 = startParallelShell(
+            'for( i = 0; i < 1800; ++i ) { \
                             db.jstests_coveredIndex3_other.save( {} ); \
                             sleep( 10 ); \
                             }');
 
         for (i = 0; i < 30; ++i) {
             t.drop();
-            t.ensureIndex({a: 1});
+            t.createIndex({a: 1});
 
             for (j = 0; j < 1000; ++j) {
                 t.save({a: j});

@@ -40,6 +40,9 @@
 #include "mongo/util/concurrency/spin_lock.h"
 
 namespace mongo {
+namespace projection_executor {
+class ProjectionExecutor;
+}  // namespace projection_executor
 
 const std::string IdentityNS("local.me");
 const BSONField<std::string> HostField("host");
@@ -116,7 +119,7 @@ public:
      * @param cmdName the name of the command
      * @param replyObj the exact reply for the command
      */
-    void setCommandReply(const std::string& cmdName, const mongo::BSONObj& replyObj);
+    void setCommandReply(const std::string& cmdName, const StatusWith<mongo::BSONObj>& replyObj);
 
     /**
      * Sets the reply for a command.
@@ -128,7 +131,7 @@ public:
      *     that requires different results when calling a method.
      */
     void setCommandReply(const std::string& cmdName,
-                         const std::vector<mongo::BSONObj>& replySequence);
+                         const std::vector<StatusWith<mongo::BSONObj>>& replySequence);
 
     /**
      * Inserts a single document to this server.
@@ -166,9 +169,10 @@ public:
                            mongo::Query query = mongo::Query(),
                            int nToReturn = 0,
                            int nToSkip = 0,
-                           const mongo::BSONObj* fieldsToReturn = 0,
+                           const mongo::BSONObj* fieldsToReturn = nullptr,
                            int queryOptions = 0,
-                           int batchSize = 0);
+                           int batchSize = 0,
+                           boost::optional<BSONObj> readConcernObj = boost::none);
 
     //
     // Getters
@@ -179,12 +183,13 @@ public:
     double getSoTimeout() const;
 
     /**
-     * @return the exact std::string address passed to hostAndPort parameter of the
+     * @returns the value passed to hostAndPort parameter of the
      *     constructor. In other words, doesn't automatically append a
      *     'default' port if none is specified.
      */
     std::string getServerAddress() const;
     std::string toString();
+    const HostAndPort& getServerHostAndPort() const;
 
     //
     // Call counters
@@ -203,12 +208,12 @@ private:
         /**
          * Creates a new iterator with a deep copy of the vector.
          */
-        CircularBSONIterator(const std::vector<mongo::BSONObj>& replyVector);
-        mongo::BSONObj next();
+        CircularBSONIterator(const std::vector<StatusWith<mongo::BSONObj>>& replyVector);
+        StatusWith<mongo::BSONObj> next();
 
     private:
-        std::vector<mongo::BSONObj>::iterator _iter;
-        std::vector<mongo::BSONObj> _replyObjs;
+        std::vector<StatusWith<mongo::BSONObj>>::iterator _iter;
+        std::vector<StatusWith<mongo::BSONObj>> _replyObjs;
     };
 
     /**
@@ -218,13 +223,26 @@ private:
      */
     void checkIfUp(InstanceID id) const;
 
+    /**
+     * Creates a ProjectionExecutor to handle fieldsToReturn.
+     */
+    std::unique_ptr<projection_executor::ProjectionExecutor> createProjectionExecutor(
+        const BSONObj& projectionSpec);
+
+    /**
+     * Projects the object, unless the projectionExecutor is null, in which case returns a
+     * copy of the object.
+     */
+    BSONObj project(projection_executor::ProjectionExecutor* projectionExecutor, const BSONObj& o);
+
+
     typedef stdx::unordered_map<std::string, std::shared_ptr<CircularBSONIterator>> CmdToReplyObj;
     typedef stdx::unordered_map<std::string, std::vector<BSONObj>> MockDataMgr;
     typedef stdx::unordered_map<mongo::UUID, std::string, UUID::Hash> UUIDMap;
 
     bool _isRunning;
 
-    const std::string _hostAndPort;
+    const HostAndPort _hostAndPort;
     long long _delayMilliSec;
 
     //

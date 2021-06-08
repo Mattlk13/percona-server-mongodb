@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -36,13 +36,15 @@
 #include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/client/remote_command_targeter.h"
 #include "mongo/db/pipeline/change_stream_constants.h"
+#include "mongo/db/pipeline/change_stream_invalidation_info.h"
 #include "mongo/db/query/cursor_response.h"
 #include "mongo/db/query/getmore_request.h"
-#include "mongo/db/query/killcursors_request.h"
+#include "mongo/db/query/kill_cursors_gen.h"
+#include "mongo/db/query/query_feature_flags_gen.h"
 #include "mongo/executor/remote_command_request.h"
 #include "mongo/executor/remote_command_response.h"
+#include "mongo/s/catalog/type_shard.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -51,12 +53,26 @@ const BSONObj AsyncResultsMerger::kWholeSortKeySortPattern = BSON(kSortKeyField 
 
 namespace {
 
-// Maximum number of retries for network and replication notMaster errors (per host).
+// Maximum number of retries for network and replication NotPrimary errors (per host).
 const int kMaxNumFailedHostRetryAttempts = 3;
 
 /**
- * Returns the sort key out of the $sortKey metadata field in 'obj'. This object is of the form
- * {'': 'firstSortKey', '': 'secondSortKey', ...}.
+ * Returns the sort key out of the $sortKey metadata field in 'obj'. The sort key should be
+ * formatted as an array with one value per field of the sort pattern:
+ *  {..., $sortKey: [<firstSortKeyComponent>, <secondSortKeyComponent>, ...], ...}
+ *
+ * This function returns the sort key not as an array, but as the equivalent BSONObj:
+ *   {"0": <firstSortKeyComponent>, "1": <secondSortKeyComponent>}
+ *
+ * The return value is allowed to omit the key names, so the caller should not rely on the key names
+ * being present. That is, the return value could consist of an object such as
+ *   {"": <firstSortKeyComponent>, "": <secondSortKeyComponent>}
+ *
+ * If 'compareWholeSortKey' is true, then the value inside the $sortKey is directly interpreted as a
+ * single-element sort key. For example, given the document
+ *   {..., $sortKey: <value>, ...}
+ * and 'compareWholeSortKey'=true, this function will return
+ *   {"": <value>}
  */
 BSONObj extractSortKey(BSONObj obj, bool compareWholeSortKey) {
     auto key = obj[AsyncResultsMerger::kSortKeyField];
@@ -64,8 +80,8 @@ BSONObj extractSortKey(BSONObj obj, bool compareWholeSortKey) {
     if (compareWholeSortKey) {
         return key.wrap();
     }
-    invariant(key.type() == BSONType::Object);
-    return key.Obj();
+    invariant(key.type() == BSONType::Array);
+    return key.embeddedObject();
 }
 
 /**
@@ -75,17 +91,17 @@ BSONObj extractSortKey(BSONObj obj, bool compareWholeSortKey) {
 int compareSortKeys(BSONObj leftSortKey, BSONObj rightSortKey, BSONObj sortKeyPattern) {
     // This does not need to sort with a collator, since mongod has already mapped strings to their
     // ICU comparison keys as part of the $sortKey meta projection.
-    const bool considerFieldName = false;
-    return leftSortKey.woCompare(rightSortKey, sortKeyPattern, considerFieldName);
+    const BSONObj::ComparisonRulesSet rules = 0;  // 'considerFieldNames' flag is not set.
+    return leftSortKey.woCompare(rightSortKey, sortKeyPattern, rules);
 }
 
 }  // namespace
 
 AsyncResultsMerger::AsyncResultsMerger(OperationContext* opCtx,
-                                       executor::TaskExecutor* executor,
+                                       std::shared_ptr<executor::TaskExecutor> executor,
                                        AsyncResultsMergerParams params)
     : _opCtx(opCtx),
-      _executor(executor),
+      _executor(std::move(executor)),
       // This strange initialization is to work around the fact that the IDL does not currently
       // support a default value for an enum. The default tailable mode should be 'kNormal', but
       // since that is not supported we treat boost::none (unspecified) to mean 'kNormal'.
@@ -102,7 +118,17 @@ AsyncResultsMerger::AsyncResultsMerger(OperationContext* opCtx,
     for (const auto& remote : _params.getRemotes()) {
         _remotes.emplace_back(remote.getHostAndPort(),
                               remote.getCursorResponse().getNSS(),
-                              remote.getCursorResponse().getCursorId());
+                              remote.getCursorResponse().getCursorId(),
+                              remote.getCursorResponse().getPartialResultsReturned());
+
+        // A remote cannot be flagged as 'partialResultsReturned' if 'allowPartialResults' is false.
+        invariant(!(_remotes.back().partialResultsReturned && !_params.getAllowPartialResults()));
+
+        // For the first batch, cursor should never be invalidated.
+        tassert(
+            5493704, "Found invalidated cursor on the first batch", !_remotes.back().invalidated);
+
+        _remotes.back().shardId = remote.getShardId().toString();
 
         // We don't check the return value of _addBatchToBuffer here; if there was an error,
         // it will be stored in the remote and the first call to ready() will return true.
@@ -111,16 +137,32 @@ AsyncResultsMerger::AsyncResultsMerger(OperationContext* opCtx,
     }
     // If this is a change stream, then we expect to have already received PBRTs from every shard.
     invariant(_promisedMinSortKeys.empty() || _promisedMinSortKeys.size() == _remotes.size());
-    _highWaterMark = _promisedMinSortKeys.empty() ? BSONObj() : _promisedMinSortKeys.begin()->first;
+    _setInitialHighWaterMark();
+}
+
+void AsyncResultsMerger::_setInitialHighWaterMark() {
+    // If we do not have any minimum promised sort keys, this is not a change stream. Return early.
+    if (_promisedMinSortKeys.empty()) {
+        return;
+    }
+    // Find the minimum promised sort key whose remote is eligible to contribute a high water mark.
+    for (auto&& [minSortKey, remoteId] : _promisedMinSortKeys) {
+        if (_remotes[remoteId].eligibleForHighWaterMark) {
+            _highWaterMark = minSortKey;
+            break;
+        }
+    }
+    // We should always be guaranteed to find an eligible remote, if this is a change stream.
+    invariant(!_highWaterMark.isEmpty());
 }
 
 AsyncResultsMerger::~AsyncResultsMerger() {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     invariant(_remotesExhausted(lk) || _lifecycleState == kKillComplete);
 }
 
 bool AsyncResultsMerger::remotesExhausted() const {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     return _remotesExhausted(lk);
 }
 
@@ -135,7 +177,7 @@ bool AsyncResultsMerger::_remotesExhausted(WithLock) const {
 }
 
 Status AsyncResultsMerger::setAwaitDataTimeout(Milliseconds awaitDataTimeout) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
 
     if (_tailableMode != TailableModeEnum::kTailableAndAwaitData) {
         return Status(ErrorCodes::BadValue,
@@ -155,12 +197,12 @@ Status AsyncResultsMerger::setAwaitDataTimeout(Milliseconds awaitDataTimeout) {
 }
 
 bool AsyncResultsMerger::ready() {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     return _ready(lk);
 }
 
 void AsyncResultsMerger::detachFromOperationContext() {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     _opCtx = nullptr;
     // If we were about ready to return a boost::none because a tailable cursor reached the end of
     // the batch, that should no longer apply to the next use - when we are reattached to a
@@ -170,37 +212,68 @@ void AsyncResultsMerger::detachFromOperationContext() {
 }
 
 void AsyncResultsMerger::reattachToOperationContext(OperationContext* opCtx) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     invariant(!_opCtx);
     _opCtx = opCtx;
 }
 
 void AsyncResultsMerger::addNewShardCursors(std::vector<RemoteCursor>&& newCursors) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     // Create a new entry in the '_remotes' list for each new shard, and add the first cursor batch
     // to its buffer. This ensures the shard's initial high water mark is respected, if it exists.
     for (auto&& remote : newCursors) {
         const auto newIndex = _remotes.size();
         _remotes.emplace_back(remote.getHostAndPort(),
                               remote.getCursorResponse().getNSS(),
-                              remote.getCursorResponse().getCursorId());
+                              remote.getCursorResponse().getCursorId(),
+                              remote.getCursorResponse().getPartialResultsReturned());
         _addBatchToBuffer(lk, newIndex, remote.getCursorResponse());
     }
 }
 
-BSONObj AsyncResultsMerger::getHighWaterMark() {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
-    auto minPromisedSortKey = _getMinPromisedSortKey(lk);
-    if (!minPromisedSortKey.isEmpty() && !_ready(lk)) {
-        _highWaterMark = minPromisedSortKey;
-    }
-    return _highWaterMark;
+bool AsyncResultsMerger::partialResultsReturned() const {
+    stdx::lock_guard<Latch> lk(_mutex);
+    return std::any_of(_remotes.begin(), _remotes.end(), [](const auto& remote) {
+        return remote.partialResultsReturned;
+    });
 }
 
-BSONObj AsyncResultsMerger::_getMinPromisedSortKey(WithLock) {
+std::size_t AsyncResultsMerger::getNumRemotes() const {
+    // Take the lock to guard against shard additions or disconnections.
+    stdx::lock_guard<Latch> lk(_mutex);
+
+    // If 'allowPartialResults' is false, the number of participating remotes is constant.
+    if (!_params.getAllowPartialResults()) {
+        return _remotes.size();
+    }
+    // Otherwise, discount remotes which failed to connect or disconnected prematurely.
+    return std::count_if(_remotes.begin(), _remotes.end(), [](const auto& remote) {
+        return !remote.partialResultsReturned;
+    });
+}
+
+BSONObj AsyncResultsMerger::getHighWaterMark() {
+    stdx::lock_guard<Latch> lk(_mutex);
+    // At this point, the high water mark may be the resume token of the last document we returned.
+    // If no further results are eligible for return, we advance to the minimum promised sort key.
+    // If the remote associated with the minimum promised sort key is not currently eligible to
+    // provide a high water mark, then we do not advance even if no further results are ready.
+    if (auto minPromisedSortKey = _getMinPromisedSortKey(lk); minPromisedSortKey && !_ready(lk)) {
+        if (_remotes[minPromisedSortKey->second].eligibleForHighWaterMark) {
+            _highWaterMark = minPromisedSortKey->first;
+        }
+    }
+    // The high water mark is stored in sort-key format: {"": <high watermark>}. We only return
+    // the <high watermark> part of of the sort key, which looks like {_data: ..., _typeBits: ...}.
+    invariant(_highWaterMark.isEmpty() || _highWaterMark.firstElement().type() == BSONType::Object);
+    return _highWaterMark.isEmpty() ? BSONObj() : _highWaterMark.firstElement().Obj().getOwned();
+}
+
+boost::optional<AsyncResultsMerger::MinSortKeyRemoteIdPair>
+AsyncResultsMerger::_getMinPromisedSortKey(WithLock) {
     // We cannot return the minimum promised sort key unless all shards have reported one.
-    return _promisedMinSortKeys.size() < _remotes.size() ? BSONObj()
-                                                         : _promisedMinSortKeys.begin()->first;
+    return _promisedMinSortKeys.size() < _remotes.size() ? boost::optional<MinSortKeyRemoteIdPair>{}
+                                                         : *_promisedMinSortKeys.begin();
 }
 
 bool AsyncResultsMerger::_ready(WithLock lk) {
@@ -252,8 +325,8 @@ bool AsyncResultsMerger::_readySortedTailable(WithLock lk) {
         extractSortKey(*smallestResult.getResult(), _params.getCompareWholeSortKey());
     // We should always have a minPromisedSortKey from every shard in the sorted tailable case.
     auto minPromisedSortKey = _getMinPromisedSortKey(lk);
-    invariant(!minPromisedSortKey.isEmpty());
-    return compareSortKeys(keyWeWantToReturn, minPromisedSortKey, *_params.getSort()) <= 0;
+    invariant(minPromisedSortKey);
+    return compareSortKeys(keyWeWantToReturn, minPromisedSortKey->first, *_params.getSort()) <= 0;
 }
 
 bool AsyncResultsMerger::_readyUnsorted(WithLock) {
@@ -272,7 +345,7 @@ bool AsyncResultsMerger::_readyUnsorted(WithLock) {
 }
 
 StatusWith<ClusterQueryResult> AsyncResultsMerger::nextReady() {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     dassert(_ready(lk));
     if (_lifecycleState != kAlive) {
         return Status(ErrorCodes::IllegalOperation, "AsyncResultsMerger killed");
@@ -315,8 +388,10 @@ ClusterQueryResult AsyncResultsMerger::_nextReadySorted(WithLock) {
 
     // For sorted tailable awaitData cursors, update the high water mark to the document's sort key.
     if (_tailableMode == TailableModeEnum::kTailableAndAwaitData) {
-        _highWaterMark =
-            extractSortKey(*front.getResult(), _params.getCompareWholeSortKey()).getOwned();
+        if (_remotes[smallestRemote].eligibleForHighWaterMark) {
+            _highWaterMark =
+                extractSortKey(*front.getResult(), _params.getCompareWholeSortKey()).getOwned();
+        }
     }
 
     return front;
@@ -396,11 +471,11 @@ Status AsyncResultsMerger::_askForNextBatch(WithLock, size_t remoteIndex) {
     }
 
     executor::RemoteCommandRequest request(
-        remote.getTargetHost(), _params.getNss().db().toString(), cmdObj, _opCtx);
+        remote.getTargetHost(), remote.cursorNss.db().toString(), cmdObj, _opCtx);
 
     auto callbackStatus =
         _executor->scheduleRemoteCommand(request, [this, remoteIndex](auto const& cbData) {
-            stdx::lock_guard<stdx::mutex> lk(this->_mutex);
+            stdx::lock_guard<Latch> lk(this->_mutex);
             this->_handleBatchResponse(lk, cbData, remoteIndex);
         });
 
@@ -413,7 +488,7 @@ Status AsyncResultsMerger::_askForNextBatch(WithLock, size_t remoteIndex) {
 }
 
 Status AsyncResultsMerger::scheduleGetMores() {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     return _scheduleGetMores(lk);
 }
 
@@ -447,7 +522,7 @@ Status AsyncResultsMerger::_scheduleGetMores(WithLock lk) {
  * 3. Remotes that reached maximum retries will be in 'exhausted' state.
  */
 StatusWith<executor::TaskExecutor::EventHandle> AsyncResultsMerger::nextEvent() {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
 
     if (_lifecycleState != kAlive) {
         // Can't schedule further network operations if the ARM is being killed.
@@ -460,6 +535,11 @@ StatusWith<executor::TaskExecutor::EventHandle> AsyncResultsMerger::nextEvent() 
         // eventually be signaled.
         return Status(ErrorCodes::IllegalOperation,
                       "nextEvent() called before an outstanding event was signaled");
+    }
+
+    // Check if the cursor should be invalidated.
+    if (feature_flags::gFeatureFlagChangeStreamsOptimization.isEnabledAndIgnoreFCV()) {
+        _assertNotInvalidated(lk);
     }
 
     auto getMoresStatus = _scheduleGetMores(lk);
@@ -480,6 +560,15 @@ StatusWith<executor::TaskExecutor::EventHandle> AsyncResultsMerger::nextEvent() 
     // the new event.
     _signalCurrentEventIfReady(lk);
     return eventToReturn;
+}
+
+void AsyncResultsMerger::_assertNotInvalidated(WithLock lk) {
+    if (auto minPromisedSortKey = _getMinPromisedSortKey(lk)) {
+        const auto& minRemote = _remotes[minPromisedSortKey->second];
+        uassert(ChangeStreamInvalidationInfo{minPromisedSortKey->first.firstElement().Obj()},
+                "Change stream invalidated",
+                !(minRemote.invalidated && !_ready(lk)));
+    }
 }
 
 StatusWith<CursorResponse> AsyncResultsMerger::_parseCursorResponse(
@@ -503,12 +592,20 @@ StatusWith<CursorResponse> AsyncResultsMerger::_parseCursorResponse(
     return std::move(cursorResponse);
 }
 
-void AsyncResultsMerger::_updateRemoteMetadata(WithLock,
+void AsyncResultsMerger::_updateRemoteMetadata(WithLock lk,
                                                size_t remoteIndex,
                                                const CursorResponse& response) {
     // Update the cursorId; it is sent as '0' when the cursor has been exhausted on the shard.
     auto& remote = _remotes[remoteIndex];
     remote.cursorId = response.getCursorId();
+
+    // If the response indicates that the cursor has been invalidated, mark the corresponding
+    // remote as invalidated. This also signifies that the shard cursor has been closed.
+    remote.invalidated = response.getInvalidated();
+    tassert(5493705,
+            "Unexpectedly encountered invalidated cursor with non-zero ID",
+            !(remote.invalidated && remote.cursorId > 0));
+
     if (response.getPostBatchResumeToken()) {
         // We only expect to see this for change streams.
         invariant(_params.getSort());
@@ -518,9 +615,16 @@ void AsyncResultsMerger::_updateRemoteMetadata(WithLock,
         // The postBatchResumeToken should never be empty.
         invariant(!response.getPostBatchResumeToken()->isEmpty());
 
+        // Note that the PBRT is an object of format {_data: ..., _typeBits: ...} that we must wrap
+        // in a sort key so that it can compare correctly with sort keys from other streams.
+        auto newMinSortKey = BSON("" << *response.getPostBatchResumeToken());
+
+        // Determine whether the new batch is eligible to provide a high water mark resume token.
+        remote.eligibleForHighWaterMark =
+            _checkHighWaterMarkEligibility(lk, newMinSortKey, remote, response);
+
         // The most recent minimum sort key should never be smaller than the previous promised
-        // minimum sort key for this remote, if one exists.
-        auto newMinSortKey = *response.getPostBatchResumeToken();
+        // minimum sort key for this remote, if a previous promised minimum sort key exists.
         if (auto& oldMinSortKey = remote.promisedMinSortKey) {
             invariant(compareSortKeys(newMinSortKey, *oldMinSortKey, *_params.getSort()) >= 0);
             invariant(_promisedMinSortKeys.size() <= _remotes.size());
@@ -528,17 +632,60 @@ void AsyncResultsMerger::_updateRemoteMetadata(WithLock,
         }
         _promisedMinSortKeys.insert({newMinSortKey, remoteIndex});
         remote.promisedMinSortKey = newMinSortKey;
-    } else {
-        // If we don't have a postBatchResumeToken, then we should never have an oplog timestamp.
-        // TODO SERVER-38539: remove this validation when $internalLatestOplogTimestamp is removed.
-        if (response.getLastOplogTimestamp()) {
-            severe() << "Host " << remote.shardHostAndPort
-                     << " returned a cursor which has an oplog timestamp but does not have a "
-                        "postBatchResumeToken, suggesting that one or more shards are running an "
-                        "older version of MongoDB. This configuration is not supported.";
-            fassertFailedNoTrace(51062);
-        }
     }
+}
+
+bool AsyncResultsMerger::_checkHighWaterMarkEligibility(WithLock,
+                                                        BSONObj newMinSortKey,
+                                                        const RemoteCursorData& remote,
+                                                        const CursorResponse& response) {
+    // If the cursor is not on the "config.shards" namespace, then it is a normal shard cursor.
+    // These cursors are always eligible to provide a high water mark resume token.
+    if (remote.cursorNss != ShardType::ConfigNS) {
+        return true;
+    }
+
+    // If we are here, the cursor is on the "config.shards" namespace. This is an internal cursor
+    // which monitors for the addition of new shards. There are two special cases which we must
+    // handle for this cursor:
+    //
+    //   - The user specified a 'startAtOperationTime' in the future. This is a problem because the
+    //     config cursor must always be opened at the current clusterTime, to ensure that it detects
+    //     all shards that are added after the change stream is dispatched. We must make sure that
+    //     the high water mark ignores the config cursor's minimum promised sort keys, otherwise we
+    //     will end up returning a token that is earlier than the start time requested by the user.
+    //
+    //   - The cursor returns a "shard added" event. All events produced by the config cursor are
+    //     handled and swallowed internally by the stream. We therefore do not want to allow their
+    //     resume tokens to be exposed to the user via the postBatchResumeToken mechanism, since
+    //     these token are not actually resumable. See SERVER-47810 for further details.
+
+    // If the current high water mark is ahead of the config cursor, it implies that the client has
+    // opened a stream with a startAtOperationTime in the future. We should hold the high water mark
+    // at the user-specified start time until the config server catches up to it. The config cursor
+    // is therefore not eligible to provide a new high water mark.
+    if (compareSortKeys(newMinSortKey, _highWaterMark, *_params.getSort()) < 0) {
+        return false;
+    }
+    // If the config server returns an event which indicates a change in the cluster topology, it
+    // will be swallowed by the stream. It will not be returned to the user, and it should not be
+    // eligible to become the high water mark either.
+    if (!response.getBatch().empty()) {
+        return false;
+    }
+    // If we are here, then the only remaining reason not to mark this batch as eligible is if the
+    // current batch's sort key is the same as the last batch's, and the last batch was ineligible.
+    // Therefore, if the previous batch was eligible, this batch is as well.
+    if (remote.eligibleForHighWaterMark) {
+        return true;
+    }
+    // If we are here, then either the last batch we received was ineligible for one of the reasons
+    // outlined above, or this is the first batch we have ever received for this cursor. If this is
+    // the first batch, then we always mark the config cursor as ineligible so that the initial high
+    // water mark will be taken from one of the shards instead. If we received an ineligible batch
+    // last time, then the current batch is only eligible if its sort key is greater than the last.
+    return remote.promisedMinSortKey &&
+        compareSortKeys(newMinSortKey, *remote.promisedMinSortKey, *_params.getSort()) > 0;
 }
 
 void AsyncResultsMerger::_handleBatchResponse(WithLock lk,
@@ -565,12 +712,10 @@ void AsyncResultsMerger::_cleanUpKilledBatch(WithLock lk) {
     invariant(_lifecycleState == kKillStarted);
 
     // If this is the last callback to run then we are ready to free the ARM. We signal the
-    // '_killCompleteEvent', which the caller of kill() may be waiting on.
+    // '_killCompleteInfo', which the caller of kill() may be waiting on.
     if (!_haveOutstandingBatchRequests(lk)) {
-        // If the event is invalid then '_executor' is in shutdown, so we cannot signal events.
-        if (_killCompleteEvent.isValid()) {
-            _executor->signalEvent(_killCompleteEvent);
-        }
+        invariant(_killCompleteInfo);
+        _killCompleteInfo->signalFutures();
 
         _lifecycleState = kKillComplete;
     }
@@ -584,14 +729,14 @@ void AsyncResultsMerger::_cleanUpFailedBatch(WithLock lk, Status status, size_t 
     //
     // The ExchangePassthrough error code is an internal-only error code used specifically to
     // communicate that an error has occurred, but some other thread is responsible for returning
-    // the error to the user. In order to avoid polluting the user's error message, we ingore such
+    // the error to the user. In order to avoid polluting the user's error message, we ignore such
     // errors with the expectation that all outstanding cursors will be closed promptly.
     if (_params.getAllowPartialResults() || remote.status == ErrorCodes::ExchangePassthrough) {
-        remote.status = Status::OK();
-
-        // Clear the results buffer and cursor id.
+        // Clear the results buffer and cursor id, and set 'partialResultsReturned' if appropriate.
+        remote.partialResultsReturned = (remote.status != ErrorCodes::ExchangePassthrough);
         std::queue<ClusterQueryResult> emptyBuffer;
         std::swap(remote.docBuffer, emptyBuffer);
+        remote.status = Status::OK();
         remote.cursorId = 0;
     }
 }
@@ -654,15 +799,13 @@ bool AsyncResultsMerger::_addBatchToBuffer(WithLock lk,
                 remote.status =
                     Status(ErrorCodes::InternalError,
                            str::stream() << "Missing field '" << AsyncResultsMerger::kSortKeyField
-                                         << "' in document: "
-                                         << obj);
+                                         << "' in document: " << obj);
                 return false;
-            } else if (!_params.getCompareWholeSortKey() && key.type() != BSONType::Object) {
+            } else if (!_params.getCompareWholeSortKey() && !key.isABSONObj()) {
                 remote.status =
                     Status(ErrorCodes::InternalError,
                            str::stream() << "Field '" << AsyncResultsMerger::kSortKeyField
-                                         << "' was not of type Object in document: "
-                                         << obj);
+                                         << "' was not of type Object in document: " << obj);
                 return false;
             }
         }
@@ -700,11 +843,12 @@ bool AsyncResultsMerger::_haveOutstandingBatchRequests(WithLock) {
 }
 
 void AsyncResultsMerger::_scheduleKillCursors(WithLock, OperationContext* opCtx) {
-    invariant(_killCompleteEvent.isValid());
+    invariant(_killCompleteInfo);
 
     for (const auto& remote : _remotes) {
         if (remote.status.isOK() && remote.cursorId && !remote.exhausted()) {
-            BSONObj cmdObj = KillCursorsRequest(_params.getNss(), {remote.cursorId}).toBSON();
+            BSONObj cmdObj =
+                KillCursorsCommandRequest(_params.getNss(), {remote.cursorId}).toBSON(BSONObj{});
 
             executor::RemoteCommandRequest request(
                 remote.getTargetHost(), _params.getNss().db().toString(), cmdObj, opCtx);
@@ -715,40 +859,29 @@ void AsyncResultsMerger::_scheduleKillCursors(WithLock, OperationContext* opCtx)
     }
 }
 
-executor::TaskExecutor::EventHandle AsyncResultsMerger::kill(OperationContext* opCtx) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+stdx::shared_future<void> AsyncResultsMerger::kill(OperationContext* opCtx) {
+    stdx::lock_guard<Latch> lk(_mutex);
 
-    if (_killCompleteEvent.isValid()) {
+    if (_killCompleteInfo) {
         invariant(_lifecycleState != kAlive);
-        return _killCompleteEvent;
+        return _killCompleteInfo->getFuture();
     }
 
     invariant(_lifecycleState == kAlive);
     _lifecycleState = kKillStarted;
 
-    // Make '_killCompleteEvent', which we will signal as soon as all of our callbacks
-    // have finished running.
-    auto statusWithEvent = _executor->makeEvent();
-    if (ErrorCodes::isShutdownError(statusWithEvent.getStatus().code())) {
-        // The underlying task executor is shutting down.
-        if (!_haveOutstandingBatchRequests(lk)) {
-            _lifecycleState = kKillComplete;
-        }
-        return executor::TaskExecutor::EventHandle();
-    }
-    fassert(28716, statusWithEvent);
-    _killCompleteEvent = statusWithEvent.getValue();
+    // Create "_killCompleteInfo", which we will signal as soon as all of our callbacks have
+    // finished running.
+    _killCompleteInfo.emplace();
 
     _scheduleKillCursors(lk, opCtx);
 
     if (!_haveOutstandingBatchRequests(lk)) {
         _lifecycleState = kKillComplete;
-        // Signal the event right now, as there's nothing to wait for.
-        _executor->signalEvent(_killCompleteEvent);
-        return _killCompleteEvent;
+        // Signal the future right now, as there's nothing to wait for.
+        _killCompleteInfo->signalFutures();
+        return _killCompleteInfo->getFuture();
     }
-
-    _lifecycleState = kKillStarted;
 
     // Cancel all of our callbacks. Once they all complete, the event will be signaled.
     for (const auto& remote : _remotes) {
@@ -756,7 +889,7 @@ executor::TaskExecutor::EventHandle AsyncResultsMerger::kill(OperationContext* o
             _executor->cancel(remote.cbHandle);
         }
     }
-    return _killCompleteEvent;
+    return _killCompleteInfo->getFuture();
 }
 
 //
@@ -765,10 +898,15 @@ executor::TaskExecutor::EventHandle AsyncResultsMerger::kill(OperationContext* o
 
 AsyncResultsMerger::RemoteCursorData::RemoteCursorData(HostAndPort hostAndPort,
                                                        NamespaceString cursorNss,
-                                                       CursorId establishedCursorId)
+                                                       CursorId establishedCursorId,
+                                                       bool partialResultsReturned)
     : cursorId(establishedCursorId),
       cursorNss(std::move(cursorNss)),
-      shardHostAndPort(std::move(hostAndPort)) {}
+      shardHostAndPort(std::move(hostAndPort)),
+      partialResultsReturned(partialResultsReturned) {
+    // If the 'partialResultsReturned' flag is set, the cursorId must be zero (closed).
+    invariant(!(partialResultsReturned && cursorId != 0));
+}
 
 const HostAndPort& AsyncResultsMerger::RemoteCursorData::getTargetHost() const {
     return shardHostAndPort;

@@ -32,6 +32,7 @@
 #include "mongo/executor/task_executor_cursor.h"
 
 #include "mongo/client/dbclient_base.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/executor/network_interface_factory.h"
 #include "mongo/executor/network_interface_thread_pool.h"
 #include "mongo/executor/thread_pool_task_executor.h"
@@ -72,8 +73,9 @@ TEST_F(TaskExecutorCursorFixture, Basic) {
     auto opCtx = client->makeOperationContext();
 
     // Write 100 documents to "test.test" via dbclient
-    std::string err;
-    auto dbclient = unittest::getFixtureConnectionString().connect("TaskExecutorCursorTest", err);
+    auto swConn = unittest::getFixtureConnectionString().connect("TaskExecutorCursorTest");
+    uassertStatusOK(swConn.getStatus());
+    auto dbclient = std::move(swConn.getValue());
 
     const size_t numDocs = 100;
 
@@ -84,14 +86,13 @@ TEST_F(TaskExecutorCursorFixture, Basic) {
     }
     dbclient->dropCollection("test.test");
     dbclient->insert("test.test", docs);
-    ASSERT_EQUALS(dbclient->count("test.test"), numDocs);
+    ASSERT_EQUALS(dbclient->count(NamespaceString("test.test")), numDocs);
 
     RemoteCommandRequest rcr(unittest::getFixtureConnectionString().getServers().front(),
                              "test",
                              BSON("find"
                                   << "test"
-                                  << "batchSize"
-                                  << 10),
+                                  << "batchSize" << 10),
                              opCtx.get());
 
     TaskExecutorCursor tec(executor(), rcr, [] {

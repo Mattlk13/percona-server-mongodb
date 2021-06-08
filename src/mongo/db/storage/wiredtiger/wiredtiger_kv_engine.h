@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include <functional>
 #include <list>
 #include <memory>
 #include <string>
@@ -38,14 +39,15 @@
 
 #include "mongo/bson/ordering.h"
 #include "mongo/bson/timestamp.h"
+#include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/storage/kv/kv_engine.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/storage/wiredtiger/encryption_keydb.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_oplog_manager.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
+#include "mongo/util/concurrency/with_lock.h"
 #include "mongo/util/elapsed_tracker.h"
 
 namespace mongo {
@@ -55,13 +57,35 @@ class JournalListener;
 class WiredTigerRecordStore;
 class WiredTigerSessionCache;
 class WiredTigerSizeStorer;
+class WiredTigerEngineRuntimeConfigParameter;
 
 struct WiredTigerFileVersion {
-    enum class StartupVersion { IS_34, IS_36, IS_40, IS_42 };
+    // MongoDB 4.4+ will not open on datafiles left behind by 4.2.5 and earlier. MongoDB 4.4
+    // shutting down in FCV 4.2 will leave data files that 4.2.6+ will understand
+    // (IS_44_FCV_42). MongoDB 4.2.x always writes out IS_42.
+    enum class StartupVersion { IS_42, IS_44_FCV_42, IS_44_FCV_44 };
 
     StartupVersion _startupVersion;
     bool shouldDowngrade(bool readOnly, bool repairMode, bool hasRecoveryTimestamp);
     std::string getDowngradeString();
+};
+
+struct WiredTigerBackup {
+    WT_CURSOR* cursor = nullptr;
+    WT_CURSOR* dupCursor = nullptr;
+    std::set<std::string> logFilePathsSeenByExtendBackupCursor;
+    std::set<std::string> logFilePathsSeenByGetNextBatch;
+
+    // 'wtBackupCursorMutex' provides concurrency control between beginNonBlockingBackup(),
+    // endNonBlockingBackup(), and getNextBatch() because we stream the output of the backup cursor.
+    Mutex wtBackupCursorMutex = MONGO_MAKE_LATCH("WiredTigerKVEngine::wtBackupCursorMutex");
+
+    // 'wtBackupDupCursorMutex' provides concurrency control between getNextBatch() and
+    // extendBackupCursor() because WiredTiger only allows one duplicate cursor to be open at a
+    // time. extendBackupCursor() blocks on condition variable 'wtBackupDupCursorCV' if a duplicate
+    // cursor is already open.
+    Mutex wtBackupDupCursorMutex = MONGO_MAKE_LATCH("WiredTigerKVEngine::wtBackupDupCursorMutex");
+    stdx::condition_variable wtBackupDupCursorCV;
 };
 
 class WiredTigerKVEngine final : public KVEngine {
@@ -72,7 +96,8 @@ public:
                        const std::string& path,
                        ClockSource* cs,
                        const std::string& extraOpenOptions,
-                       size_t cacheSizeGB,
+                       size_t cacheSizeMB,
+                       size_t maxHistoryFileSizeMB,
                        bool durable,
                        bool ephemeral,
                        bool repair,
@@ -80,12 +105,14 @@ public:
 
     ~WiredTigerKVEngine();
 
+    void notifyStartupComplete() override;
+
     void setRecordStoreExtraOptions(const std::string& options);
     void setSortedDataInterfaceExtraOptions(const std::string& options);
 
-    bool supportsDocLocking() const override;
-
     bool supportsDirectoryPerDB() const override;
+
+    void checkpoint() override;
 
     bool isDurable() const override {
         return _durable;
@@ -103,59 +130,45 @@ public:
     Status createRecordStore(OperationContext* opCtx,
                              StringData ns,
                              StringData ident,
-                             const CollectionOptions& options) override {
-        return createGroupedRecordStore(opCtx, ns, ident, options, KVPrefix::kNotPrefixed);
-    }
+                             const CollectionOptions& options) override;
 
     std::unique_ptr<RecordStore> getRecordStore(OperationContext* opCtx,
                                                 StringData ns,
                                                 StringData ident,
-                                                const CollectionOptions& options) override {
-        return getGroupedRecordStore(opCtx, ns, ident, options, KVPrefix::kNotPrefixed);
-    }
+                                                const CollectionOptions& options) override;
 
     std::unique_ptr<RecordStore> makeTemporaryRecordStore(OperationContext* opCtx,
                                                           StringData ident) override;
 
     Status createSortedDataInterface(OperationContext* opCtx,
+                                     const CollectionOptions& collOptions,
                                      StringData ident,
-                                     const IndexDescriptor* desc) override {
-        return createGroupedSortedDataInterface(opCtx, ident, desc, KVPrefix::kNotPrefixed);
-    }
+                                     const IndexDescriptor* desc) override;
 
-    SortedDataInterface* getSortedDataInterface(OperationContext* opCtx,
-                                                StringData ident,
-                                                const IndexDescriptor* desc) override {
-        return getGroupedSortedDataInterface(opCtx, ident, desc, KVPrefix::kNotPrefixed);
-    }
+    std::unique_ptr<SortedDataInterface> getSortedDataInterface(
+        OperationContext* opCtx,
+        const CollectionOptions& collOptions,
+        StringData ident,
+        const IndexDescriptor* desc) override;
 
-    Status createGroupedRecordStore(OperationContext* opCtx,
-                                    StringData ns,
-                                    StringData ident,
-                                    const CollectionOptions& options,
-                                    KVPrefix prefix) override;
+    Status importRecordStore(OperationContext* opCtx,
+                             StringData ident,
+                             const BSONObj& storageMetadata) override;
 
-    std::unique_ptr<RecordStore> getGroupedRecordStore(OperationContext* opCtx,
-                                                       StringData ns,
-                                                       StringData ident,
-                                                       const CollectionOptions& options,
-                                                       KVPrefix prefix) override;
+    Status importSortedDataInterface(OperationContext* opCtx,
+                                     StringData ident,
+                                     const BSONObj& storageMetadata) override;
 
-    Status createGroupedSortedDataInterface(OperationContext* opCtx,
-                                            StringData ident,
-                                            const IndexDescriptor* desc,
-                                            KVPrefix prefix) override;
+    /**
+     * Drops the specified ident for resumable index builds.
+     */
+    Status dropSortedDataInterface(OperationContext* opCtx, StringData ident) override;
 
-    SortedDataInterface* getGroupedSortedDataInterface(OperationContext* opCtx,
-                                                       StringData ident,
-                                                       const IndexDescriptor* desc,
-                                                       KVPrefix prefix) override;
+    Status dropIdent(RecoveryUnit* ru,
+                     StringData ident,
+                     StorageEngine::DropIdentCallback&& onDrop = nullptr) override;
 
-    Status dropIdent(OperationContext* opCtx, StringData ident) override;
-
-    void alterIdentMetadata(OperationContext* opCtx,
-                            StringData ident,
-                            const IndexDescriptor* desc) override;
+    void dropIdentForImport(OperationContext* opCtx, StringData ident) override;
 
     void keydbDropDatabase(const std::string& db) override;
 
@@ -165,13 +178,16 @@ public:
                       StringData ident,
                       const RecordStore* originalRecordStore) const override;
 
-    int flushAllFiles(OperationContext* opCtx, bool sync) override;
+    void flushAllFiles(OperationContext* opCtx, bool callerHoldsReadLock) override;
 
     Status beginBackup(OperationContext* opCtx) override;
 
     void endBackup(OperationContext* opCtx) override;
 
-    StatusWith<std::vector<std::string>> beginNonBlockingBackup(OperationContext* opCtx) override;
+    Status disableIncrementalBackup(OperationContext* opCtx) override;
+
+    StatusWith<std::unique_ptr<StorageEngine::StreamingCursor>> beginNonBlockingBackup(
+        OperationContext* opCtx, const StorageEngine::BackupOptions& options) override;
 
     void endNonBlockingBackup(OperationContext* opCtx) override;
 
@@ -179,6 +195,8 @@ public:
         OperationContext* opCtx) override;
 
     Status hotBackup(OperationContext* opCtx, const std::string& path) override;
+    Status hotBackupTar(OperationContext* opCtx, const std::string& path) override;
+    Status hotBackup(OperationContext* opCtx, const percona::S3BackupParameters& s3params) override;
 
     int64_t getIdentSize(OperationContext* opCtx, StringData ident) override;
 
@@ -204,6 +222,8 @@ public:
     void setStableTimestamp(Timestamp stableTimestamp, bool force) override;
 
     void setInitialDataTimestamp(Timestamp initialDataTimestamp) override;
+
+    Timestamp getInitialDataTimestamp() const override;
 
     void setOldestTimestampFromStable() override;
 
@@ -236,19 +256,15 @@ public:
      */
     boost::optional<Timestamp> getLastStableRecoveryTimestamp() const override;
 
-    Timestamp getAllCommittedTimestamp() const override;
+    Timestamp getAllDurableTimestamp() const override;
 
-    Timestamp getOldestOpenReadTimestamp() const override;
+    bool supportsClusteredIdIndex() const final override {
+        return true;
+    }
 
     bool supportsReadConcernSnapshot() const final override;
 
-    /*
-     * This function is called when replication has completed a batch.  In this function, we
-     * refresh our oplog visiblity read-at-timestamp value.
-     */
-    void replicationBatchIsComplete() const override;
-
-    int64_t getCacheOverflowTableInsertCount(OperationContext* opCtx) const override;
+    bool supportsOplogStones() const final override;
 
     bool supportsReadConcernMajority() const final;
 
@@ -276,18 +292,15 @@ public:
     }
 
     /*
-     * An oplog manager is always accessible, but this method will start the background thread to
+     * The oplog manager is always accessible, but this method will start the background thread to
      * control oplog entry visibility for reads.
      *
-     * On mongod, the background thread will be started when the first oplog record store is
-     * created, and stopped when the last oplog record store is destroyed, at shutdown time. For
-     * unit tests, the background thread may be started and stopped multiple times as tests create
-     * and destroy oplog record stores.
+     * On mongod, the background thread will be started when the oplog record store is created, and
+     * stopped when the oplog record store is destroyed. For unit tests, the background thread may
+     * be started and stopped multiple times as tests create and destroy the oplog record store.
      */
-    void startOplogManager(OperationContext* opCtx,
-                           const std::string& uri,
-                           WiredTigerRecordStore* oplogRecordStore);
-    void haltOplogManager();
+    void startOplogManager(OperationContext* opCtx, WiredTigerRecordStore* oplogRecordStore);
+    void haltOplogManager(WiredTigerRecordStore* oplogRecordStore, bool shuttingDown);
 
     /*
      * Always returns a non-nil pointer. However, the WiredTigerOplogManager may not have been
@@ -297,34 +310,17 @@ public:
      * `waitForAllEarlierOplogWritesToBeVisible`, is advised to first see if the oplog manager is
      * running with a call to `isRunning`.
      *
-     * A caller that simply wants to call `triggerJournalFlush` may do so without concern.
+     * A caller that simply wants to call `triggerOplogVisibilityUpdate` may do so without concern.
      */
     WiredTigerOplogManager* getOplogManager() const {
         return _oplogManager.get();
     }
-
-    /**
-     * Sets the implementation for `initRsOplogBackgroundThread` (allowing tests to skip the
-     * background job, for example). Intended to be called from a MONGO_INITIALIZER and therefore in
-     * a single threaded context.
-     */
-    static void setInitRsOplogBackgroundThreadCallback(stdx::function<bool(StringData)> cb);
-
-    /**
-     * Initializes a background job to remove excess documents in the oplog collections.
-     * This applies to the capped collections in the local.oplog.* namespaces (specifically
-     * local.oplog.rs for replica sets).
-     * Returns true if a background job is running for the namespace.
-     */
-    static bool initRsOplogBackgroundThread(StringData ns);
 
     static void appendGlobalStats(BSONObjBuilder& b);
 
     Timestamp getStableTimestamp() const override;
     Timestamp getOldestTimestamp() const override;
     Timestamp getCheckpointTimestamp() const override;
-
-    Timestamp getInitialDataTimestamp() const;
 
     /**
      * Returns the data file path associated with an ident on disk. Returns boost::none if the data
@@ -365,10 +361,38 @@ public:
         return _clockSource;
     }
 
+    StatusWith<Timestamp> pinOldestTimestamp(OperationContext* opCtx,
+                                             const std::string& requestingServiceName,
+                                             Timestamp requestedTimestamp,
+                                             bool roundUpIfTooOld) override;
+
+private:
+    StatusWith<Timestamp> _pinOldestTimestamp(WithLock,
+                                              const std::string& requestingServiceName,
+                                              Timestamp requestedTimestamp,
+                                              bool roundUpIfTooOld);
+
+public:
+    void unpinOldestTimestamp(const std::string& requestingServiceName) override;
+
+    std::map<std::string, Timestamp> getPinnedTimestampRequests();
+
+    void setPinnedOplogTimestamp(const Timestamp& pinnedTimestamp) override;
+
 private:
     class WiredTigerSessionSweeper;
-    class WiredTigerJournalFlusher;
-    class WiredTigerCheckpointThread;
+
+    struct IdentToDrop {
+        std::string uri;
+        StorageEngine::DropIdentCallback callback;
+    };
+
+    // srcPath, destPath, session, cursor
+    typedef std::tuple<boost::filesystem::path, boost::filesystem::path, std::shared_ptr<WiredTigerSession>, WT_CURSOR*> DBTuple;
+    // srcPath, destPath, filename, size to copy
+    typedef std::tuple<boost::filesystem::path, boost::filesystem::path, boost::uintmax_t, std::time_t> FileTuple;
+
+    Status _hotBackupPopulateLists(OperationContext* opCtx, const std::string& path, std::vector<DBTuple>& dbList, std::vector<FileTuple>& filesList);
 
     /**
      * Opens a connection on the WiredTiger database 'path' with the configuration 'wtOpenConfig'.
@@ -396,7 +420,7 @@ private:
     std::string _uri(StringData ident) const;
 
     /**
-     * Uses the 'stableTimestamp', the 'targetSnapshotHistoryWindowInSeconds' setting and the
+     * Uses the 'stableTimestamp', the 'minSnapshotHistoryWindowInSeconds' setting and the
      * current _oldestTimestamp to calculate what the new oldest_timestamp should be, in order to
      * maintain a window of available snapshots on the storage engine from oldest to stable
      * timestamp.
@@ -420,7 +444,8 @@ private:
 
     std::uint64_t _getCheckpointTimestamp() const;
 
-    mutable stdx::mutex _oldestActiveTransactionTimestampCallbackMutex;
+    mutable Mutex _oldestActiveTransactionTimestampCallbackMutex =
+        MONGO_MAKE_LATCH("::_oldestActiveTransactionTimestampCallbackMutex");
     StorageEngine::OldestActiveTransactionTimestampCallback
         _oldestActiveTransactionTimestampCallback;
 
@@ -431,9 +456,9 @@ private:
     std::unique_ptr<WiredTigerSessionCache> _sessionCache;
     ClockSource* const _clockSource;
 
-    // Mutex to protect use of _oplogManagerCount by this instance of KV engine.
-    mutable stdx::mutex _oplogManagerMutex;
-    std::size_t _oplogManagerCount = 0;
+    // Mutex to protect use of _oplogRecordStore by this instance of KV engine.
+    mutable Mutex _oplogManagerMutex = MONGO_MAKE_LATCH("::_oplogManagerMutex");
+    const WiredTigerRecordStore* _oplogRecordStore = nullptr;
     std::unique_ptr<WiredTigerOplogManager> _oplogManager;
 
     std::string _canonicalName;
@@ -457,21 +482,20 @@ private:
     const bool _keepDataHistory = true;
 
     std::unique_ptr<WiredTigerSessionSweeper> _sessionSweeper;
-    std::unique_ptr<WiredTigerJournalFlusher> _journalFlusher;  // Depends on _sizeStorer
-    std::unique_ptr<WiredTigerCheckpointThread> _checkpointThread;
 
     std::string _rsOptions;
     std::string _indexOptions;
 
-    mutable stdx::mutex _dropAllQueuesMutex;
-    mutable stdx::mutex _identToDropMutex;
-    std::list<std::string> _identToDrop;
+    mutable Mutex _identToDropMutex = MONGO_MAKE_LATCH("WiredTigerKVEngine::_identToDropMutex");
+    std::list<IdentToDrop> _identToDrop;
 
-    mutable Date_t _previousCheckedDropsQueued;
+    mutable AtomicWord<long long> _previousCheckedDropsQueued;
 
     std::unique_ptr<WiredTigerSession> _backupSession;
-    WT_CURSOR* _backupCursor;
-    mutable stdx::mutex _oplogPinnedByBackupMutex;
+    WiredTigerBackup _wtBackup;
+
+    mutable Mutex _oplogPinnedByBackupMutex =
+        MONGO_MAKE_LATCH("WiredTigerKVEngine::_oplogPinnedByBackupMutex");
     boost::optional<Timestamp> _oplogPinnedByBackup;
     Timestamp _recoveryTimestamp;
 
@@ -482,5 +506,21 @@ private:
     // Timestamp of data at startup. Used internally to advise checkpointing and recovery to a
     // timestamp. Provided by replication layer because WT does not persist timestamps.
     AtomicWord<std::uint64_t> _initialDataTimestamp;
+
+    AtomicWord<std::uint64_t> _oplogNeededForCrashRecovery;
+
+    std::unique_ptr<WiredTigerEngineRuntimeConfigParameter> _runTimeConfigParam;
+
+    mutable Mutex _highestDurableTimestampMutex =
+        MONGO_MAKE_LATCH("WiredTigerKVEngine::_highestDurableTimestampMutex");
+    mutable unsigned long long _highestSeenDurableTimestamp = StorageEngine::kMinimumTimestamp;
+
+    mutable Mutex _oldestTimestampPinRequestsMutex =
+        MONGO_MAKE_LATCH("WiredTigerKVEngine::_oldestTimestampPinRequestsMutex");
+    std::map<std::string, Timestamp> _oldestTimestampPinRequests;
+
+    // Pins the oplog so that OplogStones will not truncate oplog history equal or newer to this
+    // timestamp.
+    AtomicWord<std::uint64_t> _pinnedOplogTimestamp;
 };
-}
+}  // namespace mongo

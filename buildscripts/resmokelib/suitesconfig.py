@@ -4,21 +4,32 @@ import collections
 import optparse
 import os
 
-from . import config as _config
-from . import errors
-from . import utils
-from .testing import suite as _suite
-from .. import resmokeconfig
+from buildscripts.resmokelib import config as _config
+from buildscripts.resmokelib import errors
+from buildscripts.resmokelib import utils
+from buildscripts.resmokelib.testing import suite as _suite
 
 
 def get_named_suites():
-    """Return the list of suites available to execute."""
-
+    """Return a sorted list of the suites names."""
     # Skip "with_*server" and "no_server" because they do not define any test files to run.
     executor_only = {"with_server", "with_external_server", "no_server"}
-    suite_names = [suite for suite in resmokeconfig.NAMED_SUITES if suite not in executor_only]
-    suite_names.sort()
-    return suite_names
+    names = [name for name in _config.NAMED_SUITES.keys() if name not in executor_only]
+    names.sort()
+    return names
+
+
+def get_named_suites_with_root_level_key(root_level_key):
+    """Return the suites that contain the given root_level_key and their values."""
+    all_suite_names = get_named_suites()
+    suites_to_return = []
+
+    for suite in all_suite_names:
+        suite_config = _get_suite_config(suite)
+        if root_level_key in suite_config.keys() and suite_config[root_level_key]:
+            suites_to_return.append(
+                {"origin": suite, "multiversion_name": suite_config[root_level_key]})
+    return suites_to_return
 
 
 def create_test_membership_map(fail_on_missing_selector=False, test_kind=None):
@@ -29,7 +40,6 @@ def create_test_membership_map(fail_on_missing_selector=False, test_kind=None):
     definition of every available test suite, which is an expensive operation. It is therefore
     desirable for it to only ever be called once.
     """
-
     if test_kind is not None:
         if isinstance(test_kind, str):
             test_kind = [test_kind]
@@ -110,9 +120,10 @@ def _get_yaml_config(kind, pathname):
     # Named executors or suites are specified as the basename of the file, without the .yml
     # extension.
     if not utils.is_yaml_file(pathname) and not os.path.dirname(pathname):
-        if pathname not in resmokeconfig.NAMED_SUITES:
+        if pathname not in _config.NAMED_SUITES:  # pylint: disable=unsupported-membership-test
             raise errors.SuiteNotFound("Unknown %s '%s'" % (kind, pathname))
-        pathname = resmokeconfig.NAMED_SUITES[pathname]  # Expand 'pathname' to full path.
+        # Expand 'pathname' to full path.
+        pathname = _config.NAMED_SUITES[pathname]  # pylint: disable=unsubscriptable-object
 
     if not utils.is_yaml_file(pathname) or not os.path.isfile(pathname):
         raise optparse.OptionValueError(

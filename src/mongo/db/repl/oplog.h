@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -38,12 +39,13 @@
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/logical_session_id.h"
 #include "mongo/db/repl/oplog_entry.h"
+#include "mongo/db/repl/oplog_entry_or_grouped_inserts.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/replication_coordinator.h"
-#include "mongo/stdx/functional.h"
 
 namespace mongo {
 class Collection;
+class CollectionPtr;
 class Database;
 class NamespaceString;
 class OperationContext;
@@ -55,15 +57,22 @@ using OplogSlot = repl::OpTime;
 struct InsertStatement {
 public:
     InsertStatement() = default;
-    explicit InsertStatement(BSONObj toInsert) : doc(toInsert) {}
+    explicit InsertStatement(BSONObj toInsert) : doc(std::move(toInsert)) {}
 
-    InsertStatement(StmtId statementId, BSONObj toInsert) : stmtId(statementId), doc(toInsert) {}
-    InsertStatement(StmtId statementId, BSONObj toInsert, OplogSlot os)
-        : stmtId(statementId), oplogSlot(os), doc(toInsert) {}
+    InsertStatement(std::vector<StmtId> statementIds, BSONObj toInsert)
+        : stmtIds(statementIds), doc(std::move(toInsert)) {}
+    InsertStatement(StmtId stmtId, BSONObj toInsert)
+        : InsertStatement(std::vector<StmtId>{stmtId}, std::move(toInsert)) {}
+
+    InsertStatement(std::vector<StmtId> statementIds, BSONObj toInsert, OplogSlot os)
+        : stmtIds(statementIds), oplogSlot(std::move(os)), doc(std::move(toInsert)) {}
+    InsertStatement(StmtId stmtId, BSONObj toInsert, OplogSlot os)
+        : InsertStatement(std::vector<StmtId>{stmtId}, std::move(toInsert), std::move(os)) {}
+
     InsertStatement(BSONObj toInsert, Timestamp ts, long long term)
-        : oplogSlot(repl::OpTime(ts, term)), doc(toInsert) {}
+        : oplogSlot(repl::OpTime(ts, term)), doc(std::move(toInsert)) {}
 
-    StmtId stmtId = kUninitializedStmtId;
+    std::vector<StmtId> stmtIds = {kUninitializedStmtId};
     OplogSlot oplogSlot;
     BSONObj doc;
 };
@@ -78,6 +87,22 @@ struct OplogLink {
     OpTime preImageOpTime;
     OpTime postImageOpTime;
 };
+
+/**
+ * Set the "lsid", "txnNumber", "stmtId", "prevOpTime", "preImageOpTime" and "postImageOpTime"
+ * fields of the oplogEntry based on the given oplogLink for retryable writes (i.e. when
+ * stmtIds.front() != kUninitializedStmtId).
+ *
+ * If the given oplogLink.prevOpTime is a null OpTime, both the oplogLink.prevOpTime and the
+ * "prevOpTime" field of the oplogEntry will be set to the TransactionParticipant's lastWriteOpTime.
+ * The "preImageOpTime" field will only be set if the given oplogLink.preImageOpTime is not null.
+ * Similarly, the "postImageOpTime" field will only be set if the given oplogLink.postImageOpTime is
+ * not null.
+ */
+void appendOplogEntryChainInfo(OperationContext* opCtx,
+                               MutableOplogEntry* oplogEntry,
+                               OplogLink* oplogLink,
+                               const std::vector<StmtId>& stmtIds);
 
 /**
  * Create a new capped collection for the oplog if it doesn't yet exist.
@@ -96,58 +121,31 @@ void createOplog(OperationContext* opCtx);
 /**
  * Log insert(s) to the local oplog.
  * Returns the OpTime of every insert.
+ * @param oplogEntryTemplate: a template used to generate insert oplog entries. Callers must set the
+ * "ns", "ui", "fromMigrate" and "wall" fields before calling this function. This function will then
+ * augment the template with the "op" (which is set to kInsert), "lsid" and "txnNumber" fields if
+ * necessary.
+ * @param begin/end: first/last InsertStatement to be inserted. This function iterates from begin to
+ * end and generates insert oplog entries based on the augmented oplogEntryTemplate with the "ts",
+ * "t", "o", "prevOpTime" and "stmtId" fields replaced by the content of each InsertStatement
+ * defined by the begin-end range.
+ *
  */
-std::vector<OpTime> logInsertOps(OperationContext* opCtx,
-                                 const NamespaceString& nss,
-                                 OptionalCollectionUUID uuid,
-                                 std::vector<InsertStatement>::const_iterator begin,
-                                 std::vector<InsertStatement>::const_iterator end,
-                                 bool fromMigrate,
-                                 Date_t wallClockTime);
+std::vector<OpTime> logInsertOps(
+    OperationContext* opCtx,
+    MutableOplogEntry* oplogEntryTemplate,
+    std::vector<InsertStatement>::const_iterator begin,
+    std::vector<InsertStatement>::const_iterator end,
+    std::function<boost::optional<ShardId>(const BSONObj& doc)> getDestinedRecipientFn);
 
 /**
- * @param opstr
- *  "i" insert
- *  "u" update
- *  "d" delete
- *  "c" db cmd
- *  "n" no-op
- *  "db" declares presence of a database (ns is set to the db name + '.')
- *
- * For 'u' records, 'obj' captures the mutation made to the object but not
- * the object itself. 'o2' captures the the criteria for the object that will be modified.
- *
- * wallClockTime this specifies the wall-clock timestamp of then this oplog entry was generated. It
- *   is purely informational, may not be monotonically increasing and is not interpreted in any way
- *   by the replication subsystem.
- * stmtId specifies the statementId of an operation. For transaction operations, stmtId is always
- *   boost::none.
- * oplogLink this contains the timestamp that points to the previous write that will be
- *   linked via prevTs, and the timestamps of the oplog entry that contains the document
- *   before/after update was applied. The timestamps are ignored if isNull() is true.
- * prepare this specifies if the oplog entry should be put into a 'prepare' state.
- * oplogSlot If non-null, use this reserved oplog slot instead of a new one.
- *
  * Returns the optime of the oplog entry written to the oplog.
  * Returns a null optime if oplog was not modified.
  */
-OpTime logOp(OperationContext* opCtx,
-             const char* opstr,
-             const NamespaceString& ns,
-             OptionalCollectionUUID uuid,
-             const BSONObj& obj,
-             const BSONObj* o2,
-             bool fromMigrate,
-             Date_t wallClockTime,
-             const OperationSessionInfo& sessionInfo,
-             boost::optional<StmtId> stmtId,
-             const OplogLink& oplogLink,
-             const OplogSlot& oplogSlot);
+OpTime logOp(OperationContext* opCtx, MutableOplogEntry* oplogEntry);
 
 // Flush out the cached pointer to the oplog.
-// Used by the closeDatabase command to ensure we don't cache closed things.
-void oplogCheckCloseDatabase(OperationContext* opCtx, const Database* db);
-void clearLocalOplogPtr();
+void clearLocalOplogPtr(ServiceContext* service);
 
 /**
  * Establish the cached pointer to the local oplog.
@@ -160,9 +158,9 @@ void acquireOplogCollectionForLogging(OperationContext* opCtx);
  * Called by catalog::openCatalog() to re-establish the oplog collection pointer while holding onto
  * the global lock in exclusive mode.
  */
-void establishOplogCollectionForLogging(OperationContext* opCtx, Collection* oplog);
+void establishOplogCollectionForLogging(OperationContext* opCtx, const CollectionPtr& oplog);
 
-using IncrementOpsAppliedStatsFn = stdx::function<void()>;
+using IncrementOpsAppliedStatsFn = std::function<void()>;
 
 /**
  * This class represents the different modes of oplog application that are used within the
@@ -205,8 +203,8 @@ inline std::ostream& operator<<(std::ostream& s, OplogApplication::Mode mode) {
 }
 
 /**
- * Take a non-command op and apply it locally
- * Used for applying from an oplog
+ * Used for applying from an oplog entry or grouped inserts.
+ * @param opOrGroupedInserts a single oplog entry or grouped inserts to be applied.
  * @param alwaysUpsert convert some updates to upserts for idempotency reasons
  * @param mode specifies what oplog application mode we are in
  * @param incrementOpsAppliedStats is called whenever an op is applied.
@@ -214,7 +212,7 @@ inline std::ostream& operator<<(std::ostream& s, OplogApplication::Mode mode) {
  */
 Status applyOperation_inlock(OperationContext* opCtx,
                              Database* db,
-                             const BSONObj& op,
+                             const OplogEntryOrGroupedInserts& opOrGroupedInserts,
                              bool alwaysUpsert,
                              OplogApplication::Mode mode,
                              IncrementOpsAppliedStatsFn incrementOpsAppliedStats = {});
@@ -225,10 +223,8 @@ Status applyOperation_inlock(OperationContext* opCtx,
  * Returns failure status if the op that could not be applied.
  */
 Status applyCommand_inlock(OperationContext* opCtx,
-                           const BSONObj& op,
                            const OplogEntry& entry,
-                           OplogApplication::Mode mode,
-                           boost::optional<Timestamp> stableTimestampForRecovery);
+                           OplogApplication::Mode mode);
 
 /**
  * Initializes the global Timestamp with the value from the timestamp of the last oplog entry.
@@ -241,11 +237,6 @@ void initTimestampFromOplog(OperationContext* opCtx, const NamespaceString& oplo
 void setNewTimestamp(ServiceContext* opCtx, const Timestamp& newTime);
 
 /**
- * Detects the current replication mode and sets the "_oplogCollectionName" accordingly.
- */
-void setOplogCollectionName(ServiceContext* service);
-
-/**
  * Signal any waiting AwaitData queries on the oplog that there is new data or metadata available.
  */
 void signalOplogWaiters();
@@ -256,7 +247,6 @@ void signalOplogWaiters();
 void createIndexForApplyOps(OperationContext* opCtx,
                             const BSONObj& indexSpec,
                             const NamespaceString& indexNss,
-                            IncrementOpsAppliedStatsFn incrementOpsAppliedStats,
                             OplogApplication::Mode mode);
 
 /**
@@ -270,6 +260,18 @@ inline OplogSlot getNextOpTime(OperationContext* opCtx) {
     invariant(slots.size() == 1);
     return slots.back();
 }
+
+using ApplyImportCollectionFn = std::function<void(OperationContext*,
+                                                   const UUID&,
+                                                   const NamespaceString&,
+                                                   long long,
+                                                   long long,
+                                                   const BSONObj&,
+                                                   const BSONObj&,
+                                                   bool,
+                                                   OplogApplication::Mode)>;
+
+void registerApplyImportCollectionFn(ApplyImportCollectionFn func);
 
 }  // namespace repl
 }  // namespace mongo

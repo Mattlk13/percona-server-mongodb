@@ -58,10 +58,9 @@ public:
                 DiskUseRequirement::kNoDiskUse,
                 FacetRequirement::kAllowed,
                 TransactionRequirement::kAllowed,
-                LookupRequirement::kAllowed};
+                LookupRequirement::kAllowed,
+                UnionRequirement::kAllowed};
     }
-
-    GetNextResult getNext() final;
 
     const char* getSourceName() const final {
         return kStageName.rawData();
@@ -100,6 +99,8 @@ public:
 private:
     explicit DocumentSourceSkip(const boost::intrusive_ptr<ExpressionContext>& pExpCtx,
                                 long long nToSkip);
+
+    GetNextResult doGetNext() final;
 
     long long _nToSkip = 0;
     long long _nSkippedSoFar = 0;

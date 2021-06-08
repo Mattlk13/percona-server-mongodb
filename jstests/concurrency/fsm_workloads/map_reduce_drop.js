@@ -17,7 +17,6 @@
  * ]
  */
 var $config = (function() {
-
     var data = {
         mapper: function mapper() {
             emit(this.key, 1);
@@ -31,7 +30,6 @@ var $config = (function() {
     };
 
     var states = (function() {
-
         function dropColl(db, collName) {
             var mapReduceDb = db.getSiblingDB(this.mapReduceDBName);
 
@@ -43,8 +41,8 @@ var $config = (function() {
         function dropDB(db, collName) {
             var mapReduceDb = db.getSiblingDB(this.mapReduceDBName);
 
-            var res = mapReduceDb.dropDatabase();
-            assertAlways.commandWorked(res);
+            // Concurrent dropDatabase calls can result in transient errors.
+            mapReduceDb.dropDatabase();
         }
 
         function mapReduce(db, collName) {
@@ -55,12 +53,17 @@ var $config = (function() {
             // be dropped by another thread, some mapReduce commands should end up
             // running on non-empty collections by virtue of the number of
             // iterations and threads in this workload.
-            var bulk = mapReduceDb[collName].initializeUnorderedBulkOp();
-            for (var i = 0; i < this.numDocs; ++i) {
-                bulk.insert({key: Random.randInt(10000)});
+            try {
+                var bulk = mapReduceDb[collName].initializeUnorderedBulkOp();
+                for (var i = 0; i < this.numDocs; ++i) {
+                    bulk.insert({key: Random.randInt(10000)});
+                }
+                var res = bulk.execute();
+                assertAlways.commandWorked(res);
+            } catch (ex) {
+                assert.eq(true, ex instanceof BulkWriteError);
+                assert.writeErrorWithCode(ex, ErrorCodes.DatabaseDropPending);
             }
-            var res = bulk.execute();
-            assertAlways.writeOK(res);
 
             var options = {
                 finalize: function finalize(key, reducedValue) {
@@ -78,7 +81,6 @@ var $config = (function() {
         }
 
         return {dropColl: dropColl, dropDB: dropDB, mapReduce: mapReduce};
-
     })();
 
     var transitions = {
@@ -100,5 +102,4 @@ var $config = (function() {
         startState: 'mapReduce',
         transitions: transitions,
     };
-
 })();

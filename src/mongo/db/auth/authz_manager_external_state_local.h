@@ -29,21 +29,19 @@
 
 #pragma once
 
+#include <functional>
 #include <string>
 
 #include "mongo/base/status.h"
 #include "mongo/db/auth/authz_manager_external_state.h"
-#include "mongo/db/auth/role_graph.h"
+#include "mongo/db/auth/builtin_roles.h"
 #include "mongo/db/auth/role_name.h"
 #include "mongo/db/auth/user_name.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/db_raii.h"
+#include "mongo/platform/mutex.h"
 
 namespace mongo {
-
-namespace mutablebson {
-class Document;
-}  // namespace mutablebson
 
 /**
  * Common implementation of AuthzManagerExternalState for systems where role
@@ -56,22 +54,24 @@ class AuthzManagerExternalStateLocal : public AuthzManagerExternalState {
 public:
     virtual ~AuthzManagerExternalStateLocal() = default;
 
-    Status initialize(OperationContext* opCtx) override;
-
     Status getStoredAuthorizationVersion(OperationContext* opCtx, int* outVersion) override;
+    StatusWith<User> getUserObject(OperationContext* opCtx, const UserRequest& userReq) override;
     Status getUserDescription(OperationContext* opCtx,
-                              const UserName& userName,
+                              const UserRequest& user,
                               BSONObj* result) override;
-    Status getRoleDescription(OperationContext* opCtx,
-                              const RoleName& roleName,
-                              PrivilegeFormat showPrivileges,
-                              AuthenticationRestrictionsFormat,
-                              BSONObj* result) override;
+    Status rolesExist(OperationContext* opCtx, const std::vector<RoleName>& roleNames) override;
+    StatusWith<ResolvedRoleData> resolveRoles(OperationContext* opCtx,
+                                              const std::vector<RoleName>& roleNames,
+                                              ResolveRoleOption option) override;
     Status getRolesDescription(OperationContext* opCtx,
                                const std::vector<RoleName>& roles,
                                PrivilegeFormat showPrivileges,
                                AuthenticationRestrictionsFormat,
-                               BSONObj* result) override;
+                               std::vector<BSONObj>* result) override;
+    Status getRolesAsUserFragment(OperationContext* opCtx,
+                                  const std::vector<RoleName>& roles,
+                                  AuthenticationRestrictionsFormat,
+                                  BSONObj* result) override;
     Status getRoleDescriptionsForDB(OperationContext* opCtx,
                                     StringData dbname,
                                     PrivilegeFormat showPrivileges,
@@ -79,7 +79,7 @@ public:
                                     bool showBuiltinRoles,
                                     std::vector<BSONObj>* result) override;
 
-    bool hasAnyPrivilegeDocuments(OperationContext* opCtx) override;
+    bool hasAnyPrivilegeDocuments(OperationContext* opCtx) final;
 
     /**
      * Finds a document matching "query" in "collectionName", and store a shared-ownership
@@ -94,6 +94,13 @@ public:
                            BSONObj* result) = 0;
 
     /**
+     * Checks for the existance of a document matching "query" in "collectionName".
+     */
+    virtual bool hasOne(OperationContext* opCtx,
+                        const NamespaceString& collectionName,
+                        const BSONObj& query) = 0;
+
+    /**
      * Finds all documents matching "query" in "collectionName".  For each document returned,
      * calls the function resultProcessor on it.
      */
@@ -101,67 +108,60 @@ public:
                          const NamespaceString& collectionName,
                          const BSONObj& query,
                          const BSONObj& projection,
-                         const stdx::function<void(const BSONObj&)>& resultProcessor) = 0;
+                         const std::function<void(const BSONObj&)>& resultProcessor) = 0;
 
     void logOp(OperationContext* opCtx,
                AuthorizationManagerImpl* authManager,
-               const char* op,
+               StringData op,
                const NamespaceString& ns,
                const BSONObj& o,
                const BSONObj* o2) final;
 
-    /**
-     * Takes a user document, and processes it with the RoleGraph, in order to recursively
-     * resolve roles and add the 'inheritedRoles', 'inheritedPrivileges',
-     * and 'warnings' fields.
-     */
-    void resolveUserRoles(mutablebson::Document* userDoc, const std::vector<RoleName>& directRoles);
-
 protected:
     AuthzManagerExternalStateLocal() = default;
 
-private:
-    enum RoleGraphState {
-        roleGraphStateInitial = 0,
-        roleGraphStateConsistent,
-        roleGraphStateHasCycle
+    /**
+     * Ensures a consistent logically valid view of the data across users and roles collections.
+     *
+     * If running with lock-free enabled, a storage snapshot is opened that subsequent reads will
+     * all use for a consistent point-in-time data view.
+     *
+     * Otherwise, a MODE_S lock is taken on the roles collection to ensure no role changes are made
+     * across reading first the users collection and then the roles collection. This ensures an
+     * 'atomic' view of the roles and users collection data.
+     *
+     * The locks, or lock-free consistent data view, prevent the possibility of having permissions
+     * available which are logically invalid. This is how reads/writes across two collections are
+     * made 'atomic'.
+     */
+    class RolesLocks {
+    public:
+        RolesLocks() = default;
+        RolesLocks(OperationContext*);
+        ~RolesLocks();
+
+    private:
+        std::unique_ptr<AutoReadLockFree> _readLockFree;
+        std::unique_ptr<Lock::DBLock> _adminLock;
+        std::unique_ptr<Lock::CollectionLock> _rolesLock;
     };
 
     /**
-     * RecoveryUnit::Change subclass used to commit work for AuthzManager logOp listener.
+     * Set an auto-releasing shared lock on the roles database.
+     * This allows us to maintain a consistent state during user acquisiiton.
+     *
+     * virtual to allow Mock to not lock anything.
      */
-    class AuthzManagerLogOpHandler;
+    virtual RolesLocks _lockRoles(OperationContext* opCtx);
 
+private:
     /**
-     * Initializes the role graph from the contents of the admin.system.roles collection.
+     * Once *any* privilege document is observed we cache the state forever,
+     * even if these collections are emptied/dropped.
+     * This ensures that the only way to recover localHostAuthBypass is to
+     * is to clear that in-memory cache by restarting the server.
      */
-    Status _initializeRoleGraph(OperationContext* opCtx);
-
-    /**
-     * Fetches the user document for "userName" from local storage, and stores it into "result".
-     */
-    Status _getUserDocument(OperationContext* opCtx, const UserName& userName, BSONObj* result);
-
-    Status _getRoleDescription_inlock(const RoleName& roleName,
-                                      PrivilegeFormat showPrivileges,
-                                      AuthenticationRestrictionsFormat showRestrictions,
-                                      BSONObj* result);
-    /**
-     * Eventually consistent, in-memory representation of all roles in the system (both
-     * user-defined and built-in).  Synchronized via _roleGraphMutex.
-     */
-    RoleGraph _roleGraph;
-
-    /**
-     * State of _roleGraph, one of "initial", "consistent" and "has cycle".  Synchronized via
-     * _roleGraphMutex.
-     */
-    RoleGraphState _roleGraphState = roleGraphStateInitial;
-
-    /**
-     * Guards _roleGraphState and _roleGraph.
-     */
-    stdx::mutex _roleGraphMutex;
+    AtomicWord<bool> _hasAnyPrivilegeDocuments{false};
 };
 
 }  // namespace mongo

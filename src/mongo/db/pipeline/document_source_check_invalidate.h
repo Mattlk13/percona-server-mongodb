@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include "mongo/db/pipeline/change_stream_invalidation_info.h"
 #include "mongo/db/pipeline/document_source.h"
 
 namespace mongo {
@@ -38,13 +39,14 @@ namespace mongo {
  * "invalidate" entry for commands that should invalidate the change stream (e.g. collection drop
  * for a single-collection change stream). It is not intended to be created by the user.
  */
-class DocumentSourceCheckInvalidate final : public DocumentSource {
+class DocumentSourceCheckInvalidate final : public DocumentSource,
+                                            public ChangeStreamStageSerializationInterface {
 public:
-    GetNextResult getNext() final;
+    static constexpr StringData kStageName = "$_internalChangeStreamCheckInvalidate"_sd;
 
     const char* getSourceName() const final {
         // This is used in error reporting.
-        return "$_checkInvalidate";
+        return DocumentSourceCheckInvalidate::kStageName.rawData();
     }
 
     StageConstraints constraints(Pipeline::SplitState pipeState) const final {
@@ -55,6 +57,7 @@ public:
                 FacetRequirement::kNotAllowed,
                 TransactionRequirement::kNotAllowed,
                 LookupRequirement::kNotAllowed,
+                UnionRequirement::kNotAllowed,
                 ChangeStreamRequirement::kChangeStreamStage};
     }
 
@@ -62,15 +65,16 @@ public:
         return boost::none;
     }
 
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final {
-        // This stage is created by the DocumentSourceChangeStream stage, so serializing it here
-        // would result in it being created twice.
-        return Value();
+    Value serialize(boost::optional<ExplainOptions::Verbosity> explain) const final {
+        return ChangeStreamStageSerializationInterface::serializeToValue(explain);
     }
 
+    static boost::intrusive_ptr<DocumentSourceCheckInvalidate> createFromBson(
+        BSONElement spec, const boost::intrusive_ptr<ExpressionContext>& expCtx);
     static boost::intrusive_ptr<DocumentSourceCheckInvalidate> create(
-        const boost::intrusive_ptr<ExpressionContext>& expCtx, bool ignoreFirstInvalidate) {
-        return new DocumentSourceCheckInvalidate(expCtx, ignoreFirstInvalidate);
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        boost::optional<ResumeTokenData> startAfterInvalidate) {
+        return new DocumentSourceCheckInvalidate(expCtx, std::move(startAfterInvalidate));
     }
 
 private:
@@ -78,11 +82,21 @@ private:
      * Use the create static method to create a DocumentSourceCheckInvalidate.
      */
     DocumentSourceCheckInvalidate(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                  bool ignoreFirstInvalidate)
-        : DocumentSource(expCtx), _ignoreFirstInvalidate(ignoreFirstInvalidate) {}
+                                  boost::optional<ResumeTokenData> startAfterInvalidate)
+        : DocumentSource(kStageName, expCtx),
+          _startAfterInvalidate(std::move(startAfterInvalidate)) {
+        invariant(!_startAfterInvalidate ||
+                  _startAfterInvalidate->fromInvalidate == ResumeTokenData::kFromInvalidate);
+    }
 
+    GetNextResult doGetNext() final;
+
+    Value serializeLegacy(boost::optional<ExplainOptions::Verbosity> explain) const final;
+    Value serializeLatest(boost::optional<ExplainOptions::Verbosity> explain) const final;
+
+    boost::optional<ResumeTokenData> _startAfterInvalidate;
     boost::optional<Document> _queuedInvalidate;
-    bool _ignoreFirstInvalidate;
+    boost::optional<ChangeStreamInvalidationInfo> _queuedException;
 };
 
 }  // namespace mongo

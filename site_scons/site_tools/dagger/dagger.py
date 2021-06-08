@@ -1,3 +1,25 @@
+# Copyright 2020 MongoDB Inc.
+#
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and associated documentation files (the
+# "Software"), to deal in the Software without restriction, including
+# without limitation the rights to use, copy, modify, merge, publish,
+# distribute, sublicense, and/or sell copies of the Software, and to
+# permit persons to whom the Software is furnished to do so, subject to
+# the following conditions:
+#
+# The above copyright notice and this permission notice shall be included
+# in all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
+# KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE
+# WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+# LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+# WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+#
+
 """Dagger allows SCons to track it's internal build dependency data for the
 MongoDB project. The tool stores this information in a Graph object, which
 is then exported to a pickle/JSON file once the build is complete.
@@ -44,9 +66,12 @@ from . import graph
 from . import graph_consts
 
 
-LIB_DB = [] # Stores every SCons library nodes
-OBJ_DB = [] # Stores every SCons object file node
-EXE_DB = {} # Stores every SCons executable node, with the object files that build into it {Executable: [object files]}
+LIB_DB = []  # Stores every SCons library nodes
+OBJ_DB = []  # Stores every SCons object file node
+EXE_DB = (
+    {}
+)  # Stores every SCons executable node, with the object files that build into it {Executable: [object files]}
+
 
 def list_process(items):
     """From WIL, converts lists generated from an NM command with unicode strings to lists
@@ -57,12 +82,12 @@ def list_process(items):
     for l in items:
         if isinstance(l, list):
             for i in l:
-                if i.startswith('.L'):
+                if i.startswith(".L"):
                     continue
                 else:
                     r.append(str(i))
         else:
-            if l.startswith('.L'):
+            if l.startswith(".L"):
                 continue
             else:
                 r.append(str(l))
@@ -75,26 +100,26 @@ def get_symbol_worker(object_file, task):
     """From WIL, launches a worker subprocess which collects either symbols defined
     or symbols required by an object file"""
 
-    platform = 'linux' if sys.platform.startswith('linux') else 'darwin'
+    platform = "linux" if sys.platform.startswith("linux") else "darwin"
 
-    if platform == 'linux':
-        if task == 'used':
+    if platform == "linux":
+        if task == "used":
             cmd = r'nm "' + object_file + r'" | grep -e "U " | c++filt'
-        elif task == 'defined':
+        elif task == "defined":
             cmd = r'nm "' + object_file + r'" | grep -v -e "U " | c++filt'
-    elif platform == 'darwin':
-        if task == 'used':
+    elif platform == "darwin":
+        if task == "used":
             cmd = "nm -u " + object_file + " | c++filt"
-        elif task == 'defined':
+        elif task == "defined":
             cmd = "nm -jU " + object_file + " | c++filt"
 
     p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE)
     uses = p.communicate()[0].decode()
 
-    if platform == 'linux':
-        return list_process([use[19:] for use in uses.split('\n') if use != ''])
-    elif platform == 'darwin':
-        return list_process([use.strip() for use in uses.split('\n') if use != ''])
+    if platform == "linux":
+        return list_process([use[19:] for use in uses.split("\n") if use != ""])
+    elif platform == "darwin":
+        return list_process([use.strip() for use in uses.split("\n") if use != ""])
 
 
 def emit_obj_db_entry(target, source, env):
@@ -135,7 +160,7 @@ def __compute_libdeps(node):
 
     env = node.get_env()
     deps = set()
-    for child in env.Flatten(getattr(node.attributes, 'libdeps_direct', [])):
+    for child in env.Flatten(getattr(node.attributes, "libdeps_direct", [])):
         if not child:
             continue
         deps.add(child)

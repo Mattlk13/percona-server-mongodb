@@ -29,7 +29,9 @@
 
 #pragma once
 
+#include "mongo/db/commands/server_status.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/s/transaction_coordinators_stats_gen.h"
 #include "mongo/db/service_context.h"
 
 namespace mongo {
@@ -70,6 +72,21 @@ public:
     void incrementCurrentWaitingForDecisionAcks();
     void decrementCurrentWaitingForDecisionAcks();
 
+    std::int64_t getCurrentDeletingCoordinatorDoc();
+    void incrementCurrentDeletingCoordinatorDoc();
+    void decrementCurrentDeletingCoordinatorDoc();
+
+    std::int64_t getTotalAbortedTwoPhaseCommit();
+    void incrementTotalAbortedTwoPhaseCommit();
+
+    std::int64_t getTotalSuccessfulTwoPhaseCommit();
+    void incrementTotalSuccessfulTwoPhaseCommit();
+
+    /**
+     * Appends the accumulated stats to a transaction coordinators stats object for reporting.
+     */
+    void updateStats(TransactionCoordinatorsStats* stats);
+
 private:
     // The total number of transaction coordinators created on this process since the process's
     // inception.
@@ -78,6 +95,14 @@ private:
     // The total number of transaction coordinators on this process that started a two-phase commit
     // since the process's inception.
     AtomicWord<std::int64_t> _totalStartedTwoPhaseCommit{0};
+
+    // The total number of transaction coordinators on this process that aborted a two-phase commit
+    // since the process's inception.
+    AtomicWord<std::int64_t> _totalAbortedTwoPhaseCommit{0};
+
+    // The total number of transaction coordinators on this process that committed a two-phase
+    // commit since the process's inception.
+    AtomicWord<std::int64_t> _totalSuccessfulTwoPhaseCommit{0};
 
     // The number of transaction coordinators currently in the "writing participant list" phase.
     AtomicWord<std::int64_t> _totalWritingParticipantList{0};
@@ -90,6 +115,21 @@ private:
 
     // The number of transaction coordinators currently in the "waiting for decision acks" phase.
     AtomicWord<std::int64_t> _totalWaitingForDecisionAcks{0};
+
+    // The number of transaction coordinators currently in the "deleting coordinator doc" phase.
+    AtomicWord<std::int64_t> _totalDeletingCoordinatorDoc{0};
+};
+
+class TransactionCoordinatorsSSS final : public ServerStatusSection {
+public:
+    TransactionCoordinatorsSSS() : ServerStatusSection("twoPhaseCommitCoordinator") {}
+
+    bool includeByDefault() const override {
+        return true;
+    }
+
+    BSONObj generateSection(OperationContext* opCtx,
+                            const BSONElement& configElement) const override;
 };
 
 }  // namespace mongo

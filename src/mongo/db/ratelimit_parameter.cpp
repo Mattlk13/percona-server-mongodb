@@ -74,7 +74,7 @@ Status RateLimitParameter::set(const BSONElement& newValueElement) {
 
 Status RateLimitParameter::setFromString(const std::string& newValueString) {
     int num = 0;
-    Status status = parseNumberFromString(newValueString, &num);
+    Status status = NumberParser{}(newValueString, &num);
     if (!status.isOK()) return status;
     return _set(num);
 }

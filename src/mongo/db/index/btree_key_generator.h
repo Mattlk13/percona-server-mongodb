@@ -37,6 +37,7 @@
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index/multikey_paths.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/storage/key_string.h"
 
 namespace mongo {
 
@@ -55,7 +56,9 @@ public:
     BtreeKeyGenerator(std::vector<const char*> fieldNames,
                       std::vector<BSONElement> fixed,
                       bool isSparse,
-                      const CollatorInterface* collator);
+                      const CollatorInterface* collator,
+                      KeyString::Version keyStringVersion,
+                      Ordering ordering);
 
     /**
      * Generates the index keys for the document 'obj', and stores them in the set 'keys'.
@@ -65,18 +68,21 @@ public:
      * 'multikeyPaths' to have the same number of elements as the index key pattern and fills each
      * element with the prefixes of the indexed field that would cause this index to be multikey as
      * a result of inserting 'keys'.
+     *
+     * If the caller is certain that the current index is not multikey, and the insertion of 'obj'
+     * will not turn the index into a multikey, then the 'skipMultikey' parameter can be set to
+     * 'true' to be able to use an optimized algorithm for the index key generation. Otherwise,
+     * this parameter must be set to 'false'. In this case a generic algorithm will be used, which
+     * can handle both multikey and non-multikey indexes.
      */
-    void getKeys(const BSONObj& obj, BSONObjSet* keys, MultikeyPaths* multikeyPaths) const;
+    void getKeys(SharedBufferFragmentBuilder& pooledBufferBuilder,
+                 const BSONObj& obj,
+                 bool skipMultikey,
+                 KeyStringSet* keys,
+                 MultikeyPaths* multikeyPaths,
+                 boost::optional<RecordId> id = boost::none) const;
 
 private:
-    // These are used by getKeys below.
-    std::vector<const char*> _fieldNames;
-    bool _isIdIndex;
-    bool _isSparse;
-    BSONObj _nullKey;  // A full key with all fields null.
-    BSONSizeTracker _sizeTracker;
-
-    std::vector<BSONElement> _fixed;
     /**
      * Stores info regarding traversal of a positional path. A path through a document is
      * considered positional if this path element names an array element. Generally this means
@@ -132,14 +138,26 @@ private:
 
     /**
      * This recursive method does the heavy-lifting for getKeys().
+     * It will modify 'fieldNames' and 'fixed'.
      */
-    void _getKeysWithArray(std::vector<const char*> fieldNames,
-                           std::vector<BSONElement> fixed,
+    void _getKeysWithArray(std::vector<const char*>* fieldNames,
+                           std::vector<BSONElement>* fixed,
+                           SharedBufferFragmentBuilder& pooledBufferBuilder,
                            const BSONObj& obj,
-                           BSONObjSet* keys,
+                           KeyStringSet::sequence_type* keys,
                            unsigned numNotFound,
                            const std::vector<PositionalPathInfo>& positionalInfo,
-                           MultikeyPaths* multikeyPaths) const;
+                           MultikeyPaths* multikeyPaths,
+                           boost::optional<RecordId> id) const;
+
+    /**
+     * An optimized version of the key generation algorithm to be used when it is known that 'obj'
+     * doesn't contain an array value in any of the fields in the key pattern.
+     */
+    void _getKeysWithoutArray(SharedBufferFragmentBuilder& pooledBufferBuilder,
+                              const BSONObj& obj,
+                              boost::optional<RecordId> id,
+                              KeyStringSet* keys) const;
 
     /**
      * A call to _getKeysWithArray() begins by calling this for each field in the key pattern. It
@@ -182,18 +200,42 @@ private:
     /**
      * Sets extracted elements in 'fixed' for field paths that we have traversed to the end.
      *
+     * fieldNamesTemp and fixedTemp are temporary vectors that will be modified by this method
+     *
      * Then calls _getKeysWithArray() recursively.
      */
-    void _getKeysArrEltFixed(std::vector<const char*>* fieldNames,
-                             std::vector<BSONElement>* fixed,
+    void _getKeysArrEltFixed(const std::vector<const char*>& fieldNames,
+                             const std::vector<BSONElement>& fixed,
+                             std::vector<const char*>* fieldNamesTemp,
+                             std::vector<BSONElement>* fixedTemp,
+                             SharedBufferFragmentBuilder& pooledBufferBuilder,
                              const BSONElement& arrEntry,
-                             BSONObjSet* keys,
+                             KeyStringSet::sequence_type* keys,
                              unsigned numNotFound,
                              const BSONElement& arrObjElt,
                              const std::set<size_t>& arrIdxs,
                              bool mayExpandArrayUnembedded,
                              const std::vector<PositionalPathInfo>& positionalInfo,
-                             MultikeyPaths* multikeyPaths) const;
+                             MultikeyPaths* multikeyPaths,
+                             boost::optional<RecordId> id) const;
+
+    KeyString::Value _buildNullKeyString() const;
+
+    const KeyString::Version _keyStringVersion;
+
+    const bool _isIdIndex;
+    const bool _isSparse;
+    // True if any of the indexed paths contains a positional path component. This prohibits the key
+    // generator from using the non-multikey fast path.
+    bool _pathsContainPositionalComponent{false};
+
+    const Ordering _ordering;
+
+    // These are used by getKeys below.
+    const std::vector<const char*> _fieldNames;
+    const KeyString::Value _nullKeyString;  // A full key with all fields null.
+
+    std::vector<BSONElement> _fixed;
 
     const std::vector<PositionalPathInfo> _emptyPositionalInfo;
 

@@ -27,14 +27,15 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include <string>
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/db/commands/test_commands.h"
+
 #include "mongo/base/init.h"
-#include "mongo/base/initializer_context.h"
 #include "mongo/db/catalog/capped_utils.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/client.h"
@@ -42,12 +43,19 @@
 #include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index_builds_coordinator.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/op_observer.h"
+#include "mongo/db/ops/insert.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/service_context.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
+
+namespace {
+const NamespaceString kDurableHistoryTestNss("mdb_testing.pinned_timestamp");
+const std::string kTestingDurableHistoryPinName = "_testing";
+}  // namespace
 
 using repl::UnreplicatedWritesBlock;
 using std::endl;
@@ -80,7 +88,10 @@ public:
                            string& errmsg,
                            BSONObjBuilder& result) {
         const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbname, cmdObj));
-        log() << "test only command godinsert invoked coll:" << nss.coll();
+        LOGV2(20505,
+              "Test-only command 'godinsert' invoked coll:{collection}",
+              "Test-only command 'godinsert' invoked",
+              "collection"_attr = nss.coll());
         BSONObj obj = cmdObj["obj"].embeddedObjectUserCheck();
 
         Lock::DBLock lk(opCtx, dbname, MODE_X);
@@ -89,7 +100,8 @@ public:
 
         WriteUnitOfWork wunit(opCtx);
         UnreplicatedWritesBlock unreplicatedWritesBlock(opCtx);
-        Collection* collection = db->getCollection(opCtx, nss);
+        CollectionPtr collection =
+            CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss);
         if (!collection) {
             collection = db->createCollection(opCtx, nss);
             if (!collection) {
@@ -141,8 +153,7 @@ public:
         }
 
         // Lock the database in mode IX and lock the collection exclusively.
-        AutoGetCollection autoColl(opCtx, fullNs, MODE_IX, MODE_X);
-        Collection* collection = autoColl.getCollection();
+        AutoGetCollection collection(opCtx, fullNs, MODE_X);
         if (!collection) {
             uasserted(ErrorCodes::NamespaceNotFound,
                       str::stream() << "collection " << fullNs.ns() << " does not exist");
@@ -157,11 +168,13 @@ public:
             // Scan backwards through the collection to find the document to start truncating from.
             // We will remove 'n' documents, so start truncating from the (n + 1)th document to the
             // end.
-            auto exec = InternalPlanner::collectionScan(
-                opCtx, fullNs.ns(), collection, PlanExecutor::NO_YIELD, InternalPlanner::BACKWARD);
+            auto exec = InternalPlanner::collectionScan(opCtx,
+                                                        &collection.getCollection(),
+                                                        PlanYieldPolicy::YieldPolicy::NO_YIELD,
+                                                        InternalPlanner::BACKWARD);
 
             for (int i = 0; i < n + 1; ++i) {
-                PlanExecutor::ExecState state = exec->getNext(nullptr, &end);
+                PlanExecutor::ExecState state = exec->getNext(static_cast<BSONObj*>(nullptr), &end);
                 if (PlanExecutor::ADVANCED != state) {
                     uasserted(ErrorCodes::IllegalOperation,
                               str::stream() << "invalid n, collection contains fewer than " << n
@@ -170,9 +183,8 @@ public:
             }
         }
 
-        BackgroundOperation::assertNoBgOpInProgForNs(fullNs.ns());
         IndexBuildsCoordinator::get(opCtx)->assertNoIndexBuildInProgForCollection(
-            collection->uuid().get());
+            collection->uuid());
 
         collection->cappedTruncateAfter(opCtx, end, inc);
 
@@ -209,4 +221,106 @@ public:
 };
 
 MONGO_REGISTER_TEST_COMMAND(EmptyCapped);
+
+class DurableHistoryReplicatedTestCmd : public BasicCommand {
+public:
+    DurableHistoryReplicatedTestCmd() : BasicCommand("pinHistoryReplicated") {}
+
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kNever;
+    }
+
+    bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
+    }
+
+    bool adminOnly() const override {
+        return true;
+    }
+
+    bool requiresAuth() const override {
+        return false;
+    }
+
+    // No auth needed because it only works when enabled via command line.
+    void addRequiredPrivileges(const std::string& dbname,
+                               const BSONObj& cmdObj,
+                               std::vector<Privilege>* out) const override {}
+
+    std::string help() const override {
+        return "pins the oldest timestamp";
+    }
+
+    bool run(OperationContext* opCtx,
+             const std::string& dbname,
+             const BSONObj& cmdObj,
+             BSONObjBuilder& result) override {
+        const Timestamp requestedPinTs = cmdObj.firstElement().timestamp();
+        const bool round = cmdObj["round"].booleanSafe();
+
+        AutoGetDb autoDb(opCtx, kDurableHistoryTestNss.db(), MODE_IX);
+        Lock::CollectionLock collLock(opCtx, kDurableHistoryTestNss, MODE_IX);
+        if (!CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(
+                opCtx,
+                kDurableHistoryTestNss)) {  // someone else may have beat us to it.
+            uassertStatusOK(userAllowedCreateNS(opCtx, kDurableHistoryTestNss));
+            WriteUnitOfWork wuow(opCtx);
+            CollectionOptions defaultCollectionOptions;
+            auto db = autoDb.ensureDbExists();
+            uassertStatusOK(
+                db->userCreateNS(opCtx, kDurableHistoryTestNss, defaultCollectionOptions));
+            wuow.commit();
+        }
+
+        AutoGetCollection autoColl(opCtx, kDurableHistoryTestNss, MODE_IX);
+        WriteUnitOfWork wuow(opCtx);
+
+        // Note, this write will replicate to secondaries, but a secondary will not in-turn pin the
+        // oldest timestamp. The write otherwise must be timestamped in a storage engine table with
+        // logging disabled. This is to test that rolling back the written document also results in
+        // the pin being lifted.
+        Timestamp pinTs =
+            uassertStatusOK(opCtx->getServiceContext()->getStorageEngine()->pinOldestTimestamp(
+                opCtx, kTestingDurableHistoryPinName, requestedPinTs, round));
+
+        uassertStatusOK(autoColl->insertDocument(
+            opCtx,
+            InsertStatement(fixDocumentForInsert(opCtx, BSON("pinTs" << pinTs)).getValue()),
+            nullptr));
+        wuow.commit();
+
+        result.append("requestedPinTs", requestedPinTs);
+        result.append("pinTs", pinTs);
+        return true;
+    }
+};
+
+MONGO_REGISTER_TEST_COMMAND(DurableHistoryReplicatedTestCmd);
+
+std::string TestingDurableHistoryPin::getName() {
+    return kTestingDurableHistoryPinName;
 }
+
+boost::optional<Timestamp> TestingDurableHistoryPin::calculatePin(OperationContext* opCtx) {
+    AutoGetCollectionForRead autoColl(opCtx, kDurableHistoryTestNss);
+    if (!autoColl) {
+        return boost::none;
+    }
+
+    Timestamp ret = Timestamp::max();
+    auto cursor = autoColl->getCursor(opCtx);
+    for (auto doc = cursor->next(); doc; doc = cursor->next()) {
+        const BSONObj obj = doc.get().data.toBson();
+        const Timestamp ts = obj["pinTs"].timestamp();
+        ret = std::min(ret, ts);
+    }
+
+    if (ret == Timestamp::min()) {
+        return boost::none;
+    }
+
+    return ret;
+}
+
+
+}  // namespace mongo

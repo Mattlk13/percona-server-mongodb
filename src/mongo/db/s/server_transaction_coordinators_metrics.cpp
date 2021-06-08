@@ -35,6 +35,9 @@
 #include "mongo/db/service_context.h"
 
 namespace mongo {
+
+TransactionCoordinatorsSSS transactionCoordinatorsSSS;
+
 namespace {
 const auto ServerTransactionCoordinatorsMetricsDecoration =
     ServiceContext::declareDecoration<ServerTransactionCoordinatorsMetrics>();
@@ -62,6 +65,22 @@ std::int64_t ServerTransactionCoordinatorsMetrics::getTotalStartedTwoPhaseCommit
 }
 void ServerTransactionCoordinatorsMetrics::incrementTotalStartedTwoPhaseCommit() {
     _totalStartedTwoPhaseCommit.fetchAndAdd(1);
+}
+
+std::int64_t ServerTransactionCoordinatorsMetrics::getTotalAbortedTwoPhaseCommit() {
+    return _totalAbortedTwoPhaseCommit.load();
+}
+
+void ServerTransactionCoordinatorsMetrics::incrementTotalAbortedTwoPhaseCommit() {
+    _totalAbortedTwoPhaseCommit.fetchAndAdd(1);
+}
+
+std::int64_t ServerTransactionCoordinatorsMetrics::getTotalSuccessfulTwoPhaseCommit() {
+    return _totalSuccessfulTwoPhaseCommit.load();
+}
+
+void ServerTransactionCoordinatorsMetrics::incrementTotalSuccessfulTwoPhaseCommit() {
+    _totalSuccessfulTwoPhaseCommit.fetchAndAdd(1);
 }
 
 std::int64_t ServerTransactionCoordinatorsMetrics::getCurrentWritingParticipantList() {
@@ -102,6 +121,38 @@ void ServerTransactionCoordinatorsMetrics::incrementCurrentWaitingForDecisionAck
 }
 void ServerTransactionCoordinatorsMetrics::decrementCurrentWaitingForDecisionAcks() {
     _totalWaitingForDecisionAcks.fetchAndSubtract(1);
+}
+
+std::int64_t ServerTransactionCoordinatorsMetrics::getCurrentDeletingCoordinatorDoc() {
+    return _totalDeletingCoordinatorDoc.load();
+}
+void ServerTransactionCoordinatorsMetrics::incrementCurrentDeletingCoordinatorDoc() {
+    _totalDeletingCoordinatorDoc.fetchAndAdd(1);
+}
+void ServerTransactionCoordinatorsMetrics::decrementCurrentDeletingCoordinatorDoc() {
+    _totalDeletingCoordinatorDoc.fetchAndSubtract(1);
+}
+
+void ServerTransactionCoordinatorsMetrics::updateStats(TransactionCoordinatorsStats* stats) {
+    stats->setTotalCreated(_totalCreated.load());
+    stats->setTotalStartedTwoPhaseCommit(_totalStartedTwoPhaseCommit.load());
+    stats->setTotalAbortedTwoPhaseCommit(_totalAbortedTwoPhaseCommit.load());
+    stats->setTotalCommittedTwoPhaseCommit(_totalSuccessfulTwoPhaseCommit.load());
+
+    CurrentInSteps currentInSteps;
+    currentInSteps.setWritingParticipantList(_totalWritingParticipantList.load());
+    currentInSteps.setWaitingForVotes(_totalWaitingForVotes.load());
+    currentInSteps.setWritingDecision(_totalWritingDecision.load());
+    currentInSteps.setWaitingForDecisionAcks(_totalWaitingForDecisionAcks.load());
+    currentInSteps.setDeletingCoordinatorDoc(_totalDeletingCoordinatorDoc.load());
+    stats->setCurrentInSteps(currentInSteps);
+}
+
+BSONObj TransactionCoordinatorsSSS::generateSection(OperationContext* opCtx,
+                                                    const BSONElement& configElement) const {
+    TransactionCoordinatorsStats stats;
+    ServerTransactionCoordinatorsMetrics::get(opCtx)->updateStats(&stats);
+    return stats.toBSON();
 }
 
 }  // namespace mongo

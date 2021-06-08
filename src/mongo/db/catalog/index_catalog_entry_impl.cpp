@@ -27,17 +27,17 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kIndex
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kIndex
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/catalog/index_catalog_entry_impl.h"
 
 #include <algorithm>
+#include <memory>
 
 #include "mongo/base/init.h"
-#include "mongo/db/catalog/collection_catalog_entry.h"
-#include "mongo/db/catalog/collection_info_cache_impl.h"
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/index/index_access_method.h"
@@ -45,12 +45,15 @@
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/multi_key_path_tracker.h"
+#include "mongo/db/op_observer.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
+#include "mongo/db/query/collection_query_info.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/transaction_participant.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
@@ -58,27 +61,30 @@ namespace mongo {
 using std::string;
 
 IndexCatalogEntryImpl::IndexCatalogEntryImpl(OperationContext* const opCtx,
-                                             const StringData ns,
-                                             CollectionCatalogEntry* const collection,
+                                             RecordId catalogId,
+                                             const std::string& ident,
                                              std::unique_ptr<IndexDescriptor> descriptor,
-                                             CollectionInfoCache* const infoCache)
-    : _ns(ns.toString()),
-      _collection(collection),
+                                             bool isFrozen)
+    : _ident(ident),
       _descriptor(std::move(descriptor)),
-      _infoCache(infoCache),
+      _catalogId(catalogId),
       _ordering(Ordering::make(_descriptor->keyPattern())),
       _isReady(false),
-      _prefix(collection->getIndexPrefix(opCtx, _descriptor->indexName())) {
-    _descriptor->_cachedEntry = this;
+      _isFrozen(isFrozen),
+      _isDropped(false) {
 
-    _isReady = _catalogIsReady(opCtx);
+    _descriptor->_entry = this;
+    _isReady = isReadyInMySnapshot(opCtx);
 
     {
-        stdx::lock_guard<stdx::mutex> lk(_indexMultikeyPathsMutex);
-        _isMultikey.store(_catalogIsMultikey(opCtx, &_indexMultikeyPaths));
-        _indexTracksPathLevelMultikeyInfo = !_indexMultikeyPaths.empty();
+        stdx::lock_guard<Latch> lk(_indexMultikeyPathsMutex);
+        const bool isMultikey = _catalogIsMultikey(opCtx, &_indexMultikeyPaths);
+        _isMultikeyForRead.store(isMultikey);
+        _isMultikeyForWrite.store(isMultikey);
+        _indexTracksMultikeyPathsInCatalog = !_indexMultikeyPaths.empty();
     }
 
+    auto nss = DurableCatalog::get(opCtx)->getEntry(_catalogId).nss;
     const BSONObj& collation = _descriptor->collation();
     if (!collation.isEmpty()) {
         auto statusWithCollator =
@@ -93,27 +99,23 @@ IndexCatalogEntryImpl::IndexCatalogEntryImpl(OperationContext* const opCtx,
     if (_descriptor->isPartial()) {
         const BSONObj& filter = _descriptor->partialFilterExpression();
 
-        boost::intrusive_ptr<ExpressionContext> expCtx(
-            new ExpressionContext(opCtx, _collator.get()));
+        _expCtxForFilter = make_intrusive<ExpressionContext>(
+            opCtx, CollatorInterface::cloneCollator(_collator.get()), nss);
 
         // Parsing the partial filter expression is not expected to fail here since the
         // expression would have been successfully parsed upstream during index creation.
-        StatusWithMatchExpression statusWithMatcher =
-            MatchExpressionParser::parse(filter,
-                                         std::move(expCtx),
-                                         ExtensionsCallbackNoop(),
-                                         MatchExpressionParser::kBanAllSpecialFeatures);
-        invariant(statusWithMatcher.getStatus());
-        _filterExpression = std::move(statusWithMatcher.getValue());
-        LOG(2) << "have filter expression for " << _ns << " " << _descriptor->indexName() << " "
-               << redact(filter);
+        _filterExpression =
+            MatchExpressionParser::parseAndNormalize(filter,
+                                                     _expCtxForFilter,
+                                                     ExtensionsCallbackNoop(),
+                                                     MatchExpressionParser::kBanAllSpecialFeatures);
+        LOGV2_DEBUG(20350,
+                    2,
+                    "have filter expression for {namespace} {indexName} {filter}",
+                    "namespace"_attr = nss,
+                    "indexName"_attr = _descriptor->indexName(),
+                    "filter"_attr = redact(filter));
     }
-}
-
-IndexCatalogEntryImpl::~IndexCatalogEntryImpl() {
-    _descriptor->_cachedEntry = nullptr;  // defensive
-
-    _descriptor.reset();
 }
 
 void IndexCatalogEntryImpl::init(std::unique_ptr<IndexAccessMethod> accessMethod) {
@@ -122,66 +124,35 @@ void IndexCatalogEntryImpl::init(std::unique_ptr<IndexAccessMethod> accessMethod
 }
 
 bool IndexCatalogEntryImpl::isReady(OperationContext* opCtx) const {
-    auto txnParticipant = TransactionParticipant::get(opCtx);
     // For multi-document transactions, we can open a snapshot prior to checking the
     // minimumSnapshotVersion on a collection.  This means we are unprotected from reading
     // out-of-sync index catalog entries.  To fix this, we uassert if we detect that the
     // in-memory catalog is out-of-sync with the on-disk catalog.
-    if (txnParticipant && txnParticipant.inMultiDocumentTransaction()) {
-        if (!_catalogIsPresent(opCtx) || _catalogIsReady(opCtx) != _isReady) {
+    if (opCtx->inMultiDocumentTransaction()) {
+        if (!isPresentInMySnapshot(opCtx) || isReadyInMySnapshot(opCtx) != _isReady) {
             uasserted(ErrorCodes::SnapshotUnavailable,
                       str::stream() << "Unable to read from a snapshot due to pending collection"
                                        " catalog changes; please retry the operation.");
         }
     }
 
-    DEV invariant(_isReady == _catalogIsReady(opCtx));
+    if (kDebugBuild)
+        invariant(_isReady == isReadyInMySnapshot(opCtx));
     return _isReady;
 }
 
-bool IndexCatalogEntryImpl::isMultikey(OperationContext* opCtx) const {
-    auto ret = _isMultikey.load();
-    if (ret) {
-        return true;
-    }
+bool IndexCatalogEntryImpl::isFrozen() const {
+    invariant(!_isFrozen || !_isReady);
+    return _isFrozen;
+}
 
-    // Multikey updates are only persisted, to disk and in memory, when the transaction
-    // commits. In the case of multi-statement transactions, a client attempting to read their own
-    // transactions writes can return wrong results if their writes include multikey changes.
-    //
-    // To accomplish this, the write-path will persist multikey changes on the `Session` object
-    // and the read-path will query this state before determining there is no interesting multikey
-    // state. Note, it's always legal, though potentially wasteful, to return `true`.
-    auto txnParticipant = TransactionParticipant::get(opCtx);
-    if (!txnParticipant || !txnParticipant.inMultiDocumentTransaction()) {
-        return false;
-    }
-
-    for (const MultikeyPathInfo& path : txnParticipant.getUncommittedMultikeyPathInfos()) {
-        if (path.nss == NamespaceString(_ns) && path.indexName == _descriptor->indexName()) {
-            return true;
-        }
-    }
-
-    return false;
+bool IndexCatalogEntryImpl::isMultikey() const {
+    return _isMultikeyForRead.load();
 }
 
 MultikeyPaths IndexCatalogEntryImpl::getMultikeyPaths(OperationContext* opCtx) const {
-    stdx::lock_guard<stdx::mutex> lk(_indexMultikeyPathsMutex);
-
-    auto txnParticipant = TransactionParticipant::get(opCtx);
-    if (!txnParticipant || !txnParticipant.inMultiDocumentTransaction()) {
-        return _indexMultikeyPaths;
-    }
-
-    MultikeyPaths ret = _indexMultikeyPaths;
-    for (const MultikeyPathInfo& path : txnParticipant.getUncommittedMultikeyPathInfos()) {
-        if (path.nss == NamespaceString(_ns) && path.indexName == _descriptor->indexName()) {
-            MultikeyPathTracker::mergeMultikeyPaths(&ret, path.multikeyPaths);
-        }
-    }
-
-    return ret;
+    stdx::lock_guard<Latch> lk(_indexMultikeyPathsMutex);
+    return _indexMultikeyPaths;
 }
 
 // ---
@@ -197,15 +168,21 @@ void IndexCatalogEntryImpl::setIsReady(bool newIsReady) {
 }
 
 void IndexCatalogEntryImpl::setMultikey(OperationContext* opCtx,
+                                        const CollectionPtr& collection,
+                                        const KeyStringSet& multikeyMetadataKeys,
                                         const MultikeyPaths& multikeyPaths) {
-    if (!_indexTracksPathLevelMultikeyInfo && isMultikey(opCtx)) {
-        // If the index is already set as multikey and we don't have any path-level information to
-        // update, then there's nothing more for us to do.
+    // An index can either track path-level multikey information in the catalog or as metadata keys
+    // in the index itself, but not both.
+    invariant(!(_indexTracksMultikeyPathsInCatalog && multikeyMetadataKeys.size() > 0));
+    // If the index is already set as multikey and we don't have any path-level information to
+    // update, then there's nothing more for us to do.
+    bool hasNoPathLevelInfo = (!_indexTracksMultikeyPathsInCatalog && multikeyMetadataKeys.empty());
+    if (hasNoPathLevelInfo && _isMultikeyForWrite.load()) {
         return;
     }
 
-    if (_indexTracksPathLevelMultikeyInfo) {
-        stdx::lock_guard<stdx::mutex> lk(_indexMultikeyPathsMutex);
+    if (_indexTracksMultikeyPathsInCatalog) {
+        stdx::lock_guard<Latch> lk(_indexMultikeyPathsMutex);
         invariant(multikeyPaths.size() == _indexMultikeyPaths.size());
 
         bool newPathIsMultikey = false;
@@ -228,7 +205,7 @@ void IndexCatalogEntryImpl::setMultikey(OperationContext* opCtx,
         }
     }
 
-    MultikeyPaths paths = _indexTracksPathLevelMultikeyInfo ? multikeyPaths : MultikeyPaths{};
+    MultikeyPaths paths = _indexTracksMultikeyPathsInCatalog ? multikeyPaths : MultikeyPaths{};
 
     // On a primary, we can simply assign this write the same timestamp as the index creation,
     // insert, or update that caused this index to become multikey. This is because if two
@@ -251,76 +228,188 @@ void IndexCatalogEntryImpl::setMultikey(OperationContext* opCtx,
     // it multikey, that write will be marked as "isTrackingMultikeyPathInfo" on the applier's
     // OperationContext and we can safely defer that write to the end of the batch.
     if (MultikeyPathTracker::get(opCtx).isTrackingMultikeyPathInfo()) {
-        MultikeyPathInfo info;
-        info.nss = _collection->ns();
-        info.indexName = _descriptor->indexName();
-        info.multikeyPaths = paths;
-        MultikeyPathTracker::get(opCtx).addMultikeyPathInfo(info);
+        MultikeyPathTracker::get(opCtx).addMultikeyPathInfo(
+            {collection->ns(), _descriptor->indexName(), multikeyMetadataKeys, std::move(paths)});
         return;
     }
 
+    // If multikeyMetadataKeys is non-empty, we must insert these keys into the index itself. We do
+    // not have to account for potential dupes, since all metadata keys are indexed against a single
+    // RecordId. An attempt to write a duplicate key will therefore be ignored.
+    if (!multikeyMetadataKeys.empty()) {
+        uassertStatusOK(accessMethod()->insertKeys(
+            opCtx, collection, multikeyMetadataKeys, {}, {}, {}, nullptr));
+    }
+
+    // Mark the catalog as multikey, and record the multikey paths if applicable.
+    if (opCtx->inMultiDocumentTransaction()) {
+        auto status = _setMultikeyInMultiDocumentTransaction(opCtx, collection, paths);
+        // Retry without side transaction.
+        if (!status.isOK()) {
+            _catalogSetMultikey(opCtx, collection, paths);
+        }
+    } else {
+        _catalogSetMultikey(opCtx, collection, paths);
+    }
+}
+
+void IndexCatalogEntryImpl::forceSetMultikey(OperationContext* const opCtx,
+                                             const CollectionPtr& coll,
+                                             bool isMultikey,
+                                             const MultikeyPaths& multikeyPaths) {
+    invariant(opCtx->lockState()->isCollectionLockedForMode(coll->ns(), MODE_X));
+
+    // Don't check _indexTracksMultikeyPathsInCatalog because the caller may be intentionally trying
+    // to bypass this check. That is, pre-3.4 indexes may be 'stuck' in a state where they are not
+    // tracking multikey paths in the catalog (i.e. the multikeyPaths field is absent), but the
+    // caller wants to upgrade this index because it knows exactly which paths are multikey. We rely
+    // on the following function to make sure this upgrade only takes place on index types that
+    // currently support path-level multikey path tracking.
+    DurableCatalog::get(opCtx)->forceSetIndexIsMultikey(
+        opCtx, _catalogId, _descriptor.get(), isMultikey, multikeyPaths);
+
+    // The prior call to set the multikey metadata in the catalog does some validation and clean up
+    // based on the inputs, so reset the multikey variables based on what is actually in the durable
+    // catalog entry.
+    {
+        stdx::lock_guard<Latch> lk(_indexMultikeyPathsMutex);
+        const bool isMultikey = _catalogIsMultikey(opCtx, &_indexMultikeyPaths);
+        _isMultikeyForRead.store(isMultikey);
+        _isMultikeyForWrite.store(isMultikey);
+        _indexTracksMultikeyPathsInCatalog = !_indexMultikeyPaths.empty();
+    }
+
+    // Since multikey metadata has changed, invalidate the query cache.
+    CollectionQueryInfo::get(coll).clearQueryCacheForSetMultikey(coll);
+}
+
+Status IndexCatalogEntryImpl::_setMultikeyInMultiDocumentTransaction(
+    OperationContext* opCtx, const CollectionPtr& collection, const MultikeyPaths& multikeyPaths) {
+    // If we are inside a multi-document transaction, we write the on-disk multikey update in a
+    // separate transaction so that it will not generate prepare conflicts with other operations
+    // that try to set the multikey flag. In general, it should always be safe to update the
+    // multikey flag earlier than necessary, and so we are not concerned with the atomicity of the
+    // multikey flag write and the parent transaction. We can do this write separately and commit it
+    // before the parent transaction commits.
+    auto txnParticipant = TransactionParticipant::get(opCtx);
+
+    TransactionParticipant::SideTransactionBlock sideTxn(opCtx);
+
+    // If the index is not visible within the side transaction, the index may have been created,
+    // but not committed, in the parent transaction. Therefore, we abandon the side transaction
+    // and set the multikey flag in the parent transaction.
+    if (!isPresentInMySnapshot(opCtx)) {
+        return {ErrorCodes::SnapshotUnavailable, "index not visible in side transaction"};
+    }
+
+    writeConflictRetry(
+        opCtx, "set index multikey", collection->ns().ns(), [&] {
+            WriteUnitOfWork wuow(opCtx);
+
+            // If we have a prepare optime for recovery, then we always use that. This is safe since
+            // the prepare timestamp is always <= the commit timestamp of a transaction, which
+            // satisfies the correctness requirement for multikey writes i.e. they must occur at or
+            // before the first write that set the multikey flag. This only occurs when
+            // reconstructing prepared transactions, and not during replication recovery oplog
+            // application.
+            auto recoveryPrepareOpTime = txnParticipant.getPrepareOpTimeForRecovery();
+            if (!recoveryPrepareOpTime.isNull()) {
+                // We might replay a prepared transaction behind the oldest timestamp during initial
+                // sync or behind the stable timestamp during rollback. During initial sync, we
+                // may not have a stable timestamp. Therefore, we need to round up
+                // the multi-key write timestamp to the max of the three so that we don't write
+                // behind the oldest/stable timestamp. This code path is only hit during initial
+                // sync/recovery when reconstructing prepared transactions and so we don't expect
+                // the oldest/stable timestamp to advance concurrently.
+                auto status = opCtx->recoveryUnit()->setTimestamp(std::max(
+                    {recoveryPrepareOpTime.getTimestamp(),
+                     opCtx->getServiceContext()->getStorageEngine()->getOldestTimestamp(),
+                     opCtx->getServiceContext()->getStorageEngine()->getStableTimestamp()}));
+                fassert(31164, status);
+            } else {
+                // If there is no recovery prepare OpTime, then this node must be a primary. We
+                // write a noop oplog entry to get a properly ordered timestamp.
+                invariant(opCtx->writesAreReplicated());
+
+                auto msg = BSON("msg"
+                                << "Setting index to multikey"
+                                << "coll" << collection->ns().ns() << "index"
+                                << _descriptor->indexName());
+                opCtx->getClient()->getServiceContext()->getOpObserver()->onOpMessage(opCtx, msg);
+            }
+
+            _catalogSetMultikey(opCtx, collection, multikeyPaths);
+
+            wuow.commit();
+        });
+
+    return Status::OK();
+}
+
+std::shared_ptr<Ident> IndexCatalogEntryImpl::getSharedIdent() const {
+    return {shared_from_this(), _accessMethod->getSortedDataInterface()};  // aliasing constructor
+}
+
+// ----
+
+NamespaceString IndexCatalogEntryImpl::getNSSFromCatalog(OperationContext* opCtx) const {
+    return DurableCatalog::get(opCtx)->getEntry(_catalogId).nss;
+}
+
+bool IndexCatalogEntryImpl::isReadyInMySnapshot(OperationContext* opCtx) const {
+    return DurableCatalog::get(opCtx)->isIndexReady(opCtx, _catalogId, _descriptor->indexName());
+}
+
+bool IndexCatalogEntryImpl::isPresentInMySnapshot(OperationContext* opCtx) const {
+    return DurableCatalog::get(opCtx)->isIndexPresent(opCtx, _catalogId, _descriptor->indexName());
+}
+
+bool IndexCatalogEntryImpl::_catalogIsMultikey(OperationContext* opCtx,
+                                               MultikeyPaths* multikeyPaths) const {
+    return DurableCatalog::get(opCtx)->isIndexMultikey(
+        opCtx, _catalogId, _descriptor->indexName(), multikeyPaths);
+}
+
+void IndexCatalogEntryImpl::_catalogSetMultikey(OperationContext* opCtx,
+                                                const CollectionPtr& collection,
+                                                const MultikeyPaths& multikeyPaths) {
     // It's possible that the index type (e.g. ascending/descending index) supports tracking
     // path-level multikey information, but this particular index doesn't.
     // CollectionCatalogEntry::setIndexIsMultikey() requires that we discard the path-level
     // multikey information in order to avoid unintentionally setting path-level multikey
     // information on an index created before 3.4.
-    const bool indexMetadataHasChanged =
-        _collection->setIndexIsMultikey(opCtx, _descriptor->indexName(), paths);
+    auto indexMetadataHasChanged = DurableCatalog::get(opCtx)->setIndexIsMultikey(
+        opCtx, _catalogId, _descriptor->indexName(), multikeyPaths);
 
-    // When the recovery unit commits, update the multikey paths if needed and clear the plan cache
-    // if the index metadata has changed.
-    opCtx->recoveryUnit()->onCommit(
-        [this, multikeyPaths, indexMetadataHasChanged](boost::optional<Timestamp>) {
-            _isMultikey.store(true);
-
-            if (_indexTracksPathLevelMultikeyInfo) {
-                stdx::lock_guard<stdx::mutex> lk(_indexMultikeyPathsMutex);
-                for (size_t i = 0; i < multikeyPaths.size(); ++i) {
-                    _indexMultikeyPaths[i].insert(multikeyPaths[i].begin(), multikeyPaths[i].end());
-                }
-            }
-
-            if (indexMetadataHasChanged && _infoCache) {
-                LOG(1) << _ns << ": clearing plan cache - index " << _descriptor->keyPattern()
-                       << " set to multi key.";
-                _infoCache->clearQueryCache();
-            }
-        });
-
-    // Keep multikey changes in memory to correctly service later reads using this index.
-    auto txnParticipant = TransactionParticipant::get(opCtx);
-    if (txnParticipant && txnParticipant.inMultiDocumentTransaction()) {
-        txnParticipant.addUncommittedMultikeyPathInfo(
-            MultikeyPathInfo{_collection->ns(), _descriptor->indexName(), std::move(paths)});
+    // In the absense of using the storage engine to read from the catalog, we must set multikey
+    // prior to the storage engine transaction committing.
+    //
+    // Moreover, there must not be an `onRollback` handler to reset this back to false. Given a long
+    // enough pause in processing `onRollback` handlers, a later writer that successfully flipped
+    // multikey can be undone. Alternatively, one could use a counter instead of a boolean to avoid
+    // that problem.
+    _isMultikeyForRead.store(true);
+    if (_indexTracksMultikeyPathsInCatalog) {
+        stdx::lock_guard<Latch> lk(_indexMultikeyPathsMutex);
+        for (size_t i = 0; i < multikeyPaths.size(); ++i) {
+            _indexMultikeyPaths[i].insert(multikeyPaths[i].begin(), multikeyPaths[i].end());
+        }
     }
-}
+    if (indexMetadataHasChanged) {
+        LOGV2_DEBUG(4718705,
+                    1,
+                    "Index set to multi key, clearing query plan cache",
+                    "namespace"_attr = collection->ns(),
+                    "keyPattern"_attr = _descriptor->keyPattern());
+        CollectionQueryInfo::get(collection).clearQueryCacheForSetMultikey(collection);
+    }
 
-void IndexCatalogEntryImpl::setIndexKeyStringWithLongTypeBitsExistsOnDisk(OperationContext* opCtx) {
-    _collection->setIndexKeyStringWithLongTypeBitsExistsOnDisk(opCtx);
-}
-
-void IndexCatalogEntryImpl::setNs(NamespaceString ns) {
-    _ns = ns;
-    _descriptor->setNs(std::move(ns));
-}
-
-// ----
-
-bool IndexCatalogEntryImpl::_catalogIsReady(OperationContext* opCtx) const {
-    return _collection->isIndexReady(opCtx, _descriptor->indexName());
-}
-
-bool IndexCatalogEntryImpl::_catalogIsPresent(OperationContext* opCtx) const {
-    return _collection->isIndexPresent(opCtx, _descriptor->indexName());
-}
-
-bool IndexCatalogEntryImpl::_catalogIsMultikey(OperationContext* opCtx,
-                                               MultikeyPaths* multikeyPaths) const {
-    return _collection->isIndexMultikey(opCtx, _descriptor->indexName(), multikeyPaths);
-}
-
-KVPrefix IndexCatalogEntryImpl::_catalogGetPrefix(OperationContext* opCtx) const {
-    return _collection->getIndexPrefix(opCtx, _descriptor->indexName());
+    opCtx->recoveryUnit()->onCommit([this](boost::optional<Timestamp>) {
+        // Writers must attempt to flip multikey until it's confirmed a storage engine
+        // transaction successfully commits. Only after this point may a writer optimize out
+        // flipping multikey.
+        _isMultikeyForWrite.store(true);
+    });
 }
 
 }  // namespace mongo

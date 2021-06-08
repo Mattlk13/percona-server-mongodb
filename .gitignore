@@ -1,9 +1,11 @@
+/.ccls_cache
 /build
 /src/mongo/db/modules
 /.jsdbshell
+/.cache
 /.dbshell
 /*.ninja
-/*.ninja.deps
+/*.ninja.*
 /.ninja_deps
 /.ninja_log
 /perf.data
@@ -20,10 +22,10 @@
 *.tar.gz
 *.suo
 *.ncb
-*.idb 
-*.obj 
-*.opt 
-*.pch 
+*.idb
+*.obj
+*.opt
+*.pch
 *.jsh
 *.jsall
 *.pyc
@@ -39,6 +41,7 @@
 *.*sdf
 *.psess
 *.tmp
+*.eslintcache
 *#
 .#*
 
@@ -56,6 +59,10 @@
 /src/third_party/*/*.tlog
 /src/third_party/*/*.lastbuildstate
 /src/third_party/install/*
+/buildscripts/libdeps/graph_visualizer_web_stack/build
+/buildscripts/libdeps/graph_visualizer_web_stack/node_modules
+package-lock.json
+libdeps.graphml
 config.log
 settings.py
 log_config.py
@@ -81,6 +88,8 @@ scratch
 /mongod
 /mongoed
 /mongogrid
+/mongokerberos
+/mongoldap
 /mongoperf
 /mongos
 /mongoshim
@@ -161,7 +170,7 @@ CMakeLists.txt
 # Visual Studio and VSCode projects
 .vscode/
 .vs/
-x64/
+/x64/
 
 # Windows MSI builder artifacts
 *.msi
@@ -176,8 +185,12 @@ src/mongo/embedded/java/aar/build/
 src/mongo/embedded/java/jar/build/
 local.properties
 
+# clangd language server
+.clangd/
+
 compile_commands.json
 generated_resmoke_config
+selected_tests_config
 
 # Code review tool config
 codereview.rc
@@ -185,3 +198,17 @@ codereview.rc
 # Python venvs and virtualenvs
 python3-venv
 python2-venv
+
+# Generated resmoke configuration file
+resmoke.ini
+
+# UndoDB Recordings
+*.undo
+
+# Resmoke runtime trackers
+.resmoke_start_time.yml
+
+# libfuzzer artifacts
+default.profraw
+/corpora
+/corpora-merged

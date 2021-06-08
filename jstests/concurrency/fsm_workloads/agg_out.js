@@ -19,7 +19,6 @@ load('jstests/concurrency/fsm_workloads/agg_base.js');             // for $confi
 load('jstests/concurrency/fsm_workload_helpers/server_types.js');  // for isMongos
 
 var $config = extendWorkload($config, function($config, $super) {
-
     // Use a smaller document size, but more iterations. The smaller documents will ensure each
     // operation is faster, giving us time to do more operations and thus increasing the likelihood
     // that any two operations will be happening concurrently.
@@ -39,7 +38,7 @@ var $config = extendWorkload($config, function($config, $super) {
     $config.transitions = {
         query: {
             query: 0.68,
-            ensureIndexes: 0.1,
+            createIndexes: 0.1,
             dropIndex: 0.1,
             collMod: 0.1,
             // Converting the target collection to a capped collection or a sharded collection will
@@ -48,7 +47,7 @@ var $config = extendWorkload($config, function($config, $super) {
             convertToCapped: 0.01,
             shardCollection: 0.01,
         },
-        ensureIndexes: {query: 1},
+        createIndexes: {query: 1},
         dropIndex: {query: 1},
         collMod: {query: 1},
         convertToCapped: {query: 1},
@@ -66,10 +65,11 @@ var $config = extendWorkload($config, function($config, $super) {
         });
 
         const allowedErrorCodes = [
-            ErrorCodes.CommandFailed,  // indexes of target collection changed during processing.
-            17017,  // $out is not supported to an existing *sharded* output collection.
-            17152,  // namespace is capped so it can't be used for $out.
-            28769,  // $out collection cannot be sharded.
+            ErrorCodes.CommandFailed,     // indexes of target collection changed during processing.
+            ErrorCodes.IllegalOperation,  // $out is not supported to an existing *sharded* output
+                                          // collection.
+            17152,                        // namespace is capped so it can't be used for $out.
+            28769,                        // $out collection cannot be sharded.
         ];
         assertWhenOwnDB.commandWorkedOrFailedWithCode(res, allowedErrorCodes);
 
@@ -85,9 +85,9 @@ var $config = extendWorkload($config, function($config, $super) {
      * Ensures all the indexes exist. This will have no affect unless some thread has already
      * dropped an index.
      */
-    $config.states.ensureIndexes = function ensureIndexes(db, unusedCollName) {
+    $config.states.createIndexes = function createIndexes(db, unusedCollName) {
         for (var i = 0; i < this.indexSpecs; ++i) {
-            assertWhenOwnDB.commandWorked(db[this.outputCollName].ensureIndex(this.indexSpecs[i]));
+            assertWhenOwnDB.commandWorked(db[this.outputCollName].createIndex(this.indexSpecs[i]));
         }
     };
 
@@ -133,10 +133,12 @@ var $config = extendWorkload($config, function($config, $super) {
 
     /**
      * If being run against a mongos, shards '$config.data.outputCollName'. This is never undone,
-     * and all subsequent $out's to this collection should fail.
+     * and all subsequent $out's to this collection should fail. Collection sharding is restricted
+     * to a single thread as multiple concurrent invocations can result in command timeout /
+     * failure.
      */
     $config.states.shardCollection = function shardCollection(db, unusedCollName) {
-        if (isMongos(db)) {
+        if (isMongos(db) && this.tid === 0) {
             assertWhenOwnDB.commandWorked(db.adminCommand({enableSharding: db.getName()}));
             assertWhenOwnDB.commandWorked(db.adminCommand(
                 {shardCollection: db[this.outputCollName].getFullName(), key: {_id: 'hashed'}}));

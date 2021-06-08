@@ -38,11 +38,10 @@
 
 namespace mongo {
 
-const char* DocumentSourceListSessions::kStageName = "$listSessions";
-
 REGISTER_DOCUMENT_SOURCE(listSessions,
                          DocumentSourceListSessions::LiteParsed::parse,
-                         DocumentSourceListSessions::createFromBson);
+                         DocumentSourceListSessions::createFromBson,
+                         LiteParsedDocumentSource::AllowedWithApiStrict::kNeverInVersion1);
 
 boost::intrusive_ptr<DocumentSource> DocumentSourceListSessions::createFromBson(
     BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pExpCtx) {
@@ -74,7 +73,6 @@ boost::intrusive_ptr<DocumentSource> DocumentSourceListSessions::createFromBson(
     const auto& query = BSON("_id.uid" << BSON("$in" << builder.arr()));
     return new DocumentSourceListSessions(query, pExpCtx, spec.getAllUsers(), spec.getUsers());
 }
-
 
 Value DocumentSourceListSessions::serialize(
     boost::optional<ExplainOptions::Verbosity> explain) const {

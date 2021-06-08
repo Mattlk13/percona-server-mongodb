@@ -74,32 +74,14 @@ public:
     inline Database(Database&&) = delete;
     inline Database& operator=(Database&&) = delete;
 
-    virtual CollectionCatalog::iterator begin(OperationContext* opCtx) const = 0;
-    virtual CollectionCatalog::iterator end(OperationContext* opCtx) const = 0;
-
     /**
      * Sets up internal memory structures.
      */
     virtual void init(OperationContext* opCtx) const = 0;
 
-    // closes files and other cleanup see below.
-    virtual void close(OperationContext* const opCtx) const = 0;
-
     virtual const std::string& name() const = 0;
 
     virtual void clearTmpCollections(OperationContext* const opCtx) const = 0;
-
-    /**
-     * Sets a new profiling level for the database and returns the outcome.
-     *
-     * @param opCtx Operation context which to use for creating the profiling collection.
-     * @param newLevel New profiling level to use.
-     */
-    virtual Status setProfilingLevel(OperationContext* const opCtx, const int newLevel) = 0;
-
-    virtual int getProfilingLevel() const = 0;
-
-    virtual const NamespaceString& getProfilingNS() const = 0;
 
     /**
      * Sets the 'drop-pending' state of this Database.
@@ -111,7 +93,6 @@ public:
 
     /**
      * Returns the 'drop-pending' state of this Database.
-     * The database must be locked in MODE_X when calling this function.
      */
     virtual bool isDropPending(OperationContext* opCtx) const = 0;
 
@@ -135,10 +116,19 @@ public:
                                   repl::OpTime dropOpTime = {}) const = 0;
     virtual Status dropCollectionEvenIfSystem(OperationContext* const opCtx,
                                               NamespaceString nss,
-                                              repl::OpTime dropOpTime = {}) const = 0;
+                                              repl::OpTime dropOpTime = {},
+                                              bool markFromMigrate = false) const = 0;
 
     virtual Status dropView(OperationContext* const opCtx, NamespaceString viewName) const = 0;
 
+    /**
+     * A MODE_IX collection lock must be held for this call. Throws a WriteConflictException error
+     * if the collection already exists (say if another thread raced to create it).
+     *
+     * Surrounding writeConflictRetry loops must encompass checking that the collection exists as
+     * well as creating it. Otherwise the loop will endlessly throw WCEs: the caller must check that
+     * the collection exists to break free.
+     */
     virtual Collection* createCollection(OperationContext* const opCtx,
                                          const NamespaceString& nss,
                                          const CollectionOptions& options = CollectionOptions(),
@@ -148,12 +138,6 @@ public:
     virtual Status createView(OperationContext* const opCtx,
                               const NamespaceString& viewName,
                               const CollectionOptions& options) const = 0;
-
-    virtual Collection* getCollection(OperationContext* opCtx,
-                                      const NamespaceString& nss) const = 0;
-
-    virtual Collection* getOrCreateCollection(OperationContext* const opCtx,
-                                              const NamespaceString& nss) const = 0;
 
     /**
      * Arguments are passed by value as they otherwise would be changing as result of renaming.
@@ -173,10 +157,10 @@ public:
      * Returns NamespaceExists if we are unable to generate a collection name that does not conflict
      * with an existing collection in this database.
      *
-     * The database must be locked in MODE_X when calling this function.
+     * The database must be locked in MODE_IX when calling this function.
      */
     virtual StatusWith<NamespaceString> makeUniqueCollectionNamespace(
-        OperationContext* opCtx, StringData collectionNameModel) = 0;
+        OperationContext* opCtx, StringData collectionNameModel) const = 0;
 
     /**
      * If we are in a replset, every replicated collection must have an _id index.  As we scan each
@@ -184,19 +168,6 @@ public:
      * DropPendingCollectionReaper to clean up eventually.
      */
     virtual void checkForIdIndexesAndDropPendingCollections(OperationContext* opCtx) const = 0;
-
-    /**
-     * A database is assigned a new epoch whenever it is closed and re-opened. This involves
-     * deleting and reallocating a new Database object, so the epoch for a particular Database
-     * instance is immutable.
-     *
-     * Callers of this method must hold the global lock in at least MODE_IS.
-     *
-     * This allows callers which drop and reacquire locks to detect an intervening database close.
-     * For example, closing a database must kill all active queries against the database. This is
-     * implemented by checking that the epoch has not changed during query yield recovery.
-     */
-    virtual uint64_t epoch() const = 0;
 };
 
 }  // namespace mongo

@@ -29,14 +29,17 @@
 
 #pragma once
 
+#include "mongo/db/logical_session_id.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
 
 class BSONObj;
+class MigrationSessionId;
 class OperationContext;
 class Status;
 class Timestamp;
+class UUID;
 
 namespace repl {
 class OpTime;
@@ -71,7 +74,10 @@ public:
      * NOTE: Must be called without any locks and must succeed, before any other methods are called
      * (except for cancelClone and [insert/update/delete]Op).
      */
-    virtual Status startClone(OperationContext* opCtx) = 0;
+    virtual Status startClone(OperationContext* opCtx,
+                              const UUID& migrationId,
+                              const LogicalSessionId& lsid,
+                              TxnNumber txnNumber) = 0;
 
     /**
      * Blocking method, which uses some custom selected logic for deciding whether it is appropriate
@@ -157,15 +163,10 @@ public:
                             const repl::OpTime& preImageOpTime) = 0;
 
     /**
-     * Notifies this cloner that a transaction involving the collection being cloned was prepared or
-     * committed. It is up to the cloner's implementation to decide what to do with this information
-     * and it is valid for the implementation to ignore it.
-     *
-     * NOTE: Must be called with at least IX lock held on the collection.
+     * Returns the migration session id associated with this cloner, so stale sessions can be
+     * disambiguated.
      */
-    virtual void onTransactionPrepareOrUnpreparedCommit(OperationContext* opCtx,
-                                                        const repl::OpTime& opTime) = 0;
-
+    virtual const MigrationSessionId& getSessionId() const = 0;
 
 protected:
     MigrationChunkClonerSource();

@@ -51,8 +51,8 @@ namespace {
 
 constexpr CollatorInterface* kSimpleCollator = nullptr;
 
-using std::unique_ptr;
 using std::string;
+using std::unique_ptr;
 using std::vector;
 
 /**
@@ -197,6 +197,7 @@ void findRelevantTaggedNodePathsAndIndices(MatchExpression* root,
 IndexEntry buildSimpleIndexEntry(const BSONObj& kp) {
     return {kp,
             IndexNames::nameToType(IndexNames::findPluginName(kp)),
+            IndexDescriptor::kLatestIndexVersion,
             false,
             {},
             {},
@@ -1050,17 +1051,18 @@ TEST(QueryPlannerIXSelectTest, NoStringComparisonType) {
     }
 }
 
-// Helper which constructs an IndexEntry and returns it along with an owned ProjectionExecAgg, which
-// is non-null if the requested entry represents a wildcard index and null otherwise. When non-null,
-// it simulates the ProjectionExecAgg that is owned by the $** IndexAccessMethod.
+// Helper which constructs an IndexEntry and returns it along with an owned ProjectionExecutor,
+// which is non-null if the requested entry represents a wildcard index and null otherwise. When
+// non-null, it simulates the ProjectionExecutor that is owned by the $** IndexAccessMethod.
 auto makeIndexEntry(BSONObj keyPattern,
                     MultikeyPaths multiKeyPaths,
                     std::set<FieldRef> multiKeyPathSet = {},
                     BSONObj infoObj = BSONObj()) {
-    auto projExec = (keyPattern.firstElement().fieldNameStringData().endsWith("$**"_sd)
-                         ? WildcardKeyGenerator::createProjectionExec(
-                               keyPattern, infoObj.getObjectField("wildcardProjection"))
-                         : nullptr);
+
+    auto wcProj = keyPattern.firstElement().fieldNameStringData().endsWith("$**"_sd)
+        ? std::make_unique<WildcardProjection>(WildcardKeyGenerator::createProjectionExecutor(
+              keyPattern, infoObj.getObjectField("wildcardProjection")))
+        : std::unique_ptr<WildcardProjection>(nullptr);
 
     auto multiKey = !multiKeyPathSet.empty() ||
         std::any_of(multiKeyPaths.cbegin(), multiKeyPaths.cend(), [](const auto& entry) {
@@ -1068,6 +1070,7 @@ auto makeIndexEntry(BSONObj keyPattern,
         });
     return std::make_pair(IndexEntry(keyPattern,
                                      IndexNames::nameToType(IndexNames::findPluginName(keyPattern)),
+                                     IndexDescriptor::kLatestIndexVersion,
                                      multiKey,
                                      multiKeyPaths,
                                      multiKeyPathSet,
@@ -1077,8 +1080,8 @@ auto makeIndexEntry(BSONObj keyPattern,
                                      nullptr,
                                      {},
                                      nullptr,
-                                     projExec.get()),
-                          std::move(projExec));
+                                     wcProj.get()),
+                          std::move(wcProj));
 }
 
 TEST(QueryPlannerIXSelectTest, InternalExprEqCannotUseMultiKeyIndex) {
@@ -1131,8 +1134,7 @@ TEST(QueryPlannerIXSelectTest, InternalExprEqCanUseHashedIndex) {
 TEST(QueryPlannerIXSelectTest, InternalExprEqCannotUseTextIndexPrefix) {
     auto entry = buildSimpleIndexEntry(BSON("a" << 1 << "_fts"
                                                 << "text"
-                                                << "_ftsx"
-                                                << 1));
+                                                << "_ftsx" << 1));
     std::vector<IndexEntry> indices;
     indices.push_back(entry);
     std::set<size_t> expectedIndices;
@@ -1143,10 +1145,7 @@ TEST(QueryPlannerIXSelectTest, InternalExprEqCannotUseTextIndexPrefix) {
 TEST(QueryPlannerIXSelectTest, InternalExprEqCanUseTextIndexSuffix) {
     auto entry = buildSimpleIndexEntry(BSON("_fts"
                                             << "text"
-                                            << "_ftsx"
-                                            << 1
-                                            << "a"
-                                            << 1));
+                                            << "_ftsx" << 1 << "a" << 1));
     std::vector<IndexEntry> indices;
     indices.push_back(entry);
     std::set<size_t> expectedIndices = {0};
@@ -1196,7 +1195,7 @@ TEST(QueryPlannerIXSelectTest, NotEqualsNullCannotUseDottedMultiKeyIndex) {
 
 TEST(QueryPlannerIXSelectTest, NotEqualsNullCanUseIndexWhichIsMultiKeyOnAnotherPath) {
     auto entry = buildSimpleIndexEntry(BSON("a" << 1 << "mk" << 1));
-    entry.multikeyPaths = {{}, {0}};
+    entry.multikeyPaths = {MultikeyComponents{}, MultikeyComponents{0}};
     std::set<size_t> expectedIndices = {0};
     testRateIndices("{a: {$ne: null}}", "", kSimpleCollator, {entry}, "a,a", expectedIndices);
 }
@@ -1292,6 +1291,42 @@ TEST(QueryPlannerIXSelectTest, HashedIndexShouldNotBeRelevantForNotEqualsNullPre
     entry.type = IndexType::INDEX_HASHED;
     std::set<size_t> expectedIndices = {};
     testRateIndices("{a: {$ne: null}}", "", kSimpleCollator, {entry}, "a,a", expectedIndices);
+}
+
+TEST(QueryPlannerIXSelectTest, HashedSparseIndexShouldNotBeRelevantForExistsFalse) {
+    auto entry = buildSimpleIndexEntry(BSON("a"
+                                            << "hashed"));
+    entry.type = IndexType::INDEX_HASHED;
+    entry.sparse = true;
+    std::set<size_t> expectedIndices = {};
+    testRateIndices("{a: {$exists: false}}", "", kSimpleCollator, {entry}, "a,a", expectedIndices);
+}
+
+TEST(QueryPlannerIXSelectTest, HashedSparseIndexShouldNotBeRelevantForEqualsNull) {
+    auto entry = buildSimpleIndexEntry(BSON("a"
+                                            << "hashed"));
+    entry.type = IndexType::INDEX_HASHED;
+    entry.sparse = true;
+    std::set<size_t> expectedIndices = {};
+    testRateIndices("{a: {$eq: null}}", "", kSimpleCollator, {entry}, "a", expectedIndices);
+}
+
+TEST(QueryPlannerIXSelectTest, HashedNonSparseIndexShouldBeRelevantForExistsFalse) {
+    auto entry = buildSimpleIndexEntry(BSON("a"
+                                            << "hashed"));
+    entry.type = IndexType::INDEX_HASHED;
+    entry.sparse = false;
+    std::set<size_t> expectedIndices = {0};
+    testRateIndices("{a: {$exists: false}}", "", kSimpleCollator, {entry}, "a,a", expectedIndices);
+}
+
+TEST(QueryPlannerIXSelectTest, HashedSparseIndexShouldBeRelevantForExistsTrue) {
+    auto entry = buildSimpleIndexEntry(BSON("a"
+                                            << "hashed"));
+    entry.type = IndexType::INDEX_HASHED;
+    entry.sparse = true;
+    std::set<size_t> expectedIndices = {0};
+    testRateIndices("{a: {$exists: true}}", "", kSimpleCollator, {entry}, "a", expectedIndices);
 }
 
 /*
@@ -1395,7 +1430,7 @@ TEST(QueryPlannerIXSelectTest, ExpandedIndexEntriesAreCorrectlyMarkedAsMultikeyO
 
         if (SimpleBSONObjComparator::kInstance.evaluate(entry.keyPattern == BSON("a.b" << 1))) {
             ASSERT_TRUE(entry.multikey);
-            ASSERT(entry.multikeyPaths[0] == std::set<std::size_t>{0u});
+            ASSERT(entry.multikeyPaths[0] == MultikeyComponents{0u});
         } else {
             ASSERT_BSONOBJ_EQ(entry.keyPattern, BSON("c.d" << 1));
             ASSERT_FALSE(entry.multikey);

@@ -44,9 +44,9 @@ namespace mongo {
  */
 class OrStage final : public PlanStage {
 public:
-    OrStage(OperationContext* opCtx, WorkingSet* ws, bool dedup, const MatchExpression* filter);
+    OrStage(ExpressionContext* expCtx, WorkingSet* ws, bool dedup, const MatchExpression* filter);
 
-    void addChild(PlanStage* child);
+    void addChild(std::unique_ptr<PlanStage> child);
 
     void addChildren(Children childrenToAdd);
 

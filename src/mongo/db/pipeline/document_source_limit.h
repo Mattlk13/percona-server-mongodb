@@ -56,10 +56,10 @@ public:
                 DiskUseRequirement::kNoDiskUse,
                 FacetRequirement::kAllowed,
                 TransactionRequirement::kAllowed,
-                LookupRequirement::kAllowed};
+                LookupRequirement::kAllowed,
+                UnionRequirement::kAllowed};
     }
 
-    GetNextResult getNext() final;
     const char* getSourceName() const final {
         return kStageName.rawData();
     }
@@ -96,6 +96,7 @@ public:
 
 private:
     DocumentSourceLimit(const boost::intrusive_ptr<ExpressionContext>& pExpCtx, long long limit);
+    GetNextResult doGetNext() final;
 
     long long _limit;
     long long _nReturned = 0;

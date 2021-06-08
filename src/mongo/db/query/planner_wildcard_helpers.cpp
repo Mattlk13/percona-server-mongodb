@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -36,9 +36,10 @@
 #include <vector>
 
 #include "mongo/bson/util/builder.h"
+#include "mongo/db/exec/projection_executor_utils.h"
 #include "mongo/db/index/wildcard_key_generator.h"
 #include "mongo/db/query/index_bounds.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 namespace wildcard_planning {
@@ -53,7 +54,7 @@ namespace {
  */
 bool fieldNameOrArrayIndexPathMatches(const FieldRef& fieldNameOrArrayIndexPath,
                                       const FieldRef& staticComparisonPath,
-                                      const std::set<size_t>& multikeyPathComponents) {
+                                      const MultikeyComponents& multikeyPathComponents) {
     // Can't be equal if 'staticComparisonPath' has more parts than 'fieldNameOrArrayIndexPath'.
     if (staticComparisonPath.numParts() > fieldNameOrArrayIndexPath.numParts()) {
         return false;
@@ -81,7 +82,7 @@ bool fieldNameOrArrayIndexPathMatches(const FieldRef& fieldNameOrArrayIndexPath,
  * matches 'pathToLookup' when the latter's array indices are ignored.
  */
 bool fieldNameOrArrayIndexPathSetContains(const std::set<FieldRef>& multikeyPathSet,
-                                          const std::set<std::size_t>& multikeyPathComponents,
+                                          const MultikeyComponents& multikeyPathComponents,
                                           const FieldRef& pathToLookup) {
     // Fast-path check for an exact match. If there is no exact match and 'pathToLookup' has no
     // numeric path components, then 'multikeyPathSet' does not contain the path.
@@ -106,7 +107,7 @@ bool fieldNameOrArrayIndexPathSetContains(const std::set<FieldRef>& multikeyPath
  * prefix of the full path used to generate 'multikeyPaths', and so we must avoid checking path
  * components beyond the end of 'queryPath'.
  */
-std::vector<size_t> findArrayIndexPathComponents(const std::set<std::size_t>& multikeyPaths,
+std::vector<size_t> findArrayIndexPathComponents(const MultikeyComponents& multikeyPaths,
                                                  const FieldRef& queryPath) {
     std::vector<size_t> arrayIndices;
     for (auto i : multikeyPaths) {
@@ -143,7 +144,7 @@ FieldRef pathWithoutSpecifiedComponents(const FieldRef& path,
 MultikeyPaths buildMultiKeyPathsForExpandedWildcardIndexEntry(
     const FieldRef& indexedPath, const std::set<FieldRef>& multikeyPathSet) {
     FieldRef pathToLookup;
-    std::set<std::size_t> multikeyPaths;
+    MultikeyComponents multikeyPaths;
     for (size_t i = 0; i < indexedPath.numParts(); ++i) {
         pathToLookup.appendPart(indexedPath.getPart(i));
         if (fieldNameOrArrayIndexPathSetContains(multikeyPathSet, multikeyPaths, pathToLookup)) {
@@ -153,7 +154,7 @@ MultikeyPaths buildMultiKeyPathsForExpandedWildcardIndexEntry(
     return {multikeyPaths};
 }
 
-std::set<FieldRef> generateFieldNameOrArrayIndexPathSet(const std::set<std::size_t>& multikeyPaths,
+std::set<FieldRef> generateFieldNameOrArrayIndexPathSet(const MultikeyComponents& multikeyPaths,
                                                         const FieldRef& queryPath,
                                                         bool requiresSubpathBounds) {
     // We iterate over the power set of array index positions to generate all necessary paths.
@@ -208,11 +209,13 @@ std::set<FieldRef> generateFieldNameOrArrayIndexPathSet(const std::set<std::size
 
 /**
  * Returns false if 'queryPath' includes any numerical path components which render it unanswerable
- * by the $** index, true otherwise. Specifically, the $** index cannot answer the query if either
+ * by the $** index, true otherwise. Specifically, the $** index cannot answer the query if any
  * of the following scenarios occur:
  *
  * - The query path traverses through more than 'kWildcardMaxArrayIndexTraversalDepth' nested arrays
  * via explicit array indices.
+ * - The query path has multiple successive positional components that come immediately after a
+ *   multikey path component.
  * - The query path lies along a $** projection through an array index.
  *
  * For an example of the latter case, say that our query path is 'a.0.b', our projection includes
@@ -242,11 +245,39 @@ bool validateNumericPathComponents(const MultikeyPaths& multikeyPaths,
     // all paths with and without array indices. Because this is O(2^n), we decline to answer
     // queries that traverse more than 8 levels of array indices.
     if (arrayIndices.size() > kWildcardMaxArrayIndexTraversalDepth) {
-        LOG(2) << "Declining to answer query on field '" << queryPath.dottedField()
-               << "' with $** index, as it traverses through more than "
-               << kWildcardMaxArrayIndexTraversalDepth << " nested array indices.";
+        LOGV2_DEBUG(20955,
+                    2,
+                    "Declining to answer query on a field with $** index, as it traverses through "
+                    "more than the maximum permitted depth of nested array indices",
+                    "field"_attr = queryPath.dottedField(),
+                    "maxNestedArrayIndices"_attr = kWildcardMaxArrayIndexTraversalDepth);
         return false;
     }
+
+    // Prevent the query from attempting to use a wildcard index if there are multiple successive
+    // positional path components that follow a multikey path component. For example, the path
+    // "a.0.1" cannot use a wildcard index if "a" is multikey.
+    //
+    // This restriction stems from the fact that wildcard indices do not recursively index nested
+    // arrays. The document {a: [[3, 4]]}, for instance, will have a single index key containing
+    // the array [3, 4] rather than individual index keys for 3 and 4. If "a" is known to be
+    // multikey, then a user could issue a query like {"a.0.1": {$eq: 4}} to attempt to match by
+    // position within a nested array. The access planner is not able to generate useful bounds for
+    // such positional queries over nested arrays.
+    //
+    // We have already found all positional path components that are immediately preceded by a
+    // multikey path component. All that remains is to bail out if any of these positional path
+    // components are followed by another positional component.
+    for (auto&& positionalComponentIndex : arrayIndices) {
+        auto adjacentIndex = positionalComponentIndex + 1;
+        if (adjacentIndex < queryPath.numParts() &&
+            queryPath.isNumericPathComponentStrict(adjacentIndex)) {
+            // There are two adjacent positional components, so this query might need to match by
+            // position in a nested array. The query cannot be answered using a wildcard index.
+            return false;
+        }
+    }
+
     // If 'includedPaths' is empty, then either the $** projection is an exclusion, or no explicit
     // projection was provided. In either case, it is not possible for the query path to lie along
     // an array index projection, and so we are safe to proceed with planning.
@@ -328,13 +359,15 @@ void expandWildcardIndexEntry(const IndexEntry& wildcardIndex,
     invariant(wildcardIndex.multikeyPaths.empty());
 
     // Obtain the projection executor from the parent wildcard IndexEntry.
-    const auto* projExec = wildcardIndex.wildcardProjection;
-    invariant(projExec);
+    auto* wildcardProjection = wildcardIndex.wildcardProjection;
+    invariant(wildcardProjection);
 
-    const auto projectedFields = projExec->applyProjectionToFields(fields);
+    const auto projectedFields =
+        projection_executor_utils::applyProjectionToFields(wildcardProjection->exec(), fields);
 
-    const auto& includedPaths = projExec->getExhaustivePaths();
-
+    const static auto kEmptySet = std::set<FieldRef>{};
+    const auto& includedPaths =
+        wildcardProjection->exhaustivePaths() ? *wildcardProjection->exhaustivePaths() : kEmptySet;
     out->reserve(out->size() + projectedFields.size());
     for (auto&& fieldName : projectedFields) {
         // Convert string 'fieldName' into a FieldRef, to better facilitate the subsequent checks.
@@ -364,6 +397,7 @@ void expandWildcardIndexEntry(const IndexEntry& wildcardIndex,
 
         IndexEntry entry(BSON(fieldName << wildcardIndex.keyPattern.firstElement()),
                          IndexType::INDEX_WILDCARD,
+                         IndexDescriptor::kLatestIndexVersion,
                          isMultikey,
                          std::move(multikeyPaths),
                          // Expanded index entries always use the fixed-size multikey paths
@@ -431,7 +465,7 @@ void finalizeWildcardIndexScanConfiguration(IndexScanNode* scan) {
     // field in each key is 'path.to.field'. We push a new entry into the bounds vector for the
     // leading '$_path' bound here. We also push corresponding fields into the IndexScanNode's
     // keyPattern and its multikeyPaths vector.
-    index->multikeyPaths.insert(index->multikeyPaths.begin(), std::set<std::size_t>{});
+    index->multikeyPaths.insert(index->multikeyPaths.begin(), MultikeyComponents{});
     bounds->fields.insert(bounds->fields.begin(), {"$_path"});
     index->keyPattern =
         BSON("$_path" << index->keyPattern.firstElement() << index->keyPattern.firstElement());

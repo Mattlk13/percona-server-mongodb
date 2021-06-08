@@ -27,8 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
-
 #include <vector>
 
 #include "mongo/base/init.h"
@@ -37,8 +35,8 @@
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/test_commands_enabled.h"
-#include "mongo/util/fail_point_service.h"
-#include "mongo/util/log.h"
+#include "mongo/s/request_types/wait_for_fail_point_gen.h"
+#include "mongo/util/fail_point.h"
 
 namespace mongo {
 
@@ -48,19 +46,24 @@ namespace mongo {
  * Format
  * {
  *    configureFailPoint: <string>, // name of the fail point.
- *    mode: <string|Object>, // the new mode to set. Can have one of the
- *        following format:
  *
- *        1. 'off' - disable fail point.
- *        2. 'alwaysOn' - fail point is always active.
- *        3. { activationProbability: <n> } - n should be a double between 0 and 1,
- *           representing the probability that the fail point will fire.  0 means never,
- *           1 means (nearly) always.
- *        4. { times: <n> } - n should be positive and within the range of a 32 bit
- *            signed integer and this is the number of passes on the fail point will
- *            remain activated.
+ *    mode: <string|Object>, // the new mode to set. Can have one of the following format:
  *
- *    data: <Object> // optional arbitrary object to store.
+ *        - 'off' - disable fail point.
+ *
+ *        - 'alwaysOn' - fail point is always active.
+ *
+ *        - { activationProbability: <n> } - double n. [0 <= n <= 1]
+ *          n: the probability that the fail point will fire.  0=never, 1=always.
+ *
+ *        - { times: <n> } - int32 n. n > 0. n: # of passes the fail point remains active.
+ *
+ *        - { skip: <n> } - int32 n. n > 0. n: # of passes before the fail point activates
+ *          and remains active.
+ *
+ *    data: <Object> // optional arbitrary object to inject into the failpoint.
+ *        When activated, the FailPoint can read this data and it can be used to inform
+ *        the specific action taken by the code under test.
  * }
  */
 class FaultInjectCmd : public BasicCommand {
@@ -97,10 +100,68 @@ public:
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
         const std::string failPointName(cmdObj.firstElement().str());
-        setGlobalFailPoint(failPointName, cmdObj);
-
+        const auto timesEntered = setGlobalFailPoint(failPointName, cmdObj);
+        result.appendNumber("count", timesEntered);
         return true;
     }
 };
+
+/**
+ * Command for waiting for installed fail points.
+ *
+ * For number of additional times entered > 1, this command is only guaranteed to work
+ * correctly if the code that enters the fail point uses the FailPoint API correctly.
+ * That is, the code can only use one of shouldFail, pauseWhileSet, scopedIf, scoped,
+ * executeIf, and execute to enter the fail point (as all of these functions have side
+ * effects on the counter for times entered).
+ */
+class WaitForFailPointCommand : public TypedCommand<WaitForFailPointCommand> {
+public:
+    using Request = WaitForFailPoint;
+    class Invocation final : public InvocationBase {
+    public:
+        using InvocationBase::InvocationBase;
+
+        void typedRun(OperationContext* opCtx) {
+            const std::string failPointName = request().getCommandParameter().toString();
+            FailPoint* failPoint = globalFailPointRegistry().find(failPointName);
+            if (failPoint == nullptr)
+                uasserted(ErrorCodes::FailPointSetFailed, failPointName + " not found");
+            failPoint->waitForTimesEntered(opCtx, request().getTimesEntered());
+        }
+
+    private:
+        bool supportsWriteConcern() const override {
+            return false;
+        }
+
+        // The command parameter happens to be string so it's historically been interpreted
+        // by parseNs as a collection. Continuing to do so here for unexamined compatibility.
+        NamespaceString ns() const override {
+            return NamespaceString(request().getDbName(), "");
+        }
+
+        // No auth needed because it only works when enabled via command line.
+        void doCheckAuthorization(OperationContext* opCtx) const override {}
+    };
+
+    std::string help() const override {
+        return "wait for a fail point to be entered a certain number of times";
+    }
+
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kAlways;
+    }
+
+    bool adminOnly() const override {
+        return true;
+    }
+
+    bool requiresAuth() const override {
+        return false;
+    }
+
+} WaitForFailPointCmd;
+
 MONGO_REGISTER_TEST_COMMAND(FaultInjectCmd);
-}
+}  // namespace mongo

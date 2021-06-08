@@ -32,8 +32,6 @@ Copyright (C) 2018-present Percona and/or its affiliates. All rights reserved.
     it in the license file.
 ======= */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kAccessControl
-
 #include <boost/filesystem/path.hpp>
 
 #include "mongo/base/status.h"
@@ -41,7 +39,6 @@ Copyright (C) 2018-present Percona and/or its affiliates. All rights reserved.
 #include "mongo/db/server_options.h"
 #include "mongo/db/json.h"
 #include "mongo/util/file.h"
-#include "mongo/util/log.h"
 #include "mongo/util/options_parser/startup_option_init.h"
 #include "mongo/util/options_parser/startup_options.h"
 
@@ -113,11 +110,11 @@ namespace mongo {
     }
 
     MONGO_MODULE_STARTUP_OPTIONS_REGISTER(AuditOptions)(InitializerContext* context) {
-        return addAuditOptions(&optionenvironment::startupOptions);
+        uassertStatusOK(addAuditOptions(&optionenvironment::startupOptions));
     }
 
     MONGO_STARTUP_OPTIONS_STORE(AuditOptions)(InitializerContext* context) {
-        return storeAuditOptions(optionenvironment::startupOptionsParsed);
+        uassertStatusOK(storeAuditOptions(optionenvironment::startupOptionsParsed));
     }
 
     // Can't use MONGO_STARTUP_OPTIONS_VALIDATE here as we need serverGlobalParams
@@ -129,9 +126,10 @@ namespace mongo {
             File auditFile;
             auditFile.open(auditOptions.path.c_str(), false, false);
             if (auditFile.bad()) {
-                return Status(ErrorCodes::BadValue,
-                              "Could not open a file for writing at the given auditPath: " +
-                                  auditOptions.path);
+                uassertStatusOK(
+                    Status(ErrorCodes::BadValue,
+                           "Could not open a file for writing at the given auditPath: " +
+                               auditOptions.path));
             }
         } else if (!serverGlobalParams.logWithSyslog && !serverGlobalParams.logpath.empty()) {
             auditOptions.path = (boost::filesystem::path(serverGlobalParams.logpath).parent_path() /
@@ -141,6 +139,5 @@ namespace mongo {
             auditOptions.path =
                 (boost::filesystem::path(serverGlobalParams.cwd) / "auditLog.json").native();
         }
-        return Status::OK();
     }
 } // namespace mongo

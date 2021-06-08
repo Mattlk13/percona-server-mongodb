@@ -27,6 +27,8 @@
  *    it in the license file.
  */
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
 #include "mongo/platform/basic.h"
 
 #include <fstream>
@@ -39,6 +41,7 @@
 #include "mongo/db/service_context_test_fixture.h"
 #include "mongo/unittest/unittest.h"
 
+#include "mongo/logv2/log.h"
 #include <boost/filesystem/operations.hpp>
 #include <boost/optional.hpp>
 #include <boost/optional/optional_io.hpp>
@@ -84,11 +87,15 @@ void compareOptions(size_t lineNumber,
 
     for (std::size_t i = 0; i < std::min(options.size(), expectedOptions.size()); ++i) {
         if (options[i] != expectedOptions[i]) {
-            unittest::log() << "Option: \"tolower(" << options[i].first.original()
-                            << ")=" << options[i].second << "\" doesn't equal: \"tolower("
-                            << expectedOptions[i].first.original()
-                            << ")=" << expectedOptions[i].second << "\""
-                            << " data on line: " << lineNumber << std::endl;
+            LOGV2(20152,
+                  "Option: \"tolower({key})={value}\" doesn't equal: "
+                  "\"tolower({expectedKey})={expectedValue}\" data on line: {lineNumber}",
+                  "Option key-value pair doesn't equal expected pair",
+                  "key"_attr = options[i].first.original(),
+                  "value"_attr = options[i].second,
+                  "expectedKey"_attr = expectedOptions[i].first.original(),
+                  "expectedValue"_attr = expectedOptions[i].second,
+                  "lineNumber"_attr = lineNumber);
             std::cerr << "Failing URI: \"" << uri << "\""
                       << " data on line: " << lineNumber << std::endl;
             ASSERT(false);
@@ -98,8 +105,8 @@ void compareOptions(size_t lineNumber,
                                                       << " data on line: " << lineNumber << uri;
 }
 
-const ConnectionString::ConnectionType kMaster = ConnectionString::MASTER;
-const ConnectionString::ConnectionType kSet = ConnectionString::SET;
+const ConnectionString::ConnectionType kMaster = ConnectionString::ConnectionType::kStandalone;
+const ConnectionString::ConnectionType kReplicaSet = ConnectionString::ConnectionType::kReplicaSet;
 
 const URITestCase validCases[] = {
 
@@ -148,7 +155,7 @@ const URITestCase validCases[] = {
     {"mongodb://user:pwd@127.0.0.1,127.0.0.2/dbname?a=b&replicaSet=replName",
      "user",
      "pwd",
-     kSet,
+     kReplicaSet,
      "replName",
      2,
      {{"a", "b"}, {"replicaSet", "replName"}},
@@ -159,7 +166,7 @@ const URITestCase validCases[] = {
      "dbname?a=b&replicaSet=replName",
      "needs encoding%#!<>",
      "pwd",
-     kSet,
+     kReplicaSet,
      "replName",
      2,
      {{"a", "b"}, {"replicaSet", "replName"}},
@@ -170,7 +177,7 @@ const URITestCase validCases[] = {
      "db@name?a=b&replicaSet=replName",
      "needs encoding%#!<>",
      "pwd",
-     kSet,
+     kReplicaSet,
      "replName",
      2,
      {{"a", "b"}, {"replicaSet", "replName"}},
@@ -181,7 +188,7 @@ const URITestCase validCases[] = {
      "dbname?a=b&replicaSet=replName",
      "user",
      "needs encoding%#!<>",
-     kSet,
+     kReplicaSet,
      "replName",
      2,
      {{"a", "b"}, {"replicaSet", "replName"}},
@@ -191,7 +198,7 @@ const URITestCase validCases[] = {
     {"mongodb://user:pwd@127.0.0.1,127.0.0.2/dbname?a=b&replicaSet=needs%20encoding%25%23!%3C%3E",
      "user",
      "pwd",
-     kSet,
+     kReplicaSet,
      "needs encoding%#!<>",
      2,
      {{"a", "b"}, {"replicaSet", "needs encoding%#!<>"}},
@@ -201,7 +208,7 @@ const URITestCase validCases[] = {
     {"mongodb://user:pwd@127.0.0.1,127.0.0.2/needsencoding%40hello?a=b&replicaSet=replName",
      "user",
      "pwd",
-     kSet,
+     kReplicaSet,
      "replName",
      2,
      {{"a", "b"}, {"replicaSet", "replName"}},
@@ -211,7 +218,7 @@ const URITestCase validCases[] = {
     {"mongodb://user:pwd@127.0.0.1,127.0.0.2/?replicaSet=replName",
      "user",
      "pwd",
-     kSet,
+     kReplicaSet,
      "replName",
      2,
      {{"replicaSet", "replName"}},
@@ -221,7 +228,7 @@ const URITestCase validCases[] = {
     {"mongodb://user@127.0.0.1,127.0.0.2/?replicaSet=replName",
      "user",
      "",
-     kSet,
+     kReplicaSet,
      "replName",
      2,
      {{"replicaSet", "replName"}},
@@ -231,7 +238,7 @@ const URITestCase validCases[] = {
     {"mongodb://user@127.0.0.1,127.0.0.2/?replicaset=replName",
      "user",
      "",
-     kSet,
+     kReplicaSet,
      "replName",
      2,
      {{"replicaSet", "replName"}},
@@ -241,7 +248,7 @@ const URITestCase validCases[] = {
     {"mongodb://127.0.0.1,127.0.0.2/dbName?foo=a&c=b&replicaSet=replName",
      "",
      "",
-     kSet,
+     kReplicaSet,
      "replName",
      2,
      {{"foo", "a"}, {"c", "b"}, {"replicaSet", "replName"}},
@@ -251,7 +258,7 @@ const URITestCase validCases[] = {
     {"mongodb://user:pwd@127.0.0.1:1234,127.0.0.2:1234/?replicaSet=replName",
      "user",
      "pwd",
-     kSet,
+     kReplicaSet,
      "replName",
      2,
      {{"replicaSet", "replName"}},
@@ -261,7 +268,7 @@ const URITestCase validCases[] = {
     {"mongodb://user@127.0.0.1:1234,127.0.0.2:1234/?replicaSet=replName",
      "user",
      "",
-     kSet,
+     kReplicaSet,
      "replName",
      2,
      {{"replicaSet", "replName"}},
@@ -271,7 +278,7 @@ const URITestCase validCases[] = {
     {"mongodb://127.0.0.1:1234,127.0.0.1:1234/dbName?foo=a&c=b&replicaSet=replName",
      "",
      "",
-     kSet,
+     kReplicaSet,
      "replName",
      2,
      {{"foo", "a"}, {"c", "b"}, {"replicaSet", "replName"}},
@@ -309,7 +316,7 @@ const URITestCase validCases[] = {
     {"mongodb://user:pwd@[::1],127.0.0.2/?replicaSet=replName",
      "user",
      "pwd",
-     kSet,
+     kReplicaSet,
      "replName",
      2,
      {{"replicaSet", "replName"}},
@@ -319,7 +326,7 @@ const URITestCase validCases[] = {
     {"mongodb://user@[::1],127.0.0.2/?replicaSet=replName",
      "user",
      "",
-     kSet,
+     kReplicaSet,
      "replName",
      2,
      {{"replicaSet", "replName"}},
@@ -329,7 +336,7 @@ const URITestCase validCases[] = {
     {"mongodb://[::1],127.0.0.2/dbName?foo=a&c=b&replicaSet=replName",
      "",
      "",
-     kSet,
+     kReplicaSet,
      "replName",
      2,
      {{"foo", "a"}, {"c", "b"}, {"replicaSet", "replName"}},
@@ -339,7 +346,7 @@ const URITestCase validCases[] = {
     {"mongodb://user:pwd@[::1]:1234,127.0.0.2:1234/?replicaSet=replName",
      "user",
      "pwd",
-     kSet,
+     kReplicaSet,
      "replName",
      2,
      {{"replicaSet", "replName"}},
@@ -349,7 +356,7 @@ const URITestCase validCases[] = {
     {"mongodb://user@[::1]:1234,127.0.0.2:1234/?replicaSet=replName",
      "user",
      "",
-     kSet,
+     kReplicaSet,
      "replName",
      2,
      {{"replicaSet", "replName"}},
@@ -359,7 +366,7 @@ const URITestCase validCases[] = {
     {"mongodb://[::1]:1234,[::1]:1234/dbName?foo=a&c=b&replicaSet=replName",
      "",
      "",
-     kSet,
+     kReplicaSet,
      "replName",
      2,
      {{"foo", "a"}, {"c", "b"}, {"replicaSet", "replName"}},
@@ -397,7 +404,7 @@ const URITestCase validCases[] = {
     {"mongodb://user:pwd@[::1],127.0.0.2/?replicaSet=replName",
      "user",
      "pwd",
-     kSet,
+     kReplicaSet,
      "replName",
      2,
      {{"replicaSet", "replName"}},
@@ -407,7 +414,7 @@ const URITestCase validCases[] = {
     {"mongodb://user@[::1],127.0.0.2/?replicaSet=replName",
      "user",
      "",
-     kSet,
+     kReplicaSet,
      "replName",
      2,
      {{"replicaSet", "replName"}},
@@ -417,7 +424,7 @@ const URITestCase validCases[] = {
     {"mongodb://[::1],127.0.0.2/dbName?foo=a&c=b&replicaSet=replName",
      "",
      "",
-     kSet,
+     kReplicaSet,
      "replName",
      2,
      {{"foo", "a"}, {"c", "b"}, {"replicaSet", "replName"}},
@@ -427,7 +434,7 @@ const URITestCase validCases[] = {
     {"mongodb://user:pwd@[::1]:1234,127.0.0.2:1234/?replicaSet=replName",
      "user",
      "pwd",
-     kSet,
+     kReplicaSet,
      "replName",
      2,
      {{"replicaSet", "replName"}},
@@ -437,7 +444,7 @@ const URITestCase validCases[] = {
     {"mongodb://user@[::1]:1234,127.0.0.2:1234/?replicaSet=replName",
      "user",
      "",
-     kSet,
+     kReplicaSet,
      "replName",
      2,
      {{"replicaSet", "replName"}},
@@ -447,7 +454,7 @@ const URITestCase validCases[] = {
     {"mongodb://[::1]:1234,[::1]:1234/dbName?foo=a&c=b&replicaSet=replName",
      "",
      "",
-     kSet,
+     kReplicaSet,
      "replName",
      2,
      {{"foo", "a"}, {"c", "b"}, {"replicaSet", "replName"}},
@@ -479,7 +486,7 @@ const URITestCase validCases[] = {
     {"mongodb://%2Ftmp%2Fmongodb-27017.sock,%2Ftmp%2Fmongodb-27018.sock/?replicaSet=replName",
      "",
      "",
-     kSet,
+     kReplicaSet,
      "replName",
      2,
      {{"replicaSet", "replName"}},
@@ -575,7 +582,7 @@ BSONObj getBsonFromJsonFile(std::string fileName) {
     std::ifstream infile(filename.c_str());
     std::string data((std::istreambuf_iterator<char>(infile)), std::istreambuf_iterator<char>());
     BSONObj obj = fromjson(data);
-    ASSERT_TRUE(obj.valid(BSONVersion::kLatest));
+    ASSERT_TRUE(obj.valid());
     ASSERT_TRUE(obj.hasField("tests"));
     BSONObj arr = obj.getField("tests").embeddedObject().getOwned();
     ASSERT_TRUE(arr.couldBeArray());
@@ -594,7 +601,7 @@ std::string returnStringFromElementOrNull(BSONElement element) {
 
 // Helper method to take a valid test case, parse() it, and assure the output is correct
 void testValidURIFormat(URITestCase testCase) {
-    unittest::log() << "Testing URI: " << testCase.URI << '\n';
+    LOGV2(20153, "Testing URI: {mongoUri}", "Testing URI", "mongoUri"_attr = testCase.URI);
     std::string errMsg;
     const auto cs_status = MongoURI::parse(testCase.URI);
     ASSERT_OK(cs_status);
@@ -602,7 +609,7 @@ void testValidURIFormat(URITestCase testCase) {
     ASSERT_EQ(testCase.uname, result.getUser());
     ASSERT_EQ(testCase.password, result.getPassword());
     ASSERT_EQ(testCase.type, result.type());
-    ASSERT_EQ(testCase.setname, result.getSetName());
+    ASSERT_EQ(testCase.setname, result.getReplicaSetName());
     ASSERT_EQ(testCase.numservers, result.getServers().size());
     compareOptions(0, testCase.URI, result.getOptions(), testCase.options);
     ASSERT_EQ(testCase.database, result.getDatabase());
@@ -622,7 +629,7 @@ TEST(MongoURI, InvalidURIs) {
 
     for (size_t i = 0; i != numCases; ++i) {
         const InvalidURITestCase testCase = invalidCases[i];
-        unittest::log() << "Testing URI: " << testCase.URI << '\n';
+        LOGV2(20154, "Testing URI: {mongoUri}", "Testing URI", "mongoUri"_attr = testCase.URI);
         auto cs_status = MongoURI::parse(testCase.URI);
         ASSERT_NOT_OK(cs_status);
         if (testCase.code) {
@@ -650,17 +657,17 @@ TEST(MongoURI, CloneURIForServer) {
     ASSERT_OK(sw_uri.getStatus());
 
     auto uri = sw_uri.getValue();
-    ASSERT_EQ(uri.type(), kSet);
-    ASSERT_EQ(uri.getSetName(), "rs1");
+    ASSERT_EQ(uri.type(), kReplicaSet);
+    ASSERT_EQ(uri.getReplicaSetName(), "rs1");
     ASSERT_EQ(uri.getServers().size(), static_cast<std::size_t>(3));
 
     auto& uriOptions = uri.getOptions();
     ASSERT_EQ(uriOptions.at("ssl"), "true");
 
-    auto clonedURI = uri.cloneURIForServer(HostAndPort{"localhost:27020"});
+    auto clonedURI = uri.cloneURIForServer(HostAndPort{"localhost:27020"}, StringData());
 
     ASSERT_EQ(clonedURI.type(), kMaster);
-    ASSERT_TRUE(clonedURI.getSetName().empty());
+    ASSERT_TRUE(clonedURI.getReplicaSetName().empty());
     ASSERT_EQ(clonedURI.getServers().size(), static_cast<std::size_t>(1));
     auto& clonedURIOptions = clonedURI.getOptions();
     ASSERT_EQ(clonedURIOptions.at("ssl"), "true");
@@ -704,7 +711,10 @@ TEST(MongoURI, specTests) {
             if (!valid) {
                 // This uri string is invalid --> parse the uri and ensure it fails
                 const InvalidURITestCase testCase = InvalidURITestCase{uri};
-                unittest::log() << "Testing URI: " << testCase.URI << '\n';
+                LOGV2(20155,
+                      "Testing URI: {mongoUri}",
+                      "Testing URI",
+                      "mongoUri"_attr = testCase.URI);
                 auto cs_status = MongoURI::parse(testCase.URI);
                 ASSERT_NOT_OK(cs_status);
             } else {
@@ -744,7 +754,7 @@ TEST(MongoURI, specTests) {
                     if (!replsetElement.eoo()) {
                         ASSERT_EQ(replsetElement.type(), String);
                         setName = replsetElement.String();
-                        connectionType = kSet;
+                        connectionType = kReplicaSet;
                     }
 
                     for (auto&& field : optionsElement.Obj()) {
@@ -828,7 +838,8 @@ TEST(MongoURI, srvRecordTest) {
              {"localhost.sub.test.build.10gen.cc", 27017},
          },
          {
-             {"ssl", "true"}, {"replicaSet", "repl0"},
+             {"ssl", "true"},
+             {"replicaSet", "repl0"},
          },
          success},
 
@@ -842,7 +853,8 @@ TEST(MongoURI, srvRecordTest) {
              {"localhost.sub.test.build.10gen.cc", 27017},
          },
          {
-             {"ssl", "true"}, {"replicaSet", "repl0"},
+             {"ssl", "true"},
+             {"replicaSet", "repl0"},
          },
          success},
 
@@ -988,19 +1000,19 @@ TEST(MongoURI, srvRecordTest) {
     for (const auto& test : tests) {
         auto rs = MongoURI::parse(test.uri);
         if (test.expectation == failure) {
-            ASSERT_FALSE(rs.getStatus().isOK()) << "Failing URI: " << test.uri
-                                                << " data on line: " << test.lineNumber;
+            ASSERT_FALSE(rs.getStatus().isOK())
+                << "Failing URI: " << test.uri << " data on line: " << test.lineNumber;
             continue;
         }
         ASSERT_OK(rs.getStatus()) << "Failed on URI: " << test.uri
                                   << " data on line: " << test.lineNumber;
         auto rv = rs.getValue();
-        ASSERT_EQ(rv.getUser(), test.user) << "Failed on URI: " << test.uri
-                                           << " data on line: " << test.lineNumber;
-        ASSERT_EQ(rv.getPassword(), test.password) << "Failed on URI: " << test.uri
-                                                   << " data on line : " << test.lineNumber;
-        ASSERT_EQ(rv.getDatabase(), test.database) << "Failed on URI: " << test.uri
-                                                   << " data on line : " << test.lineNumber;
+        ASSERT_EQ(rv.getUser(), test.user)
+            << "Failed on URI: " << test.uri << " data on line: " << test.lineNumber;
+        ASSERT_EQ(rv.getPassword(), test.password)
+            << "Failed on URI: " << test.uri << " data on line : " << test.lineNumber;
+        ASSERT_EQ(rv.getDatabase(), test.database)
+            << "Failed on URI: " << test.uri << " data on line : " << test.lineNumber;
         compareOptions(test.lineNumber, test.uri, rv.getOptions(), test.options);
 
         std::vector<HostAndPort> hosts(begin(rv.getServers()), end(rv.getServers()));
@@ -1009,9 +1021,9 @@ TEST(MongoURI, srvRecordTest) {
         std::sort(begin(expectedHosts), end(expectedHosts));
 
         for (std::size_t i = 0; i < std::min(hosts.size(), expectedHosts.size()); ++i) {
-            ASSERT_EQ(hosts[i], expectedHosts[i]) << "Failed on URI: " << test.uri
-                                                  << " at host number" << i
-                                                  << " data on line: " << test.lineNumber;
+            ASSERT_EQ(hosts[i], expectedHosts[i])
+                << "Failed on URI: " << test.uri << " at host number" << i
+                << " data on line: " << test.lineNumber;
         }
         ASSERT_TRUE(hosts.size() == expectedHosts.size())
             << "Failed on URI: " << test.uri << " Found " << hosts.size() << " hosts, expected "

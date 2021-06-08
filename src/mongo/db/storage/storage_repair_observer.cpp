@@ -27,10 +27,11 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/db/storage/storage_repair_observer.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
 
@@ -46,10 +47,11 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/storage/control/journal_flusher.h"
 #include "mongo/db/storage/storage_file_util.h"
 #include "mongo/db/storage/storage_options.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/file.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -88,9 +90,14 @@ void StorageRepairObserver::onRepairStarted() {
     _repairState = RepairState::kIncomplete;
 }
 
-void StorageRepairObserver::onModification(const std::string& description) {
+void StorageRepairObserver::benignModification(const std::string& description) {
     invariant(_repairState == RepairState::kIncomplete);
-    _modifications.emplace_back(description);
+    _modifications.emplace_back(Modification::benign(description));
+}
+
+void StorageRepairObserver::invalidatingModification(const std::string& description) {
+    invariant(_repairState == RepairState::kIncomplete);
+    _modifications.emplace_back(Modification::invalidating(description));
 }
 
 void StorageRepairObserver::onRepairDone(OperationContext* opCtx) {
@@ -98,7 +105,7 @@ void StorageRepairObserver::onRepairDone(OperationContext* opCtx) {
 
     // This ordering is important. The incomplete file should only be removed once the
     // replica set configuration has been invalidated successfully.
-    if (!_modifications.empty()) {
+    if (isDataInvalidated()) {
         _invalidateReplConfigIfNeeded(opCtx);
     }
     _removeRepairIncompleteFile();
@@ -106,13 +113,22 @@ void StorageRepairObserver::onRepairDone(OperationContext* opCtx) {
     _repairState = RepairState::kDone;
 }
 
+bool StorageRepairObserver::isDataInvalidated() const {
+    invariant(_repairState == RepairState::kIncomplete || _repairState == RepairState::kDone);
+    return std::any_of(_modifications.begin(), _modifications.end(), [](Modification mod) -> bool {
+        return mod.isInvalidating();
+    });
+}
+
 void StorageRepairObserver::_touchRepairIncompleteFile() {
     boost::filesystem::ofstream fileStream(_repairIncompleteFilePath);
     fileStream << "This file indicates that a repair operation is in progress or incomplete.";
     if (fileStream.fail()) {
-        severe() << "Failed to write to file " << _repairIncompleteFilePath.string() << ": "
-                 << errnoWithDescription();
-        fassertFailedNoTrace(50920);
+        LOGV2_FATAL_NOTRACE(50920,
+                            "Failed to write to file {file}: {error}",
+                            "Failed to write to file",
+                            "file"_attr = _repairIncompleteFilePath.generic_string(),
+                            "error"_attr = errnoWithDescription());
     }
     fileStream.close();
 
@@ -125,9 +141,11 @@ void StorageRepairObserver::_removeRepairIncompleteFile() {
     boost::filesystem::remove(_repairIncompleteFilePath, ec);
 
     if (ec) {
-        severe() << "Failed to remove file " << _repairIncompleteFilePath.string() << ": "
-                 << ec.message();
-        fassertFailedNoTrace(50921);
+        LOGV2_FATAL_NOTRACE(50921,
+                            "Failed to remove file {file}: {error}",
+                            "Failed to remove file",
+                            "file"_attr = _repairIncompleteFilePath.generic_string(),
+                            "error"_attr = ec.message());
     }
     fassertNoTrace(50927, fsyncParentDirectory(_repairIncompleteFilePath));
 }
@@ -148,7 +166,7 @@ void StorageRepairObserver::_invalidateReplConfigIfNeeded(OperationContext* opCt
     configBuilder.append(repl::ReplSetConfig::kRepairedFieldName, true);
     Helpers::putSingleton(opCtx, kConfigNss.ns().c_str(), configBuilder.obj());
 
-    opCtx->recoveryUnit()->waitUntilDurable();
+    JournalFlusher::get(opCtx)->waitForJournalFlush();
 }
 
 }  // namespace mongo

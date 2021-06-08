@@ -4,6 +4,7 @@
 // operation on a mongos may be active when it happens.  All operations should handle gracefully.
 //
 
+(function() {
 var st = new ShardingTest({shards: 2, mongos: 5, verbose: 1});
 // Balancer is by default stopped, thus it will not interfere
 
@@ -32,7 +33,7 @@ assert.commandWorked(admin.runCommand({enableSharding: coll.getDB() + ""}));
 st.ensurePrimaryShard(coll.getDB().getName(), st.shard1.shardName);
 assert.commandWorked(admin.runCommand({shardCollection: coll + "", key: {_id: 1}}));
 
-assert.writeOK(coll.insert({hello: "world"}));
+assert.commandWorked(coll.insert({hello: "world"}));
 
 jsTest.log("Sharding collection across multiple shards...");
 
@@ -72,12 +73,15 @@ jsTest.log("Rebuilding sharded collection with different split...");
 
 coll.drop();
 
+// TODO (SERVER-51881): Remove this check after 5.0 is released
 var droppedCollDoc = config.collections.findOne({_id: coll.getFullName()});
-assert(droppedCollDoc != null);
-assert.eq(true, droppedCollDoc.dropped);
-assert(droppedCollDoc.lastmodEpoch != null);
-assert(droppedCollDoc.lastmodEpoch.equals(new ObjectId("000000000000000000000000")),
-       "epoch not zero: " + droppedCollDoc.lastmodEpoch);
+if (droppedCollDoc) {
+    assert(droppedCollDoc != null);
+    assert.eq(true, droppedCollDoc.dropped);
+    assert(droppedCollDoc.lastmodEpoch != null);
+    assert(droppedCollDoc.lastmodEpoch.equals(new ObjectId("000000000000000000000000")),
+           "epoch not zero: " + droppedCollDoc.lastmodEpoch);
+}
 
 assert.commandWorked(admin.runCommand({enableSharding: coll.getDB() + ""}));
 st.ensurePrimaryShard(coll.getDB().getName(), st.shard1.shardName);
@@ -86,7 +90,7 @@ assert.commandWorked(admin.runCommand({shardCollection: coll + "", key: {_id: 1}
 var bulk = coll.initializeUnorderedBulkOp();
 for (var i = 0; i < 100; i++)
     bulk.insert({_id: i});
-assert.writeOK(bulk.execute());
+assert.commandWorked(bulk.execute());
 
 res = admin.runCommand({split: coll + "", middle: {_id: 200}});
 assert.commandWorked(res);
@@ -112,17 +116,18 @@ assert.neq(null, readMongos.getCollection(coll + "").findOne({_id: 1}));
 
 jsTest.log("Checking update...");
 // Ensure that updating an element finds the right location
-assert.writeOK(updateMongos.getCollection(coll + "").update({_id: 1}, {$set: {updated: true}}));
+assert.commandWorked(
+    updateMongos.getCollection(coll + "").update({_id: 1}, {$set: {updated: true}}));
 assert.neq(null, coll.findOne({updated: true}));
 
 jsTest.log("Checking insert...");
 // Ensure that inserting an element finds the right shard
-assert.writeOK(insertMongos.getCollection(coll + "").insert({_id: 101}));
+assert.commandWorked(insertMongos.getCollection(coll + "").insert({_id: 101}));
 assert.neq(null, coll.findOne({_id: 101}));
 
 jsTest.log("Checking remove...");
 // Ensure that removing an element finds the right shard, verified by the mongos doing the sharding
-assert.writeOK(removeMongos.getCollection(coll + "").remove({_id: 2}));
+assert.commandWorked(removeMongos.getCollection(coll + "").remove({_id: 2}));
 assert.eq(null, coll.findOne({_id: 2}));
 
 coll.drop();
@@ -130,3 +135,4 @@ coll.drop();
 jsTest.log("Done!");
 
 st.stop();
+})();

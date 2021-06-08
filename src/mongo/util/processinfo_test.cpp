@@ -36,20 +36,14 @@
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/processinfo.h"
 
-using mongo::ProcessInfo;
 using boost::optional;
+using mongo::ProcessInfo;
 
 namespace mongo_test {
 TEST(ProcessInfo, SysInfoIsInitialized) {
     ProcessInfo processInfo;
     if (processInfo.supported()) {
         ASSERT_FALSE(processInfo.getOsType().empty());
-    }
-}
-
-TEST(ProcessInfo, NonZeroPageSize) {
-    if (ProcessInfo::blockCheckSupported()) {
-        ASSERT_GREATER_THAN(ProcessInfo::getPageSize(), 0u);
     }
 }
 
@@ -65,4 +59,4 @@ TEST(ProcessInfo, GetNumAvailableCores) {
 TEST(ProcessInfo, GetNumCoresReturnsNonZeroNumberOfProcessors) {
     ASSERT_GREATER_THAN(ProcessInfo::getNumCores(), 0u);
 }
-}
+}  // namespace mongo_test

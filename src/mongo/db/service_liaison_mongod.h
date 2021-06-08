@@ -32,6 +32,7 @@
 #include "mongo/db/logical_session_id.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_liaison.h"
+#include "mongo/util/hierarchical_acquisition.h"
 #include "mongo/util/periodic_runner.h"
 #include "mongo/util/time_support.h"
 
@@ -68,7 +69,10 @@ protected:
      * Returns the service context.
      */
     ServiceContext* _context() override;
-    std::vector<std::unique_ptr<PeriodicRunner::PeriodicJobHandle>> _jobs;
+
+    Mutex _mutex =
+        MONGO_MAKE_LATCH(HierarchicalAcquisitionLevel(0), "ServiceLiaisonMongod::_mutex");
+    std::vector<PeriodicJobAnchor> _jobs;
 };
 
 }  // namespace mongo

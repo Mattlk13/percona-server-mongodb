@@ -36,53 +36,53 @@
 
 namespace mongo {
 
-std::string CurOpFailpointHelpers::updateCurOpMsg(OperationContext* opCtx,
-                                                  const std::string& newMsg) {
+std::string CurOpFailpointHelpers::updateCurOpFailPointMsg(OperationContext* opCtx,
+                                                           const std::string& newMsg) {
     stdx::lock_guard<Client> lk(*opCtx->getClient());
-    auto oldMsg = CurOp::get(opCtx)->getMessage();
-    CurOp::get(opCtx)->setMessage_inlock(newMsg.c_str());
+    auto oldMsg = CurOp::get(opCtx)->getFailPointMessage();
+    CurOp::get(opCtx)->setFailPointMessage_inlock(newMsg.c_str());
     return oldMsg;
 }
 
 void CurOpFailpointHelpers::waitWhileFailPointEnabled(FailPoint* failPoint,
                                                       OperationContext* opCtx,
-                                                      const std::string& curOpMsg,
-                                                      const std::function<void(void)>& whileWaiting,
-                                                      bool checkForInterrupt,
+                                                      const std::string& failpointMsg,
+                                                      const std::function<void()>& whileWaiting,
                                                       boost::optional<NamespaceString> nss) {
-
     invariant(failPoint);
-    MONGO_FAIL_POINT_BLOCK((*failPoint), options) {
-        const BSONObj& data = options.getData();
-        StringData fpNss = data.getStringField("nss");
-        if (nss && !fpNss.empty() && fpNss != nss.get().toString()) {
-            return;
-        }
+    failPoint->executeIf(
+        [&](const BSONObj& data) {
+            auto origCurOpFailpointMsg = updateCurOpFailPointMsg(opCtx, failpointMsg);
 
-        auto origCurOpMsg = updateCurOpMsg(opCtx, curOpMsg);
+            const bool shouldCheckForInterrupt = data["shouldCheckForInterrupt"].booleanSafe();
+            const bool shouldContinueOnInterrupt = data["shouldContinueOnInterrupt"].booleanSafe();
+            while (MONGO_unlikely(failPoint->shouldFail())) {
+                sleepFor(Milliseconds(10));
+                if (whileWaiting) {
+                    whileWaiting();
+                }
 
-        const bool shouldCheckForInterrupt =
-            checkForInterrupt || data["shouldCheckForInterrupt"].booleanSafe();
-        const bool shouldContinueOnInterrupt = data["shouldContinueOnInterrupt"].booleanSafe();
-        while (MONGO_FAIL_POINT((*failPoint))) {
-            sleepFor(Milliseconds(10));
-            if (whileWaiting) {
-                whileWaiting();
+                // Check for interrupt so that an operation can be killed while waiting for the
+                // failpoint to be disabled, if the failpoint is configured to be interruptible.
+                //
+                // For shouldContinueOnInterrupt, an interrupt merely allows the code to continue
+                // past the failpoint; it is up to the code under test to actually check for
+                // interrupt.
+                if (shouldContinueOnInterrupt) {
+                    if (!opCtx->checkForInterruptNoAssert().isOK())
+                        break;
+                } else if (shouldCheckForInterrupt) {
+                    opCtx->checkForInterrupt();
+                }
             }
-
-            // Check for interrupt so that an operation can be killed while waiting for the
-            // failpoint to be disabled, if the failpoint is configured to be interruptible.
-            //
-            // For shouldContinueOnInterrupt, an interrupt merely allows the code to continue past
-            // the failpoint; it is up to the code under test to actually check for interrupt.
-            if (shouldContinueOnInterrupt) {
-                if (!opCtx->checkForInterruptNoAssert().isOK())
-                    break;
-            } else if (shouldCheckForInterrupt) {
-                opCtx->checkForInterrupt();
+            updateCurOpFailPointMsg(opCtx, origCurOpFailpointMsg);
+        },
+        [&](const BSONObj& data) {
+            StringData fpNss = data.getStringField("nss");
+            if (nss && !fpNss.empty() && fpNss != nss.get().toString()) {
+                return false;
             }
-        }
-        updateCurOpMsg(opCtx, origCurOpMsg);
-    }
+            return true;
+        });
 }
-}
+}  // namespace mongo

@@ -6,15 +6,26 @@ var kCommandsSupportingReadConcern = new Set([
     "count",
     "distinct",
     "find",
-    "geoSearch",
 ]);
 
-var kCommandsOnlySupportingReadConcernSnapshot = new Set([
+/**
+ * Write commands supporting snapshot readConcern in a transaction.
+ */
+var kWriteCommandsSupportingSnapshotInTransaction = new Set([
     "delete",
     "findAndModify",
     "findandmodify",
     "insert",
     "update",
+]);
+
+/**
+ * Commands supporting snapshot readConcern outside of transactions.
+ */
+var kCommandsSupportingSnapshot = new Set([
+    "aggregate",
+    "distinct",
+    "find",
 ]);
 
 var kCommandsSupportingWriteConcern = new Set([
@@ -40,7 +51,6 @@ var kCommandsSupportingWriteConcern = new Set([
     "captrunc",
     "cleanupOrphaned",
     "clone",
-    "cloneCollection",
     "cloneCollectionAsCapped",
     "collMod",
     "commitTransaction",
@@ -51,7 +61,6 @@ var kCommandsSupportingWriteConcern = new Set([
     "createUser",
     "delete",
     "deleteIndexes",
-    "doTxn",
     "drop",
     "dropAllRolesFromDatabase",
     "dropAllUsersFromDatabase",
@@ -69,7 +78,6 @@ var kCommandsSupportingWriteConcern = new Set([
     "insert",
     "mapReduce",
     "mapreduce",
-    "mapreduce.shardedfinish",
     "moveChunk",
     "renameCollection",
     "revokePrivilegesFromRole",
@@ -82,4 +90,4 @@ var kCommandsSupportingWriteConcern = new Set([
 ]);
 
 var kCommandsSupportingWriteConcernInTransaction =
-    new Set(["doTxn", "abortTransaction", "commitTransaction"]);
+    new Set(["abortTransaction", "commitTransaction"]);

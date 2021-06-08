@@ -29,30 +29,43 @@
 
 #pragma once
 
-#include "mongo/db/operation_context.h"
-#include "mongo/db/service_context.h"
+#include "mongo/client/remote_command_targeter_factory_mock.h"
+#include "mongo/db/service_context_test_fixture.h"
+#include "mongo/executor/network_interface_mock.h"
 #include "mongo/executor/network_test_env.h"
 #include "mongo/s/grid.h"
 #include "mongo/transport/session.h"
-#include "mongo/unittest/unittest.h"
 
 namespace mongo {
-
-namespace executor {
-class NetworkInterfaceMock;
-class TaskExecutor;
-}  // namespace executor
 
 /**
  * Contains common functionality and tools, which apply to both mongos and mongod unit-tests.
  */
-class ShardingTestFixtureCommon {
+class ShardingTestFixtureCommon : public virtual ServiceContextTest {
 public:
+    /**
+     * Constructs a standalone RoutingTableHistory object (i.e., not linked to any CatalogCache),
+     * which can be used to pass to ChunkManager for tests, which specifically target the behaviour
+     * of the ChunkManager.
+     */
+    static RoutingTableHistoryValueHandle makeStandaloneRoutingTableHistory(RoutingTableHistory rt);
+
+protected:
     ShardingTestFixtureCommon();
     ~ShardingTestFixtureCommon();
 
+    void setUp() override;
+
+    void tearDown() override;
+
+    OperationContext* operationContext() const {
+        invariant(_opCtxHolder,
+                  "ShardingTestFixtureCommon::setUp() must have been called before this method");
+        return _opCtxHolder.get();
+    }
+
     template <typename Lambda>
-    executor::NetworkTestEnv::FutureHandle<typename std::result_of<Lambda()>::type> launchAsync(
+    executor::NetworkTestEnv::FutureHandle<typename std::invoke_result<Lambda>::type> launchAsync(
         Lambda&& func) const {
         return _networkTestEnv->launchAsync(std::forward<Lambda>(func));
     }
@@ -60,6 +73,11 @@ public:
     executor::NetworkInterfaceMock* network() const {
         invariant(_mockNetwork);
         return _mockNetwork;
+    }
+
+    RemoteCommandTargeterFactoryMock* targeterFactory() const {
+        invariant(_targeterFactory);
+        return _targeterFactory;
     }
 
     /**
@@ -74,7 +92,30 @@ public:
     void onFindWithMetadataCommand(
         executor::NetworkTestEnv::OnFindCommandWithMetadataFunction func);
 
-protected:
+    /**
+     * Waits for an operation which creates a capped config collection with the specified name and
+     * capped size.
+     */
+    void expectConfigCollectionCreate(const HostAndPort& configHost,
+                                      StringData collName,
+                                      int cappedSize,
+                                      const BSONObj& response);
+
+    /**
+     * Wait for a single insert in one of the change or action log collections with the specified
+     * contents and return a successful response.
+     */
+    void expectConfigCollectionInsert(const HostAndPort& configHost,
+                                      StringData collName,
+                                      Date_t timestamp,
+                                      const std::string& what,
+                                      const std::string& ns,
+                                      const BSONObj& detail);
+
+    virtual std::unique_ptr<ShardingCatalogClient> makeShardingCatalogClient() {
+        return nullptr;
+    }
+
     // Since a NetworkInterface is a private member of a TaskExecutor, we store a raw pointer to the
     // fixed TaskExecutor's NetworkInterface here.
     //
@@ -85,6 +126,14 @@ protected:
 
     // Allows for processing tasks through the NetworkInterfaceMock/ThreadPoolMock subsystem
     std::unique_ptr<executor::NetworkTestEnv> _networkTestEnv;
+
+    // Since the RemoteCommandTargeterFactory is currently a private member of ShardFactory, we
+    // store a raw pointer to it here.
+    RemoteCommandTargeterFactoryMock* _targeterFactory = nullptr;
+
+private:
+    // Keeps the lifetime of the operation context
+    ServiceContext::UniqueOperationContext _opCtxHolder;
 };
 
 }  // namespace mongo

@@ -1,4 +1,7 @@
-// @tags: [requires_fastcount, assumes_balancer_off]
+// @tags: [
+//   assumes_balancer_off,
+//   requires_fastcount,
+// ]
 
 t = db.geo_center_sphere1;
 
@@ -38,10 +41,10 @@ function test(index) {
         }
         gc();  // needed with low skip values
     }
-    assert.writeOK(bulk.execute());
+    assert.commandWorked(bulk.execute());
 
     if (index) {
-        t.ensureIndex({loc: index});
+        t.createIndex({loc: index});
     }
 
     for (i = 0; i < searches.length; i++) {

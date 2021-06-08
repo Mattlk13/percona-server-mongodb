@@ -7,11 +7,12 @@ import bson
 import bson.errors
 import pymongo.errors
 
-from . import cleanup
-from . import interface
-from . import jsfile
-from ..fixtures import replicaset
-from ... import errors
+from buildscripts.resmokelib import errors
+from buildscripts.resmokelib.testing.fixtures import interface as fixture_interface
+from buildscripts.resmokelib.testing.fixtures import replicaset
+from buildscripts.resmokelib.testing.hooks import cleanup
+from buildscripts.resmokelib.testing.hooks import interface
+from buildscripts.resmokelib.testing.hooks import jsfile
 
 
 class BackgroundInitialSync(interface.Hook):
@@ -49,7 +50,7 @@ class BackgroundInitialSync(interface.Hook):
         self.tests_run += 1
 
         hook_test_case = BackgroundInitialSyncTestCase.create_after_test(
-            self.logger.test_case_logger, test, self, self._shell_options)
+            test.logger, test, self, self._shell_options)
         hook_test_case.configure(self.fixture)
         hook_test_case.run_dynamic_test(test_report)
 
@@ -77,27 +78,21 @@ class BackgroundInitialSyncTestCase(jsfile.DynamicJSTestCase):
                 " node to go into SECONDARY state", self._hook.tests_run)
             self._hook.tests_run = 0
 
-            cmd = bson.SON([("replSetTest", 1), ("waitForMemberState", 2),
-                            ("timeoutMillis", 20 * 60 * 1000)])
+            cmd = bson.SON(
+                [("replSetTest", 1), ("waitForMemberState", 2),
+                 ("timeoutMillis",
+                  fixture_interface.ReplFixture.AWAIT_REPL_TIMEOUT_FOREVER_MINS * 60 * 1000)])
             sync_node_conn.admin.command(cmd)
 
         # Check if the initial sync node is in SECONDARY state. If it's been 'n' tests, then it
         # should have waited to be in SECONDARY state and the test should be marked as a failure.
         # Otherwise, we just skip the hook and will check again after the next test.
         try:
-            while True:
-                # TODO SERVER-40078: The server is reporting invalid
-                # dates in its response to the replSetGetStatus
-                # command
-                try:
-                    state = sync_node_conn.admin.command("replSetGetStatus").get("myState")
-                    break
-                except bson.errors.InvalidBSON:
-                    continue
+            state = sync_node_conn.admin.command("replSetGetStatus").get("myState")
 
             if state != 2:
                 if self._hook.tests_run == 0:
-                    msg = "Initial sync node did not catch up after waiting 20 minutes"
+                    msg = "Initial sync node did not catch up after waiting 24 hours"
                     self.logger.exception("{0} failed: {1}".format(self._hook.description, msg))
                     raise errors.TestFailure(msg)
 
@@ -135,6 +130,7 @@ class BackgroundInitialSyncTestCase(jsfile.DynamicJSTestCase):
 
         self.logger.info("Starting the initial sync node back up again...")
         sync_node.setup()
+        self.logger.info(fixture_interface.create_fixture_table(self.fixture))
         sync_node.await_ready()
 
 
@@ -176,8 +172,7 @@ class IntermediateInitialSync(interface.Hook):
         if not self._should_run_after_test():
             return
 
-        hook_test_case = IntermediateInitialSyncTestCase.create_after_test(
-            self.logger.test_case_logger, test, self)
+        hook_test_case = IntermediateInitialSyncTestCase.create_after_test(test.logger, test, self)
         hook_test_case.configure(self.fixture)
         hook_test_case.run_dynamic_test(test_report)
 
@@ -206,8 +201,10 @@ class IntermediateInitialSyncTestCase(jsfile.DynamicJSTestCase):
 
         # Do initial sync round.
         self.logger.info("Waiting for initial sync node to go into SECONDARY state")
-        cmd = bson.SON([("replSetTest", 1), ("waitForMemberState", 2),
-                        ("timeoutMillis", 20 * 60 * 1000)])
+        cmd = bson.SON(
+            [("replSetTest", 1), ("waitForMemberState", 2),
+             ("timeoutMillis",
+              fixture_interface.ReplFixture.AWAIT_REPL_TIMEOUT_FOREVER_MINS * 60 * 1000)])
         sync_node_conn.admin.command(cmd)
 
         # Run data validation and dbhash checking.

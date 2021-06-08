@@ -51,10 +51,8 @@ class ReplSetHeartbeatResponse {
 public:
     /**
      * Initializes this ReplSetHeartbeatResponse from the contents of "doc".
-     * "term" is only used to complete a V0 OpTime (which is really a Timestamp).
-     * Only processes wall clock time elements if FCV is 4.2 (i.e., requireWallTime is true).
      */
-    Status initialize(const BSONObj& doc, long long term, bool requireWallTime);
+    Status initialize(const BSONObj& doc, long long term);
 
     /**
      * Appends all non-default values to "builder".
@@ -90,6 +88,12 @@ public:
     int getConfigVersion() const {
         return _configVersion;
     }
+    int getConfigTerm() const {
+        return _configTerm;
+    }
+    ConfigVersionAndTerm getConfigVersionAndTerm() const {
+        return ConfigVersionAndTerm(_configVersion, _configTerm);
+    }
     bool hasConfig() const {
         return _configSet;
     }
@@ -111,12 +115,16 @@ public:
     }
     OpTime getDurableOpTime() const;
     OpTimeAndWallTime getDurableOpTimeAndWallTime() const;
+    bool hasIsElectable() const {
+        return _electableSet;
+    }
+    bool isElectable() const;
 
     /**
      * Sets _setName to "name".
      */
-    void setSetName(std::string name) {
-        _setName = name;
+    void setSetName(StringData name) {
+        _setName = name.toString();
     }
 
     /**
@@ -150,6 +158,13 @@ public:
     }
 
     /**
+     * Sets _configTerm to "configTerm".
+     */
+    void setConfigTerm(int configTerm) {
+        _configTerm = configTerm;
+    }
+
+    /**
      * Initializes _config with "config".
      */
     void setConfig(const ReplSetConfig& config) {
@@ -174,6 +189,10 @@ public:
     void setTerm(long long term) {
         _term = term;
     }
+    void setElectable(bool electable) {
+        _electableSet = true;
+        _electable = electable;
+    }
 
 private:
     bool _electionTimeSet = false;
@@ -191,6 +210,7 @@ private:
     MemberState _state;
 
     int _configVersion = -1;
+    int _configTerm = OpTime::kUninitializedTerm;
     std::string _setName;
     HostAndPort _syncingTo;
 
@@ -200,6 +220,9 @@ private:
     bool _primaryIdSet = false;
     long long _primaryId = -1;
     long long _term = -1;
+
+    bool _electableSet = false;
+    bool _electable = false;
 };
 
 }  // namespace repl

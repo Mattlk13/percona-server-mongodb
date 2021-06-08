@@ -29,7 +29,7 @@ Copyright (C) 2018-present Percona and/or its affiliates. All rights reserved.
     it in the license file.
 ======= */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include <boost/filesystem/path.hpp>
 
@@ -40,8 +40,7 @@ Copyright (C) 2018-present Percona and/or its affiliates. All rights reserved.
 #include "mongo/db/encryption/encryption_options.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_data_protector.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_encryption_hooks.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 #include <third_party/wiredtiger/ext/encryptors/percona/encryption_keydb_c_api.h>
 
@@ -84,7 +83,7 @@ namespace {
 
     // callback for ERR_print_errors_cb
     static int err_print_cb(const char *str, size_t len, void *param) {
-        error() << str;
+        LOGV2_ERROR(29029, "{str}", "str"_attr = str);
         return 1;
     }
 
@@ -96,12 +95,9 @@ namespace {
 }
 
 
-WiredTigerEncryptionHooks::WiredTigerEncryptionHooks() {
-    // get master key
-    get_key_by_id(nullptr, 0, _masterkey, nullptr);
-}
+WiredTigerEncryptionHooks::WiredTigerEncryptionHooks() = default;
 
-WiredTigerEncryptionHooks::~WiredTigerEncryptionHooks() {}
+WiredTigerEncryptionHooks::~WiredTigerEncryptionHooks() = default;
 
 bool WiredTigerEncryptionHooks::enabled() const {
     return true;
@@ -109,6 +105,23 @@ bool WiredTigerEncryptionHooks::enabled() const {
 
 bool WiredTigerEncryptionHooks::restartRequired() {
     return false;
+}
+
+const unsigned char* WiredTigerEncryptionHooks::dbKey(boost::optional<std::string> dbName,
+                                                      unsigned char* buf) {
+    if (!dbName) {
+        // static local initialization is thread safe since C++11
+        static const struct TmpKey {
+            unsigned char _tmpkey[_key_len];
+            TmpKey() {
+                // generate temporary key valid only while current process is running
+                generate_secure_key(static_cast<unsigned char*>(_tmpkey));
+            }
+        } tmp_key_holder;
+        return static_cast<const unsigned char*>(tmp_key_holder._tmpkey);
+    }
+    get_key_by_id(dbName->c_str(), dbName->length(), buf, nullptr);
+    return buf;
 }
 
 
@@ -121,8 +134,12 @@ WiredTigerEncryptionHooksCBC::WiredTigerEncryptionHooksCBC() {
 
 WiredTigerEncryptionHooksCBC::~WiredTigerEncryptionHooksCBC() {}
 
-Status WiredTigerEncryptionHooksCBC::protectTmpData(
-    const uint8_t* in, size_t inLen, uint8_t* out, size_t outLen, size_t* resultLen) {
+Status WiredTigerEncryptionHooksCBC::protectTmpData(const uint8_t* in,
+                                                    size_t inLen,
+                                                    uint8_t* out,
+                                                    size_t outLen,
+                                                    size_t* resultLen,
+                                                    boost::optional<std::string> dbName) {
 
     if (outLen < _chksum_len + _iv_len + inLen + EVP_CIPHER_block_size(_cipher))
         return Status(ErrorCodes::InternalError,
@@ -138,7 +155,10 @@ Status WiredTigerEncryptionHooksCBC::protectTmpData(
     store_pseudo_bytes(iv, _iv_len);
     *resultLen += _iv_len;
 
-    if (1 != EVP_EncryptInit_ex(ctx, _cipher, nullptr, _masterkey, iv))
+    unsigned char db_key[_key_len];
+    if (1 !=
+        EVP_EncryptInit_ex(
+            ctx, _cipher, nullptr, dbKey(dbName, static_cast<unsigned char*>(db_key)), iv))
         return handleCryptoErrors();
 
     int encrypted_len = 0;
@@ -153,8 +173,12 @@ Status WiredTigerEncryptionHooksCBC::protectTmpData(
     return Status::OK();
 }
 
-Status WiredTigerEncryptionHooksCBC::unprotectTmpData(
-    const uint8_t* in, size_t inLen, uint8_t* out, size_t outLen, size_t* resultLen) {
+Status WiredTigerEncryptionHooksCBC::unprotectTmpData(const uint8_t* in,
+                                                      size_t inLen,
+                                                      uint8_t* out,
+                                                      size_t outLen,
+                                                      size_t* resultLen,
+                                                      boost::optional<std::string> dbName) {
 
     *resultLen = 0;
     EVPCipherCtx ctx;
@@ -163,7 +187,10 @@ Status WiredTigerEncryptionHooksCBC::unprotectTmpData(
     in += _chksum_len;
     inLen -= _chksum_len;
 
-    if (1 != EVP_DecryptInit_ex(ctx, _cipher, nullptr, _masterkey, in))
+    unsigned char db_key[_key_len];
+    if (1 !=
+        EVP_DecryptInit_ex(
+            ctx, _cipher, nullptr, dbKey(dbName, static_cast<unsigned char*>(db_key)), in))
         return handleCryptoErrors();
     in += _iv_len;
     inLen -= _iv_len;
@@ -192,7 +219,7 @@ size_t WiredTigerEncryptionHooksCBC::additionalBytesForProtectedBuffer() {
 }
 
 std::unique_ptr<DataProtector> WiredTigerEncryptionHooksCBC::getDataProtector() {
-    return stdx::make_unique<WiredTigerDataProtectorCBC>();
+    return std::make_unique<WiredTigerDataProtectorCBC>();
 }
 
 boost::filesystem::path WiredTigerEncryptionHooksCBC::getProtectedPathSuffix() {
@@ -207,8 +234,12 @@ WiredTigerEncryptionHooksGCM::WiredTigerEncryptionHooksGCM() {
 
 WiredTigerEncryptionHooksGCM::~WiredTigerEncryptionHooksGCM() {}
 
-Status WiredTigerEncryptionHooksGCM::protectTmpData(
-    const uint8_t* in, size_t inLen, uint8_t* out, size_t outLen, size_t* resultLen) {
+Status WiredTigerEncryptionHooksGCM::protectTmpData(const uint8_t* in,
+                                                    size_t inLen,
+                                                    uint8_t* out,
+                                                    size_t outLen,
+                                                    size_t* resultLen,
+                                                    boost::optional<std::string> dbName) {
 
     if (outLen < _iv_len + inLen + _gcm_tag_len)
         return Status(ErrorCodes::InternalError,
@@ -226,7 +257,10 @@ Status WiredTigerEncryptionHooksGCM::protectTmpData(
                       "failed generating IV for GCM");
     *resultLen += _iv_len;
 
-    if (1 != EVP_EncryptInit_ex(ctx, _cipher, nullptr, _masterkey, iv))
+    unsigned char db_key[_key_len];
+    if (1 !=
+        EVP_EncryptInit_ex(
+            ctx, _cipher, nullptr, dbKey(dbName, static_cast<unsigned char*>(db_key)), iv))
         return handleCryptoErrors();
 
     // we don't provide any AAD data yet
@@ -248,8 +282,12 @@ Status WiredTigerEncryptionHooksGCM::protectTmpData(
     return Status::OK();
 }
 
-Status WiredTigerEncryptionHooksGCM::unprotectTmpData(
-    const uint8_t* in, size_t inLen, uint8_t* out, size_t outLen, size_t* resultLen) {
+Status WiredTigerEncryptionHooksGCM::unprotectTmpData(const uint8_t* in,
+                                                      size_t inLen,
+                                                      uint8_t* out,
+                                                      size_t outLen,
+                                                      size_t* resultLen,
+                                                      boost::optional<std::string> dbName) {
 
     *resultLen = 0;
     EVPCipherCtx ctx;
@@ -259,7 +297,10 @@ Status WiredTigerEncryptionHooksGCM::unprotectTmpData(
     in += _gcm_tag_len;
     inLen -= _gcm_tag_len;
 
-    if (1 != EVP_DecryptInit_ex(ctx, _cipher, nullptr, _masterkey, in))
+    unsigned char db_key[_key_len];
+    if (1 !=
+        EVP_DecryptInit_ex(
+            ctx, _cipher, nullptr, dbKey(dbName, static_cast<unsigned char*>(db_key)), in))
         return handleCryptoErrors();
     in += _iv_len;
     inLen -= _iv_len;
@@ -289,7 +330,7 @@ size_t WiredTigerEncryptionHooksGCM::additionalBytesForProtectedBuffer() {
 }
 
 std::unique_ptr<DataProtector> WiredTigerEncryptionHooksGCM::getDataProtector() {
-    return stdx::make_unique<WiredTigerDataProtectorGCM>();
+    return std::make_unique<WiredTigerDataProtectorGCM>();
 }
 
 boost::filesystem::path WiredTigerEncryptionHooksGCM::getProtectedPathSuffix() {

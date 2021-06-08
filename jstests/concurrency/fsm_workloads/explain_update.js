@@ -10,7 +10,6 @@ load('jstests/concurrency/fsm_workloads/explain.js');              // for $confi
 load('jstests/concurrency/fsm_workload_helpers/server_types.js');  // for isMongos
 
 var $config = extendWorkload($config, function($config, $super) {
-
     $config.states = Object.extend({
         explainBasicUpdate: function explainBasicUpdate(db, collName) {
             var res =
@@ -38,7 +37,7 @@ var $config = extendWorkload($config, function($config, $super) {
                 stage = stage.shards[0].executionStages;
             }
             assertAlways.eq(stage.stage, 'UPDATE');
-            assertWhenOwnColl(stage.wouldInsert);
+            assertWhenOwnColl(stage.nWouldUpsert == 1);
 
             // make sure that the insert didn't actually happen.
             assertWhenOwnColl.eq(this.nInserted, db[collName].find().itcount());
@@ -58,7 +57,7 @@ var $config = extendWorkload($config, function($config, $super) {
                 stage = stage.shards[0].executionStages;
             }
             assertAlways.eq(stage.stage, 'UPDATE');
-            assertWhenOwnColl(!stage.wouldInsert);
+            assertWhenOwnColl(stage.nWouldUpsert == 0);
             assertWhenOwnColl.eq(3, stage.nMatched);
             assertWhenOwnColl.eq(3, stage.nWouldModify);
         }

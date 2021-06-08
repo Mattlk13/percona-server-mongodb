@@ -191,9 +191,9 @@ TEST(CollatorInterfaceMockSelfTest, MockCollatorReportsMockVersionString) {
     CollatorInterfaceMock reverseCollator(CollatorInterfaceMock::MockType::kReverseString);
     CollatorInterfaceMock alwaysEqualCollator(CollatorInterfaceMock::MockType::kAlwaysEqual);
     CollatorInterfaceMock toLowerCollator(CollatorInterfaceMock::MockType::kToLowerString);
-    ASSERT_EQ(reverseCollator.getSpec().version, "mock_version");
-    ASSERT_EQ(alwaysEqualCollator.getSpec().version, "mock_version");
-    ASSERT_EQ(toLowerCollator.getSpec().version, "mock_version");
+    ASSERT_EQ(*reverseCollator.getSpec().getVersion(), "mock_version");
+    ASSERT_EQ(*alwaysEqualCollator.getSpec().getVersion(), "mock_version");
+    ASSERT_EQ(*toLowerCollator.getSpec().getVersion(), "mock_version");
 }
 
 TEST(CollatorInterfaceMockSelfTest, StringsAreHashedWithRespectToCollation) {
@@ -242,10 +242,12 @@ TEST(CollatorInterfaceMockSelfTest, BSONObjsEqualUnderCollatorHashEquallyNested)
     SimpleBSONObjComparator bsonCmpConsiderCase;
     BSONObjComparator bsonCmpIgnoreCase(
         BSONObj(), BSONObjComparator::FieldNamesMode::kConsider, &toLowerCollator);
-    BSONObj obj1 = BSON("a" << 1 << "b" << BSON("c"
-                                                << "foo"));
-    BSONObj obj2 = BSON("a" << 1 << "b" << BSON("c"
-                                                << "FOO"));
+    BSONObj obj1 = BSON("a" << 1 << "b"
+                            << BSON("c"
+                                    << "foo"));
+    BSONObj obj2 = BSON("a" << 1 << "b"
+                            << BSON("c"
+                                    << "FOO"));
     ASSERT_NE(bsonCmpConsiderCase.hash(obj1), bsonCmpConsiderCase.hash(obj2));
     ASSERT_EQ(bsonCmpIgnoreCase.hash(obj1), bsonCmpIgnoreCase.hash(obj2));
 }

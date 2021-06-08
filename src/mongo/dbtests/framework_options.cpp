@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
@@ -43,8 +43,9 @@
 #include "mongo/db/storage/flow_control_parameters_gen.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/dbtests/dbtests.h"
+#include "mongo/logv2/log.h"
+#include "mongo/unittest/log_test.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/log.h"
 #include "mongo/util/options_parser/startup_options.h"
 #include "mongo/util/password.h"
 
@@ -90,7 +91,7 @@ Status storeTestFrameworkOptions(const moe::Environment& params,
     }
 
     if (params.count("debug") || params.count("verbose")) {
-        logger::globalLogDomain()->setMinimumLoggedSeverity(logger::LogSeverity::Debug(1));
+        setMinimumLoggedSeverity(logv2::LogSeverity::Debug(1));
     }
 
     boost::filesystem::path p(frameworkGlobalParams.dbpathSpec);
@@ -118,7 +119,8 @@ Status storeTestFrameworkOptions(const moe::Environment& params,
         return Status(ErrorCodes::BadValue, sb.str());
     }
 
-    DEV log() << "DEBUG build" << endl;
+    if (kDebugBuild)
+        LOGV2(22491, "DEBUG build");
 
     string dbpathString = p.string();
     storageGlobalParams.dbpath = dbpathString.c_str();
@@ -127,15 +129,49 @@ Status storeTestFrameworkOptions(const moe::Environment& params,
     gFlowControlEnabled.store(params["enableFlowControl"].as<bool>());
 
     if (gFlowControlEnabled.load()) {
-        log() << "Flow Control enabled" << endl;
+        LOGV2(22492, "Flow Control enabled");
     }
 
-    if (storageGlobalParams.engine == "wiredTiger" &&
-        params.count("replication.enableMajorityReadConcern")) {
+    if (params.count("replication.enableMajorityReadConcern")) {
         serverGlobalParams.enableMajorityReadConcern =
             params["replication.enableMajorityReadConcern"].as<bool>();
     }
 
+    if (params.count("setParameter")) {
+        std::map<std::string, std::string> parameters =
+            params["setParameter"].as<std::map<std::string, std::string>>();
+        for (std::map<std::string, std::string>::iterator parametersIt = parameters.begin();
+             parametersIt != parameters.end();
+             parametersIt++) {
+            const auto& serverParams = ServerParameterSet::getGlobal()->getMap();
+            auto iter = serverParams.find(parametersIt->first);
+            ServerParameter* parameter = (iter == serverParams.end()) ? nullptr : iter->second;
+            if (nullptr == parameter) {
+                StringBuilder sb;
+                sb << "Illegal --setParameter parameter: \"" << parametersIt->first << "\"";
+                return Status(ErrorCodes::BadValue, sb.str());
+            }
+            if (!parameter->allowedToChangeAtStartup()) {
+                StringBuilder sb;
+                sb << "Cannot use --setParameter to set \"" << parametersIt->first
+                   << "\" at startup";
+                return Status(ErrorCodes::BadValue, sb.str());
+            }
+            Status status = parameter->setFromString(parametersIt->second);
+            if (!status.isOK()) {
+                StringBuilder sb;
+                sb << "Bad value for parameter \"" << parametersIt->first
+                   << "\": " << status.reason();
+                return Status(ErrorCodes::BadValue, sb.str());
+            }
+
+            LOGV2(4539300,
+                  "Setting server parameter",
+                  "parameter"_attr = parametersIt->first,
+                  "value"_attr = parametersIt->second);
+        }
+    }
+
     return Status::OK();
 }
-}
+}  // namespace mongo

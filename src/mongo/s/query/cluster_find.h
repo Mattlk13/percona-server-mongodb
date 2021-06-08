@@ -35,6 +35,7 @@
 #include "mongo/db/cursor_id.h"
 #include "mongo/db/query/cursor_response.h"
 #include "mongo/db/query/explain_options.h"
+#include "mongo/db/query/getmore_command_gen.h"
 
 namespace mongo {
 
@@ -42,7 +43,6 @@ template <typename T>
 class StatusWith;
 class CanonicalQuery;
 class OperationContext;
-struct GetMoreRequest;
 struct ReadPreferenceSetting;
 
 /**
@@ -64,13 +64,14 @@ public:
     static CursorId runQuery(OperationContext* opCtx,
                              const CanonicalQuery& query,
                              const ReadPreferenceSetting& readPref,
-                             std::vector<BSONObj>* results);
+                             std::vector<BSONObj>* results,
+                             bool* partialResultsReturned = nullptr);
 
     /**
-     * Executes the getMore request 'request', and on success returns a CursorResponse.
+     * Executes the getMore command 'cmd', and on success returns a CursorResponse.
      */
     static StatusWith<CursorResponse> runGetMore(OperationContext* opCtx,
-                                                 const GetMoreRequest& request);
+                                                 const GetMoreCommandRequest& cmd);
 };
 
 }  // namespace mongo

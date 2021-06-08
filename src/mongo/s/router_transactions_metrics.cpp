@@ -52,7 +52,43 @@ RouterTransactionsMetrics* RouterTransactionsMetrics::get(OperationContext* opCt
     return get(opCtx->getServiceContext());
 }
 
-std::int64_t RouterTransactionsMetrics::getTotalStarted() {
+std::int64_t RouterTransactionsMetrics::getCurrentOpen() const {
+    return _currentOpen.load();
+}
+
+void RouterTransactionsMetrics::incrementCurrentOpen() {
+    _currentOpen.fetchAndAdd(1);
+}
+
+void RouterTransactionsMetrics::decrementCurrentOpen() {
+    _currentOpen.fetchAndSubtract(1);
+}
+
+std::int64_t RouterTransactionsMetrics::getCurrentActive() const {
+    return _currentActive.load();
+}
+
+void RouterTransactionsMetrics::incrementCurrentActive() {
+    _currentActive.fetchAndAdd(1);
+}
+
+void RouterTransactionsMetrics::decrementCurrentActive() {
+    _currentActive.fetchAndSubtract(1);
+}
+
+std::int64_t RouterTransactionsMetrics::getCurrentInactive() const {
+    return _currentInactive.load();
+}
+
+void RouterTransactionsMetrics::incrementCurrentInactive() {
+    _currentInactive.fetchAndAdd(1);
+}
+
+void RouterTransactionsMetrics::decrementCurrentInactive() {
+    _currentInactive.fetchAndSubtract(1);
+}
+
+std::int64_t RouterTransactionsMetrics::getTotalStarted() const {
     return _totalStarted.load();
 }
 
@@ -60,7 +96,7 @@ void RouterTransactionsMetrics::incrementTotalStarted() {
     _totalStarted.fetchAndAdd(1);
 }
 
-std::int64_t RouterTransactionsMetrics::getTotalAborted() {
+std::int64_t RouterTransactionsMetrics::getTotalAborted() const {
     return _totalAborted.load();
 }
 
@@ -68,7 +104,7 @@ void RouterTransactionsMetrics::incrementTotalAborted() {
     _totalAborted.fetchAndAdd(1);
 }
 
-std::int64_t RouterTransactionsMetrics::getTotalCommitted() {
+std::int64_t RouterTransactionsMetrics::getTotalCommitted() const {
     return _totalCommitted.load();
 }
 
@@ -76,7 +112,7 @@ void RouterTransactionsMetrics::incrementTotalCommitted() {
     _totalCommitted.fetchAndAdd(1);
 }
 
-std::int64_t RouterTransactionsMetrics::getTotalContactedParticipants() {
+std::int64_t RouterTransactionsMetrics::getTotalContactedParticipants() const {
     return _totalContactedParticipants.load();
 }
 
@@ -84,7 +120,7 @@ void RouterTransactionsMetrics::incrementTotalContactedParticipants() {
     _totalContactedParticipants.fetchAndAdd(1);
 }
 
-std::int64_t RouterTransactionsMetrics::getTotalParticipantsAtCommit() {
+std::int64_t RouterTransactionsMetrics::getTotalParticipantsAtCommit() const {
     return _totalParticipantsAtCommit.load();
 }
 
@@ -92,7 +128,7 @@ void RouterTransactionsMetrics::addToTotalParticipantsAtCommit(std::int64_t inc)
     _totalParticipantsAtCommit.fetchAndAdd(inc);
 }
 
-std::int64_t RouterTransactionsMetrics::getTotalRequestsTargeted() {
+std::int64_t RouterTransactionsMetrics::getTotalRequestsTargeted() const {
     return _totalRequestsTargeted.load();
 }
 
@@ -101,7 +137,7 @@ void RouterTransactionsMetrics::incrementTotalRequestsTargeted() {
 }
 
 const RouterTransactionsMetrics::CommitStats& RouterTransactionsMetrics::getCommitTypeStats_forTest(
-    TransactionRouter::CommitType commitType) {
+    TransactionRouter::CommitType commitType) const {
     switch (commitType) {
         case TransactionRouter::CommitType::kNotInitiated:
             break;
@@ -146,29 +182,53 @@ void RouterTransactionsMetrics::incrementCommitInitiated(TransactionRouter::Comm
     }
 }
 
-void RouterTransactionsMetrics::incrementCommitSuccessful(
-    TransactionRouter::CommitType commitType) {
+void RouterTransactionsMetrics::incrementCommitSuccessful(TransactionRouter::CommitType commitType,
+                                                          Microseconds durationMicros) {
     switch (commitType) {
         case TransactionRouter::CommitType::kNotInitiated:
             MONGO_UNREACHABLE;
         case TransactionRouter::CommitType::kNoShards:
             _noShardsCommitStats.successful.fetchAndAdd(1);
+            _noShardsCommitStats.successfulDurationMicros.fetchAndAdd(
+                durationCount<Microseconds>(durationMicros));
             break;
         case TransactionRouter::CommitType::kSingleShard:
             _singleShardCommitStats.successful.fetchAndAdd(1);
+            _singleShardCommitStats.successfulDurationMicros.fetchAndAdd(
+                durationCount<Microseconds>(durationMicros));
             break;
         case TransactionRouter::CommitType::kSingleWriteShard:
             _singleWriteShardCommitStats.successful.fetchAndAdd(1);
+            _singleWriteShardCommitStats.successfulDurationMicros.fetchAndAdd(
+                durationCount<Microseconds>(durationMicros));
             break;
         case TransactionRouter::CommitType::kReadOnly:
             _readOnlyCommitStats.successful.fetchAndAdd(1);
+            _readOnlyCommitStats.successfulDurationMicros.fetchAndAdd(
+                durationCount<Microseconds>(durationMicros));
             break;
         case TransactionRouter::CommitType::kTwoPhaseCommit:
             _twoPhaseCommitStats.successful.fetchAndAdd(1);
+            _twoPhaseCommitStats.successfulDurationMicros.fetchAndAdd(
+                durationCount<Microseconds>(durationMicros));
             break;
         case TransactionRouter::CommitType::kRecoverWithToken:
             _recoverWithTokenCommitStats.successful.fetchAndAdd(1);
+            _recoverWithTokenCommitStats.successfulDurationMicros.fetchAndAdd(
+                durationCount<Microseconds>(durationMicros));
             break;
+    }
+}
+
+void RouterTransactionsMetrics::incrementAbortCauseMap(std::string abortCause) {
+    invariant(!abortCause.empty());
+
+    stdx::lock_guard<Latch> lock(_abortCauseMutex);
+    auto it = _abortCauseMap.find(abortCause);
+    if (it == _abortCauseMap.end()) {
+        _abortCauseMap.emplace(std::pair<std::string, std::int64_t>(std::move(abortCause), 1));
+    } else {
+        it->second++;
     }
 }
 
@@ -176,10 +236,15 @@ CommitTypeStats RouterTransactionsMetrics::_constructCommitTypeStats(const Commi
     CommitTypeStats commitStats;
     commitStats.setInitiated(stats.initiated.load());
     commitStats.setSuccessful(stats.successful.load());
+    commitStats.setSuccessfulDurationMicros(stats.successfulDurationMicros.load());
     return commitStats;
 }
 
 void RouterTransactionsMetrics::updateStats(RouterTransactionsStats* stats) {
+    stats->setCurrentOpen(_currentOpen.load());
+    stats->setCurrentActive(_currentActive.load());
+    stats->setCurrentInactive(_currentInactive.load());
+
     stats->setTotalStarted(_totalStarted.load());
     stats->setTotalCommitted(_totalCommitted.load());
     stats->setTotalAborted(_totalAborted.load());
@@ -195,6 +260,15 @@ void RouterTransactionsMetrics::updateStats(RouterTransactionsStats* stats) {
     commitTypes.setTwoPhaseCommit(_constructCommitTypeStats(_twoPhaseCommitStats));
     commitTypes.setRecoverWithToken(_constructCommitTypeStats(_recoverWithTokenCommitStats));
     stats->setCommitTypes(commitTypes);
+
+    BSONObjBuilder bob;
+    {
+        stdx::lock_guard<Latch> lock(_abortCauseMutex);
+        for (auto const& abortCauseEntry : _abortCauseMap) {
+            bob.append(abortCauseEntry.first, abortCauseEntry.second);
+        }
+    }
+    stats->setAbortCause(bob.obj());
 }
 
 }  // namespace mongo

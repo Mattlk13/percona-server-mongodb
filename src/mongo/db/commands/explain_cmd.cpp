@@ -31,6 +31,7 @@
 
 #include "mongo/db/command_can_run_here.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/explain_gen.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/util/str.h"
 
@@ -53,6 +54,10 @@ class CmdExplain final : public Command {
 public:
     CmdExplain() : Command("explain") {}
 
+    const std::set<std::string>& apiVersions() const {
+        return kApiVersions1;
+    }
+
     std::unique_ptr<CommandInvocation> parse(OperationContext* opCtx,
                                              const OpMsgRequest& request) override;
 
@@ -69,6 +74,10 @@ public:
 
     bool adminOnly() const override {
         return false;
+    }
+
+    bool collectsResourceConsumptionMetrics() const override {
+        return true;
     }
 
     std::string help() const override {
@@ -143,18 +152,26 @@ private:
 std::unique_ptr<CommandInvocation> CmdExplain::parse(OperationContext* opCtx,
                                                      const OpMsgRequest& request) {
     CommandHelpers::uassertNoDocumentSequences(getName(), request);
-    std::string dbname = request.getDatabase().toString();
-    const BSONObj& cmdObj = request.body;
-    ExplainOptions::Verbosity verbosity = uassertStatusOK(ExplainOptions::parseCmdBSON(cmdObj));
-    uassert(ErrorCodes::BadValue,
-            "explain command requires a nested object",
-            cmdObj.firstElement().type() == Object);
-    auto explainedObj = cmdObj.firstElement().Obj();
+
+    // To enforce API versioning
+    auto cmdObj = ExplainCommandRequest::parse(
+        IDLParserErrorContext(ExplainCommandRequest::kCommandName,
+                              APIParameters::get(opCtx).getAPIStrict().value_or(false)),
+        request.body);
+    std::string dbname = cmdObj.getDbName().toString();
+    ExplainOptions::Verbosity verbosity = cmdObj.getVerbosity();
+    auto explainedObj = cmdObj.getCommandParameter();
+
+    // Extract 'comment' field from the 'explainedObj' only if there is no top-level comment.
+    auto commentField = explainedObj["comment"];
+    if (!opCtx->getComment() && commentField) {
+        opCtx->setComment(commentField.wrap());
+    }
+
     if (auto innerDb = explainedObj["$db"]) {
         uassert(ErrorCodes::InvalidNamespace,
                 str::stream() << "Mismatched $db in explain command. Expected " << dbname
-                              << " but got "
-                              << innerDb.checkAndGetStringData(),
+                              << " but got " << innerDb.checkAndGetStringData(),
                 innerDb.checkAndGetStringData() == dbname);
     }
     auto explainedCommand = CommandHelpers::findCommand(explainedObj.firstElementFieldName());
@@ -163,9 +180,9 @@ std::unique_ptr<CommandInvocation> CmdExplain::parse(OperationContext* opCtx,
                           << explainedObj.firstElementFieldName(),
             explainedCommand);
     auto innerRequest =
-        stdx::make_unique<OpMsgRequest>(OpMsgRequest::fromDBAndBody(dbname, explainedObj));
-    auto innerInvocation = explainedCommand->parse(opCtx, *innerRequest);
-    return stdx::make_unique<Invocation>(
+        std::make_unique<OpMsgRequest>(OpMsgRequest::fromDBAndBody(dbname, explainedObj));
+    auto innerInvocation = explainedCommand->parseForExplain(opCtx, *innerRequest, verbosity);
+    return std::make_unique<Invocation>(
         this, request, std::move(verbosity), std::move(innerRequest), std::move(innerInvocation));
 }
 

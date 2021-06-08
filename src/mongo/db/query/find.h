@@ -50,20 +50,18 @@ class OperationContext;
  * a cursor ID of 0.
  */
 bool shouldSaveCursor(OperationContext* opCtx,
-                      const Collection* collection,
+                      const CollectionPtr& collection,
                       PlanExecutor::ExecState finalState,
                       PlanExecutor* exec);
 
 /**
- * Similar to shouldSaveCursor(), but used in getMore to determine whether we should keep
- * the cursor around for additional getMores().
+ * Similar to shouldSaveCursor(), but used in getMore to determine whether we should keep the cursor
+ * around for additional getMores().
  *
- * If false, the caller should close the cursor and indicate this to the client by sending back
- * a cursor ID of 0.
+ * If false, the caller should close the cursor and indicate this to the client by sending back a
+ * cursor ID of 0.
  */
-bool shouldSaveCursorGetMore(PlanExecutor::ExecState finalState,
-                             PlanExecutor* exec,
-                             bool isTailable);
+bool shouldSaveCursorGetMore(PlanExecutor* exec, bool isTailable);
 
 /**
  * Fills out the CurOp for "opCtx" with information about this query.
@@ -76,12 +74,12 @@ void beginQueryOp(OperationContext* opCtx,
 
 /**
  * 1) Fills out CurOp for "opCtx" with information regarding this query's execution.
- * 2) Reports index usage to the CollectionInfoCache.
+ * 2) Reports index usage to the CollectionQueryInfo.
  *
  * Uses explain functionality to extract stats from 'exec'.
  */
 void endQueryOp(OperationContext* opCtx,
-                Collection* collection,
+                const CollectionPtr& collection,
                 const PlanExecutor& exec,
                 long long numResults,
                 CursorId cursorId);
@@ -98,11 +96,8 @@ Message getMore(OperationContext* opCtx,
                 bool* isCursorAuthorized);
 
 /**
- * Run the query 'q' and place the result in 'result'.
+ * Run the query 'q' and place the result in 'result'. Returns true if in exhaust mode.
  */
-std::string runQuery(OperationContext* opCtx,
-                     QueryMessage& q,
-                     const NamespaceString& ns,
-                     Message& result);
+bool runQuery(OperationContext* opCtx, QueryMessage& q, const NamespaceString& ns, Message& result);
 
 }  // namespace mongo

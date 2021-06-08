@@ -29,6 +29,8 @@
 
 #pragma once
 
+#include <memory>
+
 #include "mongo/s/async_requests_sender.h"
 
 namespace mongo {
@@ -47,11 +49,13 @@ public:
      */
     MultiStatementTransactionRequestsSender(
         OperationContext* opCtx,
-        executor::TaskExecutor* executor,
+        std::shared_ptr<executor::TaskExecutor> executor,
         StringData dbName,
         const std::vector<AsyncRequestsSender::Request>& requests,
         const ReadPreferenceSetting& readPreference,
         Shard::RetryPolicy retryPolicy);
+
+    ~MultiStatementTransactionRequestsSender();
 
     bool done();
 
@@ -61,7 +65,7 @@ public:
 
 private:
     OperationContext* _opCtx;
-    AsyncRequestsSender _ars;
+    std::unique_ptr<AsyncRequestsSender> _ars;
 };
 
 }  // namespace mongo

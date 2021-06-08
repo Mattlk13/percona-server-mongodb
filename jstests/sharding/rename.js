@@ -2,84 +2,99 @@
 TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
 
 (function() {
-    'use strict';
+'use strict';
 
-    load("jstests/replsets/rslib.js");
+load("jstests/replsets/rslib.js");
 
-    var s = new ShardingTest({shards: 2, mongos: 1, rs: {oplogSize: 10}});
+var s = new ShardingTest({shards: 2, mongos: 1, rs: {oplogSize: 10}});
+var db = s.getDB("test");
 
-    var db = s.getDB("test");
-    var replTest = s.rs0;
+assert.commandWorked(db.foo.insert({_id: 1}));
+db.foo.renameCollection('bar');
+assert.isnull(db.getLastError(), '1.0');
+assert.eq(db.bar.findOne(), {_id: 1}, '1.1');
+assert.eq(db.bar.count(), 1, '1.2');
+assert.eq(db.foo.count(), 0, '1.3');
 
-    assert.writeOK(db.foo.insert({_id: 1}));
-    db.foo.renameCollection('bar');
-    assert.isnull(db.getLastError(), '1.0');
-    assert.eq(db.bar.findOne(), {_id: 1}, '1.1');
-    assert.eq(db.bar.count(), 1, '1.2');
-    assert.eq(db.foo.count(), 0, '1.3');
+assert.commandWorked(db.foo.insert({_id: 2}));
+db.foo.renameCollection('bar', true);
+assert.isnull(db.getLastError(), '2.0');
+assert.eq(db.bar.findOne(), {_id: 2}, '2.1');
+assert.eq(db.bar.count(), 1, '2.2');
+assert.eq(db.foo.count(), 0, '2.3');
 
-    assert.writeOK(db.foo.insert({_id: 2}));
-    db.foo.renameCollection('bar', true);
-    assert.isnull(db.getLastError(), '2.0');
-    assert.eq(db.bar.findOne(), {_id: 2}, '2.1');
-    assert.eq(db.bar.count(), 1, '2.2');
-    assert.eq(db.foo.count(), 0, '2.3');
+assert.commandWorked(s.s0.adminCommand({enablesharding: 'test'}));
+s.ensurePrimaryShard('test', s.shard0.shardName);
+assert.commandWorked(
+    s.s0.adminCommand({enablesharding: 'otherDBSamePrimary', primaryShard: s.shard0.shardName}));
 
-    assert.commandWorked(s.s0.adminCommand({enablesharding: "test"}));
-    s.ensurePrimaryShard('test', s.shard0.shardName);
+assert.commandWorked(s.s0.adminCommand(
+    {enablesharding: 'otherDBDifferentPrimary', primaryShard: s.shard1.shardName}));
 
-    // Ensure renaming to or from a sharded collection fails.
-    jsTest.log('Testing renaming sharded collections');
-    assert.commandWorked(
-        s.s0.adminCommand({shardCollection: 'test.shardedColl', key: {_id: 'hashed'}}));
+jsTest.log('Testing renaming sharded collections');
+assert.commandWorked(
+    s.s0.adminCommand({shardCollection: 'test.shardedColl', key: {_id: 'hashed'}}));
 
+const DDLFeatureFlagParam = assert.commandWorked(
+    s.configRS.getPrimary().adminCommand({getParameter: 1, featureFlagShardingFullDDLSupport: 1}));
+const isDDLFeatureFlagEnabled = DDLFeatureFlagParam.featureFlagShardingFullDDLSupport.value;
+// Ensure renaming to or from a sharded collection fails in the legacy path.
+if (!isDDLFeatureFlagEnabled) {
     // Renaming from a sharded collection
     assert.commandFailed(db.shardedColl.renameCollection('somethingElse'));
 
-    // Renaming to a sharded collection
-    assert.commandFailed(db.bar.renameCollection('shardedColl'));
-
+    // Renaming to a sharded collection with dropTarget=true
     const dropTarget = true;
     assert.commandFailed(db.bar.renameCollection('shardedColl', dropTarget));
+}
 
-    jsTest.log('Testing renaming sharded collections, directly on the shard');
-    var primary = replTest.getPrimary();
-    assert.commandFailed(primary.getDB('test').shardedColl.renameCollection('somethingElse'));
-    assert.commandFailed(primary.getDB('test').bar.renameCollection('shardedColl'));
-    assert.commandFailed(primary.getDB('test').bar.renameCollection('shardedColl', dropTarget));
+// Renaming to a sharded collection without dropTarget=true
+assert.commandFailed(db.bar.renameCollection('shardedColl'));
 
-    jsTest.log("Testing write concern (1)");
+// Renaming unsharded collection to a different db with different primary shard.
+db.unSharded.insert({x: 1});
+assert.commandFailedWithCode(
+    db.adminCommand({renameCollection: 'test.unSharded', to: 'otherDBDifferentPrimary.foo'}),
+    // TODO SERVER-54879 just check for ErrorCodes.CommandFailed
+    [ErrorCodes.CommandFailed, 13137],
+    "Source and destination collections must be on the same database.");
 
-    assert.writeOK(db.foo.insert({_id: 3}));
-    db.foo.renameCollection('bar', true);
+// Renaming unsharded collection to a different db with same primary shard.
+assert.commandWorked(
+    db.adminCommand({renameCollection: 'test.unSharded', to: 'otherDBSamePrimary.foo'}));
+assert.eq(0, db.unsharded.countDocuments({}));
+assert.eq(1, s.getDB('otherDBSamePrimary').foo.countDocuments({}));
 
-    var ans = db.runCommand({getLastError: 1, w: 3});
-    printjson(ans);
-    assert.isnull(ans.err, '3.0');
+jsTest.log("Testing that rename operations involving views are not allowed");
+{
+    assert.commandWorked(db.collForView.insert({_id: 1}));
+    assert.commandWorked(db.createView('view', 'collForView', []));
 
-    assert.eq(db.bar.findOne(), {_id: 3}, '3.1');
-    assert.eq(db.bar.count(), 1, '3.2');
-    assert.eq(db.foo.count(), 0, '3.3');
+    let toAView = db.unsharded.renameCollection('view', true /* dropTarget */);
+    assert.commandFailed(toAView);
 
-    // Ensure write concern works by shutting down 1 node in a replica set shard
-    jsTest.log("Testing write concern (2)");
+    let fromAView = db.view.renameCollection('target');
+    assert.commandFailed(fromAView);
+}
 
-    // Kill any node. Don't care if it's a primary or secondary.
-    replTest.stop(0);
+// Ensure write concern works by shutting down 1 node in a replica set shard
+jsTest.log("Testing write concern (2)");
 
-    // Call getPrimary() to populate replTest._slaves.
-    replTest.getPrimary();
-    let liveSlaves = replTest._slaves.filter(function(node) {
-        return node.host !== replTest.nodes[0].host;
-    });
-    replTest.awaitSecondaryNodes(null, liveSlaves);
-    awaitRSClientHosts(s.s, replTest.getPrimary(), {ok: true, ismaster: true}, replTest.name);
+var replTest = s.rs0;
 
-    assert.writeOK(db.foo.insert({_id: 4}));
-    assert.commandWorked(db.foo.renameCollection('bar', true));
+// Kill any node. Don't care if it's a primary or secondary.
+replTest.stop(0);
 
-    ans = db.runCommand({getLastError: 1, w: 3, wtimeout: 5000});
-    assert.eq(ans.err, "timeout", 'gle: ' + tojson(ans));
+// Call getPrimary() to populate replTest._secondaries.
+replTest.getPrimary();
+let liveSecondaries = replTest.getSecondaries().filter(function(node) {
+    return node.host !== replTest.nodes[0].host;
+});
+replTest.awaitSecondaryNodes(null, liveSecondaries);
+awaitRSClientHosts(s.s, replTest.getPrimary(), {ok: true, ismaster: true}, replTest.name);
 
-    s.stop();
+assert.commandWorked(db.foo.insert({_id: 4}));
+assert.commandWorked(db.foo.renameCollection('bar', true));
+
+s.stop();
 })();

@@ -11,7 +11,6 @@ load('jstests/concurrency/fsm_libs/extend_workload.js');           // for extend
 load('jstests/concurrency/fsm_workloads/indexed_insert_base.js');  // for $config
 
 var $config = extendWorkload($config, function($config, $super) {
-
     $config.states.init = function init(db, collName) {
         $super.states.init.apply(this, arguments);
     };
@@ -22,6 +21,12 @@ var $config = extendWorkload($config, function($config, $super) {
             indexed_insert_compound_y: this.tid >> 4,    // high bits
             indexed_insert_compound_z: String.fromCharCode(33 + this.tid)
         };
+    };
+
+    $config.data.getIndexName = function getIndexName() {
+        return 'indexed_insert_compound_x_1_' +
+            'indexed_insert_compound_y_1_' +
+            'indexed_insert_compound_z_1';
     };
 
     $config.data.getIndexSpec = function getIndexSpec() {

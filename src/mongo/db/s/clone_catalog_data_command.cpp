@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/authorization_session.h"
@@ -35,25 +35,25 @@
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/cloner.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/dbdirectclient.h"
-#include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/clone_catalog_data_gen.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
 
 /**
- * Currently, _cloneCatalogData will clone all data (including metadata). In the second part of
+ * Currently, _shardsvrCloneCatalogData will clone all data (including metadata). In the second part
+ * of
  * PM-1017 (Introduce Database Versioning in Sharding Config) this command will be changed to only
  * clone catalog metadata, as the name would suggest.
  */
 class CloneCatalogDataCommand : public BasicCommand {
 public:
-    CloneCatalogDataCommand() : BasicCommand("_cloneCatalogData") {}
+    CloneCatalogDataCommand() : BasicCommand("_shardsvrCloneCatalogData", "_cloneCatalogData") {}
 
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
@@ -87,16 +87,17 @@ public:
         uassertStatusOK(shardingState->canAcceptShardedCommands());
 
         uassert(ErrorCodes::IllegalOperation,
-                str::stream() << "_cloneCatalogData can only be run on shard servers",
+                str::stream() << "_shardsvrCloneCatalogData can only be run on shard servers",
                 serverGlobalParams.clusterRole == ClusterRole::ShardServer);
 
         uassert(ErrorCodes::InvalidOptions,
-                str::stream() << "_cloneCatalogData must be called with majority writeConcern, got "
-                              << cmdObj,
+                str::stream()
+                    << "_shardsvrCloneCatalogData must be called with majority writeConcern, got "
+                    << cmdObj,
                 opCtx->getWriteConcern().wMode == WriteConcernOptions::kMajority);
 
         const auto cloneCatalogDataRequest =
-            CloneCatalogData::parse(IDLParserErrorContext("_cloneCatalogData"), cmdObj);
+            CloneCatalogData::parse(IDLParserErrorContext("_shardsvrCloneCatalogData"), cmdObj);
         const auto dbname = cloneCatalogDataRequest.getCommandParameter().toString();
 
         uassert(
@@ -112,18 +113,12 @@ public:
         auto from = cloneCatalogDataRequest.getFrom();
 
         uassert(ErrorCodes::InvalidOptions,
-                str::stream() << "Can't run _cloneCatalogData without a source",
+                str::stream() << "Can't run _shardsvrCloneCatalogData without a source",
                 !from.empty());
 
         auto const catalogClient = Grid::get(opCtx)->catalogClient();
         const auto shardedColls = catalogClient->getAllShardedCollectionsForDb(
             opCtx, dbname, repl::ReadConcernLevel::kMajorityReadConcern);
-
-        CloneOptions opts;
-        opts.fromDB = dbname;
-        for (const auto& shardedColl : shardedColls) {
-            opts.shardedColls.insert(shardedColl.ns());
-        }
 
         DisableDocumentValidation disableValidation(opCtx);
 
@@ -132,7 +127,7 @@ public:
         Lock::DBLock dbXLock(opCtx, dbname, MODE_X);
 
         Cloner cloner;
-        uassertStatusOK(cloner.copyDb(opCtx, dbname, from.toString(), opts, &clonedColls));
+        uassertStatusOK(cloner.copyDb(opCtx, dbname, from.toString(), shardedColls, &clonedColls));
         {
             BSONArrayBuilder cloneBarr = result.subarrayStart("clonedColls");
             cloneBarr.append(clonedColls);
@@ -141,7 +136,7 @@ public:
         return true;
     }
 
-} CloneCatalogDataCmd;
+} cloneCatalogDataCmd;
 
 }  // namespace
 }  // namespace mongo

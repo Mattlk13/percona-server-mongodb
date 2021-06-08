@@ -31,6 +31,7 @@
 
 #include "mongo/s/multi_statement_transaction_requests_sender.h"
 
+#include "mongo/db/operation_context.h"
 #include "mongo/s/transaction_router.h"
 
 namespace mongo {
@@ -50,7 +51,7 @@ std::vector<AsyncRequestsSender::Request> attachTxnDetails(
     for (auto request : requests) {
         newRequests.emplace_back(
             request.shardId,
-            txnRouter->attachTxnFieldsIfNeeded(opCtx, request.shardId, request.cmdObj));
+            txnRouter.attachTxnFieldsIfNeeded(opCtx, request.shardId, request.cmdObj));
     }
 
     return newRequests;
@@ -66,35 +67,49 @@ void processReplyMetadata(OperationContext* opCtx, const AsyncRequestsSender::Re
         return;
     }
 
-    txnRouter->processParticipantResponse(response.shardId, response.swResponse.getValue().data);
+    txnRouter.processParticipantResponse(
+        opCtx, response.shardId, response.swResponse.getValue().data);
 }
 
 }  // unnamed namespace
 
 MultiStatementTransactionRequestsSender::MultiStatementTransactionRequestsSender(
     OperationContext* opCtx,
-    executor::TaskExecutor* executor,
+    std::shared_ptr<executor::TaskExecutor> executor,
     StringData dbName,
     const std::vector<AsyncRequestsSender::Request>& requests,
     const ReadPreferenceSetting& readPreference,
     Shard::RetryPolicy retryPolicy)
     : _opCtx(opCtx),
-      _ars(
-          opCtx, executor, dbName, attachTxnDetails(opCtx, requests), readPreference, retryPolicy) {
+      _ars(std::make_unique<AsyncRequestsSender>(opCtx,
+                                                 std::move(executor),
+                                                 dbName,
+                                                 attachTxnDetails(opCtx, requests),
+                                                 readPreference,
+                                                 retryPolicy)) {}
+
+MultiStatementTransactionRequestsSender::~MultiStatementTransactionRequestsSender() {
+    invariant(_opCtx);
+    auto baton = _opCtx->getBaton();
+    invariant(baton);
+    // Delegate the destruction of `_ars` to the `_opCtx` baton to potentially move the cost off of
+    // the critical path. The assumption is that postponing the destruction is safe so long as the
+    // `_opCtx` that corresponds to `_ars` remains alive.
+    baton->schedule([ars = std::move(_ars)](Status) mutable { ars.reset(); });
 }
 
 bool MultiStatementTransactionRequestsSender::done() {
-    return _ars.done();
+    return _ars->done();
 }
 
 AsyncRequestsSender::Response MultiStatementTransactionRequestsSender::next() {
-    const auto response = _ars.next();
+    const auto response = _ars->next();
     processReplyMetadata(_opCtx, response);
     return response;
 }
 
 void MultiStatementTransactionRequestsSender::stopRetrying() {
-    _ars.stopRetrying();
+    _ars->stopRetrying();
 }
 
 }  // namespace mongo

@@ -31,6 +31,7 @@
 
 #include "mongo/db/ftdc/ftdc_system_stats.h"
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -39,7 +40,6 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/ftdc/collector.h"
 #include "mongo/db/ftdc/controller.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/processinfo.h"
 #include "mongo/util/procparser.h"
 
@@ -51,6 +51,7 @@ static const std::vector<StringData> kCpuKeys{
     "btime"_sd, "cpu"_sd, "ctxt"_sd, "processes"_sd, "procs_blocked"_sd, "procs_running"_sd};
 
 static const std::vector<StringData> kMemKeys{
+    "MemAvailable"_sd,
     "MemTotal"_sd,
     "MemFree"_sd,
     "Cached"_sd,
@@ -68,7 +69,21 @@ static const std::vector<StringData> kMemKeys{
 };
 
 static const std::vector<StringData> kNetstatKeys{
-    "Tcp:"_sd, "Ip:"_sd, "TcpExt:"_sd, "IpExt:"_sd,
+    "Tcp:"_sd,
+    "Ip:"_sd,
+    "TcpExt:"_sd,
+    "IpExt:"_sd,
+};
+
+static const std::vector<StringData> kVMKeys{
+    "balloon_deflate"_sd,
+    "balloon_inflate"_sd,
+    "nr_mlock"_sd,
+    "numa_pages_migrated"_sd,
+    "pgfault"_sd,
+    "pgmajfault"_sd,
+    "pswpin"_sd,
+    "pswpout"_sd,
 };
 
 /**
@@ -88,7 +103,7 @@ public:
 
             // Include the number of cpus to simplify client calculations
             ProcessInfo p;
-            subObjBuilder.append("num_cpus", p.getNumCores());
+            subObjBuilder.append("num_cpus", static_cast<int>(p.getNumAvailableCores()));
 
             processStatusErrors(
                 procparser::parseProcStatFile("/proc/stat"_sd, kCpuKeys, &subObjBuilder),
@@ -124,6 +139,14 @@ public:
                                 &subObjBuilder);
             subObjBuilder.doneFast();
         }
+
+        {
+            BSONObjBuilder subObjBuilder(builder.subobjStart("vmstat"_sd));
+            processStatusErrors(
+                procparser::parseProcVMStatFile("/proc/vmstat"_sd, kVMKeys, &subObjBuilder),
+                &subObjBuilder);
+            subObjBuilder.doneFast();
+        }
     }
 
 private:
@@ -137,7 +160,7 @@ private:
 }  // namespace
 
 void installSystemMetricsCollector(FTDCController* controller) {
-    controller->addPeriodicCollector(stdx::make_unique<LinuxSystemMetricsCollector>());
+    controller->addPeriodicCollector(std::make_unique<LinuxSystemMetricsCollector>());
 }
 
 }  // namespace mongo

@@ -32,17 +32,18 @@
 #include <set>
 #include <string>
 
-#include "mongo/db/exec/projection_exec_agg.h"
 #include "mongo/db/field_ref.h"
+#include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index/multikey_paths.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/util/container_size_helper.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
-
 class CollatorInterface;
 class MatchExpression;
+class WildcardProjection;
 
 /**
  * A CoreIndexInfo is a representation of an index in the catalog with parsed information which is
@@ -59,16 +60,16 @@ struct CoreIndexInfo {
                   Identifier ident,
                   const MatchExpression* fe = nullptr,
                   const CollatorInterface* ci = nullptr,
-                  const ProjectionExecAgg* projExec = nullptr)
+                  const WildcardProjection* wildcardProj = nullptr)
         : identifier(std::move(ident)),
           keyPattern(kp),
           filterExpr(fe),
           type(type),
           sparse(sp),
           collator(ci),
-          wildcardProjection(projExec) {
+          wildcardProjection(wildcardProj) {
         // We always expect a projection executor for $** indexes, and none otherwise.
-        invariant((type == IndexType::INDEX_WILDCARD) == (projExec != nullptr));
+        invariant((type == IndexType::INDEX_WILDCARD) == (wildcardProjection != nullptr));
     }
 
     virtual ~CoreIndexInfo() = default;
@@ -109,6 +110,9 @@ struct CoreIndexInfo {
             return "(" + catalogName + ", " + disambiguator + ")";
         }
 
+        uint64_t estimateObjectSizeInBytes() const {
+            return catalogName.capacity() + disambiguator.capacity() + sizeof(*this);
+        }
         // The name of the index in the catalog.
         std::string catalogName;
 
@@ -133,7 +137,7 @@ struct CoreIndexInfo {
 
     // For $** indexes, a pointer to the projection executor owned by the index access method. Null
     // unless this IndexEntry represents a wildcard index, in which case this is always non-null.
-    const ProjectionExecAgg* wildcardProjection = nullptr;
+    const WildcardProjection* wildcardProjection = nullptr;
 };
 
 /**
@@ -146,6 +150,7 @@ struct CoreIndexInfo {
 struct IndexEntry : CoreIndexInfo {
     IndexEntry(const BSONObj& kp,
                IndexType type,
+               IndexDescriptor::IndexVersion version,
                bool mk,
                const MultikeyPaths& mkp,
                std::set<FieldRef> multikeyPathSet,
@@ -155,8 +160,9 @@ struct IndexEntry : CoreIndexInfo {
                const MatchExpression* fe,
                const BSONObj& io,
                const CollatorInterface* ci,
-               const ProjectionExecAgg* projExec)
-        : CoreIndexInfo(kp, type, sp, std::move(ident), fe, ci, projExec),
+               const WildcardProjection* wildcardProjection)
+        : CoreIndexInfo(kp, type, sp, std::move(ident), fe, ci, wildcardProjection),
+          version(version),
           multikey(mk),
           multikeyPaths(mkp),
           multikeyPathSet(std::move(multikeyPathSet)),
@@ -195,6 +201,33 @@ struct IndexEntry : CoreIndexInfo {
 
     std::string toString() const;
 
+    uint64_t estimateObjectSizeInBytes() const {
+
+        return  // For each element in 'multikeyPaths' add the 'length of the vector * size of the
+                // vector element'.
+            container_size_helper::estimateObjectSizeInBytes(
+                multikeyPaths,
+                [](const auto& keyPath) {
+                    // Calculate the size of each std::set in 'multiKeyPaths'.
+                    return container_size_helper::estimateObjectSizeInBytes(keyPath);
+                },
+                true) +
+            container_size_helper::estimateObjectSizeInBytes(
+                multikeyPathSet,
+                [](const auto& fieldRef) { return fieldRef.estimateObjectSizeInBytes(); },
+                false) +
+            // Subtract static size of 'identifier' since it is already included in
+            // 'sizeof(*this)'.
+            (identifier.estimateObjectSizeInBytes() - sizeof(identifier)) +
+            // Add the runtime BSONObj size of 'keyPattern'.
+            keyPattern.objsize() +
+            // The BSON size of the 'infoObj' is purposefully excluded since its ownership is shared
+            // with the index catalog.
+            // Add size of the object.
+            sizeof(*this);
+    }
+
+    IndexDescriptor::IndexVersion version;
     bool multikey;
 
     // If non-empty, 'multikeyPaths' is a vector with size equal to the number of elements in the

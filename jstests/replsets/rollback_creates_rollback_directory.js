@@ -26,19 +26,19 @@ function runRollbackDirectoryTest(shouldCreateRollbackFiles) {
         ],
     });
 
-    // Make sure we have a master
+    // Make sure we have a primary
     replTest.waitForState(replTest.nodes[0], ReplSetTest.State.PRIMARY);
-    var master = replTest.getPrimary();
+    var primary = replTest.getPrimary();
     var a_conn = conns[0];
     var b_conn = conns[1];
-    a_conn.setSlaveOk();
-    b_conn.setSlaveOk();
+    a_conn.setSecondaryOk();
+    b_conn.setSecondaryOk();
     var A = a_conn.getDB("test");
     var B = b_conn.getDB("test");
     var Apath = replTest.getDbPath(a_conn) + '/';
     var Bpath = replTest.getDbPath(b_conn) + '/';
-    assert(master == conns[0], "conns[0] assumed to be master");
-    assert(a_conn.host == master.host);
+    assert(primary == conns[0], "conns[0] assumed to be primary");
+    assert(a_conn.host == primary.host);
 
     // Make sure we have an arbiter
     assert.soon(function() {
@@ -47,21 +47,21 @@ function runRollbackDirectoryTest(shouldCreateRollbackFiles) {
     }, "Arbiter failed to initialize.");
 
     var options = {writeConcern: {w: 2, wtimeout: replTest.kDefaultTimeoutMS}, upsert: true};
-    assert.writeOK(A.foo.update({key: 'value1'}, {$set: {req: 'req'}}, options));
+    assert.commandWorked(A.foo.update({key: 'value1'}, {$set: {req: 'req'}}, options));
     var AID = replTest.getNodeId(a_conn);
     replTest.stop(AID);
 
-    master = replTest.getPrimary();
-    assert(b_conn.host == master.host);
+    primary = replTest.getPrimary();
+    assert(b_conn.host == primary.host);
     options = {writeConcern: {w: 1, wtimeout: replTest.kDefaultTimeoutMS}, upsert: true};
-    assert.writeOK(B.foo.update({key: 'value1'}, {$set: {res: 'res'}}, options));
+    assert.commandWorked(B.foo.update({key: 'value1'}, {$set: {res: 'res'}}, options));
     var BID = replTest.getNodeId(b_conn);
     replTest.stop(BID);
     replTest.restart(AID);
-    master = replTest.getPrimary();
-    assert(a_conn.host == master.host);
+    primary = replTest.getPrimary();
+    assert(a_conn.host == primary.host);
     options = {writeConcern: {w: 1, wtimeout: replTest.kDefaultTimeoutMS}, upsert: true};
-    assert.writeOK(A.foo.update({key: 'value2'}, {$set: {req: 'req'}}, options));
+    assert.commandWorked(A.foo.update({key: 'value2'}, {$set: {req: 'req'}}, options));
     replTest.restart(BID);  // should rollback
     reconnect(B);
 

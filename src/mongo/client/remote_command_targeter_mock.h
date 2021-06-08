@@ -29,9 +29,9 @@
 
 #pragma once
 
-#include "mongo/client/connection_string.h"
+#include <set>
+
 #include "mongo/client/remote_command_targeter.h"
-#include "mongo/util/net/hostandport.h"
 
 namespace mongo {
 
@@ -55,11 +55,11 @@ public:
      * Returns the return value last set by setFindHostReturnValue.
      * Returns ErrorCodes::InternalError if setFindHostReturnValue was never called.
      */
-    SemiFuture<HostAndPort> findHostWithMaxWait(const ReadPreferenceSetting& readPref,
-                                                Milliseconds maxWait) override;
+    SemiFuture<HostAndPort> findHost(const ReadPreferenceSetting& readPref,
+                                     const CancellationToken& cancelToken) override;
 
-    SemiFuture<std::vector<HostAndPort>> findHostsWithMaxWait(const ReadPreferenceSetting& readPref,
-                                                              Milliseconds maxWait) override;
+    SemiFuture<std::vector<HostAndPort>> findHosts(const ReadPreferenceSetting& readPref,
+                                                   const CancellationToken& cancelToken) override;
 
     StatusWith<HostAndPort> findHost(OperationContext* opCtx,
                                      const ReadPreferenceSetting& readPref) override;
@@ -67,12 +67,17 @@ public:
     /**
      * Adds host to a set of hosts marked down, otherwise a no-op.
      */
-    void markHostNotMaster(const HostAndPort& host, const Status& status) override;
+    void markHostNotPrimary(const HostAndPort& host, const Status& status) override;
 
     /**
      * Adds host to a set of hosts marked down, otherwise a no-op.
      */
     void markHostUnreachable(const HostAndPort& host, const Status& status) override;
+
+    /**
+     * Adds host to a set of hosts marked down, otherwise a no-op.
+     */
+    void markHostShuttingDown(const HostAndPort& host, const Status& status) override;
 
     /**
      * Sets the return value for the next call to connectionString.
@@ -97,9 +102,9 @@ private:
     StatusWith<std::vector<HostAndPort>> _findHostReturnValue;
 
     // Protects _hostsMarkedDown.
-    mutable stdx::mutex _mutex;
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("RemoteCommandTargeterMock::_mutex");
 
-    // HostAndPorts marked not master or unreachable. Meant to verify a code path updates the
+    // HostAndPorts marked not primary or unreachable. Meant to verify a code path updates the
     // RemoteCommandTargeterMock.
     std::set<HostAndPort> _hostsMarkedDown;
 };

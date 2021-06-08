@@ -36,9 +36,9 @@ namespace mongo {
 
 class DocumentSourceUnwind final : public DocumentSource {
 public:
-    // virtuals from DocumentSource
-    GetNextResult getNext() final;
+    static constexpr StringData kStageName = "$unwind"_sd;
 
+    // virtuals from DocumentSource
     const char* getSourceName() const final;
 
     Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
@@ -55,7 +55,8 @@ public:
                                      DiskUseRequirement::kNoDiskUse,
                                      FacetRequirement::kAllowed,
                                      TransactionRequirement::kAllowed,
-                                     LookupRequirement::kAllowed);
+                                     LookupRequirement::kAllowed,
+                                     UnionRequirement::kAllowed);
 
         constraints.canSwapWithMatch = true;
         return constraints;
@@ -96,6 +97,8 @@ private:
                          const FieldPath& fieldPath,
                          bool includeNullIfEmptyOrMissing,
                          const boost::optional<FieldPath>& includeArrayIndex);
+
+    GetNextResult doGetNext() final;
 
     // Configuration state.
     const FieldPath _unwindPath;

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -35,10 +35,11 @@
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/field_parser.h"
 #include "mongo/s/catalog_cache.h"
-#include "mongo/s/client/shard_registry.h"
+#include "mongo/s/cluster_ddl.h"
 #include "mongo/s/grid.h"
-#include "mongo/util/log.h"
+#include "mongo/s/request_types/sharded_ddl_commands_gen.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
@@ -61,9 +62,10 @@ public:
     }
 
     std::string help() const override {
-        return "Enable sharding for a database. "
+        return "Enable sharding for a database. Optionally allows the caller to specify the shard "
+               "to be used as primary."
                "(Use 'shardcollection' command afterwards.)\n"
-               "  { enablesharding : \"<dbname>\" }\n";
+               "  { enableSharding : \"<dbname>\", primaryShard:  \"<shard>\"}\n";
     }
 
     Status checkAuthForCommand(Client* client,
@@ -87,22 +89,37 @@ public:
                    const BSONObj& cmdObj,
                    std::string& errmsg,
                    BSONObjBuilder& result) override {
-        const std::string db = parseNs("", cmdObj);
+        const std::string dbName = parseNs("", cmdObj);
 
-        // Invalidate the routing table cache entry for this database so that we reload the
-        // collection the next time it's accessed, even if we receive a failure, e.g. NetworkError.
-        ON_BLOCK_EXIT([opCtx, db] { Grid::get(opCtx)->catalogCache()->purgeDatabase(db); });
+        auto catalogCache = Grid::get(opCtx)->catalogCache();
+        ON_BLOCK_EXIT([opCtx, dbName] { Grid::get(opCtx)->catalogCache()->purgeDatabase(dbName); });
+
+        constexpr StringData kShardNameField = "primaryShard"_sd;
+        auto shardElem = cmdObj[kShardNameField];
+
+        ConfigsvrCreateDatabase request(dbName);
+        request.setDbName(NamespaceString::kAdminDb);
+        request.setEnableSharding(true);
+        if (shardElem.ok())
+            request.setPrimaryShardId(StringData(shardElem.String()));
 
         auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
-        auto cmdResponse = uassertStatusOK(configShard->runCommandWithFixedRetryAttempts(
+        auto response = uassertStatusOK(configShard->runCommandWithFixedRetryAttempts(
             opCtx,
             ReadPreferenceSetting(ReadPreference::PrimaryOnly),
             "admin",
-            CommandHelpers::appendMajorityWriteConcern(CommandHelpers::appendPassthroughFields(
-                cmdObj, BSON("_configsvrEnableSharding" << db))),
+            CommandHelpers::appendMajorityWriteConcern(request.toBSON({})),
             Shard::RetryPolicy::kIdempotent));
+        uassertStatusOKWithContext(response.commandStatus,
+                                   str::stream()
+                                       << "Database " << dbName << " could not be created");
+        uassertStatusOK(response.writeConcernStatus);
 
-        CommandHelpers::filterCommandReplyForPassthrough(cmdResponse.response, &result);
+        auto createDbResponse = ConfigsvrCreateDatabaseResponse::parse(
+            IDLParserErrorContext("configsvrCreateDatabaseResponse"), response.response);
+        catalogCache->onStaleDatabaseVersion(
+            dbName, DatabaseVersion(createDbResponse.getDatabaseVersion()));
+
         return true;
     }
 

@@ -38,7 +38,6 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/query/collation/collator_interface_mock.h"
 #include "mongo/db/views/view.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
 
@@ -47,6 +46,7 @@ namespace {
 
 const NamespaceString viewNss("testdb.testview");
 const NamespaceString backingNss("testdb.testcoll");
+const NamespaceString bucketsColl("testdb.system.buckets.testcoll");
 const BSONObj samplePipeline = BSON_ARRAY(BSON("limit" << 9));
 
 TEST(ViewDefinitionTest, ViewDefinitionCreationCorrectlyBuildsNamespaceStrings) {
@@ -58,7 +58,7 @@ TEST(ViewDefinitionTest, ViewDefinitionCreationCorrectlyBuildsNamespaceStrings) 
 
 TEST(ViewDefinitionTest, CopyConstructorProperlyClonesAllFields) {
     auto collator =
-        stdx::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kReverseString);
+        std::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kReverseString);
     ViewDefinition originalView(
         viewNss.db(), viewNss.coll(), backingNss.coll(), samplePipeline, std::move(collator));
     ViewDefinition copiedView(originalView);
@@ -71,11 +71,12 @@ TEST(ViewDefinitionTest, CopyConstructorProperlyClonesAllFields) {
                       SimpleBSONObjComparator::kInstance.makeEqualTo()));
     ASSERT(CollatorInterface::collatorsMatch(originalView.defaultCollator(),
                                              copiedView.defaultCollator()));
+    ASSERT_EQ(originalView.timeseries(), copiedView.timeseries());
 }
 
 TEST(ViewDefinitionTest, CopyAssignmentOperatorProperlyClonesAllFields) {
     auto collator =
-        stdx::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kReverseString);
+        std::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kReverseString);
     ViewDefinition originalView(
         viewNss.db(), viewNss.coll(), backingNss.coll(), samplePipeline, std::move(collator));
     ViewDefinition copiedView = originalView;
@@ -90,9 +91,9 @@ TEST(ViewDefinitionTest, CopyAssignmentOperatorProperlyClonesAllFields) {
                                              copiedView.defaultCollator()));
 }
 
-DEATH_TEST(ViewDefinitionTest,
-           SetViewOnFailsIfNewViewOnNotInSameDatabaseAsView,
-           "Invariant failure _viewNss.db() == viewOnNss.db()") {
+DEATH_TEST_REGEX(ViewDefinitionTest,
+                 SetViewOnFailsIfNewViewOnNotInSameDatabaseAsView,
+                 R"#(Invariant failure.*_viewNss.db\(\) == viewOnNss.db\(\))#") {
     ViewDefinition viewDef(
         viewNss.db(), viewNss.coll(), backingNss.coll(), samplePipeline, nullptr);
     NamespaceString badViewOn("someOtherDb.someOtherCollection");
@@ -109,9 +110,9 @@ TEST(ViewDefinitionTest, SetViewOnSucceedsIfNewViewOnIsInSameDatabaseAsView) {
     ASSERT_EQ(newViewOn, viewDef.viewOn());
 }
 
-DEATH_TEST(ViewDefinitionTest,
-           SetPiplineFailsIfPipelineTypeIsNotArray,
-           "Invariant failure pipeline.type() == Array") {
+DEATH_TEST_REGEX(ViewDefinitionTest,
+                 SetPiplineFailsIfPipelineTypeIsNotArray,
+                 R"#(Invariant failure.*pipeline.type\(\) == Array)#") {
     ViewDefinition viewDef(
         viewNss.db(), viewNss.coll(), backingNss.coll(), samplePipeline, nullptr);
 
@@ -142,6 +143,12 @@ TEST(ViewDefinitionTest, SetPipelineSucceedsOnValidArrayBSONElement) {
                       expectedPipeline.end(),
                       viewDef.pipeline().begin(),
                       SimpleBSONObjComparator::kInstance.makeEqualTo()));
+}
+
+TEST(ViewDefinitionTest, ViewDefinitionCreationCorrectlySetsTimeseries) {
+    ViewDefinition viewDef(
+        viewNss.db(), viewNss.coll(), bucketsColl.coll(), samplePipeline, nullptr);
+    ASSERT(viewDef.timeseries());
 }
 }  // namespace
 }  // namespace mongo

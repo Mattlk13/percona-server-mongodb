@@ -52,9 +52,9 @@ class ParsedMatchExpression {
 public:
     ParsedMatchExpression(const std::string& str, const CollatorInterface* collator = nullptr)
         : _obj(fromjson(str)) {
-        boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-        expCtx->setCollator(collator);
-        StatusWithMatchExpression result = MatchExpressionParser::parse(_obj, std::move(expCtx));
+        _expCtx = make_intrusive<ExpressionContextForTest>();
+        _expCtx->setCollator(CollatorInterface::cloneCollator(collator));
+        StatusWithMatchExpression result = MatchExpressionParser::parse(_obj, _expCtx);
         ASSERT_OK(result.getStatus());
         _expr = std::move(result.getValue());
     }
@@ -66,6 +66,7 @@ public:
 private:
     const BSONObj _obj;
     std::unique_ptr<MatchExpression> _expr;
+    boost::intrusive_ptr<ExpressionContext> _expCtx;
 };
 
 TEST(ExpressionAlgoIsSubsetOf, NullAndOmittedField) {
@@ -810,6 +811,32 @@ TEST(IsIndependent, BallIsIndependentOfBalloon) {
     ASSERT_FALSE(expression::isIndependentOf(*expr.get(), {"a.ball.c"}));
 }
 
+// This is a descriptive test to ensure that until renames are implemented for these expressions,
+// matches on these expressions cannot be swapped with other stages.
+TEST(IsIndependent, NonRenameableExpressionIsNotIndependent) {
+    std::vector<std::string> stringExpressions = {
+        // Category: kOther.
+        "{$or: [{a: {$size: 3}}, {b: {$size: 4}}]}",
+        // Category: kArrayMatching.
+        "{$or: [{a: {$_internalSchemaMaxItems: 3}}, {b: {$_internalSchemaMaxItems: 4}}]}",
+        "{$or: [{a: {$_internalSchemaMinItems: 3}}, {b: {$_internalSchemaMinItems: 4}}]}",
+        "{$or: [{a: {$_internalSchemaObjectMatch: {b: 1}}},"
+        "       {a: {$_internalSchemaObjectMatch: {b: 2}}}]}",
+        "{$or: [{a: {$elemMatch: {b: 3}}}, {a: {$elemMatch: {b: 4}}}]}"};
+
+    for (auto str : stringExpressions) {
+        BSONObj matchPredicate = fromjson(str);
+        boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+        auto swMatchExpression = MatchExpressionParser::parse(matchPredicate, std::move(expCtx));
+        ASSERT_OK(swMatchExpression.getStatus());
+        auto matchExpression = std::move(swMatchExpression.getValue());
+
+        // Both of these should be true once renames are implemented.
+        ASSERT_FALSE(expression::isIndependentOf(*matchExpression.get(), {"c"}));
+        ASSERT_FALSE(expression::isOnlyDependentOn(*matchExpression.get(), {"a", "b"}));
+    }
+}
+
 TEST(SplitMatchExpression, AndWithSplittableChildrenIsSplittable) {
     BSONObj matchPredicate = fromjson("{$and: [{a: 1}, {b: 1}]}");
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
@@ -822,11 +849,11 @@ TEST(SplitMatchExpression, AndWithSplittableChildrenIsSplittable) {
 
     ASSERT_TRUE(splitExpr.first.get());
     BSONObjBuilder firstBob;
-    splitExpr.first->serialize(&firstBob);
+    splitExpr.first->serialize(&firstBob, true);
 
     ASSERT_TRUE(splitExpr.second.get());
     BSONObjBuilder secondBob;
-    splitExpr.second->serialize(&secondBob);
+    splitExpr.second->serialize(&secondBob, true);
 
     ASSERT_BSONOBJ_EQ(firstBob.obj(), fromjson("{a: {$eq: 1}}"));
     ASSERT_BSONOBJ_EQ(secondBob.obj(), fromjson("{b: {$eq: 1}}"));
@@ -844,11 +871,11 @@ TEST(SplitMatchExpression, NorWithIndependentChildrenIsSplittable) {
 
     ASSERT_TRUE(splitExpr.first.get());
     BSONObjBuilder firstBob;
-    splitExpr.first->serialize(&firstBob);
+    splitExpr.first->serialize(&firstBob, true);
 
     ASSERT_TRUE(splitExpr.second.get());
     BSONObjBuilder secondBob;
-    splitExpr.second->serialize(&secondBob);
+    splitExpr.second->serialize(&secondBob, true);
 
     ASSERT_BSONOBJ_EQ(firstBob.obj(), fromjson("{$nor: [{a: {$eq: 1}}]}"));
     ASSERT_BSONOBJ_EQ(secondBob.obj(), fromjson("{$nor: [{b: {$eq: 1}}]}"));
@@ -866,7 +893,7 @@ TEST(SplitMatchExpression, NotWithIndependentChildIsSplittable) {
 
     ASSERT_TRUE(splitExpr.first.get());
     BSONObjBuilder firstBob;
-    splitExpr.first->serialize(&firstBob);
+    splitExpr.first->serialize(&firstBob, true);
 
     ASSERT_BSONOBJ_EQ(firstBob.obj(), fromjson("{x: {$not: {$gt: 4}}}"));
     ASSERT_FALSE(splitExpr.second);
@@ -884,7 +911,7 @@ TEST(SplitMatchExpression, OrWithOnlyIndependentChildrenIsNotSplittable) {
 
     ASSERT_TRUE(splitExpr.second.get());
     BSONObjBuilder bob;
-    splitExpr.second->serialize(&bob);
+    splitExpr.second->serialize(&bob, true);
 
     ASSERT_FALSE(splitExpr.first);
     ASSERT_BSONOBJ_EQ(bob.obj(), fromjson("{$or: [{a: {$eq: 1}}, {b: {$eq: 1}}]}"));
@@ -905,11 +932,11 @@ TEST(SplitMatchExpression, ComplexMatchExpressionSplitsCorrectly) {
 
     ASSERT_TRUE(splitExpr.first.get());
     BSONObjBuilder firstBob;
-    splitExpr.first->serialize(&firstBob);
+    splitExpr.first->serialize(&firstBob, true);
 
     ASSERT_TRUE(splitExpr.second.get());
     BSONObjBuilder secondBob;
-    splitExpr.second->serialize(&secondBob);
+    splitExpr.second->serialize(&secondBob, true);
 
     ASSERT_BSONOBJ_EQ(firstBob.obj(), fromjson("{$or: [{'a.b': {$eq: 3}}, {'a.b.c': {$eq: 4}}]}"));
     ASSERT_BSONOBJ_EQ(secondBob.obj(),
@@ -930,11 +957,11 @@ TEST(SplitMatchExpression, ShouldNotExtractPrefixOfDottedPathAsIndependent) {
 
     ASSERT_TRUE(splitExpr.first.get());
     BSONObjBuilder firstBob;
-    splitExpr.first->serialize(&firstBob);
+    splitExpr.first->serialize(&firstBob, true);
 
     ASSERT_TRUE(splitExpr.second.get());
     BSONObjBuilder secondBob;
-    splitExpr.second->serialize(&secondBob);
+    splitExpr.second->serialize(&secondBob, true);
 
     ASSERT_BSONOBJ_EQ(firstBob.obj(), fromjson("{'a.c': {$eq: 1}}"));
     ASSERT_BSONOBJ_EQ(secondBob.obj(), fromjson("{$and: [{a: {$eq: 1}}, {'a.b': {$eq: 1}}]}"));
@@ -952,7 +979,7 @@ TEST(SplitMatchExpression, ShouldMoveIndependentLeafPredicateAcrossRename) {
 
     ASSERT_TRUE(splitExpr.first.get());
     BSONObjBuilder firstBob;
-    splitExpr.first->serialize(&firstBob);
+    splitExpr.first->serialize(&firstBob, true);
     ASSERT_BSONOBJ_EQ(firstBob.obj(), fromjson("{b: {$eq: 1}}"));
 
     ASSERT_FALSE(splitExpr.second.get());
@@ -970,7 +997,7 @@ TEST(SplitMatchExpression, ShouldMoveIndependentAndPredicateAcrossRename) {
 
     ASSERT_TRUE(splitExpr.first.get());
     BSONObjBuilder firstBob;
-    splitExpr.first->serialize(&firstBob);
+    splitExpr.first->serialize(&firstBob, true);
     ASSERT_BSONOBJ_EQ(firstBob.obj(), fromjson("{$and: [{c: {$eq: 1}}, {b: {$eq: 2}}]}"));
 
     ASSERT_FALSE(splitExpr.second.get());
@@ -988,12 +1015,12 @@ TEST(SplitMatchExpression, ShouldSplitPartiallyDependentAndPredicateAcrossRename
 
     ASSERT_TRUE(splitExpr.first.get());
     BSONObjBuilder firstBob;
-    splitExpr.first->serialize(&firstBob);
+    splitExpr.first->serialize(&firstBob, true);
     ASSERT_BSONOBJ_EQ(firstBob.obj(), fromjson("{c: {$eq: 1}}"));
 
     ASSERT_TRUE(splitExpr.second.get());
     BSONObjBuilder secondBob;
-    splitExpr.second->serialize(&secondBob);
+    splitExpr.second->serialize(&secondBob, true);
     ASSERT_BSONOBJ_EQ(secondBob.obj(), fromjson("{b: {$eq: 2}}"));
 }
 
@@ -1009,12 +1036,12 @@ TEST(SplitMatchExpression, ShouldSplitPartiallyDependentComplexPredicateMultiple
 
     ASSERT_TRUE(splitExpr.first.get());
     BSONObjBuilder firstBob;
-    splitExpr.first->serialize(&firstBob);
+    splitExpr.first->serialize(&firstBob, true);
     ASSERT_BSONOBJ_EQ(firstBob.obj(), fromjson("{$or: [{d: {$eq: 2}}, {e: {$eq: 3}}]}"));
 
     ASSERT_TRUE(splitExpr.second.get());
     BSONObjBuilder secondBob;
-    splitExpr.second->serialize(&secondBob);
+    splitExpr.second->serialize(&secondBob, true);
     ASSERT_BSONOBJ_EQ(secondBob.obj(), fromjson("{a: {$eq: 1}}"));
 }
 
@@ -1031,12 +1058,12 @@ TEST(SplitMatchExpression,
 
     ASSERT_TRUE(splitExpr.first.get());
     BSONObjBuilder firstBob;
-    splitExpr.first->serialize(&firstBob);
+    splitExpr.first->serialize(&firstBob, true);
     ASSERT_BSONOBJ_EQ(firstBob.obj(), fromjson("{$or: [{x: {$eq: 2}}, {y: {$eq: 3}}]}"));
 
     ASSERT_TRUE(splitExpr.second.get());
     BSONObjBuilder secondBob;
-    splitExpr.second->serialize(&secondBob);
+    splitExpr.second->serialize(&secondBob, true);
     ASSERT_BSONOBJ_EQ(secondBob.obj(), fromjson("{a: {$eq: 1}}"));
 }
 
@@ -1054,7 +1081,7 @@ TEST(SplitMatchExpression, ShouldNotMoveElemMatchObjectAcrossRename) {
 
     ASSERT_TRUE(splitExpr.second.get());
     BSONObjBuilder secondBob;
-    splitExpr.second->serialize(&secondBob);
+    splitExpr.second->serialize(&secondBob, true);
     ASSERT_BSONOBJ_EQ(secondBob.obj(), fromjson("{a: {$elemMatch: {b: {$eq: 3}}}}"));
 }
 
@@ -1072,7 +1099,7 @@ TEST(SplitMatchExpression, ShouldNotMoveElemMatchValueAcrossRename) {
 
     ASSERT_TRUE(splitExpr.second.get());
     BSONObjBuilder secondBob;
-    splitExpr.second->serialize(&secondBob);
+    splitExpr.second->serialize(&secondBob, true);
     ASSERT_BSONOBJ_EQ(secondBob.obj(), fromjson("{a: {$elemMatch: {$eq: 3}}}"));
 }
 
@@ -1088,7 +1115,7 @@ TEST(SplitMatchExpression, ShouldMoveTypeAcrossRename) {
 
     ASSERT_TRUE(splitExpr.first.get());
     BSONObjBuilder firstBob;
-    splitExpr.first->serialize(&firstBob);
+    splitExpr.first->serialize(&firstBob, true);
     ASSERT_BSONOBJ_EQ(firstBob.obj(), fromjson("{c: {$type: [16]}}"));
 
     ASSERT_FALSE(splitExpr.second.get());
@@ -1108,7 +1135,7 @@ TEST(SplitMatchExpression, ShouldNotMoveSizeAcrossRename) {
 
     ASSERT_TRUE(splitExpr.second.get());
     BSONObjBuilder secondBob;
-    splitExpr.second->serialize(&secondBob);
+    splitExpr.second->serialize(&secondBob, true);
     ASSERT_BSONOBJ_EQ(secondBob.obj(), fromjson("{a: {$size: 3}}"));
 }
 
@@ -1126,7 +1153,7 @@ TEST(SplitMatchExpression, ShouldNotMoveMinItemsAcrossRename) {
 
     ASSERT_TRUE(splitExpr.second.get());
     BSONObjBuilder secondBob;
-    splitExpr.second->serialize(&secondBob);
+    splitExpr.second->serialize(&secondBob, true);
     ASSERT_BSONOBJ_EQ(secondBob.obj(), fromjson("{a: {$_internalSchemaMinItems: 3}}"));
 }
 
@@ -1144,8 +1171,52 @@ TEST(SplitMatchExpression, ShouldNotMoveMaxItemsAcrossRename) {
 
     ASSERT_TRUE(splitExpr.second.get());
     BSONObjBuilder secondBob;
-    splitExpr.second->serialize(&secondBob);
+    splitExpr.second->serialize(&secondBob, true);
     ASSERT_BSONOBJ_EQ(secondBob.obj(), fromjson("{a: {$_internalSchemaMaxItems: 3}}"));
+}
+
+TEST(SplitMatchExpression, ShouldNotMoveMaxItemsInLogicalExpressionAcrossRename) {
+    BSONObj matchPredicate = fromjson(
+        "{$or: [{a: {$_internalSchemaMaxItems: 3}},"
+        "       {a: {$_internalSchemaMaxItems: 4}}]}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto matcher = MatchExpressionParser::parse(matchPredicate, std::move(expCtx));
+    ASSERT_OK(matcher.getStatus());
+
+    StringMap<std::string> renames{{"a", "c"}};
+    std::pair<unique_ptr<MatchExpression>, unique_ptr<MatchExpression>> splitExpr =
+        expression::splitMatchExpressionBy(std::move(matcher.getValue()), {}, renames);
+
+    ASSERT_FALSE(splitExpr.first.get());
+
+    ASSERT_TRUE(splitExpr.second.get());
+    BSONObjBuilder secondBob;
+    splitExpr.second->serialize(&secondBob, true);
+    ASSERT_BSONOBJ_EQ(secondBob.obj(),
+                      fromjson("{$or: [{a: {$_internalSchemaMaxItems: 3}},"
+                               "       {a: {$_internalSchemaMaxItems: 4}}]}"));
+}
+
+TEST(SplitMatchExpression, ShouldNotMoveInternalSchemaObjectMatchInLogicalExpressionAcrossRename) {
+    BSONObj matchPredicate = fromjson(
+        "{$or: [{a: {$_internalSchemaObjectMatch: {b: 1}}},"
+        "       {a: {$_internalSchemaObjectMatch: {b: 1}}}]}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto matcher = MatchExpressionParser::parse(matchPredicate, std::move(expCtx));
+    ASSERT_OK(matcher.getStatus());
+
+    StringMap<std::string> renames{{"a", "c"}};
+    std::pair<unique_ptr<MatchExpression>, unique_ptr<MatchExpression>> splitExpr =
+        expression::splitMatchExpressionBy(std::move(matcher.getValue()), {}, renames);
+
+    ASSERT_FALSE(splitExpr.first.get());
+
+    ASSERT_TRUE(splitExpr.second.get());
+    BSONObjBuilder secondBob;
+    splitExpr.second->serialize(&secondBob, true);
+    ASSERT_BSONOBJ_EQ(secondBob.obj(),
+                      fromjson("{$or: [{a: {$_internalSchemaObjectMatch: {b: {$eq: 1}}}},"
+                               "       {a: {$_internalSchemaObjectMatch: {b: {$eq: 1}}}}]}"));
 }
 
 TEST(SplitMatchExpression, ShouldMoveMinLengthAcrossRename) {
@@ -1160,7 +1231,7 @@ TEST(SplitMatchExpression, ShouldMoveMinLengthAcrossRename) {
 
     ASSERT_TRUE(splitExpr.first.get());
     BSONObjBuilder firstBob;
-    splitExpr.first->serialize(&firstBob);
+    splitExpr.first->serialize(&firstBob, true);
     ASSERT_BSONOBJ_EQ(firstBob.obj(), fromjson("{c: {$_internalSchemaMinLength: 3}}"));
 
     ASSERT_FALSE(splitExpr.second.get());
@@ -1178,7 +1249,7 @@ TEST(SplitMatchExpression, ShouldMoveMaxLengthAcrossRename) {
 
     ASSERT_TRUE(splitExpr.first.get());
     BSONObjBuilder firstBob;
-    splitExpr.first->serialize(&firstBob);
+    splitExpr.first->serialize(&firstBob, true);
     ASSERT_BSONOBJ_EQ(firstBob.obj(), fromjson("{c: {$_internalSchemaMaxLength: 3}}"));
 
     ASSERT_FALSE(splitExpr.second.get());
@@ -1197,10 +1268,64 @@ TEST(SplitMatchExpression, ShouldMoveIndependentPredicateWhenThereAreMultipleRen
 
     ASSERT_TRUE(splitExpr.first.get());
     BSONObjBuilder firstBob;
-    splitExpr.first->serialize(&firstBob);
+    splitExpr.first->serialize(&firstBob, true);
     ASSERT_BSONOBJ_EQ(firstBob.obj(), fromjson("{x: {$eq: 3}}"));
 
     ASSERT_FALSE(splitExpr.second.get());
+}
+
+TEST(ApplyRenamesToExpression, ShouldApplyBasicRenamesForAMatchWithExpr) {
+    BSONObj matchPredicate = fromjson("{$expr: {$eq: ['$a.b', '$c']}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto matcher = MatchExpressionParser::parse(matchPredicate, std::move(expCtx));
+    ASSERT_OK(matcher.getStatus());
+
+    StringMap<std::string> renames{{"a", "d"}, {"c", "e"}, {"x", "y"}};
+    expression::applyRenamesToExpression(matcher.getValue().get(), renames);
+
+    ASSERT_BSONOBJ_EQ(matcher.getValue()->serialize(), fromjson("{$expr: {$eq: ['$d.b', '$e']}}"));
+}
+
+TEST(ApplyRenamesToExpression, ShouldApplyDottedRenamesForAMatchWithExpr) {
+    BSONObj matchPredicate = fromjson("{$expr: {$lt: ['$a.b.c', '$d.e.f']}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto matcher = MatchExpressionParser::parse(matchPredicate, std::move(expCtx));
+    ASSERT_OK(matcher.getStatus());
+
+    StringMap<std::string> renames{{"a.b.c", "x"}, {"d.e", "y"}};
+    expression::applyRenamesToExpression(matcher.getValue().get(), renames);
+
+    ASSERT_BSONOBJ_EQ(matcher.getValue()->serialize(), fromjson("{$expr: {$lt: ['$x', '$y.f']}}"));
+}
+
+TEST(ApplyRenamesToExpression, ShouldApplyDottedRenamesForAMatchWithNestedExpr) {
+    BSONObj matchPredicate =
+        fromjson("{$and: [{$expr: {$eq: ['$a.b.c', '$c']}}, {$expr: {$lt: ['$d.e.f', '$a']}}]}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto matcher = MatchExpressionParser::parse(matchPredicate, std::move(expCtx));
+    ASSERT_OK(matcher.getStatus());
+
+    StringMap<std::string> renames{{"a", "x.y"}, {"d.e", "y"}, {"c", "q.r"}};
+    expression::applyRenamesToExpression(matcher.getValue().get(), renames);
+
+    ASSERT_BSONOBJ_EQ(
+        matcher.getValue()->serialize(),
+        fromjson(
+            "{$and: [{$expr: {$eq: ['$x.y.b.c', '$q.r']}}, {$expr: {$lt: ['$y.f', '$x.y']}}]}"));
+}
+
+TEST(ApplyRenamesToExpression, ShouldNotApplyRenamesForAMatchWithExprWithNoFieldPaths) {
+    BSONObj matchPredicate = fromjson("{$expr: {$concat: ['a', 'b', 'c']}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto matcher = MatchExpressionParser::parse(matchPredicate, std::move(expCtx));
+    ASSERT_OK(matcher.getStatus());
+
+    StringMap<std::string> renames{{"a", "x.y"}, {"d.e", "y"}, {"c", "q.r"}};
+    expression::applyRenamesToExpression(matcher.getValue().get(), renames);
+
+    ASSERT_BSONOBJ_EQ(
+        matcher.getValue()->serialize(),
+        fromjson("{$expr: {$concat: [{$const: 'a'}, {$const: 'b'}, {$const: 'c'}]}}"));
 }
 
 TEST(MapOverMatchExpression, DoesMapOverLogicalNodes) {
@@ -1279,5 +1404,68 @@ TEST(IsPathPrefixOf, ComputesPrefixesCorrectly) {
     ASSERT_FALSE(expression::isPathPrefixOf("a.b", "a"));
 }
 
+TEST(HasExistencePredicateOnPath, IdentifiesLeavesCorrectly) {
+    BSONObj matchPredicate = fromjson("{$and: [{a: {$exists: true}}, {b: {$lte: 2}}]}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto swMatchExpression = MatchExpressionParser::parse(matchPredicate, std::move(expCtx));
+    ASSERT_OK(swMatchExpression.getStatus());
+    ASSERT_TRUE(
+        expression::hasExistencePredicateOnPath(*swMatchExpression.getValue().get(), "a"_sd));
+    ASSERT_FALSE(
+        expression::hasExistencePredicateOnPath(*swMatchExpression.getValue().get(), "b"_sd));
+}
+
+TEST(HasExistencePredicateOnPath, HandlesMultiplePredicatesWithSamePath) {
+    BSONObj matchPredicate = fromjson("{$and: [{a: {$gt: 5000}}, {a: {$exists: false}}]}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto swMatchExpression = MatchExpressionParser::parse(matchPredicate, std::move(expCtx));
+    ASSERT_OK(swMatchExpression.getStatus());
+    ASSERT_TRUE(
+        expression::hasExistencePredicateOnPath(*swMatchExpression.getValue().get(), "a"_sd));
+}
+
+TEST(HasExistencePredicateOnPath, DeeperTreeTest) {
+    BSONObj matchPredicate = fromjson(
+        "{$and: [{q: {$gt: 5000}}, {$and: [{z: {$lte: 50}},"
+        "{$or: [{f : {$gte: 4}}, {a : {$exists : true}}]}]}]}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto swMatchExpression = MatchExpressionParser::parse(matchPredicate, std::move(expCtx));
+    ASSERT_OK(swMatchExpression.getStatus());
+    ASSERT_TRUE(
+        expression::hasExistencePredicateOnPath(*swMatchExpression.getValue().get(), "a"_sd));
+}
+
+TEST(HasExistencePredicateOnPath, HandlesDottedPathsInDeepTree) {
+    BSONObj matchPredicate = fromjson(
+        "{$and: [{q: {$gt: 5000}}, {$and: [{z: {$lte: 50}},"
+        "{$or: [{f : {$gte: 4}}, {'a.b.c.d' : {$exists : true}}]}]}]}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto swMatchExpression = MatchExpressionParser::parse(matchPredicate, std::move(expCtx));
+    ASSERT_OK(swMatchExpression.getStatus());
+    ASSERT_TRUE(
+        expression::hasExistencePredicateOnPath(*swMatchExpression.getValue().get(), "a.b.c.d"_sd));
+}
+
+TEST(HasExistencePredicateOnPath, ReturnsFalseWhenExistsOnlyOnPrefix) {
+    BSONObj matchPredicate = fromjson(
+        "{$and: [{q: {$gt: 5000}}, {$and: [{z: {$lte: 50}},"
+        "{$or: [{f : {$gte: 4}}, {'a' : {$exists : true}}]}]}]}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto swMatchExpression = MatchExpressionParser::parse(matchPredicate, std::move(expCtx));
+    ASSERT_OK(swMatchExpression.getStatus());
+    ASSERT_FALSE(
+        expression::hasExistencePredicateOnPath(*swMatchExpression.getValue().get(), "a.b"_sd));
+}
+
+TEST(HasExistencePredicateOnPath, ReturnsFalseWhenExistsOnSubpath) {
+    BSONObj matchPredicate = fromjson(
+        "{$and: [{q: {$gt: 5000}}, {$and: [{z: {$lte: 50}},"
+        "{$or: [{f : {$gte: 4}}, {'a.b' : {$exists : true}}]}]}]}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto swMatchExpression = MatchExpressionParser::parse(matchPredicate, std::move(expCtx));
+    ASSERT_OK(swMatchExpression.getStatus());
+    ASSERT_FALSE(
+        expression::hasExistencePredicateOnPath(*swMatchExpression.getValue().get(), "a"_sd));
+}
 
 }  // namespace mongo

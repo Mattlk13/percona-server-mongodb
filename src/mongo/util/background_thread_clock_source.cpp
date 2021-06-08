@@ -27,19 +27,18 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/util/background_thread_clock_source.h"
 
 #include <chrono>
+#include <memory>
 #include <thread>
 
-#include "mongo/stdx/memory.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/concurrency/idle_thread_block.h"
-#include "mongo/util/log.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -94,8 +93,10 @@ void BackgroundThreadClockSource::_updateClock() {
 // This will be called at most once per _granularity per thread. In common cases it will only be
 // called by a single thread per _granularity.
 void BackgroundThreadClockSource::_updateClockAndWakeTimerIfNeeded() {
+    uint8_t expected = kTimerWillPause;
+    _state.compareAndSwap(&expected, kReaderHasRead);
     // Try to go from TimerWillPause to ReaderHasRead.
-    if (_state.compareAndSwap(kTimerWillPause, kReaderHasRead) != kTimerPaused) {
+    if (expected != kTimerPaused) {
         // There are three possible states _state could have been in before this cas:
         //
         // kTimerWillPause - In this case, we've transitioned to kReaderHasRead, telling the timer

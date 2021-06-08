@@ -36,6 +36,7 @@
 #include "mongo/base/status_with.h"
 #include "mongo/client/connection_string.h"
 #include "mongo/db/repl/member_config.h"
+#include "mongo/db/repl/repl_set_config_gen.h"
 #include "mongo/db/repl/repl_set_tag.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/util/string_map.h"
@@ -48,21 +49,134 @@ class BSONObj;
 namespace repl {
 
 /**
+ * A structure that stores a ReplSetConfig (version, term) pair.
+ *
+ * This can be used to compare two ReplSetConfig objects to determine which is logically newer.
+ */
+class ConfigVersionAndTerm {
+public:
+    ConfigVersionAndTerm() : _version(0), _term(OpTime::kUninitializedTerm) {}
+    ConfigVersionAndTerm(int version, long long term) : _version(version), _term(term) {}
+
+    inline bool operator==(const ConfigVersionAndTerm& rhs) const {
+        // If term of either item is uninitialized (-1), then we ignore terms entirely and only
+        // compare versions.
+        if (_term == OpTime::kUninitializedTerm || rhs._term == OpTime::kUninitializedTerm) {
+            return _version == rhs._version;
+        }
+        // Compare term first, then the versions.
+        return std::tie(_term, _version) == std::tie(rhs._term, rhs._version);
+    }
+
+    inline bool operator<(const ConfigVersionAndTerm& rhs) const {
+        // If term of either item is uninitialized (-1), then we ignore terms entirely and only
+        // compare versions. This allows force reconfigs, which set the config term to -1, to
+        // override other configs by using a high config version.
+        if (_term == OpTime::kUninitializedTerm || rhs._term == OpTime::kUninitializedTerm) {
+            return _version < rhs._version;
+        }
+        // Compare term first, then the versions.
+        return std::tie(_term, _version) < std::tie(rhs._term, rhs._version);
+    }
+
+    inline bool operator!=(const ConfigVersionAndTerm& rhs) const {
+        return !(*this == rhs);
+    }
+
+    inline bool operator<=(const ConfigVersionAndTerm& rhs) const {
+        return *this < rhs || *this == rhs;
+    }
+
+    inline bool operator>(const ConfigVersionAndTerm& rhs) const {
+        return !(*this <= rhs);
+    }
+
+    inline bool operator>=(const ConfigVersionAndTerm& rhs) const {
+        return !(*this < rhs);
+    }
+
+    std::string toString() const {
+        return str::stream() << "{version: " << _version << ", term: " << _term << "}";
+    };
+
+    friend std::ostream& operator<<(std::ostream& out, const ConfigVersionAndTerm& cvt) {
+        return out << cvt.toString();
+    }
+
+private:
+    long long _version;
+    long long _term;
+};
+
+/**
+ * This class is used for mutating the ReplicaSetConfig.  Call ReplSetConfig::getMutable()
+ * to get a mutable copy, mutate it, and use the ReplSetConfig(MutableReplSetConfig&&) constructor
+ * to get a usable immutable config from it.
+ */
+class MutableReplSetConfig : public ReplSetConfigBase {
+public:
+    ReplSetConfigSettings& getMutableSettings() {
+        invariant(ReplSetConfigBase::getSettings());
+        // TODO(SERVER-47937): Get rid of the const_cast when the IDL supports that.
+        return const_cast<ReplSetConfigSettings&>(*ReplSetConfigBase::getSettings());
+    }
+
+    /**
+     * Adds 'newlyAdded=true' to the MemberConfig of the specified member.
+     */
+    void addNewlyAddedFieldForMember(MemberId memberId);
+
+    /**
+     * Removes the 'newlyAdded' field from the MemberConfig of the specified member.
+     */
+    void removeNewlyAddedFieldForMember(MemberId memberId);
+
+    /**
+     * Sets the member config's 'secondaryDelaySecs' to the value of 'slaveDelay' and removes the
+     * 'slaveDelay' field entirely. If 'slaveDelay' is not set, then sets 'secondaryDelaySecs' to
+     * the default value.
+     */
+    void useSecondaryDelaySecsFieldName(MemberId memberId);
+
+    /**
+     * Sets the member config's 'slaveDelay' to the value of 'secondaryDelaySecs' and removes the
+     * 'secondaryDelaySecs' field entirely. If 'secondaryDelaySecs' is not set, then sets
+     * 'slaveDelay' to the default value.
+     */
+    void useSlaveDelayFieldName(MemberId memberId);
+
+protected:
+    MutableReplSetConfig() = default;
+
+    /**
+     * Returns a pointer to a mutable MemberConfig.
+     */
+    MemberConfig* _findMemberByID(MemberId id);
+};
+
+/**
  * Representation of the configuration information about a particular replica set.
  */
-class ReplSetConfig {
+class ReplSetConfig : private MutableReplSetConfig {
 public:
     typedef std::vector<MemberConfig>::const_iterator MemberIterator;
 
-    static const std::string kConfigServerFieldName;
-    static const std::string kVersionFieldName;
-    static const std::string kMajorityWriteConcernModeName;
+    using ReplSetConfigBase::kConfigServerFieldName;
+    using ReplSetConfigBase::kConfigTermFieldName;
+    static constexpr char kMajorityWriteConcernModeName[] = "$majority";
+    static constexpr char kVotingMembersWriteConcernModeName[] = "$votingMembers";
+    static constexpr char kConfigMajorityWriteConcernModeName[] = "$configMajority";
+    static constexpr char kConfigAllWriteConcernName[] = "$configAll";
 
     // If this field is present, a repair operation potentially modified replicated data. This
     // should never be included in a valid configuration document.
-    static const std::string kRepairedFieldName;
+    using ReplSetConfigBase::kRepairedFieldName;
 
-    static const size_t kMaxMembers = 50;
+    /**
+     * Inline `kMaxMembers` to allow others (e.g, `WriteConcernOptions`) use
+     * the constant without linking to `repl_set_config.cpp`.
+     */
+    inline static const size_t kMaxMembers = 50;
     static const size_t kMaxVotingMembers = 7;
     static const Milliseconds kInfiniteCatchUpTimeout;
     static const Milliseconds kCatchUpDisabled;
@@ -75,17 +189,54 @@ public:
     static const bool kDefaultChainingAllowed;
     static const Milliseconds kDefaultCatchUpTakeoverDelay;
 
-    /**
-     * Initializes this ReplSetConfig from the contents of "cfg".
-     * Sets _replicaSetId to "defaultReplicaSetId" if a replica set ID is not specified in "cfg".
-     */
-    Status initialize(const BSONObj& cfg, OID defaultReplicaSetId = OID());
+    // Methods inherited from the base IDL class.  Do not include any setters here.
+    using ReplSetConfigBase::getConfigServer;
+    using ReplSetConfigBase::getConfigTerm;
+    using ReplSetConfigBase::getConfigVersion;
+    using ReplSetConfigBase::getProtocolVersion;
+    using ReplSetConfigBase::getReplSetName;
+    using ReplSetConfigBase::getWriteConcernMajorityShouldJournal;
+    using ReplSetConfigBase::serialize;
+    using ReplSetConfigBase::toBSON;
 
     /**
-     * Same as the generic initialize() above except will default "configsvr" setting to the value
-     * of serverGlobalParams.configsvr.
+     * Constructor used for converting a mutable config to an immutable one.
      */
-    Status initializeForInitiate(const BSONObj& cfg);
+    explicit ReplSetConfig(MutableReplSetConfig&& base);
+
+    ReplSetConfig() {
+        // This is not defaultable in the IDL.
+        // SERVER-47938 would make it possible to be defaulted.
+
+        setSettings(ReplSetConfigSettings());
+        _setRequiredFields();
+    }
+    /**
+     * Initializes a new ReplSetConfig from the contents of "cfg".
+     * Sets replicaSetId to "defaultReplicaSetId" if a replica set ID is not specified in "cfg";
+     * If forceTerm is not boost::none, sets _term to the given term. Otherwise, uses term from
+     * config BSON.
+     *
+     * Parse errors are reported via exceptions.
+     */
+    static ReplSetConfig parse(const BSONObj& cfg,
+                               boost::optional<long long> forceTerm = boost::none,
+                               OID defaultReplicaSetId = OID());
+
+    /**
+     * Same as the generic parse() above except will default "configsvr" setting to the value
+     * of serverGlobalParams.configsvr.
+     * Sets term to kInitialTerm.
+     * Sets replicaSetId to "newReplicaSetId", which must be set.
+     */
+    static ReplSetConfig parseForInitiate(const BSONObj& cfg, OID newReplicaSetId);
+
+    /**
+     * Sets the default delay field name for a member config based on feature compatibility version,
+     * but only if the member config has neither 'secondaryDelaySecs' nor 'slaveDelay' already set.
+     * This function is used when constructing 'ReplSetConfigs' for initiate and reconfig.
+     */
+    void setDefaultDelayFieldForMember(MemberConfig mem);
 
     /**
      * Returns true if this object has been successfully initialized or copied from
@@ -101,6 +252,12 @@ public:
     Status validate() const;
 
     /**
+     * Performs basic consistency checks on the replica set configuration, but does not fail on
+     * IP addresses in split horizon configuration
+     */
+    Status validateAllowingSplitHorizonIP() const;
+
+    /**
      * Checks if this configuration can satisfy the given write concern.
      *
      * Things that are taken into consideration include:
@@ -111,20 +268,10 @@ public:
     Status checkIfWriteConcernCanBeSatisfied(const WriteConcernOptions& writeConcern) const;
 
     /**
-     * Gets the version of this configuration.
-     *
-     * The version number sequences configurations of the replica set, so that
-     * nodes may distinguish between "older" and "newer" configurations.
+     * Gets the (version, term) pair of this configuration.
      */
-    long long getConfigVersion() const {
-        return _version;
-    }
-
-    /**
-     * Gets the name (_id field value) of the replica set described by this configuration.
-     */
-    const std::string& getReplSetName() const {
-        return _replSetName;
+    ConfigVersionAndTerm getConfigVersionAndTerm() const {
+        return ConfigVersionAndTerm(getConfigVersion(), getConfigTerm());
     }
 
     /**
@@ -138,7 +285,7 @@ public:
      * Gets the number of members in this configuration.
      */
     int getNumMembers() const {
-        return _members.size();
+        return getMembers().size();
     }
 
     /**
@@ -150,19 +297,32 @@ public:
      * Gets a begin iterator over the MemberConfigs stored in this ReplSetConfig.
      */
     MemberIterator membersBegin() const {
-        return _members.begin();
+        return getMembers().begin();
     }
 
     /**
      * Gets an end iterator over the MemberConfigs stored in this ReplSetConfig.
      */
     MemberIterator membersEnd() const {
-        return _members.end();
+        return getMembers().end();
     }
 
     const std::vector<MemberConfig>& members() const {
-        return _members;
+        return getMembers();
     }
+
+    /**
+     * Returns all voting members in this ReplSetConfig.
+     */
+    std::vector<MemberConfig> votingMembers() const {
+        std::vector<MemberConfig> votingMembers;
+        for (const MemberConfig& m : getMembers()) {
+            if (m.getNumVotes() > 0) {
+                votingMembers.push_back(m);
+            }
+        }
+        return votingMembers;
+    };
 
     /**
      * Access a MemberConfig element by index.
@@ -191,13 +351,13 @@ public:
      * Returns a MemberConfig index position corresponding to the member with the given
      * _id in the config, or -1 if there is no member with that address.
      */
-    int findMemberIndexByConfigId(long long configId) const;
+    int findMemberIndexByConfigId(int configId) const;
 
     /**
      * Gets the default write concern for the replica set described by this configuration.
      */
     const WriteConcernOptions& getDefaultWriteConcern() const {
-        return _defaultWriteConcern;
+        return getSettings()->getDefaultWriteConcern();
     }
 
     /**
@@ -212,7 +372,7 @@ public:
      * run for election.
      */
     Milliseconds getElectionTimeoutPeriod() const {
-        return _electionTimeoutPeriod;
+        return Milliseconds(getSettings()->getElectionTimeoutMillis());
     }
 
     /**
@@ -220,7 +380,7 @@ public:
      * nodes in the replica set.
      */
     Seconds getHeartbeatTimeoutPeriod() const {
-        return _heartbeatTimeoutPeriod;
+        return Seconds(getSettings()->getHeartbeatTimeoutSecs());
     }
 
     /**
@@ -229,14 +389,14 @@ public:
      * Seconds object.
      */
     Milliseconds getHeartbeatTimeoutPeriodMillis() const {
-        return _heartbeatTimeoutPeriod;
+        return duration_cast<Milliseconds>(getHeartbeatTimeoutPeriod());
     }
 
     /**
      * Gets the timeout to wait for a primary to catch up its oplog.
      */
     Milliseconds getCatchUpTimeoutPeriod() const {
-        return _catchUpTimeoutPeriod;
+        return Milliseconds(getSettings()->getCatchUpTimeoutMillis());
     }
 
     /**
@@ -257,28 +417,13 @@ public:
      * Returns true if automatic (not explicitly set) chaining is allowed.
      */
     bool isChainingAllowed() const {
-        return _chainingAllowed;
+        return getSettings()->getChainingAllowed();
     }
 
     /**
      * Returns whether all members of this replica set have hostname localhost.
      */
     bool isLocalHostAllowed() const;
-
-    /**
-     * Returns whether or not majority write concerns should implicitly journal, if j has not been
-     * explicitly set.
-     */
-    bool getWriteConcernMajorityShouldJournal() const {
-        return _writeConcernMajorityJournalDefault;
-    }
-
-    /**
-     * Returns true if this replica set is for use as a config server replica set.
-     */
-    bool isConfigServer() const {
-        return _configServer;
-    }
 
     /**
      * Returns a ReplSetTag with the given "key" and "value", or an invalid
@@ -303,15 +448,22 @@ public:
     }
 
     /**
-     * Returns the config as a BSONObj.
+     * Returns the config as a BSONObj. Omits 'newlyAdded' fields.
      */
-    BSONObj toBSON() const;
+    BSONObj toBSONWithoutNewlyAdded() const;
 
     /**
      * Returns a vector of strings which are the names of the WriteConcernModes.
      * Currently used in unit tests to compare two configs.
      */
     std::vector<std::string> getWriteConcernNames() const;
+
+    /**
+     *  Returns the number of voting data-bearing members.
+     */
+    int getWritableVotingMembersCount() const {
+        return _writableVotingMembersCount;
+    }
 
     /**
      * Returns the number of voting data-bearing members that must acknowledge a write
@@ -322,29 +474,19 @@ public:
     }
 
     /**
-     * Gets the protocol version for this configuration.
-     *
-     * The protocol version number currently determines what election protocol is used by the
-     * cluster; 1 is the default.
-     */
-    long long getProtocolVersion() const {
-        return _protocolVersion;
-    }
-
-    /**
      * Returns true if this configuration contains a valid replica set ID.
      * This ID is set at creation and is used to disambiguate replica set configurations that may
      * have the same replica set name (_id field) but meant for different replica set instances.
      */
     bool hasReplicaSetId() const {
-        return _replicaSetId.isSet();
+        return getSettings()->getReplicaSetId() != boost::none;
     }
 
     /**
      * Returns replica set ID.
      */
     OID getReplicaSetId() const {
-        return _replicaSetId;
+        return getSettings()->getReplicaSetId() ? *getSettings()->getReplicaSetId() : OID();
     }
 
     /**
@@ -358,7 +500,7 @@ public:
      * sees that it is more caught up than the current primary.
      */
     Milliseconds getCatchUpTakeoverDelay() const {
-        return _catchUpTakeoverDelay;
+        return Milliseconds(getSettings()->getCatchUpTakeoverDelayMillis());
     }
 
     /**
@@ -371,11 +513,44 @@ public:
      */
     bool containsArbiter() const;
 
+    /**
+     * Returns true if this replica set has at least one member with 'newlyAdded'
+     * field set to true.
+     */
+    bool containsNewlyAddedMembers() const;
+
+    /**
+     * Returns a mutable (but not directly usable) copy of the config.
+     */
+    MutableReplSetConfig getMutable() const;
+
+    /**
+     * Returns true if implicit default write concern should be majority.
+     */
+    bool isImplicitDefaultWriteConcernMajority() const;
+
+    /**
+     * Returns true if the config consists of a Primary-Secondary-Arbiter (PSA) architecture.
+     */
+    bool isPSASet() const {
+        return getNumMembers() == 3 && getNumDataBearingMembers() == 2;
+    }
+
+    /**
+     * Returns true if the getLastErrorDefaults has been customized.
+     */
+    bool containsCustomizedGetLastErrorDefaults() const;
+
 private:
     /**
-     * Parses the "settings" subdocument of a replica set configuration.
+     * Sets replica set ID to 'defaultReplicaSetId' if 'cfg' does not contain an ID.
+     * Sets term to kInitialTerm for initiate.
+     * Sets term to forceTerm if it is not boost::none. Otherwise, parses term from 'cfg'.
      */
-    Status _parseSettingsSubdocument(const BSONObj& settings);
+    ReplSetConfig(const BSONObj& cfg,
+                  bool forInitiate,
+                  boost::optional<long long> forceTerm,
+                  OID defaultReplicaSetId);
 
     /**
      * Calculates and stores the majority for electing a primary (_majorityVoteCount).
@@ -388,39 +563,36 @@ private:
     void _addInternalWriteConcernModes();
 
     /**
-     * Populate _connectionString based on the contents of _members and _replSetName.
+     * Populate _connectionString based on the contents of members and replSetName.
      */
     void _initializeConnectionString();
 
     /**
-     * Sets replica set ID to 'defaultReplicaSetId' if forInitiate is false and 'cfg' does not
-     * contain an ID.
+     * Sets the required fields of the IDL object.
      */
-    Status _initialize(const BSONObj& cfg, bool forInitiate, OID defaultReplicaSetId);
+    void _setRequiredFields();
+
+    /**
+     * Performs basic consistency checks on the replica set configuration.
+     */
+    Status _validate(bool allowSplitHorizonIP) const;
+
+    /**
+     * Common code used by constructors
+     */
+    Status _initialize(bool forInitiate,
+                       boost::optional<long long> forceTerm,
+                       OID defaultReplicaSetId);
 
     bool _isInitialized = false;
-    long long _version = 1;
-    std::string _replSetName;
-    std::vector<MemberConfig> _members;
-    WriteConcernOptions _defaultWriteConcern;
-    Milliseconds _electionTimeoutPeriod = kDefaultElectionTimeoutPeriod;
-    Milliseconds _heartbeatInterval = kDefaultHeartbeatInterval;
-    Seconds _heartbeatTimeoutPeriod = kDefaultHeartbeatTimeoutPeriod;
-    Milliseconds _catchUpTimeoutPeriod = kDefaultCatchUpTimeoutPeriod;
-    Milliseconds _catchUpTakeoverDelay = kDefaultCatchUpTakeoverDelay;
-    bool _chainingAllowed = kDefaultChainingAllowed;
-    bool _writeConcernMajorityJournalDefault = false;
     int _majorityVoteCount = 0;
+    int _writableVotingMembersCount = 0;
     int _writeMajority = 0;
     int _totalVotingMembers = 0;
     ReplSetTagConfig _tagConfig;
     StringMap<ReplSetTagPattern> _customWriteConcernModes;
-    long long _protocolVersion = 1;
-    bool _configServer = false;
-    OID _replicaSetId;
     ConnectionString _connectionString;
 };
-
 
 }  // namespace repl
 }  // namespace mongo

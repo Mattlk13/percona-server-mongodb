@@ -29,18 +29,22 @@
 
 #pragma once
 
+#include <functional>
 #include <map>
 #include <string>
 #include <vector>
 
 #include "mongo/db/catalog/multi_index_block.h"
+#include "mongo/db/catalog_raii.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/db/rebuild_indexes.h"
+#include "mongo/db/repl_index_build_state.h"
+#include "mongo/platform/mutex.h"
 
 namespace mongo {
 
 class Collection;
+class CollectionPtr;
 class OperationContext;
 class ServiceContext;
 
@@ -67,7 +71,7 @@ public:
     struct SetupOptions {
         SetupOptions();
         IndexConstraints indexConstraints = IndexConstraints::kEnforce;
-        bool forRecovery = false;
+        IndexBuildProtocol protocol = IndexBuildProtocol::kSinglePhase;
     };
 
     IndexBuildsManager() = default;
@@ -78,41 +82,41 @@ public:
      */
     using OnInitFn = MultiIndexBlock::OnInitFn;
     Status setUpIndexBuild(OperationContext* opCtx,
-                           Collection* collection,
+                           CollectionWriter& collection,
                            const std::vector<BSONObj>& specs,
                            const UUID& buildUUID,
                            OnInitFn onInit,
-                           SetupOptions options = {});
+                           SetupOptions options = {},
+                           const boost::optional<ResumeIndexInfo>& resumeInfo = boost::none);
 
     /**
-     * Recovers the index build from its persisted state and sets it up to run again.
-     *
-     * Returns an enum reflecting the point up to which the build was recovered, so the caller knows
-     * where to recommence.
-     *
-     * TODO: Not yet implemented.
+     * Unregisters the builder associated with the given buildUUID from the _builders map.
      */
-    StatusWith<IndexBuildRecoveryState> recoverIndexBuild(const NamespaceString& nss,
-                                                          const UUID& buildUUID,
-                                                          std::vector<std::string> indexNames);
+    void unregisterIndexBuild(const UUID& buildUUID);
 
     /**
      * Runs the scanning/insertion phase of the index build..
-     *
-     * TODO: Not yet implemented.
      */
     Status startBuildingIndex(OperationContext* opCtx,
-                              Collection* collection,
-                              const UUID& buildUUID);
+                              const CollectionPtr& collection,
+                              const UUID& buildUUID,
+                              boost::optional<RecordId> resumeAfterRecordId = boost::none);
+
+    Status resumeBuildingIndexFromBulkLoadPhase(OperationContext* opCtx,
+                                                const CollectionPtr& collection,
+                                                const UUID& buildUUID);
 
     /**
-     * Iterates through every record in the collection to index it while also removing documents
-     * that are not valid BSON objects.
+     * Iterates through every record in the collection to index it. May also remove documents
+     * that are not valid BSON objects, if repair is set to kYes.
      *
      * Returns the number of records and the size of the data iterated over.
      */
     StatusWith<std::pair<long long, long long>> startBuildingIndexForRecovery(
-        OperationContext* opCtx, NamespaceString ns, const UUID& buildUUID);
+        OperationContext* opCtx,
+        const CollectionPtr& coll,
+        const UUID& buildUUID,
+        RepairData repair);
 
     /**
      * Document inserts observed during the scanning/insertion phase of an index build are not
@@ -120,22 +124,23 @@ public:
      */
     Status drainBackgroundWrites(OperationContext* opCtx,
                                  const UUID& buildUUID,
-                                 RecoveryUnit::ReadSource readSource);
+                                 RecoveryUnit::ReadSource readSource,
+                                 IndexBuildInterceptor::DrainYieldPolicy drainYieldPolicy);
 
     /**
-     * Persists information in the index catalog entry to reflect the successful completion of the
-     * scanning/insertion phase.
-     *
-     * TODO: Not yet implemented.
+     * Retries the key generation and insertion of records that were skipped during the scanning
+     * phase due to error suppression.
      */
-    Status finishBuildingPhase(const UUID& buildUUID);
+    Status retrySkippedRecords(OperationContext* opCtx,
+                               const UUID& buildUUID,
+                               const CollectionPtr& collection);
 
     /**
      * Runs the index constraint violation checking phase of the index build..
-     *
-     * TODO: Not yet implemented.
      */
-    Status checkIndexConstraintViolations(OperationContext* opCtx, const UUID& buildUUID);
+    Status checkIndexConstraintViolations(OperationContext* opCtx,
+                                          const CollectionPtr& collection,
+                                          const UUID& buildUUID);
 
     /**
      * Persists information in the index catalog entry that the index is ready for use, as well as
@@ -144,42 +149,39 @@ public:
     using OnCreateEachFn = MultiIndexBlock::OnCreateEachFn;
     using OnCommitFn = MultiIndexBlock::OnCommitFn;
     Status commitIndexBuild(OperationContext* opCtx,
-                            Collection* collection,
+                            CollectionWriter& collection,
                             const NamespaceString& nss,
                             const UUID& buildUUID,
                             OnCreateEachFn onCreateEachFn,
                             OnCommitFn onCommitFn);
 
     /**
-     * Signals the index build to be aborted and returns without waiting for completion.
-     *
-     * Returns true if a build existed to be signaled, as opposed to having already finished and
-     * been cleared away, or not having yet started..
-     *
-     * TODO: Not yet fully implemented. The MultiIndexBlock::abort function that is called is
-     * not yet implemented.
+     * Deletes the index entry from the durable catalog.
      */
-    bool abortIndexBuild(const UUID& buildUUID, const std::string& reason);
+    using OnCleanUpFn = MultiIndexBlock::OnCleanUpFn;
+    bool abortIndexBuild(OperationContext* opCtx,
+                         CollectionWriter& collection,
+                         const UUID& buildUUID,
+                         OnCleanUpFn onCleanUpFn);
 
     /**
-     * Signals the index build to be interrupted and returns without waiting for it to stop. Does
-     * nothing if the index build has already been cleared away.
+     * Signals the index build to be aborted without being cleaned up and returns without waiting
+     * for it to stop. Does nothing if the index build has already been cleared away.
+     *
+     * Writes the current state of the index build to disk if the specified index build is a
+     * two-phase hybrid index build and resumable index builds are supported.
      *
      * Returns true if a build existed to be signaled, as opposed to having already finished and
-     * been cleared away, or not having yet started..
+     * been cleared away, or not having yet started.
      */
-    bool interruptIndexBuild(OperationContext* opCtx,
-                             const UUID& buildUUID,
-                             const std::string& reason);
-
-    /**
-     * Cleans up the index build state and unregisters it from the manager.
-     */
-    void tearDownIndexBuild(OperationContext* opCtx, Collection* collection, const UUID& buildUUID);
+    bool abortIndexBuildWithoutCleanup(OperationContext* opCtx,
+                                       const CollectionPtr& collection,
+                                       const UUID& buildUUID,
+                                       bool isResumable);
 
     /**
      * Returns true if the index build supports background writes while building an index. This is
-     * true for the kHybrid and kBackground methods.
+     * true for the kHybrid method.
      */
     bool isBackgroundBuilding(const UUID& buildUUID);
 
@@ -195,21 +197,26 @@ private:
     void _registerIndexBuild(UUID buildUUID);
 
     /**
-     * Unregisters the builder associcated with the given buildUUID from the _builders map.
+     * Returns a pointer to the builder. Returns a bad status if the builder does not exist.
      */
-    void _unregisterIndexBuild(const UUID& buildUUID);
-
-    /**
-     * Returns a shared pointer to the builder. Invariants if the builder does not exist.
-     */
-    std::shared_ptr<MultiIndexBlock> _getBuilder(const UUID& buildUUID);
+    StatusWith<MultiIndexBlock*> _getBuilder(const UUID& buildUUID);
 
     // Protects the map data structures below.
-    mutable stdx::mutex _mutex;
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("IndexBuildsManager::_mutex");
 
     // Map of index builders by build UUID. Allows access to the builders so that actions can be
     // taken on and information passed to and from index builds.
-    std::map<UUID, std::shared_ptr<MultiIndexBlock>> _builders;
+    std::map<UUID, std::unique_ptr<MultiIndexBlock>> _builders;
+
+    /**
+     * Deletes record containing duplicate keys and insert it into a local lost and found collection
+     * titled "local.lost_and_found.<original collection UUID>". Returns the size of the
+     * record removed.
+     */
+    StatusWith<int> _moveRecordToLostAndFound(OperationContext* opCtx,
+                                              const NamespaceString& ns,
+                                              const NamespaceString& lostAndFoundNss,
+                                              RecordId dupRecord);
 };
 
 }  // namespace mongo

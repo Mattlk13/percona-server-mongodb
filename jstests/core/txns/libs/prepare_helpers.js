@@ -5,7 +5,6 @@
  *
  */
 const PrepareHelpers = (function() {
-
     /**
      * Prepares the active transaction on the session. This expects the 'prepareTransaction' command
      * to succeed and return a non-null 'prepareTimestamp'.
@@ -35,8 +34,13 @@ const PrepareHelpers = (function() {
     function commitTransaction(session, commitTimestamp) {
         assert(session);
 
-        const res = session.getDatabase('admin').adminCommand(
-            {commitTransaction: 1, commitTimestamp: commitTimestamp});
+        let cmd = {commitTransaction: 1, commitTimestamp: commitTimestamp};
+        const writeConcern = session.getTxnWriteConcern_forTesting();
+        if (writeConcern !== undefined) {
+            cmd.writeConcern = writeConcern;
+        }
+
+        const res = session.getDatabase('admin').adminCommand(cmd);
 
         // End the transaction on the shell session.
         if (res.ok) {
@@ -106,7 +110,7 @@ const PrepareHelpers = (function() {
             assert.commandWorked(coll.insert({tenKB: tenKB}, {writeConcern: {w: numNodes}}));
         }
 
-        for (let [nodeName, oplog] of[["primary", primaryOplog], ["secondary", secondaryOplog]]) {
+        for (let [nodeName, oplog] of [["primary", primaryOplog], ["secondary", secondaryOplog]]) {
             assert.soon(function() {
                 const dataSize = oplog.dataSize();
                 const prepareEntryRemoved = (oplog.findOne({prepare: true}) === null);
@@ -128,16 +132,17 @@ const PrepareHelpers = (function() {
      * Waits for the oplog entry of the given timestamp to be majority committed.
      */
     function awaitMajorityCommitted(replSet, timestamp) {
-        print(`Waiting for majority commit point to advance past the given timestamp ${timestamp}`);
+        print(`Waiting for majority commit point to advance past the given timestamp ${
+            tojson(timestamp)}`);
         const primary = replSet.getPrimary();
         assert.soon(() => {
             const ts = assert.commandWorked(primary.adminCommand({replSetGetStatus: 1}))
                            .optimes.lastCommittedOpTime.ts;
             if (timestampCmp(ts, timestamp) >= 0) {
-                print(`Finished awaiting lastCommittedOpTime.ts, now at ${ts}`);
+                print(`Finished awaiting lastCommittedOpTime.ts, now at ${tojson(ts)}`);
                 return true;
             } else {
-                print(`Awaiting lastCommittedOpTime.ts, now at ${ts}`);
+                print(`Awaiting lastCommittedOpTime.ts, now at ${tojson(ts)}`);
                 return false;
             }
         }, "Timeout waiting for majority commit point", ReplSetTest.kDefaultTimeoutMS, 1000);
@@ -145,19 +150,6 @@ const PrepareHelpers = (function() {
 
     function findPrepareEntry(oplogColl) {
         return oplogColl.findOne({op: "c", "o.prepare": true});
-    }
-
-    /**
-     * Retrieves the oldest required timestamp from the serverStatus output.
-     *
-     * @return {Timestamp} oldest required timestamp for crash recovery.
-     */
-    function getOldestRequiredTimestampForCrashRecovery(database) {
-        const res = database.serverStatus().storageEngine;
-        const ts = res.oldestRequiredTimestampForCrashRecovery;
-        assert(ts instanceof Timestamp,
-               'oldestRequiredTimestampForCrashRecovery was not a Timestamp: ' + tojson(res));
-        return ts;
     }
 
     return {
@@ -171,6 +163,5 @@ const PrepareHelpers = (function() {
         awaitOplogTruncation: awaitOplogTruncation,
         awaitMajorityCommitted: awaitMajorityCommitted,
         findPrepareEntry: findPrepareEntry,
-        getOldestRequiredTimestampForCrashRecovery: getOldestRequiredTimestampForCrashRecovery,
     };
 })();

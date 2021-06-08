@@ -38,12 +38,12 @@
 #include "mongo/client/connection_string.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/s/active_migrations_registry.h"
-#include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/migration_session_id.h"
 #include "mongo/db/s/session_catalog_migration_destination.h"
+#include "mongo/platform/mutex.h"
+#include "mongo/s/chunk_manager.h"
 #include "mongo/s/shard_id.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/concurrency/with_lock.h"
 #include "mongo/util/timer.h"
@@ -58,6 +58,13 @@ struct WriteConcernOptions;
 namespace repl {
 class OpTime;
 }
+
+struct CollectionOptionsAndIndexes {
+    UUID uuid;
+    std::vector<BSONObj> indexSpecs;
+    BSONObj idIndexSpec;
+    BSONObj options;
+};
 
 /**
  * Drives the receiving side of the MongoD migration process. One instance exists per shard.
@@ -74,8 +81,6 @@ public:
 
     /**
      * Returns the singleton instance of the migration destination manager.
-     *
-     * TODO (SERVER-25333): This should become per-collection instance instead of singleton.
      */
     static MigrationDestinationManager* get(OperationContext* opCtx);
 
@@ -104,17 +109,17 @@ public:
     Status start(OperationContext* opCtx,
                  const NamespaceString& nss,
                  ScopedReceiveChunk scopedReceiveChunk,
-                 StartChunkCloneRequest cloneRequest,
+                 const StartChunkCloneRequest& cloneRequest,
                  const OID& epoch,
                  const WriteConcernOptions& writeConcern);
 
     /**
      * Clones documents from a donor shard.
      */
-    static void cloneDocumentsFromDonor(
+    static repl::OpTime cloneDocumentsFromDonor(
         OperationContext* opCtx,
-        stdx::function<void(OperationContext*, BSONObj)> insertBatchFn,
-        stdx::function<BSONObj(OperationContext*)> fetchBatchFn);
+        std::function<void(OperationContext*, BSONObj)> insertBatchFn,
+        std::function<BSONObj(OperationContext*)> fetchBatchFn);
 
     /**
      * Idempotent method, which causes the current ongoing migration to abort only if it has the
@@ -131,11 +136,42 @@ public:
     Status startCommit(const MigrationSessionId& sessionId);
 
     /**
-     * Creates the collection nss on the shard and clones the indexes and options from fromShardId.
+     * Gets the collection indexes from fromShardId. If given a chunk manager, will fetch the
+     * indexes using the shard version protocol.
      */
-    static void cloneCollectionIndexesAndOptions(OperationContext* opCtx,
-                                                 const NamespaceString& nss,
-                                                 const ShardId& fromShardId);
+    struct IndexesAndIdIndex {
+        std::vector<BSONObj> indexSpecs;
+        BSONObj idIndexSpec;
+    };
+    static IndexesAndIdIndex getCollectionIndexes(OperationContext* opCtx,
+                                                  const NamespaceStringOrUUID& nssOrUUID,
+                                                  const ShardId& fromShardId,
+                                                  const boost::optional<ChunkManager>& cm,
+                                                  boost::optional<Timestamp> afterClusterTime);
+
+    /**
+     * Gets the collection uuid and options from fromShardId. If given a chunk manager, will fetch
+     * the collection options using the database version protocol.
+     */
+    struct CollectionOptionsAndUUID {
+        BSONObj options;
+        UUID uuid;
+    };
+    static CollectionOptionsAndUUID getCollectionOptions(
+        OperationContext* opCtx,
+        const NamespaceStringOrUUID& nssOrUUID,
+        const ShardId& fromShardId,
+        const boost::optional<ChunkManager>& cm,
+        boost::optional<Timestamp> afterClusterTime);
+
+
+    /**
+     * Creates the collection on the shard and clones the indexes and options.
+     */
+    static void cloneCollectionIndexesAndOptions(
+        OperationContext* opCtx,
+        const NamespaceString& nss,
+        const CollectionOptionsAndIndexes& collectionOptionsAndIndexes);
 
 private:
     /**
@@ -157,13 +193,21 @@ private:
     bool _flushPendingWrites(OperationContext* opCtx, const repl::OpTime& lastOpApplied);
 
     /**
+     * If this shard doesn't own any chunks for the collection to be cloned and the collection
+     * exists locally, drops its indexes to guarantee that no stale indexes carry over.
+     */
+    void _dropLocalIndexesIfNecessary(
+        OperationContext* opCtx,
+        const NamespaceString& nss,
+        const CollectionOptionsAndIndexes& collectionOptionsAndIndexes);
+
+    /**
      * Remembers a chunk range between 'min' and 'max' as a range which will have data migrated
      * into it, to protect it against separate commands to clean up orphaned data. First, though,
      * it schedules deletion of any documents in the range, so that process must be seen to be
      * complete before migrating any new documents in.
      */
-    CollectionShardingRuntime::CleanupNotification _notePending(OperationContext*,
-                                                                ChunkRange const&);
+    SharedSemiFuture<void> _notePending(OperationContext*, ChunkRange const&);
 
     /**
      * Stops tracking a chunk range between 'min' and 'max' that previously was having data
@@ -178,7 +222,7 @@ private:
     bool _isActive(WithLock) const;
 
     // Mutex to guard all fields
-    mutable stdx::mutex _mutex;
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("MigrationDestinationManager::_mutex");
 
     // Migration session ID uniquely identifies the migration and indicates whether the prepare
     // method has been called.
@@ -190,7 +234,11 @@ private:
 
     stdx::thread _migrateThreadHandle;
 
+    boost::optional<UUID> _migrationId;
+    LogicalSessionId _lsid;
+    TxnNumber _txnNumber{kUninitializedTxnNumber};
     NamespaceString _nss;
+    boost::optional<UUID> _collUuid;
     ConnectionString _fromShardConnString;
     ShardId _fromShard;
     ShardId _toShard;

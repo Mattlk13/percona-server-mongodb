@@ -40,7 +40,6 @@
 #include "mongo/stdx/type_traits.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/debug_util.h"
-#include "mongo/util/if_constexpr.h"
 #include "mongo/util/interruptible.h"
 #include "mongo/util/intrusive_counter.h"
 #include "mongo/util/out_of_line_executor.h"
@@ -144,7 +143,7 @@ public:
         return SemiFuture(Impl::makeReady(std::move(val)));
     }
 
-    template <typename U = T, typename = std::enable_if_t<std::is_void_v<U>>>
+    REQUIRES_FOR_NON_TEMPLATE(std::is_void_v<T>)
     static SemiFuture<void> makeReady() {
         return SemiFuture(Impl::makeReady());
     }
@@ -250,6 +249,14 @@ public:
      */
     ExecutorFuture<T> thenRunOn(ExecutorPtr exec) && noexcept;
 
+    /**
+     * Returns an inline Future type from this SemiFuture.
+     *
+     * WARNING: Do not use this unless you're extremely sure of what you're doing, as callbacks
+     * chained to the resulting Future may run in unexpected places.
+     */
+    Future<T> unsafeToInlineFuture() && noexcept;
+
 private:
     friend class Promise<T>;
     friend class SharedPromise<T>;
@@ -261,8 +268,9 @@ private:
     friend class future_details::FutureImpl;
     template <typename>
     friend class SharedSemiFuture;
+    template <typename>
+    friend class SemiFuture;
 
-    Future<T> unsafeToInlineFuture() && noexcept;
 
     explicit SemiFuture(future_details::SharedStateHolder<T_unless_void>&& impl)
         : _impl(std::move(impl)) {}
@@ -281,8 +289,8 @@ private:
 };
 
 // Deduction Guides
-template <typename T,
-          typename = std::enable_if_t<!isStatusOrStatusWith<T> && !future_details::isFutureLike<T>>>
+TEMPLATE(typename T)
+REQUIRES(!isStatusOrStatusWith<T> && !future_details::isFutureLike<T>)
 SemiFuture(T)->SemiFuture<T>;
 template <typename T>
 SemiFuture(StatusWith<T>)->SemiFuture<T>;
@@ -327,7 +335,7 @@ public:
     static Future<T> makeReady(StatusWith<T_unless_void> val) {
         return Future(Impl::makeReady(std::move(val)));
     }
-    template <typename U = T, typename = std::enable_if_t<std::is_void_v<U>>>
+    REQUIRES_FOR_NON_TEMPLATE(std::is_void_v<T>)
     static Future<void> makeReady() {
         return Future(Impl::makeReady());
     }
@@ -337,14 +345,22 @@ public:
     }
 
     /**
-     * This ends the Future continuation chain by calling a callback on completion. Use this to
-     * escape back into a callback-based API.
+     * Attaches a `func` callback that will consume the result of this `Future` when it completes. A
+     * `getAsync` call can be the tail end of a continuation chain, and that is only position at
+     * which it can appear.
      *
-     * For now, the callback must not fail, since there is nowhere to propagate the error to.
+     * The result argument passed to `func` is `Status` if `T` is `void`, otherwise `StatusWith<T>`.
+     * The `func(result)` return type must be `void`, and not a discarded return value.
+     *
+     * `func` must not throw an exception. It is invoked as if by a `noexcept` function, and it will
+     * `std::terminate` the process. This is because there is no appropriate context in which to
+     * handle such an asynchronous exception.
+     *
      * TODO decide how to handle func throwing.
      */
-    template <typename Func>
-        void getAsync(Func&& func) && noexcept {
+    TEMPLATE(typename Func)
+    REQUIRES(future_details::isCallableExactR<void, Func, StatusOrStatusWith<T>>)
+    void getAsync(Func&& func) && noexcept {
         std::move(this->_impl).getAsync(std::forward<Func>(func));
     }
 
@@ -383,8 +399,9 @@ public:
      * The callback takes a T and can return anything (see above for how Statusy and Futurey returns
      * are handled.)
      */
-    template <typename Func>
-        /*see above*/ auto then(Func&& func) && noexcept {
+    TEMPLATE(typename Func)
+    REQUIRES(future_details::isCallable<Func, T>)
+    /*see above*/ auto then(Func&& func) && noexcept {
         return wrap<Func, T>(std::move(this->_impl).then(std::forward<Func>(func)));
     }
 
@@ -395,8 +412,9 @@ public:
      * The callback takes a StatusOrStatusWith<T> and can return anything (see above for how Statusy
      * and Futurey returns are handled.)
      */
-    template <typename Func>
-        /*see above*/ auto onCompletion(Func&& func) && noexcept {
+    TEMPLATE(typename Func)
+    REQUIRES(future_details::isCallable<Func, StatusOrStatusWith<T>>)
+    /*see above*/ auto onCompletion(Func&& func) && noexcept {
         return wrap<Func, Status>(std::move(this->_impl).onCompletion(std::forward<Func>(func)));
     }
 
@@ -413,8 +431,9 @@ public:
      * The callback takes a non-OK Status and returns a possibly-wrapped T (see above for how
      * Statusy and Futurey returns are handled.)
      */
-    template <typename Func>
-        /*see above*/ auto onError(Func&& func) && noexcept {
+    TEMPLATE(typename Func)
+    REQUIRES(future_details::isCallableR<T, Func, Status>)
+    /*see above*/ auto onError(Func&& func) && noexcept {
         return wrap<Func, Status>(std::move(this->_impl).onError(std::forward<Func>(func)));
     }
 
@@ -425,8 +444,9 @@ public:
      * The callback takes a non-OK Status and returns a possibly-wrapped T (see above for how
      * Statusy and Futurey returns are handled.)
      */
-    template <ErrorCodes::Error code, typename Func>
-        /*see above*/ auto onError(Func&& func) && noexcept {
+    TEMPLATE(ErrorCodes::Error code, typename Func)
+    REQUIRES(future_details::isCallableR<T, Func, Status>)
+    /*see above*/ auto onError(Func&& func) && noexcept {
         return wrap<Func, Status>(
             std::move(this->_impl).template onError<code>(std::forward<Func>(func)));
     }
@@ -438,8 +458,9 @@ public:
      * The callback takes a non-OK Status and returns a possibly-wrapped T (see above for how
      * Statusy and Futurey returns are handled.)
      */
-    template <ErrorCategory category, typename Func>
-        /*see above*/ auto onErrorCategory(Func&& func) && noexcept {
+    TEMPLATE(ErrorCategory category, typename Func)
+    REQUIRES(future_details::isCallableR<T, Func, Status>)
+    /*see above*/ auto onErrorCategory(Func&& func) && noexcept {
         return wrap<Func, Status>(
             std::move(this->_impl).template onErrorCategory<category>(std::forward<Func>(func)));
     }
@@ -464,8 +485,9 @@ public:
      *
      * The callback takes a const T& and must return void.
      */
-    template <typename Func>
-        Future<T> tap(Func&& func) && noexcept {
+    TEMPLATE(typename Func)
+    REQUIRES(future_details::isCallableExactR<void, Func, const T>)
+    Future<T> tap(Func&& func) && noexcept {
         return Future<T>(std::move(this->_impl).tap(std::forward<Func>(func)));
     }
 
@@ -476,8 +498,9 @@ public:
      *
      * The callback takes a non-OK Status and must return void.
      */
-    template <typename Func>
-        Future<T> tapError(Func&& func) && noexcept {
+    TEMPLATE(typename Func)
+    REQUIRES(future_details::isCallableExactR<void, Func, const Status>)
+    Future<T> tapError(Func&& func) && noexcept {
         return Future<T>(std::move(this->_impl).tapError(std::forward<Func>(func)));
     }
 
@@ -489,10 +512,16 @@ public:
      *
      * The callback takes a StatusOrStatusWith<T> and must return void.
      */
-    template <typename Func>
-        Future<T> tapAll(Func&& func) && noexcept {
+    TEMPLATE(typename Func)
+    REQUIRES(future_details::isCallableExactR<void, Func, const StatusOrStatusWith<T>>)
+    Future<T> tapAll(Func&& func) && noexcept {
         return Future<T>(std::move(this->_impl).tapAll(std::forward<Func>(func)));
     }
+
+    // Calling this on a Future is never strictly necessary, since this is already an inline
+    // Future, but making this public helps for writing generic utilities which need to use
+    // unsafeToInlineFuture for some future types but not others.
+    using SemiFuture<T>::unsafeToInlineFuture;
 
 private:
     template <typename>
@@ -504,7 +533,6 @@ private:
     friend class Promise<T>;
     friend class SharedPromise<T>;
 
-    using SemiFuture<T>::unsafeToInlineFuture;
 
     template <typename Func, typename Arg, typename U>
     static auto wrap(future_details::FutureImpl<U>&& impl) {
@@ -514,8 +542,8 @@ private:
 };
 
 // Deduction Guides
-template <typename T,
-          typename = std::enable_if_t<!isStatusOrStatusWith<T> && !future_details::isFutureLike<T>>>
+TEMPLATE(typename T)
+REQUIRES(!isStatusOrStatusWith<T> && !future_details::isFutureLike<T>)
 Future(T)->Future<T>;
 template <typename T>
 Future(StatusWith<T>)->Future<T>;
@@ -532,7 +560,7 @@ Future(StatusWith<T>)->Future<T>;
  * because they will propagate out BrokenPromise if the executor refuses work.
  */
 template <typename T>
-class ExecutorFuture : private SemiFuture<T> {
+class MONGO_WARN_UNUSED_RESULT_CLASS ExecutorFuture : private SemiFuture<T> {
     using Impl = typename SemiFuture<T>::Impl;
     using T_unless_void = typename SemiFuture<T>::T_unless_void;
 
@@ -556,7 +584,7 @@ public:
         static_assert(!std::is_void_v<T>);
     }
 
-    template <typename U = T, typename = std::enable_if_t<std::is_void_v<U>>>
+    REQUIRES_FOR_NON_TEMPLATE(std::is_void_v<T>)
     explicit ExecutorFuture(ExecutorPtr exec) : SemiFuture<void>(), _exec(std::move(exec)) {}
 
     /**
@@ -592,8 +620,13 @@ public:
     // it should be doable, but will be fairly complicated.
     //
 
-    template <typename Func>
-        void getAsync(Func&& func) && noexcept {
+    /**
+     * Attach a completion callback to asynchronously consume this `ExecutorFuture`'s result.
+     * \see `Future<T>::getAsync()`.
+     */
+    TEMPLATE(typename Func)
+    REQUIRES(future_details::isCallableExactR<void, Func, StatusOrStatusWith<T>>)
+    void getAsync(Func&& func) && noexcept {
         static_assert(std::is_void_v<decltype(func(std::declval<StatusOrStatusWith<T>>()))>,
                       "func passed to getAsync must return void");
 
@@ -611,42 +644,55 @@ public:
         });
     }
 
-    template <typename Func>
-        auto then(Func&& func) && noexcept {
+    TEMPLATE(typename Func)
+    REQUIRES(future_details::isCallable<Func, T>)
+    auto then(Func&& func) && noexcept {
         return mongo::ExecutorFuture(
             std::move(_exec), std::move(this->_impl).then(wrapCB<T>(std::forward<Func>(func))));
     }
 
-    template <typename Func>
-        auto onCompletion(Func&& func) && noexcept {
+    TEMPLATE(typename Func)
+    REQUIRES(future_details::isCallable<Func, StatusOrStatusWith<T>>)
+    auto onCompletion(Func&& func) && noexcept {
         return mongo::ExecutorFuture(
             std::move(_exec),
             std::move(this->_impl)
                 .onCompletion(wrapCB<StatusOrStatusWith<T>>(std::forward<Func>(func))));
     }
 
-    template <typename Func>
-        ExecutorFuture<T> onError(Func&& func) && noexcept {
+    TEMPLATE(typename Func)
+    REQUIRES(future_details::isCallableR<T, Func, Status>)
+    ExecutorFuture<T> onError(Func&& func) && noexcept {
         return mongo::ExecutorFuture(
             std::move(_exec),
             std::move(this->_impl).onError(wrapCB<Status>(std::forward<Func>(func))));
     }
 
-    template <ErrorCodes::Error code, typename Func>
-        ExecutorFuture<T> onError(Func&& func) && noexcept {
+    TEMPLATE(ErrorCodes::Error code, typename Func)
+    REQUIRES(future_details::isCallableR<T, Func, Status>)
+    ExecutorFuture<T> onError(Func&& func) && noexcept {
         return mongo::ExecutorFuture(
             std::move(_exec),
             std::move(this->_impl)
                 .template onError<code>(wrapCB<Status>(std::forward<Func>(func))));
     }
 
-    template <ErrorCategory category, typename Func>
-        ExecutorFuture<T> onErrorCategory(Func&& func) && noexcept {
+    TEMPLATE(ErrorCategory category, typename Func)
+    REQUIRES(future_details::isCallableR<T, Func, Status>)
+    ExecutorFuture<T> onErrorCategory(Func&& func) && noexcept {
         return mongo::ExecutorFuture(
             std::move(_exec),
             std::move(this->_impl)
                 .template onErrorCategory<category>(wrapCB<Status>(std::forward<Func>(func))));
     }
+
+    /**
+     * Returns an inline Future type from this ExecutorFuture.
+     *
+     * WARNING: Do not use this unless you're extremely sure of what you're doing, as callbacks
+     * chained to the resulting Future may run in unexpected places.
+     */
+    using SemiFuture<T>::unsafeToInlineFuture;
 
 private:
     // This *must* take exec by ref to ensure it isn't moved from while evaluating wrapCB above.
@@ -675,9 +721,7 @@ private:
     }
 
     template <typename Sig>
-    NOINLINE_DECL auto wrapCBHelper(unique_function<Sig>&& func);
-
-    using SemiFuture<T>::unsafeToInlineFuture;
+    MONGO_COMPILER_NOINLINE auto wrapCBHelper(unique_function<Sig>&& func);
 
     template <typename>
     friend class ExecutorFuture;
@@ -692,8 +736,8 @@ private:
 };
 
 // Deduction Guides
-template <typename T,
-          typename = std::enable_if_t<!isStatusOrStatusWith<T> && !future_details::isFutureLike<T>>>
+TEMPLATE(typename T)
+REQUIRES(!isStatusOrStatusWith<T> && !future_details::isFutureLike<T>)
 ExecutorFuture(ExecutorPtr, T)->ExecutorFuture<T>;
 template <typename T>
 ExecutorFuture(ExecutorPtr, future_details::FutureImpl<T>)->ExecutorFuture<T>;
@@ -723,6 +767,7 @@ ExecutorFuture(ExecutorPtr)->ExecutorFuture<void>;
 template <typename T>
 class Promise {
     using SharedStateT = future_details::SharedState<T>;
+    using T_unless_void = typename SemiFuture<T>::T_unless_void;
 
 public:
     using value_type = T;
@@ -766,7 +811,8 @@ public:
      * because this method will correctly propagate errors thrown from makeResult(), rather than
      * ErrorCodes::BrokenPromise.
      */
-    template <typename Func>
+    TEMPLATE(typename Func)
+    REQUIRES(future_details::isCallableR<T, Func, void>)
     void setWith(Func&& func) noexcept {
         setFrom(Future<void>::makeReady().then(std::forward<Func>(func)));
     }
@@ -777,12 +823,32 @@ public:
      * involved.
      */
     void setFrom(Future<T>&& future) noexcept {
-        setImpl([&](boost::intrusive_ptr<future_details::SharedState<T>>&& sharedState) {
+        setImpl([&](boost::intrusive_ptr<SharedStateT>&& sharedState) {
             std::move(future).propagateResultTo(sharedState.get());
         });
     }
 
-    template <typename... Args>
+    /**
+     * Sets the value into this Promise immediately.
+     *
+     * This accepts a Status for Promises<void> or a StatusWith<T> for Promise<T>.
+     */
+    void setFrom(StatusOrStatusWith<T> sosw) noexcept {
+        setImpl([&](boost::intrusive_ptr<SharedStateT>&& sharedState) {
+            sharedState->setFrom(std::move(sosw));
+        });
+    }
+
+    // Use emplaceValue(Args&&...) instead.
+    REQUIRES_FOR_NON_TEMPLATE(!std::is_void_v<T>)
+    void setFrom(T_unless_void val) noexcept = delete;
+
+    // Use setError(Status) instead.
+    REQUIRES_FOR_NON_TEMPLATE(!std::is_void_v<T>)
+    void setFrom(Status) noexcept = delete;
+
+    TEMPLATE(typename... Args)
+    REQUIRES(std::is_constructible_v<T, Args...> || (std::is_void_v<T> && sizeof...(Args) == 0))
     void emplaceValue(Args&&... args) noexcept {
         setImpl([&](boost::intrusive_ptr<SharedStateT>&& sharedState) {
             sharedState->emplaceValue(std::forward<Args>(args)...);
@@ -793,13 +859,6 @@ public:
         invariant(!status.isOK());
         setImpl([&](boost::intrusive_ptr<SharedStateT>&& sharedState) {
             sharedState->setError(std::move(status));
-        });
-    }
-
-    // TODO rename to not XXXWith and handle void
-    void setFromStatusWith(StatusWith<T> sw) noexcept {
-        setImpl([&](boost::intrusive_ptr<SharedStateT>&& sharedState) {
-            sharedState->setFromStatusWith(std::move(sw));
         });
     }
 
@@ -927,6 +986,27 @@ public:
         return ExecutorFuture<T>(std::move(exec), toFutureImpl());
     }
 
+    /**
+     * Makes a copy of this SharedSemiFuture that resolves at the same time as the original.
+     */
+    SharedSemiFuture split() const noexcept {
+        return toFutureImpl().share();
+    }
+
+    SemiFuture<T> semi() && noexcept {
+        return SemiFuture<T>(toFutureImpl());
+    }
+
+    /**
+     * Returns an inline Future type from this SharedSemiFuture.
+     *
+     * WARNING: Do not use this unless you're extremely sure of what you're doing, as callbacks
+     * chained to the resulting Future may run in unexpected places.
+     */
+    Future<T> unsafeToInlineFuture() const noexcept {
+        return Future<T>(toFutureImpl());
+    }
+
 private:
     template <typename>
     friend class SharedPromise;
@@ -950,10 +1030,6 @@ private:
     void propagateResultTo(U&& arg) const noexcept {
         toFutureImpl().propagateResultTo(std::forward<U>(arg));
     }
-    Future<T> unsafeToInlineFuture() const noexcept {
-        return Future<T>(toFutureImpl());
-    }
-
     explicit SharedSemiFuture(boost::intrusive_ptr<future_details::SharedState<T>> ptr)
         : _shared(std::move(ptr)) {}
     explicit SharedSemiFuture(future_details::SharedStateHolder<T>&& holder)
@@ -963,8 +1039,8 @@ private:
 };
 
 // Deduction Guides
-template <typename T,
-          typename = std::enable_if_t<!isStatusOrStatusWith<T> && !future_details::isFutureLike<T>>>
+TEMPLATE(typename T)
+REQUIRES(!isStatusOrStatusWith<T> && !future_details::isFutureLike<T>)
 SharedSemiFuture(T)->SharedSemiFuture<T>;
 template <typename T>
 SharedSemiFuture(StatusWith<T>)->SharedSemiFuture<T>;
@@ -987,6 +1063,9 @@ SharedSemiFuture(StatusWith<T>)->SharedSemiFuture<T>;
  */
 template <typename T>
 class SharedPromise {
+    using SharedStateT = future_details::SharedState<T>;
+    using T_unless_void = std::conditional_t<std::is_void_v<T>, future_details::FakeVoid, T>;
+
 public:
     using value_type = T;
 
@@ -1014,18 +1093,41 @@ public:
         return SharedSemiFuture<T>(_sharedState);
     }
 
-    template <typename Func>
+    TEMPLATE(typename Func)
+    REQUIRES(future_details::isCallableR<T, Func, void>)
     void setWith(Func&& func) noexcept {
-        invariant(!std::exchange(_haveCompleted, true));
         setFrom(Future<void>::makeReady().then(std::forward<Func>(func)));
     }
 
+    /**
+     * Sets the value into this SharedPromise when the passed-in Future completes, which may have
+     * already happened.
+     */
     void setFrom(Future<T>&& future) noexcept {
         invariant(!std::exchange(_haveCompleted, true));
         std::move(future).propagateResultTo(_sharedState.get());
     }
 
-    template <typename... Args>
+    /**
+     * Sets the value into this SharedPromise immediately.
+     *
+     * This accepts a Status for SharedPromises<void> or a StatusWith<T> for SharedPromise<T>.
+     */
+    void setFrom(StatusOrStatusWith<T> sosw) noexcept {
+        invariant(!std::exchange(_haveCompleted, true));
+        _sharedState->setFrom(std::move(sosw));
+    }
+
+    // Use emplaceValue(Args&&...) instead.
+    REQUIRES_FOR_NON_TEMPLATE(!std::is_void_v<T>)
+    void setFrom(T_unless_void val) noexcept = delete;
+
+    // Use setError(Status) instead.
+    REQUIRES_FOR_NON_TEMPLATE(!std::is_void_v<T>)
+    void setFrom(Status) noexcept = delete;
+
+    TEMPLATE(typename... Args)
+    REQUIRES(std::is_constructible_v<T, Args...> || (std::is_void_v<T> && sizeof...(Args) == 0))
     void emplaceValue(Args&&... args) noexcept {
         invariant(!std::exchange(_haveCompleted, true));
         _sharedState->emplaceValue(std::forward<Args>(args)...);
@@ -1037,31 +1139,14 @@ public:
         _sharedState->setError(std::move(status));
     }
 
-    // TODO rename to not XXXWith and handle void
-    void setFromStatusWith(StatusWith<T> sw) noexcept {
-        invariant(!std::exchange(_haveCompleted, true));
-        _sharedState->setFromStatusWith(std::move(sw));
-    }
-
 private:
     friend class Future<void>;
 
     // This is slightly different from whether the SharedState is in kFinished, because this
     // SharedPromise may have been completed with a Future that isn't ready yet.
     bool _haveCompleted = false;
-    const boost::intrusive_ptr<future_details::SharedState<T>> _sharedState =
-        make_intrusive<future_details::SharedState<T>>();
+    const boost::intrusive_ptr<SharedStateT> _sharedState = make_intrusive<SharedStateT>();
 };
-
-/**
- * Makes a ready Future with the return value of a nullary function. This has the same semantics as
- * Promise::setWith, and has the same reasons to prefer it over Future<T>::makeReady(). Also, it
- * deduces the T, so it is easier to use.
- */
-template <typename Func>
-auto makeReadyFutureWith(Func&& func) {
-    return Future<void>::makeReady().then(std::forward<Func>(func));
-}
 
 /**
  * Returns a bound Promise and Future in a struct with friendly names (promise and future) that also
@@ -1098,20 +1183,51 @@ template <typename Func, typename... Args>
 using FutureContinuationResult =
     future_details::UnwrappedType<std::invoke_result_t<Func, Args&&...>>;
 
+/**
+ * This type transform is useful for coercing (T,StatusWith<T>)->Future<T> and Status->Future<void>.
+ */
+template <typename T>
+using FutureFor = Future<future_details::UnwrappedType<T>>;
+
+template <typename T>
+auto coerceToFuture(T&& value) {
+    return FutureFor<T>(std::forward<T>(value));
+}
+
+/**
+ * Makes a Future with the return value of a nullary function. This has the same semantics as
+ * Promise::setWith, and has the same reasons to prefer it over Future<T>::makeReady(). Also, it
+ * deduces the T, so it is easier to use.
+ *
+ * Note that if func returns an unready Future, this function will not block until it is ready.
+ */
+TEMPLATE(typename Func)
+REQUIRES(future_details::isCallable<Func, void>)
+auto makeReadyFutureWith(Func&& func) -> Future<FutureContinuationResult<Func&&>> try {
+    if constexpr (std::is_void_v<std::invoke_result_t<Func>>) {
+        std::forward<Func>(func)();
+        return Future<void>::makeReady();
+    } else {
+        return std::forward<Func>(func)();
+    }
+} catch (const DBException& ex) {
+    return ex.toStatus();
+}
+
 //
 // Implementations of methods that couldn't be defined in the class due to ordering requirements.
 //
 
 template <typename T>
 template <typename Sig>
-NOINLINE_DECL auto ExecutorFuture<T>::wrapCBHelper(unique_function<Sig>&& func) {
+MONGO_COMPILER_NOINLINE auto ExecutorFuture<T>::wrapCBHelper(unique_function<Sig>&& func) {
     using namespace future_details;
     return [
         func = std::move(func),
         exec = _exec  // can't move this!
     ](auto&&... args) mutable noexcept
         ->Future<UnwrappedType<decltype(func(std::forward<decltype(args)>(args)...))>> {
-        auto[promise, future] = makePromiseFuture<
+        auto [promise, future] = makePromiseFuture<
             UnwrappedType<decltype(func(std::forward<decltype(args)>(args)...))>>();
 
         exec->schedule([
@@ -1126,10 +1242,9 @@ NOINLINE_DECL auto ExecutorFuture<T>::wrapCBHelper(unique_function<Sig>&& func) 
                         // Using a lambda taking a nullary lambda here to work around an MSVC2017
                         // bug that caused it to not ignore the other side of the constexpr-if.
                         // TODO Make this less silly once we upgrade to 2019.
-                        IF_CONSTEXPR(!isFutureLike<decltype(nullary())>) {
+                        if constexpr (!isFutureLike<decltype(nullary())>) {
                             return nullary();
-                        }
-                        else {
+                        } else {
                             // Cheat and convert to an inline Future since we know we will schedule
                             // further user callbacks onto an executor.
                             return nullary().unsafeToInlineFuture();

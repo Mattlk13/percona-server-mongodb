@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -40,28 +40,22 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/repl_client_info.h"
+#include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/migration_source_manager.h"
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/shard_filtering_metadata_refresh.h"
 #include "mongo/db/s/sharding_state.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/catalog_cache_loader.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/flush_routing_table_cache_updates_gen.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
 
-class FlushRoutingTableCacheUpdatesCmd final
-    : public TypedCommand<FlushRoutingTableCacheUpdatesCmd> {
+template <typename Derived>
+class FlushRoutingTableCacheUpdatesCmdBase : public TypedCommand<Derived> {
 public:
-    using Request = _flushRoutingTableCacheUpdates;
-
-    // Support deprecated name 'forceRoutingTableRefresh' for backwards compatibility with 3.6.0.
-    FlushRoutingTableCacheUpdatesCmd()
-        : TypedCommand<FlushRoutingTableCacheUpdatesCmd>(Request::kCommandName,
-                                                         "forceRoutingTableRefresh") {}
-
     std::string help() const override {
         return "Internal command which waits for any pending routing table cache updates for a "
                "particular namespace to be written locally. The operationTime returned in the "
@@ -75,20 +69,21 @@ public:
         return true;
     }
 
-    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
-        return AllowedOnSecondary::kNever;
+    Command::AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return Command::AllowedOnSecondary::kNever;
     }
 
-    class Invocation final : public InvocationBase {
+    class Invocation final : public TypedCommand<Derived>::InvocationBase {
     public:
-        using InvocationBase::InvocationBase;
+        using Base = typename TypedCommand<Derived>::InvocationBase;
+        using Base::Base;
 
         bool supportsWriteConcern() const override {
-            return false;
+            return Derived::supportsWriteConcern();
         }
 
         NamespaceString ns() const override {
-            return request().getCommandParameter();
+            return Base::request().getCommandParameter();
         }
 
         void doCheckAuthorization(OperationContext* opCtx) const override {
@@ -121,9 +116,9 @@ public:
                 // inclusive of the commit (and new writes to the committed chunk) that hasn't yet
                 // propagated back to this shard. This ensures the read your own writes causal
                 // consistency guarantee.
-                auto const css = CollectionShardingState::get(opCtx, ns());
+                auto const csr = CollectionShardingRuntime::get(opCtx, ns());
                 auto criticalSectionSignal =
-                    css->getCriticalSectionSignal(ShardingMigrationCriticalSection::kRead);
+                    csr->getCriticalSectionSignal(opCtx, ShardingMigrationCriticalSection::kWrite);
                 if (criticalSectionSignal) {
                     oss.setMigrationCriticalSectionSignal(criticalSectionSignal);
                 }
@@ -131,9 +126,13 @@ public:
 
             oss.waitForMigrationCriticalSectionSignal(opCtx);
 
-            if (request().getSyncFromConfig()) {
-                LOG(1) << "Forcing remote routing table refresh for " << ns();
-                forceShardFilteringMetadataRefresh(opCtx, ns());
+            if (Base::request().getSyncFromConfig()) {
+                LOGV2_DEBUG(21982,
+                            1,
+                            "Forcing remote routing table refresh for {namespace}",
+                            "Forcing remote routing table refresh",
+                            "namespace"_attr = ns());
+                onShardVersionMismatch(opCtx, ns(), boost::none);
             }
 
             CatalogCacheLoader::get(opCtx).waitForCollectionFlush(opCtx, ns());
@@ -141,7 +140,30 @@ public:
             repl::ReplClientInfo::forClient(opCtx->getClient()).setLastOpToSystemLastOpTime(opCtx);
         }
     };
+};
+
+class FlushRoutingTableCacheUpdatesCmd
+    : public FlushRoutingTableCacheUpdatesCmdBase<FlushRoutingTableCacheUpdatesCmd> {
+public:
+    using Request = _flushRoutingTableCacheUpdates;
+
+    static bool supportsWriteConcern() {
+        return false;
+    }
+
 } _flushRoutingTableCacheUpdatesCmd;
+
+class FlushRoutingTableCacheUpdatesCmdWithWriteConcern
+    : public FlushRoutingTableCacheUpdatesCmdBase<
+          FlushRoutingTableCacheUpdatesCmdWithWriteConcern> {
+public:
+    using Request = _flushRoutingTableCacheUpdatesWithWriteConcern;
+
+    static bool supportsWriteConcern() {
+        return true;
+    }
+
+} _flushRoutingTableCacheUpdatesWithWriteConcernCmd;
 
 }  // namespace
 }  // namespace mongo

@@ -1,9 +1,9 @@
 """The unittest.TestCase for mongos --test."""
 
-from . import interface
-from ... import config
-from ... import core
-from ... import utils
+from buildscripts.resmokelib import config
+from buildscripts.resmokelib import core
+from buildscripts.resmokelib import utils
+from buildscripts.resmokelib.testing.testcases import interface
 
 
 class MongosTestCase(interface.ProcessTestCase):
@@ -29,5 +29,5 @@ class MongosTestCase(interface.ProcessTestCase):
             self.options["test"] = ""
 
     def _make_process(self):
-        return core.programs.mongos_program(self.logger, executable=self.mongos_executable,
-                                            **self.options)
+        return core.programs.mongos_program(self.logger, self.fixture.job_num, test_id=self._id,
+                                            executable=self.mongos_executable, **self.options)

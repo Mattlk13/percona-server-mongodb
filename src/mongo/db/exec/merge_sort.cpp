@@ -29,11 +29,13 @@
 
 #include "mongo/db/exec/merge_sort.h"
 
+#include <memory>
+
 #include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/exec/working_set_common.h"
+#include "mongo/db/query/collation/collation_index_key.h"
 #include "mongo/db/query/collation/collator_interface.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -42,26 +44,25 @@ using std::list;
 using std::string;
 using std::unique_ptr;
 using std::vector;
-using stdx::make_unique;
 
 // static
 const char* MergeSortStage::kStageType = "SORT_MERGE";
 
-MergeSortStage::MergeSortStage(OperationContext* opCtx,
+MergeSortStage::MergeSortStage(ExpressionContext* expCtx,
                                const MergeSortStageParams& params,
                                WorkingSet* ws)
-    : PlanStage(kStageType, opCtx),
+    : PlanStage(kStageType, expCtx),
       _ws(ws),
       _pattern(params.pattern),
       _collator(params.collator),
       _dedup(params.dedup),
       _merging(StageWithValueComparison(ws, params.pattern, params.collator)) {}
 
-void MergeSortStage::addChild(PlanStage* child) {
-    _children.emplace_back(child);
+void MergeSortStage::addChild(std::unique_ptr<PlanStage> child) {
+    _children.emplace_back(std::move(child));
 
     // We have to call work(...) on every child before we can pick a min.
-    _noResultToMerge.push(child);
+    _noResultToMerge.push(_children.back().get());
 }
 
 bool MergeSortStage::isEOF() {
@@ -130,12 +131,6 @@ PlanStage::StageState MergeSortStage::doWork(WorkingSetID* out) {
             // anymore.
             _noResultToMerge.pop();
             return PlanStage::NEED_TIME;
-        } else if (PlanStage::FAILURE == code) {
-            // The stage which produces a failure is responsible for allocating a working set member
-            // with error details.
-            invariant(WorkingSet::INVALID_ID != id);
-            *out = id;
-            return code;
         } else if (PlanStage::NEED_YIELD == code) {
             *out = id;
             return code;
@@ -180,11 +175,44 @@ bool MergeSortStage::StageWithValueComparison::operator()(const MergingRef& lhs,
         BSONElement lhsElt;
         verify(lhsMember->getFieldDotted(fn, &lhsElt));
 
+        // Determine if the left-hand side sort key part comes from an index key.
+        auto lhsIsFromIndexKey = !lhsMember->hasObj();
+
         BSONElement rhsElt;
         verify(rhsMember->getFieldDotted(fn, &rhsElt));
 
+        // Determine if the right-hand side sort key part comes from an index key.
+        auto rhsIsFromIndexKey = !rhsMember->hasObj();
+
+        // A collator to use for comparing the sort keys. We need a collator when values of both
+        // operands are supplied from a document and the query is collated. Otherwise bit-wise
+        // comparison should be used.
+        const CollatorInterface* collatorToUse = nullptr;
+        BSONObj collationEncodedKeyPart;  // A backing storage for a collation-encoded key part
+                                          // (according to collator '_collator') of one of the
+                                          // operands - either 'lhsElt' or 'rhsElt'.
+
+        if (nullptr == _collator || (lhsIsFromIndexKey && rhsIsFromIndexKey)) {
+            // Either the query has no collation or both sort key parts come directly from index
+            // keys. If the query has no collation, then the query planner should have guaranteed
+            // that we don't need to perform any collation-aware comparisons here. If both sort key
+            // parts come from index keys, we may need to respect a collation but the index keys are
+            // already collation-encoded, therefore we don't need to perform a collation-aware
+            // comparison here.
+        } else if (!lhsIsFromIndexKey && !rhsIsFromIndexKey) {
+            // Both sort key parts were extracted from fetched documents. These parts are not
+            // collation-encoded, so we will need to perform a collation-aware comparison.
+            collatorToUse = _collator;
+        } else {
+            // One of the sort key parts was extracted from fetched documents. Encode that part
+            // using the query's collation.
+            auto& keyPartFetchedFromDocument = rhsIsFromIndexKey ? lhsElt : rhsElt;
+            collationEncodedKeyPart = encodeKeyPartWithCollation(keyPartFetchedFromDocument);
+            keyPartFetchedFromDocument = collationEncodedKeyPart.firstElement();
+        }
+
         // false means don't compare field name.
-        int x = lhsElt.woCompare(rhsElt, false, _collator);
+        int x = lhsElt.woCompare(rhsElt, false, collatorToUse);
         if (-1 == patternElt.number()) {
             x = -x;
         }
@@ -199,13 +227,21 @@ bool MergeSortStage::StageWithValueComparison::operator()(const MergingRef& lhs,
     return false;
 }
 
+BSONObj MergeSortStage::StageWithValueComparison::encodeKeyPartWithCollation(
+    const BSONElement& keyPart) {
+    BSONObjBuilder objectBuilder;
+    CollationIndexKey::collationAwareIndexKeyAppend(keyPart, _collator, &objectBuilder);
+    return objectBuilder.obj();
+}
+
 unique_ptr<PlanStageStats> MergeSortStage::getStats() {
     _commonStats.isEOF = isEOF();
 
     _specificStats.sortPattern = _pattern;
 
-    unique_ptr<PlanStageStats> ret = make_unique<PlanStageStats>(_commonStats, STAGE_SORT_MERGE);
-    ret->specific = make_unique<MergeSortStats>(_specificStats);
+    unique_ptr<PlanStageStats> ret =
+        std::make_unique<PlanStageStats>(_commonStats, STAGE_SORT_MERGE);
+    ret->specific = std::make_unique<MergeSortStats>(_specificStats);
     for (size_t i = 0; i < _children.size(); ++i) {
         ret->children.emplace_back(_children[i]->getStats());
     }

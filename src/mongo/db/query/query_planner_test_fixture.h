@@ -64,6 +64,9 @@ protected:
 
     void addIndex(BSONObj keyPattern, bool multikey, bool sparse, bool unique);
 
+    void addIndex(
+        BSONObj keyPattern, bool multikey, bool sparse, bool unique, const std::string& name);
+
     void addIndex(BSONObj keyPattern, BSONObj infoObj);
 
     void addIndex(BSONObj keyPattern, MatchExpression* filterExpr);
@@ -216,10 +219,22 @@ protected:
     void assertHasOnlyCollscan() const;
 
     /**
-     * Helper function to parse a MatchExpression.
+     * Check that query planning failed with NoQueryExecutionPlans.
      */
-    static std::unique_ptr<MatchExpression> parseMatchExpression(
-        const BSONObj& obj, const CollatorInterface* collator = nullptr);
+    void assertNoSolutions() const;
+
+    /**
+     * Helper function to parse a MatchExpression.
+     *
+     * If the caller wants a collator to be used with the match expression, pass an expression
+     * context owning that collator as the second argument. The expression context passed must
+     * outlive the returned match expression.
+     *
+     * If no ExpressionContext is passed a default-constructed ExpressionContextForTest will be
+     * used.
+     */
+    std::unique_ptr<MatchExpression> parseMatchExpression(
+        const BSONObj& obj, const boost::intrusive_ptr<ExpressionContext>& expCtx = nullptr);
 
     //
     // Data members.
@@ -229,9 +244,12 @@ protected:
 
     QueryTestServiceContext serviceContext;
     ServiceContext::UniqueOperationContext opCtx;
+    boost::intrusive_ptr<ExpressionContext> expCtx;
+
     BSONObj queryObj;
     std::unique_ptr<CanonicalQuery> cq;
     QueryPlannerParams params;
+    Status plannerStatus = Status::OK();
     std::vector<std::unique_ptr<QuerySolution>> solns;
 
     bool relaxBoundsCheck = false;

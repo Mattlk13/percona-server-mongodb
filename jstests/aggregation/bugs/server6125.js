@@ -1,3 +1,4 @@
+(function() {
 //
 // testing $sort aggregation pipeline for heterogeneity (SERVER-6125)
 // method:
@@ -65,9 +66,9 @@ function setupArray() {
         {_id: 13, a: new Timestamp(1 / 1000, 1), ty: "Timestamp"},
         {_id: 14, a: /regex/, ty: "RegExp"},
         {
-          _id: 15,
-          a: new DBPointer("test.s6125", new ObjectId("0102030405060708090A0B0C")),
-          ty: "DBPointer"
+            _id: 15,
+            a: new DBPointer("test.s6125", new ObjectId("0102030405060708090A0B0C")),
+            ty: "DBPointer"
         },
         {_id: 16, a: function() {}, ty: "Code"},
         // Code with Scope not implemented in JS
@@ -93,3 +94,4 @@ runSort({a: -1}, false, "p3");
 // problem 4, reverse order sort with nested array
 runSort({"a": -1}, true, "p4a");
 runSort({"a.b": -1}, true, "p4b");
+})();

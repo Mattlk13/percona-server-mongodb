@@ -96,7 +96,7 @@ class OperationContext;
 namespace QueryResult {
 #pragma pack(1)
 /* see http://dochub.mongodb.org/core/mongowireprotocol
-*/
+ */
 struct Layout {
     MsgData::Layout msgdata;
     int64_t cursorId;
@@ -241,7 +241,7 @@ public:
 
     /* for insert and update msgs */
     bool moreJSObjs() const {
-        return _nextjsobj != 0 && _nextjsobj != _theEnd;
+        return _nextjsobj != nullptr && _nextjsobj != _theEnd;
     }
 
     BSONObj nextJsObj();
@@ -297,19 +297,20 @@ enum QueryOptions {
     */
     QueryOption_CursorTailable = 1 << 1,
 
-    /** allow query of replica slave.  normally these return an error except for namespace "local".
-    */
-    QueryOption_SlaveOk = 1 << 2,
+    /** allow query of replica secondary.  normally these return an error except for namespace
+     * "local".
+     */
+    QueryOption_SecondaryOk = 1 << 2,
 
-    // findingStart mode is used to find the first operation of interest when
-    // we are scanning through a repl log.  For efficiency in the common case,
-    // where the first operation of interest is closer to the tail than the head,
-    // we start from the tail of the log and work backwards until we find the
-    // first operation of interest.  Then we scan forward from that first operation,
-    // actually returning results to the client.  During the findingStart phase,
-    // we release the db mutex occasionally to avoid blocking the db process for
-    // an extended period of time.
-    QueryOption_OplogReplay = 1 << 3,
+    // In previous versions of the server, clients were required to set this option in order to
+    // enable an optimized oplog scan. As of 4.4, the server will apply the optimization for
+    // eligible queries regardless of whether this flag is set.
+    //
+    // This bit is reserved for compatibility with old clients, but it should not be set by modern
+    // clients.
+    //
+    // New server code should not use this flag.
+    QueryOption_OplogReplay_DEPRECATED = 1 << 3,
 
     /** The server normally times out idle cursors after an inactivity period to prevent excess
      * memory uses
@@ -319,7 +320,7 @@ enum QueryOptions {
 
     /** Use with QueryOption_CursorTailable.  If we are at the end of the data, block for a while
      * rather than returning no data. After a timeout period, we do return as normal.
-    */
+     */
     QueryOption_AwaitData = 1 << 5,
 
     /** Stream the data down full blast in multiple "more" packages, on the assumption that the
@@ -327,7 +328,7 @@ enum QueryOptions {
      * you want to pull it all down.  Note: it is not allowed to not read all the data unless you
      * close the connection.
 
-        Use the query( stdx::function<void(const BSONObj&)> f, ... ) version of the connection's
+        Use the query( std::function<void(const BSONObj&)> f, ... ) version of the connection's
         query()
         method, and it will take care of all the details for you.
     */
@@ -341,13 +342,12 @@ enum QueryOptions {
 
     // DBClientCursor reserves flag 1 << 30 to force the use of OP_QUERY.
 
-    QueryOption_AllSupported = QueryOption_CursorTailable | QueryOption_SlaveOk |
-        QueryOption_OplogReplay | QueryOption_NoCursorTimeout | QueryOption_AwaitData |
-        QueryOption_Exhaust | QueryOption_PartialResults,
-
-    QueryOption_AllSupportedForSharding = QueryOption_CursorTailable | QueryOption_SlaveOk |
-        QueryOption_OplogReplay | QueryOption_NoCursorTimeout | QueryOption_AwaitData |
+    QueryOption_AllSupported = QueryOption_CursorTailable | QueryOption_SecondaryOk |
+        QueryOption_NoCursorTimeout | QueryOption_AwaitData | QueryOption_Exhaust |
         QueryOption_PartialResults,
+
+    QueryOption_AllSupportedForSharding = QueryOption_CursorTailable | QueryOption_SecondaryOk |
+        QueryOption_NoCursorTimeout | QueryOption_AwaitData | QueryOption_PartialResults,
 };
 
 /* a request to run a query, received from the database */
@@ -443,8 +443,15 @@ Message makeGetMoreMessage(StringData ns, long long cursorId, int nToReturn, int
  * Order of fields makes DbResponse{funcReturningMessage()} valid.
  */
 struct DbResponse {
-    Message response;       // If empty, nothing will be returned to the client.
-    std::string exhaustNS;  // Namespace of cursor if exhaust mode, else "".
+    // If empty, nothing will be returned to the client.
+    Message response;
+
+    // For exhaust commands, indicates whether the command should be run again.
+    bool shouldRunAgainForExhaust = false;
+
+    // The next invocation for an exhaust command. If this is boost::none, the previous invocation
+    // should be reused for the next invocation.
+    boost::optional<BSONObj> nextInvocation;
 };
 
 /**

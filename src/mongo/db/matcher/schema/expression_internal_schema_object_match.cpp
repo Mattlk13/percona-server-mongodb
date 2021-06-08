@@ -36,11 +36,14 @@ namespace mongo {
 constexpr StringData InternalSchemaObjectMatchExpression::kName;
 
 InternalSchemaObjectMatchExpression::InternalSchemaObjectMatchExpression(
-    StringData path, std::unique_ptr<MatchExpression> expr)
+    StringData path,
+    std::unique_ptr<MatchExpression> expr,
+    clonable_ptr<ErrorAnnotation> annotation)
     : PathMatchExpression(INTERNAL_SCHEMA_OBJECT_MATCH,
                           path,
                           ElementPath::LeafArrayBehavior::kNoTraversal,
-                          ElementPath::NonLeafArrayBehavior::kTraverse),
+                          ElementPath::NonLeafArrayBehavior::kTraverse,
+                          std::move(annotation)),
       _sub(std::move(expr)) {}
 
 bool InternalSchemaObjectMatchExpression::matchesSingleElement(const BSONElement& elem,
@@ -61,7 +64,7 @@ void InternalSchemaObjectMatchExpression::debugString(StringBuilder& debug,
 BSONObj InternalSchemaObjectMatchExpression::getSerializedRightHandSide() const {
     BSONObjBuilder objMatchBob;
     BSONObjBuilder subBob(objMatchBob.subobjStart(kName));
-    _sub->serialize(&subBob);
+    _sub->serialize(&subBob, true);
     subBob.doneFast();
     return objMatchBob.obj();
 }
@@ -75,8 +78,8 @@ bool InternalSchemaObjectMatchExpression::equivalent(const MatchExpression* othe
 }
 
 std::unique_ptr<MatchExpression> InternalSchemaObjectMatchExpression::shallowClone() const {
-    auto clone =
-        stdx::make_unique<InternalSchemaObjectMatchExpression>(path(), _sub->shallowClone());
+    auto clone = std::make_unique<InternalSchemaObjectMatchExpression>(
+        path(), _sub->shallowClone(), _errorAnnotation);
     if (getTag()) {
         clone->setTag(getTag()->clone());
     }

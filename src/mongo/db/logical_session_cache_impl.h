@@ -34,6 +34,7 @@
 #include "mongo/db/sessions_collection.h"
 #include "mongo/util/concurrency/with_lock.h"
 #include "mongo/util/functional.h"
+#include "mongo/util/hierarchical_acquisition.h"
 
 namespace mongo {
 
@@ -71,9 +72,9 @@ public:
 
     Status vivify(OperationContext* opCtx, const LogicalSessionId& lsid) override;
 
-    Status refreshNow(Client* client) override;
+    Status refreshNow(OperationContext* opCtx) override;
 
-    Status reapNow(Client* client) override;
+    void reapNow(OperationContext* opCtx) override;
 
     size_t size() override;
 
@@ -100,16 +101,14 @@ private:
      */
     bool _isDead(const LogicalSessionRecord& record, Date_t now) const;
 
-    /**
-     *
-     */
-    Status _addToCache(WithLock, LogicalSessionRecord record);
+    Status _addToCacheIfNotFull(WithLock, LogicalSessionRecord record);
 
     const std::unique_ptr<ServiceLiaison> _service;
     const std::shared_ptr<SessionsCollection> _sessionsColl;
     const ReapSessionsOlderThanFn _reapSessionsOlderThanFn;
 
-    mutable stdx::mutex _mutex;
+    mutable Mutex _mutex =
+        MONGO_MAKE_LATCH(HierarchicalAcquisitionLevel(0), "LogicalSessionCacheImpl::_mutex");
 
     LogicalSessionIdMap<LogicalSessionRecord> _activeSessions;
 

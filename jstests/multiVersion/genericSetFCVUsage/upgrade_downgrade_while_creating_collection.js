@@ -2,10 +2,11 @@
  * Tests that upgrade/downgrade works correctly even while creating a new collection.
  */
 (function() {
-    "use strict";
-    load("jstests/libs/feature_compatibility_version.js");
-    load("jstests/libs/parallel_shell_helpers.js");
+"use strict";
+load("jstests/libs/parallel_shell_helpers.js");
 
+function runTest(downgradeFCV) {
+    jsTestLog("Running test with downgradeFCV: " + downgradeFCV);
     const rst = new ReplSetTest({nodes: 2});
     rst.startSet();
 
@@ -21,7 +22,7 @@
     const primaryDB = primary.getDB("test");
 
     for (let versions
-             of[{from: lastStableFCV, to: latestFCV}, {from: latestFCV, to: lastStableFCV}]) {
+             of [{from: downgradeFCV, to: latestFCV}, {from: latestFCV, to: downgradeFCV}]) {
         jsTestLog("Changing FeatureCompatibilityVersion from " + versions.from + " to " +
                   versions.to + " while creating a collection");
         assert.commandWorked(
@@ -40,7 +41,8 @@
             }, primary.port);
 
             assert.soon(function() {
-                return rawMongoProgramOutput().match("createCollection: test.mycoll");
+                return rawMongoProgramOutput().match(
+                    /\"id\":20320.*test.mycoll/);  // Create Collection log
             });
 
             awaitUpgradeFCV = startParallelShell(
@@ -73,4 +75,8 @@
         rst.checkReplicatedDataHashes();
     }
     rst.stopSet();
+}
+
+runTest(lastContinuousFCV);
+runTest(lastLTSFCV);
 })();

@@ -1,13 +1,13 @@
 doassert = function(msg, obj) {
     // eval if msg is a function
-    if (typeof(msg) == "function")
+    if (typeof (msg) == "function")
         msg = msg();
 
-    if (typeof(msg) == "object")
+    if (typeof (msg) == "object")
         msg = tojson(msg);
 
     if (jsTest.options().traceExceptions) {
-        if (typeof(msg) == "string" && msg.indexOf("assert") == 0)
+        if (typeof (msg) == "string" && msg.indexOf("assert") == 0)
             print(msg);
         else
             print("assert: " + msg);
@@ -27,7 +27,6 @@ doassert = function(msg, obj) {
 
 // Sort doc/obj fields and return new sorted obj
 sortDoc = function(doc) {
-
     // Helper to sort the elements of the array
     var sortElementsOfArray = function(arr) {
         var newArr = [];
@@ -285,7 +284,7 @@ assert = (function() {
 
         if (count != arr.length) {
             doassert(_buildAssertionMessage(
-                msg, "None of values from " + tojson(arr) + " was in " + tojson(result)));
+                msg, "Not all of the values from " + tojson(arr) + " were in " + tojson(result)));
         }
     };
 
@@ -307,28 +306,60 @@ assert = (function() {
         }
     };
 
+    assert.containsPrefix = function(prefix, arr, msg) {
+        var wasIn = false;
+        if (typeof (prefix) !== "string") {
+            throw new Error("The first argument to containsPrefix must be a string.");
+        }
+        if (!Array.isArray(arr)) {
+            throw new Error("The second argument to containsPrefix must be an array.");
+        }
+
+        for (let i = 0; i < arr.length; i++) {
+            if (typeof (arr[i]) !== "string") {
+                continue;
+            }
+
+            wasIn = arr[i].startsWith(prefix);
+            if (wasIn) {
+                break;
+            }
+        }
+
+        if (!wasIn) {
+            doassert(_buildAssertionMessage(
+                msg, tojson(prefix) + " was not a prefix in " + tojson(arr)));
+        }
+    };
+
     /*
      * Calls a function 'func' at repeated intervals until either func() returns true
      * or more than 'timeout' milliseconds have elapsed. Throws an exception with
      * message 'msg' after timing out.
      */
-    assert.soon = function(func, msg, timeout, interval) {
+    assert.soon = function(func, msg, timeout, interval, {runHangAnalyzer = true} = {}) {
         _validateAssertionMessage(msg);
 
         var msgPrefix = "assert.soon failed: " + func;
 
         if (msg) {
-            if (typeof(msg) != "function") {
+            if (typeof (msg) != "function") {
                 msgPrefix = "assert.soon failed, msg";
             }
         }
 
         var start = new Date();
-        timeout = timeout || 5 * 60 * 1000;
+
+        if (TestData && TestData.inEvergreen) {
+            timeout = timeout || 10 * 60 * 1000;
+        } else {
+            timeout = timeout || 90 * 1000;
+        }
+
         interval = interval || 200;
-        var last;
+
         while (1) {
-            if (typeof(func) == "string") {
+            if (typeof (func) == "string") {
                 if (eval(func))
                     return;
             } else {
@@ -338,9 +369,20 @@ assert = (function() {
 
             diff = (new Date()).getTime() - start.getTime();
             if (diff > timeout) {
-                doassert(_buildAssertionMessage(msg, msgPrefix));
+                msg = _buildAssertionMessage(msg, msgPrefix);
+                if (runHangAnalyzer) {
+                    msg = msg +
+                        " The hang analyzer is automatically called in assert.soon functions." +
+                        " If you are *expecting* assert.soon to possibly fail, call assert.soon" +
+                        " with {runHangAnalyzer: false} as the fifth argument" +
+                        " (you can fill unused arguments with `undefined`).";
+                    print(msg + " Running hang analyzer from assert.soon.");
+                    MongoRunner.runHangAnalyzer();
+                }
+                doassert(msg);
+            } else {
+                sleep(interval);
             }
-            sleep(interval);
         }
     };
 
@@ -352,7 +394,28 @@ assert = (function() {
     assert.soonNoExcept = function(func, msg, timeout, interval) {
         var safeFunc =
             _convertExceptionToReturnStatus(func, "assert.soonNoExcept caught exception");
-        assert.soon(safeFunc, msg, timeout, interval);
+        var getFunc = () => {
+            // No TestData means not running from resmoke. Non-resmoke tests usually don't trace
+            // exceptions.
+            if (typeof TestData === "undefined") {
+                return safeFunc;
+            }
+            return () => {
+                // Turns off printing the JavaScript stacktrace in doassert() to avoid
+                // generating an overwhelming amount of log messages when handling transient
+                // errors.
+                const origTraceExceptions = TestData.traceExceptions;
+                TestData.traceExceptions = false;
+
+                const res = safeFunc();
+
+                // Restore it's value to original value.
+                TestData.traceExceptions = origTraceExceptions;
+                return res;
+            };
+        };
+
+        assert.soon(getFunc(), msg, timeout, interval);
     };
 
     /*
@@ -362,7 +425,7 @@ assert = (function() {
      * message 'msg' after all attempts are used up. If no 'intervalMS' argument is passed,
      * it defaults to 0.
      */
-    assert.retry = function(func, msg, num_attempts, intervalMS) {
+    assert.retry = function(func, msg, num_attempts, intervalMS, {runHangAnalyzer = true} = {}) {
         var intervalMS = intervalMS || 0;
         var attempts_made = 0;
         while (attempts_made < num_attempts) {
@@ -375,6 +438,15 @@ assert = (function() {
             }
         }
         // Used up all attempts
+        msg = _buildAssertionMessage(msg);
+        if (runHangAnalyzer) {
+            msg = msg + " The hang analyzer is automatically called in assert.retry functions. " +
+                "If you are *expecting* assert.soon to possibly fail, call assert.retry " +
+                "with {runHangAnalyzer: false} as the fifth argument " +
+                "(you can fill unused arguments with `undefined`).";
+            print(msg + " Running hang analyzer from assert.retry.");
+            MongoRunner.runHangAnalyzer();
+        }
         doassert(msg);
     };
 
@@ -413,12 +485,12 @@ assert = (function() {
         return res;
     };
 
-    assert.time = function(f, msg, timeout /*ms*/) {
+    assert.time = function(f, msg, timeout /*ms*/, {runHangAnalyzer = true} = {}) {
         _validateAssertionMessage(msg);
 
         var start = new Date();
         timeout = timeout || 30000;
-        if (typeof(f) == "string") {
+        if (typeof (f) == "string") {
             res = eval(f);
         } else {
             res = f();
@@ -428,7 +500,17 @@ assert = (function() {
         if (diff > timeout) {
             const msgPrefix =
                 "assert.time failed timeout " + timeout + "ms took " + diff + "ms : " + f + ", msg";
-            doassert(_buildAssertionMessage(msg, msgPrefix));
+            msg = _buildAssertionMessage(msg, msgPrefix);
+            if (runHangAnalyzer) {
+                msg = msg +
+                    " The hang analyzer is automatically called in assert.time functions. " +
+                    "If you are *expecting* assert.soon to possibly fail, call assert.time " +
+                    "with {runHangAnalyzer: false} as the fourth argument " +
+                    "(you can fill unused arguments with `undefined`).";
+                print(msg + " Running hang analyzer from assert.time.");
+                MongoRunner.runHangAnalyzer();
+            }
+            doassert(msg);
         }
         return res;
     };
@@ -555,13 +637,65 @@ assert = (function() {
         }
     }
 
+    function _runHangAnalyzerIfWriteConcernTimedOut(res) {
+        const timeoutMsg = "waiting for replication timed out";
+        let isWriteConcernTimeout = false;
+        if (_isWriteResultType(res)) {
+            if (res.hasWriteConcernError() && res.getWriteConcernError().errmsg === timeoutMsg) {
+                isWriteConcernTimeout = true;
+            }
+        } else if ((res.hasOwnProperty("errmsg") && res.errmsg === timeoutMsg) ||
+                   (res.hasOwnProperty("writeConcernError") &&
+                    res.writeConcernError.errmsg === timeoutMsg)) {
+            isWriteConcernTimeout = true;
+        }
+        if (isWriteConcernTimeout) {
+            print("Running hang analyzer for writeConcern timeout " + tojson(res));
+            MongoRunner.runHangAnalyzer();
+            return true;
+        }
+        return false;
+    }
+
+    function _runHangAnalyzerIfNonTransientLockTimeoutError(res) {
+        // Concurrency suites see a lot of LockTimeouts when running concurrent transactions.
+        // However, they will also abort transactions and continue running rather than fail the
+        // test, so we don't want to run the hang analyzer when the error has a
+        // TransientTransactionError error label.
+        const isTransientTxnError = res.hasOwnProperty("errorLabels") &&
+            res.errorLabels.includes("TransientTransactionError");
+        const isLockTimeout = res.hasOwnProperty("code") && ErrorCodes.LockTimeout === res.code;
+        if (isLockTimeout && !isTransientTxnError) {
+            print("Running hang analyzer for lock timeout " + tojson(res));
+            MongoRunner.runHangAnalyzer();
+            return true;
+        }
+        return false;
+    }
+
+    function _runHangAnalyzerForSpecificFailureTypes(res) {
+        // If the hang analyzer is run, then we shouldn't try to run it again.
+        if (_runHangAnalyzerIfWriteConcernTimedOut(res)) {
+            return;
+        }
+
+        _runHangAnalyzerIfNonTransientLockTimeoutError(res);
+    }
+
     function _assertCommandWorked(res, msg, {ignoreWriteErrors, ignoreWriteConcernErrors}) {
         _validateAssertionMessage(msg);
         _validateCommandResponse(res, "commandWorked");
 
         // Keep this as a function so we don't call tojson if not necessary.
         const makeFailMsg = () => {
-            return _buildAssertionMessage(msg, "command failed: " + tojson(res));
+            let prefix = "command failed: " + tojson(res);
+            if (typeof res._commandObj === "object" && res._commandObj !== null) {
+                prefix += " with original command request: " + tojson(res._commandObj);
+            }
+            if (typeof res._mongo === "object" && res._mongo !== null) {
+                prefix += " on connection: " + res._mongo;
+            }
+            return _buildAssertionMessage(msg, prefix);
         };
 
         if (_isWriteResultType(res)) {
@@ -581,6 +715,7 @@ assert = (function() {
                     ignoreWriteErrors: ignoreWriteErrors,
                     ignoreWriteConcernErrors: ignoreWriteConcernErrors
                 })) {
+                _runHangAnalyzerForSpecificFailureTypes(res);
                 doassert(makeFailMsg(), res);
             }
         } else if (res.hasOwnProperty("acknowledged")) {
@@ -594,12 +729,13 @@ assert = (function() {
         return res;
     }
 
-    const kAnyErrorCode = Object.create(null);
+    assert._kAnyErrorCode = Object.create(null);
+
     function _assertCommandFailed(res, expectedCode, msg) {
         _validateAssertionMessage(msg);
         _validateCommandResponse(res, "commandFailed");
 
-        if (expectedCode !== kAnyErrorCode && !Array.isArray(expectedCode)) {
+        if (expectedCode !== assert._kAnyErrorCode && !Array.isArray(expectedCode)) {
             expectedCode = [expectedCode];
         }
 
@@ -610,7 +746,7 @@ assert = (function() {
         };
 
         const makeFailCodeMsg = () => {
-            return (expectedCode !== kAnyErrorCode)
+            return (expectedCode !== assert._kAnyErrorCode)
                 ? _buildAssertionMessage(msg,
                                          "command did not fail with any of the following codes " +
                                              tojson(expectedCode) + " " + tojson(res))
@@ -624,7 +760,7 @@ assert = (function() {
             // A WriteCommandError implies ok:0.
             // Error objects may have a `code` property added (e.g.
             // DBCollection.prototype.mapReduce) without a `ok` property.
-            if (expectedCode !== kAnyErrorCode) {
+            if (expectedCode !== assert._kAnyErrorCode) {
                 if (!res.hasOwnProperty("code") || !expectedCode.includes(res.code)) {
                     doassert(makeFailCodeMsg(), res);
                 }
@@ -636,7 +772,7 @@ assert = (function() {
                 doassert(makeFailMsg(), res);
             }
 
-            if (expectedCode !== kAnyErrorCode) {
+            if (expectedCode !== assert._kAnyErrorCode) {
                 let foundCode = false;
                 if (res.hasOwnProperty("code") && expectedCode.includes(res.code)) {
                     foundCode = true;
@@ -647,6 +783,7 @@ assert = (function() {
                 }
 
                 if (!foundCode) {
+                    _runHangAnalyzerForSpecificFailureTypes(res);
                     doassert(makeFailCodeMsg(), res);
                 }
             }
@@ -688,7 +825,7 @@ assert = (function() {
     };
 
     assert.commandFailed = function(res, msg) {
-        return _assertCommandFailed(res, kAnyErrorCode, msg);
+        return _assertCommandFailed(res, assert._kAnyErrorCode, msg);
     };
 
     // expectedCode can be an array of possible codes.
@@ -722,6 +859,7 @@ assert = (function() {
         }
 
         if (errMsg) {
+            _runHangAnalyzerForSpecificFailureTypes(res);
             doassert(_buildAssertionMessage(msg, errMsg), res);
         }
 
@@ -729,7 +867,7 @@ assert = (function() {
     };
 
     assert.writeError = function(res, msg) {
-        return assert.writeErrorWithCode(res, kAnyErrorCode, msg);
+        return assert.writeErrorWithCode(res, assert._kAnyErrorCode, msg);
     };
 
     // If expectedCode is an array then this asserts that the found code is one of the codes in
@@ -771,7 +909,7 @@ assert = (function() {
             }
         }
 
-        if (!errMsg && expectedCode !== kAnyErrorCode) {
+        if (!errMsg && expectedCode !== assert._kAnyErrorCode) {
             if (!Array.isArray(expectedCode)) {
                 expectedCode = [expectedCode];
             }
@@ -783,6 +921,7 @@ assert = (function() {
         }
 
         if (errMsg) {
+            _runHangAnalyzerForSpecificFailureTypes(res);
             doassert(_buildAssertionMessage(msg, errMsg));
         }
 
@@ -929,7 +1068,6 @@ assert = (function() {
     };
 
     assert.gleOK = function(res, msg) {
-
         var errMsg = null;
 
         if (!res) {
@@ -950,7 +1088,7 @@ assert = (function() {
     assert.gleSuccess = function(dbOrGLEDoc, msg) {
         var gle = dbOrGLEDoc instanceof DB ? dbOrGLEDoc.getLastErrorObj() : dbOrGLEDoc;
         if (gle.err) {
-            if (typeof(msg) == "function")
+            if (typeof (msg) == "function")
                 msg = msg(gle);
             doassert(_buildAssertionMessage(msg, "getLastError not null: " + tojson(gle)), gle);
         }
@@ -960,7 +1098,7 @@ assert = (function() {
     assert.gleError = function(dbOrGLEDoc, msg) {
         var gle = dbOrGLEDoc instanceof DB ? dbOrGLEDoc.getLastErrorObj() : dbOrGLEDoc;
         if (!gle.err) {
-            if (typeof(msg) == "function")
+            if (typeof (msg) == "function")
                 msg = msg(gle);
             doassert(_buildAssertionMessage(msg, "getLastError is null: " + tojson(gle)));
         }
@@ -969,7 +1107,7 @@ assert = (function() {
     assert.gleErrorCode = function(dbOrGLEDoc, code, msg) {
         var gle = dbOrGLEDoc instanceof DB ? dbOrGLEDoc.getLastErrorObj() : dbOrGLEDoc;
         if (!gle.err || gle.code != code) {
-            if (typeof(msg) == "function")
+            if (typeof (msg) == "function")
                 msg = msg(gle);
             doassert(_buildAssertionMessage(
                 msg,
@@ -980,7 +1118,7 @@ assert = (function() {
     assert.gleErrorRegex = function(dbOrGLEDoc, regex, msg) {
         var gle = dbOrGLEDoc instanceof DB ? dbOrGLEDoc.getLastErrorObj() : dbOrGLEDoc;
         if (!gle.err || !regex.test(gle.err)) {
-            if (typeof(msg) == "function")
+            if (typeof (msg) == "function")
                 msg = msg(gle);
             doassert(_buildAssertionMessage(
                 msg,

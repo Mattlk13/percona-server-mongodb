@@ -47,7 +47,7 @@ public:
         BSONElement, const boost::intrusive_ptr<ExpressionContext>&);
 
     DocumentSourceInternalInhibitOptimization(const boost::intrusive_ptr<ExpressionContext>& expCtx)
-        : DocumentSource(expCtx) {}
+        : DocumentSource(kStageName, expCtx) {}
 
     const char* getSourceName() const final {
         return kStageName.rawData();
@@ -60,17 +60,17 @@ public:
                 DiskUseRequirement::kNoDiskUse,
                 FacetRequirement::kAllowed,
                 TransactionRequirement::kAllowed,
-                LookupRequirement::kAllowed};
+                LookupRequirement::kAllowed,
+                UnionRequirement::kAllowed};
     }
 
     boost::optional<DistributedPlanLogic> distributedPlanLogic() final {
         return boost::none;
     }
 
-    GetNextResult getNext() final;
-
 private:
+    GetNextResult doGetNext() final;
     Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
 };
 
-}  // namesace mongo
+}  // namespace mongo

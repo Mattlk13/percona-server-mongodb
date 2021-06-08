@@ -29,11 +29,11 @@
 
 #pragma once
 
+#include <list>
 #include <map>
 
 #include "mongo/client/dbclient_connection.h"
-#include "mongo/stdx/list.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/time_support.h"
@@ -67,7 +67,7 @@ public:
         const Date_t creationDate;
     };
 
-    typedef stdx::list<ConnectionInfo> ConnectionList;
+    typedef std::list<ConnectionInfo> ConnectionList;
     typedef stdx::unordered_map<HostAndPort, ConnectionList> HostConnectionMap;
     typedef std::map<HostAndPort, Date_t> HostLastUsedMap;
 
@@ -194,7 +194,7 @@ private:
     const int _messagingPortTags;
 
     // Mutex guarding members of the connection pool
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH("ClientConnectionPool::_mutex");
 
     // Map from HostAndPort to idle connections.
     HostConnectionMap _connections;

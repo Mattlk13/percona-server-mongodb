@@ -7,7 +7,7 @@ Release:        @@RELEASE@@%{?dist}
 Summary:        High-performance MongoDB replacement from Percona (metapackage)
 Group:          Applications/Databases
 
-License:        AGPL
+License:        SSPL
 URL:            https://github.com/percona/percona-server-mongodb.git
 Source0:        @@SOURCE_TARBALL@@
 Source1:        mongod.conf
@@ -190,7 +190,7 @@ install -m 644 $RPM_BUILD_DIR/%{src_dir}/manpages/* %{buildroot}/%{_mandir}/man1
 %config(noreplace) %{_sysconfdir}/mongod.conf
 %config(noreplace) %{_sysconfdir}/sysconfig/mongod
 %attr(0640,mongod,mongod) %ghost /var/log/mongo/mongod.log
-%doc GNU-AGPL-3.0 README THIRD-PARTY-NOTICES
+%doc LICENSE-Community.txt README THIRD-PARTY-NOTICES
 
 %files shell
 %defattr(-,root,root,-)

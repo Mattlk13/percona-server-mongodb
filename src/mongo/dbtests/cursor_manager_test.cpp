@@ -42,8 +42,7 @@
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/operation_context_noop.h"
-#include "mongo/db/query/plan_executor.h"
+#include "mongo/db/query/plan_executor_factory.h"
 #include "mongo/db/query/query_test_service_context.h"
 #include "mongo/db/repl/read_concern_level.h"
 #include "mongo/dbtests/dbtests.h"
@@ -58,11 +57,21 @@ const NamespaceString kTestNss{"test.collection"};
 class CursorManagerTest : public unittest::Test {
 public:
     CursorManagerTest()
-        : _queryServiceContext(stdx::make_unique<QueryTestServiceContext>()),
-          _opCtx(_queryServiceContext->makeOperationContext()) {
-        _opCtx->getServiceContext()->setPreciseClockSource(stdx::make_unique<ClockSourceMock>());
-        _clock =
-            static_cast<ClockSourceMock*>(_opCtx->getServiceContext()->getPreciseClockSource());
+        : _queryServiceContext(std::make_unique<QueryTestServiceContext>()),
+          _cursorManager(nullptr) {
+        _queryServiceContext->getServiceContext()->setPreciseClockSource(
+            std::make_unique<ClockSourceMock>());
+
+        _cursorManager.setPreciseClockSource(
+            _queryServiceContext->getServiceContext()->getPreciseClockSource());
+    }
+
+    void setUp() override {
+        _opCtx = _queryServiceContext->makeOperationContext();
+    }
+
+    void tearDown() override {
+        // Do nothing.
     }
 
     std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> makeFakePlanExecutor() {
@@ -71,24 +80,32 @@ public:
 
     std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> makeFakePlanExecutor(
         OperationContext* opCtx) {
-        auto workingSet = stdx::make_unique<WorkingSet>();
-        auto queuedDataStage = stdx::make_unique<QueuedDataStage>(opCtx, workingSet.get());
-        return unittest::assertGet(PlanExecutor::make(opCtx,
-                                                      std::move(workingSet),
-                                                      std::move(queuedDataStage),
-                                                      kTestNss,
-                                                      PlanExecutor::YieldPolicy::NO_YIELD));
+        // Create a mock ExpressionContext.
+        auto expCtx = make_intrusive<ExpressionContext>(opCtx, nullptr, kTestNss);
+
+        auto workingSet = std::make_unique<WorkingSet>();
+        auto queuedDataStage = std::make_unique<QueuedDataStage>(expCtx.get(), workingSet.get());
+        return unittest::assertGet(
+            plan_executor_factory::make(expCtx,
+                                        std::move(workingSet),
+                                        std::move(queuedDataStage),
+                                        &CollectionPtr::null,
+                                        PlanYieldPolicy::YieldPolicy::NO_YIELD,
+                                        QueryPlannerParams::DEFAULT,
+                                        kTestNss));
     }
 
     ClientCursorParams makeParams(OperationContext* opCtx) {
-        return {makeFakePlanExecutor(opCtx),
-                kTestNss,
-                {},
-                opCtx->getWriteConcern(),
-                repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern),
-                BSONObj(),
-                ClientCursorParams::LockPolicy::kLocksInternally,
-                PrivilegeVector()};
+        return {
+            makeFakePlanExecutor(opCtx),
+            kTestNss,
+            {},
+            APIParameters(),
+            opCtx->getWriteConcern(),
+            repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern),
+            BSONObj(),
+            PrivilegeVector(),
+        };
     }
 
     ClientCursorPin makeCursor(OperationContext* opCtx) {
@@ -96,7 +113,8 @@ public:
     }
 
     ClockSourceMock* useClock() {
-        return _clock;
+        auto svcCtx = _queryServiceContext->getServiceContext();
+        return static_cast<ClockSourceMock*>(svcCtx->getPreciseClockSource());
     }
 
     CursorManager* useCursorManager() {
@@ -108,17 +126,16 @@ protected:
     ServiceContext::UniqueOperationContext _opCtx;
 
 private:
-    ClockSourceMock* _clock;
     CursorManager _cursorManager;
 };
 
 class CursorManagerTestCustomOpCtx : public CursorManagerTest {
     void setUp() override {
-        _queryServiceContext->getClient()->resetOperationContext();
+        // Do nothing.
     }
 
     void tearDown() override {
-        _queryServiceContext->getClient()->setOperationContext(_opCtx.get());
+        // Do nothing.
     }
 };
 
@@ -127,7 +144,6 @@ class CursorManagerTestCustomOpCtx : public CursorManagerTest {
  */
 TEST_F(CursorManagerTest, ShouldBeAbleToKillPinnedCursor) {
     CursorManager* cursorManager = useCursorManager();
-    const bool shouldAudit = false;
     OperationContext* const pinningOpCtx = _opCtx.get();
 
     auto cursorPin = cursorManager->registerCursor(
@@ -135,14 +151,14 @@ TEST_F(CursorManagerTest, ShouldBeAbleToKillPinnedCursor) {
         {makeFakePlanExecutor(),
          kTestNss,
          {},
+         APIParameters(),
          {},
          repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern),
          BSONObj(),
-         ClientCursorParams::LockPolicy::kLocksInternally,
          PrivilegeVector()});
 
     auto cursorId = cursorPin.getCursor()->cursorid();
-    ASSERT_OK(cursorManager->killCursor(_opCtx.get(), cursorId, shouldAudit));
+    ASSERT_OK(cursorManager->killCursor(_opCtx.get(), cursorId));
 
     // The original operation should have been interrupted since the cursor was pinned.
     ASSERT_EQ(pinningOpCtx->checkForInterruptNoAssert(), ErrorCodes::CursorKilled);
@@ -153,7 +169,6 @@ TEST_F(CursorManagerTest, ShouldBeAbleToKillPinnedCursor) {
  */
 TEST_F(CursorManagerTest, ShouldBeAbleToKillPinnedCursorMultiClient) {
     CursorManager* cursorManager = useCursorManager();
-    const bool shouldAudit = false;
     OperationContext* const pinningOpCtx = _opCtx.get();
 
     // Pin the cursor from one client.
@@ -162,10 +177,10 @@ TEST_F(CursorManagerTest, ShouldBeAbleToKillPinnedCursorMultiClient) {
         {makeFakePlanExecutor(),
          kTestNss,
          {},
+         APIParameters(),
          {},
          repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern),
          BSONObj(),
-         ClientCursorParams::LockPolicy::kLocksInternally,
          PrivilegeVector()});
 
     auto cursorId = cursorPin.getCursor()->cursorid();
@@ -182,7 +197,7 @@ TEST_F(CursorManagerTest, ShouldBeAbleToKillPinnedCursorMultiClient) {
 
     auto killCursorOpCtx = killCursorClient->makeOperationContext();
     invariant(killCursorOpCtx);
-    ASSERT_OK(cursorManager->killCursor(killCursorOpCtx.get(), cursorId, shouldAudit));
+    ASSERT_OK(cursorManager->killCursor(killCursorOpCtx.get(), cursorId));
 
     // The original operation should have been interrupted since the cursor was pinned.
     ASSERT_EQ(pinningOpCtx->checkForInterruptNoAssert(), ErrorCodes::CursorKilled);
@@ -199,10 +214,10 @@ TEST_F(CursorManagerTest, InactiveCursorShouldTimeout) {
                                   {makeFakePlanExecutor(),
                                    NamespaceString{"test.collection"},
                                    {},
+                                   APIParameters(),
                                    {},
                                    repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern),
                                    BSONObj(),
-                                   ClientCursorParams::LockPolicy::kLocksInternally,
                                    PrivilegeVector()});
 
     ASSERT_EQ(0UL, cursorManager->timeoutCursors(_opCtx.get(), Date_t()));
@@ -215,10 +230,10 @@ TEST_F(CursorManagerTest, InactiveCursorShouldTimeout) {
                                   {makeFakePlanExecutor(),
                                    NamespaceString{"test.collection"},
                                    {},
+                                   APIParameters(),
                                    {},
                                    repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern),
                                    BSONObj(),
-                                   ClientCursorParams::LockPolicy::kLocksInternally,
                                    PrivilegeVector()});
     ASSERT_EQ(1UL, cursorManager->timeoutCursors(_opCtx.get(), Date_t::max()));
     ASSERT_EQ(0UL, cursorManager->numCursors());
@@ -236,10 +251,10 @@ TEST_F(CursorManagerTest, InactivePinnedCursorShouldNotTimeout) {
         {makeFakePlanExecutor(),
          NamespaceString{"test.collection"},
          {},
+         APIParameters(),
          {},
          repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern),
          BSONObj(),
-         ClientCursorParams::LockPolicy::kLocksInternally,
          PrivilegeVector()});
 
     // The pin is still in scope, so it should not time out.
@@ -261,10 +276,10 @@ TEST_F(CursorManagerTest, MarkedAsKilledCursorsShouldBeDeletedOnCursorPin) {
         {makeFakePlanExecutor(),
          NamespaceString{"test.collection"},
          {},
+         APIParameters(),
          {},
          repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern),
          BSONObj(),
-         ClientCursorParams::LockPolicy::kLocksInternally,
          PrivilegeVector()});
     auto cursorId = cursorPin->cursorid();
 
@@ -295,10 +310,10 @@ TEST_F(CursorManagerTest, InactiveKilledCursorsShouldTimeout) {
         {makeFakePlanExecutor(),
          NamespaceString{"test.collection"},
          {},
+         APIParameters(),
          {},
          repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern),
          BSONObj(),
-         ClientCursorParams::LockPolicy::kLocksInternally,
          PrivilegeVector()});
 
     // A cursor will stay alive, but be marked as killed, if it is interrupted with a code other
@@ -328,10 +343,10 @@ TEST_F(CursorManagerTest, UsingACursorShouldUpdateTimeOfLastUse) {
         {makeFakePlanExecutor(),
          kTestNss,
          {},
+         APIParameters(),
          {},
          repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern),
          BSONObj(),
-         ClientCursorParams::LockPolicy::kLocksInternally,
          PrivilegeVector()});
     auto usedCursorId = cursorPin.getCursor()->cursorid();
     cursorPin.release();
@@ -342,10 +357,10 @@ TEST_F(CursorManagerTest, UsingACursorShouldUpdateTimeOfLastUse) {
                                   {makeFakePlanExecutor(),
                                    kTestNss,
                                    {},
+                                   APIParameters(),
                                    {},
                                    repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern),
                                    BSONObj(),
-                                   ClientCursorParams::LockPolicy::kLocksInternally,
                                    PrivilegeVector()});
 
     // Advance the clock to simulate time passing.
@@ -380,10 +395,10 @@ TEST_F(CursorManagerTest, CursorShouldNotTimeOutUntilIdleForLongEnoughAfterBeing
         {makeFakePlanExecutor(),
          kTestNss,
          {},
+         APIParameters(),
          {},
          repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern),
          BSONObj(),
-         ClientCursorParams::LockPolicy::kLocksInternally,
          PrivilegeVector()});
 
     // Advance the clock to simulate time passing.
@@ -405,6 +420,33 @@ TEST_F(CursorManagerTest, CursorShouldNotTimeOutUntilIdleForLongEnoughAfterBeing
     clock->advance(getDefaultCursorTimeoutMillis() + Milliseconds(1));
     ASSERT_EQ(1UL, cursorManager->timeoutCursors(_opCtx.get(), clock->now()));
     ASSERT_EQ(0UL, cursorManager->numCursors());
+}
+
+/**
+ * Test that a cursor correctly stores API parameters.
+ */
+TEST_F(CursorManagerTest, CursorStoresAPIParameters) {
+    APIParameters apiParams = APIParameters();
+    apiParams.setAPIVersion("2");
+    apiParams.setAPIStrict(true);
+    apiParams.setAPIDeprecationErrors(true);
+
+    CursorManager* cursorManager = useCursorManager();
+    auto cursorPin = cursorManager->registerCursor(
+        _opCtx.get(),
+        {makeFakePlanExecutor(),
+         kTestNss,
+         {},
+         apiParams,
+         {},
+         repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern),
+         BSONObj(),
+         PrivilegeVector()});
+
+    auto storedAPIParams = cursorPin->getAPIParameters();
+    ASSERT_EQ("2", *storedAPIParams.getAPIVersion());
+    ASSERT_TRUE(*storedAPIParams.getAPIStrict());
+    ASSERT_TRUE(*storedAPIParams.getAPIDeprecationErrors());
 }
 
 /**
@@ -467,7 +509,7 @@ TEST_F(CursorManagerTestCustomOpCtx, OneCursorWithASession) {
 
     // Remove the cursor from the manager.
     pinned.release();
-    ASSERT_OK(useCursorManager()->killCursor(opCtx.get(), cursorId, false));
+    ASSERT_OK(useCursorManager()->killCursor(opCtx.get(), cursorId));
 
     // There should be no more cursor entries by session id.
     LogicalSessionIdSet sessions;
@@ -503,7 +545,7 @@ TEST_F(CursorManagerTestCustomOpCtx, MultipleCursorsWithSameSession) {
 
     // Remove one cursor from the manager.
     pinned.release();
-    ASSERT_OK(useCursorManager()->killCursor(opCtx.get(), cursorId1, false));
+    ASSERT_OK(useCursorManager()->killCursor(opCtx.get(), cursorId1));
 
     // Should still be able to retrieve the session.
     lsids.clear();
@@ -586,5 +628,116 @@ TEST_F(CursorManagerTest, CanAccessFromOperationContext) {
     ASSERT(cursorManager);
 }
 
+TEST_F(CursorManagerTestCustomOpCtx, CursorsWithoutOperationKeys) {
+    auto opCtx = _queryServiceContext->makeOperationContext();
+    auto pinned = makeCursor(opCtx.get());
+    ASSERT_EQUALS(pinned.getCursor()->getOperationKey(), boost::none);
+}
+
+TEST_F(CursorManagerTestCustomOpCtx, OneCursorWithAnOperationKey) {
+    auto opKey = UUID::gen();
+    auto opCtx = _queryServiceContext->makeOperationContext();
+    opCtx->setOperationKey(opKey);
+    auto pinned = makeCursor(opCtx.get());
+
+    auto cursors = useCursorManager()->getCursorsForOpKeys({opKey});
+    ASSERT_EQ(cursors.size(), size_t(1));
+    auto cursorId = pinned.getCursor()->cursorid();
+    ASSERT(cursors.find(cursorId) != cursors.end());
+
+    // Remove the cursor from the manager and verify that we can't retrieve it.
+    pinned.release();
+    ASSERT_OK(useCursorManager()->killCursor(opCtx.get(), cursorId));
+    ASSERT(useCursorManager()->getCursorsForOpKeys({opKey}).empty());
+}
+
+TEST_F(CursorManagerTestCustomOpCtx, MultipleCursorsMultipleOperationKeys) {
+    auto opKey1 = UUID::gen();
+    auto opKey2 = UUID::gen();
+
+    CursorId cursor1;
+    CursorId cursor2;
+
+    // Cursor with operationKey 1.
+    {
+        auto opCtx1 = _queryServiceContext->makeOperationContext();
+        opCtx1->setOperationKey(opKey1);
+        cursor1 = makeCursor(opCtx1.get()).getCursor()->cursorid();
+    }
+
+    // Cursor with operationKey 2.
+    {
+        auto opCtx2 = _queryServiceContext->makeOperationContext();
+        opCtx2->setOperationKey(opKey2);
+        cursor2 = makeCursor(opCtx2.get()).getCursor()->cursorid();
+    }
+
+    // Cursor with no operation key.
+    {
+        auto opCtx3 = _queryServiceContext->makeOperationContext();
+        makeCursor(opCtx3.get()).getCursor();
+    }
+
+    // Retrieve cursors for each operation key - should be one for each.
+    auto cursors1 = useCursorManager()->getCursorsForOpKeys({opKey1});
+    ASSERT_EQ(cursors1.size(), size_t(1));
+    ASSERT(cursors1.find(cursor1) != cursors1.end());
+
+    auto cursors2 = useCursorManager()->getCursorsForOpKeys({opKey2});
+    ASSERT_EQ(cursors2.size(), size_t(1));
+    ASSERT(cursors2.find(cursor2) != cursors2.end());
+
+    // Retrieve cursors for both operation keys.
+    auto cursors = useCursorManager()->getCursorsForOpKeys({opKey1, opKey2});
+    ASSERT_EQ(cursors.size(), size_t(2));
+    ASSERT(cursors.find(cursor1) != cursors.end());
+    ASSERT(cursors.find(cursor2) != cursors.end());
+}
+
+TEST_F(CursorManagerTestCustomOpCtx, TimedOutCursorShouldNotBeReturnedForOpKeyLookup) {
+    auto opKey = UUID::gen();
+    auto opCtx = _queryServiceContext->makeOperationContext();
+    opCtx->setOperationKey(opKey);
+    auto clock = useClock();
+
+    auto cursor = makeCursor(opCtx.get());
+
+    ASSERT_EQ(1UL, useCursorManager()->numCursors());
+    ASSERT_EQ(0UL, useCursorManager()->timeoutCursors(opCtx.get(), Date_t()));
+
+    // Advance the clock and verify that the cursor times out.
+    cursor.release();
+    clock->advance(getDefaultCursorTimeoutMillis() + Milliseconds(1));
+    ASSERT_EQ(1UL, useCursorManager()->timeoutCursors(opCtx.get(), clock->now()));
+    ASSERT_EQ(0UL, useCursorManager()->numCursors());
+
+    // Verify that the timed out cursor is not returned when looking up by OperationKey.
+    auto cursors = useCursorManager()->getCursorsForOpKeys({opKey});
+    ASSERT_EQ(cursors.size(), size_t(0));
+}
+
+TEST_F(CursorManagerTestCustomOpCtx, CursorsMarkedAsKilledAreReturnedForOpKeyLookup) {
+    auto opKey = UUID::gen();
+    auto opCtx = _queryServiceContext->makeOperationContext();
+    opCtx->setOperationKey(opKey);
+
+    auto cursor = makeCursor(opCtx.get());
+
+    // Mark the OperationContext as killed.
+    {
+        stdx::lock_guard<Client> lkClient(*opCtx->getClient());
+        // A cursor will stay alive, but be marked as killed, if it is interrupted with a code other
+        // than ErrorCodes::Interrupted or ErrorCodes::CursorKilled and then unpinned.
+        opCtx->getServiceContext()->killOperation(lkClient, opCtx.get(), ErrorCodes::InternalError);
+    }
+    cursor.release();
+
+    // The cursor should still be present in the manager.
+    ASSERT_EQ(1UL, useCursorManager()->numCursors());
+
+    // Verify that the killed cursor is still returned when looking up by OperationKey.
+    auto cursors = useCursorManager()->getCursorsForOpKeys({opKey});
+    ASSERT_EQ(cursors.size(), size_t(1));
+}
 }  // namespace
 }  // namespace mongo

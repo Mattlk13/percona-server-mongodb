@@ -32,20 +32,19 @@
 #include <boost/optional.hpp>
 #include <string>
 
-#include "mongo/base/shim.h"
 #include "mongo/client/dbclient_base.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/logical_session_id.h"
-#include "mongo/db/ops/write_ops_parsers.h"
+#include "mongo/db/ops/write_ops.h"
 #include "mongo/platform/atomic_word.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/timer.h"
 
 namespace pcrecpp {
 class RE;
-}  // namespace pcrecpp;
+}  // namespace pcrecpp
 
 namespace mongo {
 
@@ -113,6 +112,7 @@ struct BenchRunOp {
     BSONObj query;
     bool safe = false;
     int skip = 0;
+    BSONObj sort;
     bool showError = false;
     bool showResult = false;
     std::string target;
@@ -159,8 +159,7 @@ public:
      */
     static BenchRunConfig* createFromBson(const BSONObj& args);
 
-    static MONGO_DECLARE_SHIM((const BenchRunConfig&)->std::unique_ptr<DBClientBase>)
-        createConnectionImpl;
+    static std::unique_ptr<DBClientBase> createConnectionImpl(const BenchRunConfig&);
 
     BenchRunConfig();
 
@@ -431,9 +430,9 @@ public:
     bool shouldWorkerFinish() const;
 
     /**
-    * Predicate that workers call to see if they should start collecting stats (as a result
-    * of a call to tellWorkersToCollectStats()).
-    */
+     * Predicate that workers call to see if they should start collecting stats (as a result
+     * of a call to tellWorkersToCollectStats()).
+     */
     bool shouldWorkerCollectStats() const;
 
     /**
@@ -449,7 +448,7 @@ public:
     void onWorkerFinished();
 
 private:
-    mutable stdx::mutex _mutex;
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("BenchRunState::_mutex");
 
     stdx::condition_variable _stateChangeCondition;
 
@@ -599,7 +598,7 @@ public:
 
 private:
     // TODO: Same as for createWithConfig.
-    static stdx::mutex _staticMutex;
+    static Mutex _staticMutex;
     static std::map<OID, BenchRunner*> _activeRuns;
 
     OID _oid;

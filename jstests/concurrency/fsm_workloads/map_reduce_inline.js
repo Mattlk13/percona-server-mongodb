@@ -10,11 +10,10 @@
  * Used as the base workload for the other map-reduce workloads.
  * @tags: [
  *   # mapReduce does not support afterClusterTime.
- *   does_not_support_causal_consistency,
+ *   does_not_support_causal_consistency
  * ]
  */
 var $config = (function() {
-
     function mapper() {
         if (this.hasOwnProperty('key') && this.hasOwnProperty('value')) {
             var obj = {};
@@ -45,7 +44,6 @@ var $config = (function() {
     var data = {numDocs: 2000, mapper: mapper, reducer: reducer, finalizer: finalizer};
 
     var states = (function() {
-
         function init(db, collName) {
             // no-op
             // other workloads that extend this workload use this method
@@ -59,29 +57,23 @@ var $config = (function() {
         }
 
         return {init: init, mapReduce: mapReduce};
-
     })();
 
     var transitions = {init: {mapReduce: 1}, mapReduce: {mapReduce: 1}};
-
-    function makeDoc(keyLimit, valueLimit) {
-        return {
-            _id: new ObjectId(),
-            key: Random.randInt(keyLimit),
-            value: Random.randInt(valueLimit)
-        };
-    }
 
     function setup(db, collName, cluster) {
         var bulk = db[collName].initializeUnorderedBulkOp();
         for (var i = 0; i < this.numDocs; ++i) {
             // TODO: this actually does assume that there are no unique indexes
-            var doc = makeDoc(this.numDocs / 100, this.numDocs / 10);
-            bulk.insert(doc);
+            bulk.insert({
+                _id: i,
+                key: Random.randInt(this.numDocs / 100),
+                value: Random.randInt(this.numDocs / 10)
+            });
         }
 
         var res = bulk.execute();
-        assertAlways.writeOK(res);
+        assertAlways.commandWorked(res);
         assertAlways.eq(this.numDocs, res.nInserted);
     }
 
@@ -93,5 +85,4 @@ var $config = (function() {
         transitions: transitions,
         setup: setup
     };
-
 })();

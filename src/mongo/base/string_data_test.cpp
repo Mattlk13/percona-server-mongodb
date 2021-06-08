@@ -28,21 +28,26 @@
  */
 
 #include <algorithm>
+#include <functional>
+#include <iomanip>
+#include <sstream>
 #include <string>
 #include <vector>
 
 #include "mongo/base/simple_string_data_comparator.h"
 #include "mongo/base/string_data.h"
+#include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
+namespace {
 
 using std::string;
 
 TEST(Construction, Empty) {
     StringData strData;
     ASSERT_EQUALS(strData.size(), 0U);
-    ASSERT_TRUE(strData.rawData() == NULL);
+    ASSERT_TRUE(strData.rawData() == nullptr);
 }
 
 TEST(Construction, FromStdString) {
@@ -60,10 +65,10 @@ TEST(Construction, FromCString) {
 }
 
 TEST(Construction, FromNullCString) {
-    char* c = NULL;
+    char* c = nullptr;
     StringData strData(c);
     ASSERT_EQUALS(strData.size(), 0U);
-    ASSERT_TRUE(strData.rawData() == NULL);
+    ASSERT_TRUE(strData.rawData() == nullptr);
 }
 
 TEST(Construction, FromUserDefinedLiteral) {
@@ -82,6 +87,33 @@ TEST(Construction, FromEmptyUserDefinedLiteral) {
     const auto strData = ""_sd;
     ASSERT_EQUALS(strData.size(), 0U);
     ASSERT_EQUALS(strData.toString(), string(""));
+}
+
+// Try some constexpr initializations
+TEST(Construction, Constexpr) {
+    constexpr StringData lit = "1234567"_sd;
+    ASSERT_EQUALS(lit, "1234567"_sd);
+    constexpr StringData sub = lit.substr(3, 2);
+    ASSERT_EQUALS(sub, "45"_sd);
+    constexpr StringData range(lit.begin() + 1, lit.end() - 1);
+    ASSERT_EQUALS(range, "23456"_sd);
+    constexpr char c = lit[1];
+    ASSERT_EQUALS(c, '2');
+    constexpr StringData nully{nullptr, 0};
+    ASSERT_EQUALS(nully, ""_sd);
+#if 0
+    constexpr StringData cxNully{nullptr, 1};  // must not compile
+#endif
+    constexpr StringData ptr{lit.rawData() + 1, 3};
+    ASSERT_EQUALS(ptr, "234"_sd);
+}
+
+class StringDataDeathTest : public unittest::Test {};
+
+DEATH_TEST(StringDataDeathTest,
+           InvariantNullRequiresEmpty,
+           "StringData(nullptr,len) requires len==0") {
+    StringData bad{nullptr, 1};
 }
 
 TEST(Comparison, BothEmpty) {
@@ -133,6 +165,22 @@ TEST(Find, Char1) {
     ASSERT_EQUALS(string::npos, StringData("foo").find('a'));
     ASSERT_EQUALS(0U, StringData("foo").find('f'));
     ASSERT_EQUALS(1U, StringData("foo").find('o'));
+
+    using namespace std::literals;
+    const std::string haystacks[]{"foo", "f", "", "\0"s, "f\0"s, "\0f"s, "ffoo", "afoo"};
+    const char needles[]{'a', 'f', 'o', '\0'};
+    for (const auto& s : haystacks) {
+        for (const auto& ch : needles) {
+            // Try all possibly-relevent `pos` arguments.
+            for (size_t pos = 0; pos < s.size() + 2; ++pos) {
+                // All expectations should be consistent with std::string::find.
+                auto withStdString = s.find(ch, pos);
+                auto withStringData = StringData{s}.find(ch, pos);
+                ASSERT_EQUALS(withStdString, withStringData)
+                    << format(FMT_STRING(R"(s:'{}', ch:'{}', pos:{})"), s, StringData{&ch, 1}, pos);
+            }
+        }
+    }
 }
 
 TEST(Find, Str1) {
@@ -148,6 +196,23 @@ TEST(Find, Str1) {
     ASSERT_EQUALS(1U, StringData("foo").find("oo"));
 
     ASSERT_EQUALS(string("foo").find(""), StringData("foo").find(""));
+
+    using namespace std::literals;
+    const std::string haystacks[]{"", "x", "foo", "fffoo", "\0"s};
+    const std::string needles[]{
+        "", "x", "asdsadasda", "a", "f", "fo", "foo", "food", "o", "oo", "ooo", "\0"s};
+    for (const auto& s : haystacks) {
+        for (const auto& sub : needles) {
+            // Try all possibly-relevent `pos` arguments.
+            for (size_t pos = 0; pos < std::max(s.size(), sub.size()) + 2; ++pos) {
+                // All expectations should be consistent with std::string::find.
+                auto withStdString = s.find(sub, pos);
+                auto withStringData = StringData{s}.find(StringData{sub}, pos);
+                ASSERT_EQUALS(withStdString, withStringData)
+                    << format(FMT_STRING(R"(s:'{}', sub:'{}', pos:{})"), s, sub, pos);
+            }
+        }
+    }
 }
 
 // Helper function for Test(Hasher, Str1)
@@ -192,6 +257,25 @@ TEST(Rfind, Char1) {
     ASSERT_EQUALS(1U, StringData("foo", 2).rfind('o'));
     ASSERT_EQUALS(string::npos, StringData("foo", 1).rfind('o'));
     ASSERT_EQUALS(string::npos, StringData("foo", 0).rfind('o'));
+
+    using namespace std::literals;
+    const std::string haystacks[]{"", "x", "foo", "fffoo", "oof", "\0"s};
+    const char needles[]{'f', 'o', '\0'};
+    for (const auto& s : haystacks) {
+        for (const auto& ch : needles) {
+            auto validate = [&](size_t pos) {
+                // All expectations should be consistent with std::string::rfind.
+                auto withStdString = s.rfind(ch, pos);
+                auto withStringData = StringData{s}.rfind(ch, pos);
+                ASSERT_EQUALS(withStdString, withStringData)
+                    << format(FMT_STRING(R"(s:'{}', ch:'{}', pos:{})"), s, StringData{&ch, 1}, pos);
+            };
+            // Try all possibly-relevent `pos` arguments.
+            for (size_t pos = 0; pos < s.size() + 2; ++pos)
+                validate(pos);
+            validate(std::string::npos);
+        }
+    }
 }
 
 // this is to verify we match std::string
@@ -325,4 +409,41 @@ TEST(StringDataFmt, Fmt) {
     ASSERT_EQUALS("-{}-"_format("abc"_sd), "-abc-");
 }
 
+TEST(Ostream, StringDataMatchesStdString) {
+    const std::string s = "xyz";
+    struct TestCase {
+        int line;
+        std::function<void(std::ostream&)> manip;
+    };
+    const TestCase testCases[] = {
+        {__LINE__, [](std::ostream& os) {}},
+        {__LINE__, [](std::ostream& os) { os << std::setw(5); }},
+        {__LINE__, [](std::ostream& os) { os << std::left << std::setw(5); }},
+        {__LINE__, [](std::ostream& os) { os << std::right << std::setw(5); }},
+        {__LINE__, [](std::ostream& os) { os << std::setfill('.') << std::left << std::setw(5); }},
+        {__LINE__, [](std::ostream& os) { os << std::setfill('.') << std::right << std::setw(5); }},
+    };
+    for (const auto& testCase : testCases) {
+        const std::string location = std::string(" at line:") + std::to_string(testCase.line);
+        struct Experiment {
+            Experiment(std::function<void(std::ostream&)> f) : putter(f) {}
+            std::function<void(std::ostream&)> putter;
+            std::ostringstream os;
+        };
+        Experiment expected{[&](std::ostream& os) { os << s; }};
+        Experiment actual{[&](std::ostream& os) { os << StringData(s); }};
+        for (auto& x : {&expected, &actual}) {
+            x->os << ">>";
+            testCase.manip(x->os);
+            x->putter(x->os);
+        }
+        // ASSERT_EQ(expected.os.str(), actual.os.str()) << location;
+        for (auto& x : {&expected, &actual}) {
+            x->os << "<<";
+        }
+        ASSERT_EQ(expected.os.str(), actual.os.str()) << location;
+    }
+}
+
+}  // namespace
 }  // namespace mongo

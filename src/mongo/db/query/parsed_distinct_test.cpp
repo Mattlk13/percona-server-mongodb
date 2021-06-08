@@ -33,7 +33,7 @@
 
 #include "mongo/bson/json.h"
 #include "mongo/db/matcher/extensions_callback_noop.h"
-#include "mongo/db/pipeline/aggregation_request.h"
+#include "mongo/db/pipeline/aggregation_request_helper.h"
 #include "mongo/db/query/parsed_distinct.h"
 #include "mongo/db/query/query_test_service_context.h"
 #include "mongo/unittest/unittest.h"
@@ -59,24 +59,26 @@ TEST(ParsedDistinctTest, ConvertToAggregationNoQuery) {
     auto agg = pd.getValue().asAggregationCommand();
     ASSERT_OK(agg);
 
-    auto ar = AggregationRequest::parseFromBSON(testns, agg.getValue());
+    auto cmdObj = OpMsgRequest::fromDBAndBody(testns.db(), agg.getValue()).body;
+    auto ar = aggregation_request_helper::parseFromBSONForTests(testns, cmdObj);
     ASSERT_OK(ar.getStatus());
     ASSERT(!ar.getValue().getExplain());
-    ASSERT_EQ(ar.getValue().getBatchSize(), AggregationRequest::kDefaultBatchSize);
-    ASSERT_EQ(ar.getValue().getNamespaceString(), testns);
-    ASSERT_BSONOBJ_EQ(ar.getValue().getCollation(), BSONObj());
-    ASSERT(ar.getValue().getReadConcern().isEmpty());
-    ASSERT(ar.getValue().getUnwrappedReadPref().isEmpty());
-    ASSERT(ar.getValue().getComment().empty());
-    ASSERT_EQUALS(ar.getValue().getMaxTimeMS(), 0u);
+    ASSERT_EQ(ar.getValue().getCursor().getBatchSize().value_or(
+                  aggregation_request_helper::kDefaultBatchSize),
+              aggregation_request_helper::kDefaultBatchSize);
+    ASSERT_EQ(ar.getValue().getNamespace(), testns);
+    ASSERT_BSONOBJ_EQ(ar.getValue().getCollation().value_or(BSONObj()), BSONObj());
+    ASSERT(ar.getValue().getReadConcern().value_or(BSONObj()).isEmpty());
+    ASSERT(ar.getValue().getUnwrappedReadPref().value_or(BSONObj()).isEmpty());
+    ASSERT_EQUALS(ar.getValue().getMaxTimeMS().value_or(0), 0u);
 
     std::vector<BSONObj> expectedPipeline{
         BSON("$unwind" << BSON("path"
                                << "$x"
-                               << "preserveNullAndEmptyArrays"
-                               << true)),
-        BSON("$group" << BSON("_id" << BSONNULL << "distinct" << BSON("$addToSet"
-                                                                      << "$x")))};
+                               << "preserveNullAndEmptyArrays" << true)),
+        BSON("$group" << BSON("_id" << BSONNULL << "distinct"
+                                    << BSON("$addToSet"
+                                            << "$x")))};
     ASSERT(std::equal(expectedPipeline.begin(),
                       expectedPipeline.end(),
                       ar.getValue().getPipeline().begin(),
@@ -99,37 +101,37 @@ TEST(ParsedDistinctTest, ConvertToAggregationDottedPathNoQuery) {
     auto agg = pd.getValue().asAggregationCommand();
     ASSERT_OK(agg);
 
-    auto ar = AggregationRequest::parseFromBSON(testns, agg.getValue());
+    auto cmdObj = OpMsgRequest::fromDBAndBody(testns.db(), agg.getValue()).body;
+    auto ar = aggregation_request_helper::parseFromBSONForTests(testns, cmdObj);
     ASSERT_OK(ar.getStatus());
     ASSERT(!ar.getValue().getExplain());
-    ASSERT_EQ(ar.getValue().getBatchSize(), AggregationRequest::kDefaultBatchSize);
-    ASSERT_EQ(ar.getValue().getNamespaceString(), testns);
-    ASSERT_BSONOBJ_EQ(ar.getValue().getCollation(), BSONObj());
-    ASSERT(ar.getValue().getReadConcern().isEmpty());
-    ASSERT(ar.getValue().getUnwrappedReadPref().isEmpty());
-    ASSERT(ar.getValue().getComment().empty());
-    ASSERT_EQUALS(ar.getValue().getMaxTimeMS(), 0u);
+    ASSERT_EQ(ar.getValue().getCursor().getBatchSize().value_or(
+                  aggregation_request_helper::kDefaultBatchSize),
+              aggregation_request_helper::kDefaultBatchSize);
+    ASSERT_EQ(ar.getValue().getNamespace(), testns);
+    ASSERT_BSONOBJ_EQ(ar.getValue().getCollation().value_or(BSONObj()), BSONObj());
+    ASSERT(ar.getValue().getReadConcern().value_or(BSONObj()).isEmpty());
+    ASSERT(ar.getValue().getUnwrappedReadPref().value_or(BSONObj()).isEmpty());
+    ASSERT_EQUALS(ar.getValue().getMaxTimeMS().value_or(0), 0u);
 
     std::vector<BSONObj> expectedPipeline{
         BSON("$unwind" << BSON("path"
                                << "$x"
-                               << "preserveNullAndEmptyArrays"
-                               << true)),
+                               << "preserveNullAndEmptyArrays" << true)),
         BSON("$unwind" << BSON("path"
                                << "$x.y"
-                               << "preserveNullAndEmptyArrays"
-                               << true)),
+                               << "preserveNullAndEmptyArrays" << true)),
         BSON("$unwind" << BSON("path"
                                << "$x.y.z"
-                               << "preserveNullAndEmptyArrays"
-                               << true)),
+                               << "preserveNullAndEmptyArrays" << true)),
         BSON("$match" << BSON("x" << BSON("$_internalSchemaType"
                                           << "object")
                                   << "x.y"
                                   << BSON("$_internalSchemaType"
                                           << "object"))),
-        BSON("$group" << BSON("_id" << BSONNULL << "distinct" << BSON("$addToSet"
-                                                                      << "$x.y.z")))};
+        BSON("$group" << BSON("_id" << BSONNULL << "distinct"
+                                    << BSON("$addToSet"
+                                            << "$x.y.z")))};
     ASSERT(std::equal(expectedPipeline.begin(),
                       expectedPipeline.end(),
                       ar.getValue().getPipeline().begin(),
@@ -157,11 +159,7 @@ TEST(ParsedDistinctTest, ConvertToAggregationWithAllOptions) {
                                          << "$queryOptions"
                                          << BSON("readPreference"
                                                  << "secondary")
-                                         << "comment"
-                                         << "aComment"
-                                         << "maxTimeMS"
-                                         << 100
-                                         << "$db"
+                                         << "maxTimeMS" << 100 << "$db"
                                          << "testdb"),
                                     ExtensionsCallbackNoop(),
                                     !isExplain);
@@ -170,30 +168,32 @@ TEST(ParsedDistinctTest, ConvertToAggregationWithAllOptions) {
     auto agg = pd.getValue().asAggregationCommand();
     ASSERT_OK(agg);
 
-    auto ar = AggregationRequest::parseFromBSON(testns, agg.getValue());
+    auto cmdObj = OpMsgRequest::fromDBAndBody(testns.db(), agg.getValue()).body;
+    auto ar = aggregation_request_helper::parseFromBSONForTests(testns, cmdObj);
     ASSERT_OK(ar.getStatus());
     ASSERT(!ar.getValue().getExplain());
-    ASSERT_EQ(ar.getValue().getBatchSize(), AggregationRequest::kDefaultBatchSize);
-    ASSERT_EQ(ar.getValue().getNamespaceString(), testns);
-    ASSERT_BSONOBJ_EQ(ar.getValue().getCollation(),
+    ASSERT_EQ(ar.getValue().getCursor().getBatchSize().value_or(
+                  aggregation_request_helper::kDefaultBatchSize),
+              aggregation_request_helper::kDefaultBatchSize);
+    ASSERT_EQ(ar.getValue().getNamespace(), testns);
+    ASSERT_BSONOBJ_EQ(ar.getValue().getCollation().value_or(BSONObj()),
                       BSON("locale"
                            << "en_US"));
-    ASSERT_BSONOBJ_EQ(ar.getValue().getReadConcern(),
+    ASSERT_BSONOBJ_EQ(ar.getValue().getReadConcern().value_or(BSONObj()),
                       BSON("level"
                            << "linearizable"));
-    ASSERT_BSONOBJ_EQ(ar.getValue().getUnwrappedReadPref(),
+    ASSERT_BSONOBJ_EQ(ar.getValue().getUnwrappedReadPref().value_or(BSONObj()),
                       BSON("readPreference"
                            << "secondary"));
-    ASSERT_EQUALS(ar.getValue().getComment(), "aComment");
-    ASSERT_EQUALS(ar.getValue().getMaxTimeMS(), 100u);
+    ASSERT_EQUALS(ar.getValue().getMaxTimeMS().value_or(0), 100u);
 
     std::vector<BSONObj> expectedPipeline{
         BSON("$unwind" << BSON("path"
                                << "$x"
-                               << "preserveNullAndEmptyArrays"
-                               << true)),
-        BSON("$group" << BSON("_id" << BSONNULL << "distinct" << BSON("$addToSet"
-                                                                      << "$x")))};
+                               << "preserveNullAndEmptyArrays" << true)),
+        BSON("$group" << BSON("_id" << BSONNULL << "distinct"
+                                    << BSON("$addToSet"
+                                            << "$x")))};
     ASSERT(std::equal(expectedPipeline.begin(),
                       expectedPipeline.end(),
                       ar.getValue().getPipeline().begin(),
@@ -217,25 +217,27 @@ TEST(ParsedDistinctTest, ConvertToAggregationWithQuery) {
     auto agg = pd.getValue().asAggregationCommand();
     ASSERT_OK(agg);
 
-    auto ar = AggregationRequest::parseFromBSON(testns, agg.getValue());
+    auto cmdObj = OpMsgRequest::fromDBAndBody(testns.db(), agg.getValue()).body;
+    auto ar = aggregation_request_helper::parseFromBSONForTests(testns, cmdObj);
     ASSERT_OK(ar.getStatus());
     ASSERT(!ar.getValue().getExplain());
-    ASSERT_EQ(ar.getValue().getBatchSize(), AggregationRequest::kDefaultBatchSize);
-    ASSERT_EQ(ar.getValue().getNamespaceString(), testns);
-    ASSERT_BSONOBJ_EQ(ar.getValue().getCollation(), BSONObj());
-    ASSERT(ar.getValue().getReadConcern().isEmpty());
-    ASSERT(ar.getValue().getUnwrappedReadPref().isEmpty());
-    ASSERT(ar.getValue().getComment().empty());
-    ASSERT_EQUALS(ar.getValue().getMaxTimeMS(), 0u);
+    ASSERT_EQ(ar.getValue().getCursor().getBatchSize().value_or(
+                  aggregation_request_helper::kDefaultBatchSize),
+              aggregation_request_helper::kDefaultBatchSize);
+    ASSERT_EQ(ar.getValue().getNamespace(), testns);
+    ASSERT_BSONOBJ_EQ(ar.getValue().getCollation().value_or(BSONObj()), BSONObj());
+    ASSERT(ar.getValue().getReadConcern().value_or(BSONObj()).isEmpty());
+    ASSERT(ar.getValue().getUnwrappedReadPref().value_or(BSONObj()).isEmpty());
+    ASSERT_EQUALS(ar.getValue().getMaxTimeMS().value_or(0), 0u);
 
     std::vector<BSONObj> expectedPipeline{
         BSON("$match" << BSON("z" << 7)),
         BSON("$unwind" << BSON("path"
                                << "$y"
-                               << "preserveNullAndEmptyArrays"
-                               << true)),
-        BSON("$group" << BSON("_id" << BSONNULL << "distinct" << BSON("$addToSet"
-                                                                      << "$y")))};
+                               << "preserveNullAndEmptyArrays" << true)),
+        BSON("$group" << BSON("_id" << BSONNULL << "distinct"
+                                    << BSON("$addToSet"
+                                            << "$y")))};
     ASSERT(std::equal(expectedPipeline.begin(),
                       expectedPipeline.end(),
                       ar.getValue().getPipeline().begin(),
@@ -260,19 +262,20 @@ TEST(ParsedDistinctTest, ExplainNotIncludedWhenConvertingToAggregationCommand) {
 
     ASSERT_FALSE(agg.getValue().hasField("explain"));
 
-    auto ar = AggregationRequest::parseFromBSON(testns, agg.getValue());
+    auto cmdObj = OpMsgRequest::fromDBAndBody(testns.db(), agg.getValue()).body;
+    auto ar = aggregation_request_helper::parseFromBSONForTests(testns, cmdObj);
     ASSERT_OK(ar.getStatus());
     ASSERT(!ar.getValue().getExplain());
-    ASSERT_EQ(ar.getValue().getNamespaceString(), testns);
-    ASSERT_BSONOBJ_EQ(ar.getValue().getCollation(), BSONObj());
+    ASSERT_EQ(ar.getValue().getNamespace(), testns);
+    ASSERT_BSONOBJ_EQ(ar.getValue().getCollation().value_or(BSONObj()), BSONObj());
 
     std::vector<BSONObj> expectedPipeline{
         BSON("$unwind" << BSON("path"
                                << "$x"
-                               << "preserveNullAndEmptyArrays"
-                               << true)),
-        BSON("$group" << BSON("_id" << BSONNULL << "distinct" << BSON("$addToSet"
-                                                                      << "$x")))};
+                               << "preserveNullAndEmptyArrays" << true)),
+        BSON("$group" << BSON("_id" << BSONNULL << "distinct"
+                                    << BSON("$addToSet"
+                                            << "$x")))};
     ASSERT(std::equal(expectedPipeline.begin(),
                       expectedPipeline.end(),
                       ar.getValue().getPipeline().begin(),

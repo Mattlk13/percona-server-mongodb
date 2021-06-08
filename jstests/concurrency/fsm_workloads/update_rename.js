@@ -6,7 +6,6 @@
  * Each thread does a $rename to cause documents to jump between indexes.
  */
 var $config = (function() {
-
     var fieldNames = ['update_rename_x', 'update_rename_y', 'update_rename_z'];
 
     function choose(array) {
@@ -44,7 +43,7 @@ var $config = (function() {
         fieldNames.slice(1).forEach(function(fieldName) {
             var indexSpec = {};
             indexSpec[fieldName] = 1;
-            assertAlways.commandWorked(db[collName].ensureIndex(indexSpec));
+            assertAlways.commandWorked(db[collName].createIndex(indexSpec));
         });
 
         // numDocs should be much less than threadCount, to make more threads use the same docs.
@@ -56,7 +55,7 @@ var $config = (function() {
             var doc = {};
             doc[fieldName] = i;
             var res = db[collName].insert(doc);
-            assertAlways.writeOK(res);
+            assertAlways.commandWorked(res);
             assertAlways.eq(1, res.nInserted);
         }
     }
@@ -69,5 +68,4 @@ var $config = (function() {
         transitions: transitions,
         setup: setup
     };
-
 })();

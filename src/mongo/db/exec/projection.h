@@ -30,22 +30,20 @@
 #pragma once
 
 #include "mongo/db/exec/plan_stage.h"
-#include "mongo/db/exec/projection_exec.h"
+#include "mongo/db/exec/projection_executor.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/expression.h"
+#include "mongo/db/query/projection_ast.h"
 #include "mongo/db/record_id.h"
 
 namespace mongo {
-
-class CollatorInterface;
-
 /**
  * This stage computes a projection. This is an abstract base class for various projection
  * implementations.
  */
 class ProjectionStage : public PlanStage {
 protected:
-    ProjectionStage(OperationContext* opCtx,
+    ProjectionStage(ExpressionContext* expCtx,
                     const BSONObj& projObj,
                     WorkingSet* ws,
                     std::unique_ptr<PlanStage> child,
@@ -62,29 +60,18 @@ public:
     }
 
 protected:
-    using FieldSet = StringMap<bool>;  // Value is unused.
+    using FieldSet = StringSet;
 
-    /**
-     * Given the projection spec for a simple inclusion projection,
-     * 'projObj', populates 'includedFields' with the set of field
-     * names to be included.
-     */
-    static void getSimpleInclusionFields(const BSONObj& projObj, FieldSet* includedFields);
-
-    bool projObjHasOwnedData() {
-        return _projObj.isOwned() && !_projObj.isEmpty();
-    }
-
-    // The projection object used by all projection implementations. We lack a ProjectionExpression
-    // or similar so we use a BSONObj.
-    BSONObj _projObj;
+    // The raw BSON projection used to populate projection stats. Optional, since it is required
+    // only in explain mode.
+    boost::optional<BSONObj> _projObj;
 
 private:
     /**
      * Runs either the default complete implementation or a fast path depending on how this was
      * constructed.
      */
-    virtual Status transform(WorkingSetMember* member) const = 0;
+    virtual void transform(WorkingSetMember* member) const = 0;
 
     // Used to retrieve a WorkingSetMember as part of 'doWork()'.
     WorkingSet& _ws;
@@ -101,22 +88,23 @@ public:
     /**
      * ProjectionNodeDefault should use this for construction.
      */
-    ProjectionStageDefault(OperationContext* opCtx,
+    ProjectionStageDefault(boost::intrusive_ptr<ExpressionContext> expCtx,
                            const BSONObj& projObj,
+                           const projection_ast::Projection* projection,
                            WorkingSet* ws,
-                           std::unique_ptr<PlanStage> child,
-                           const MatchExpression& fullExpression,
-                           const CollatorInterface* collator);
+                           std::unique_ptr<PlanStage> child);
 
     StageType stageType() const final {
         return STAGE_PROJECTION_DEFAULT;
     }
 
 private:
-    Status transform(WorkingSetMember* member) const final;
+    void transform(WorkingSetMember* member) const final;
 
-    // Fully-general heavy execution object.
-    ProjectionExec _exec;
+    // Represents all metadata used in the projection.
+    const QueryMetadataBitSet _requestedMetadata;
+    const projection_ast::ProjectType _projectType;
+    std::unique_ptr<projection_executor::ProjectionExecutor> _executor;
 };
 
 /**
@@ -129,8 +117,9 @@ public:
     /**
      * ProjectionNodeCovered should obtain a fast-path object through this constructor.
      */
-    ProjectionStageCovered(OperationContext* opCtx,
+    ProjectionStageCovered(ExpressionContext* expCtx,
                            const BSONObj& projObj,
+                           const projection_ast::Projection* projection,
                            WorkingSet* ws,
                            std::unique_ptr<PlanStage> child,
                            const BSONObj& coveredKeyObj);
@@ -140,9 +129,9 @@ public:
     }
 
 private:
-    Status transform(WorkingSetMember* member) const final;
+    void transform(WorkingSetMember* member) const final;
 
-    // Has the field names present in the simple projection.
+    // Field names present in the simple projection.
     FieldSet _includedFields;
 
     // This is the key pattern we're extracting covered data from. It is maintained here since
@@ -167,8 +156,9 @@ public:
     /**
      * ProjectionNodeSimple should obtain a fast-path object through this constructor.
      */
-    ProjectionStageSimple(OperationContext* opCtx,
+    ProjectionStageSimple(ExpressionContext* expCtx,
                           const BSONObj& projObj,
+                          const projection_ast::Projection* projection,
                           WorkingSet* ws,
                           std::unique_ptr<PlanStage> child);
 
@@ -177,10 +167,10 @@ public:
     }
 
 private:
-    Status transform(WorkingSetMember* member) const final;
+    void transform(WorkingSetMember* member) const final;
 
     // Has the field names present in the simple projection.
-    FieldSet _includedFields;
+    stdx::unordered_set<std::string> _includedFields;
 };
 
 }  // namespace mongo

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -42,9 +42,10 @@
 #include "mongo/base/status_with.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/util/bson_extract.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/grid.h"
-#include "mongo/util/log.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -75,8 +76,7 @@ const char kStopped[] = "stopped";
 const char kMode[] = "mode";
 const char kActiveWindow[] = "activeWindow";
 const char kWaitForDelete[] = "_waitForDelete";
-
-const NamespaceString kSettingsNamespace("config", "settings");
+const char kAttemptToBalanceJumboChunks[] = "attemptToBalanceJumboChunks";
 
 }  // namespace
 
@@ -96,7 +96,7 @@ BalancerConfiguration::BalancerConfiguration()
 BalancerConfiguration::~BalancerConfiguration() = default;
 
 BalancerSettingsType::BalancerMode BalancerConfiguration::getBalancerMode() const {
-    stdx::lock_guard<stdx::mutex> lk(_balancerSettingsMutex);
+    stdx::lock_guard<Latch> lk(_balancerSettingsMutex);
     return _balancerSettings.getMode();
 }
 
@@ -104,7 +104,7 @@ Status BalancerConfiguration::setBalancerMode(OperationContext* opCtx,
                                               BalancerSettingsType::BalancerMode mode) {
     auto updateStatus = Grid::get(opCtx)->catalogClient()->updateConfigDocument(
         opCtx,
-        kSettingsNamespace,
+        NamespaceString::kConfigSettingsNamespace,
         BSON("_id" << BalancerSettingsType::kKey),
         BSON("$set" << BSON(kStopped << (mode == BalancerSettingsType::kOff) << kMode
                                      << BalancerSettingsType::kBalancerModes[mode])),
@@ -117,14 +117,38 @@ Status BalancerConfiguration::setBalancerMode(OperationContext* opCtx,
     }
 
     if (!updateStatus.isOK() && (getBalancerMode() != mode)) {
-        return updateStatus.getStatus().withContext("Failed to update balancer configuration");
+        return updateStatus.getStatus().withContext(str::stream()
+                                                    << "Failed to set the balancer mode to "
+                                                    << BalancerSettingsType::kBalancerModes[mode]);
+    }
+
+    return Status::OK();
+}
+
+Status BalancerConfiguration::enableAutoSplit(OperationContext* opCtx, bool enable) {
+    auto updateStatus = Grid::get(opCtx)->catalogClient()->updateConfigDocument(
+        opCtx,
+        NamespaceString::kConfigSettingsNamespace,
+        BSON("_id" << AutoSplitSettingsType::kKey),
+        BSON("$set" << BSON(kEnabled << enable)),
+        true,
+        ShardingCatalogClient::kMajorityWriteConcern);
+
+    Status refreshStatus = refreshAndCheck(opCtx);
+    if (!refreshStatus.isOK()) {
+        return refreshStatus;
+    }
+
+    if (!updateStatus.isOK() && (getShouldAutoSplit() != enable)) {
+        return updateStatus.getStatus().withContext(
+            str::stream() << "Failed to " << (enable ? "enable" : "disable") << " auto split");
     }
 
     return Status::OK();
 }
 
 bool BalancerConfiguration::shouldBalance() const {
-    stdx::lock_guard<stdx::mutex> lk(_balancerSettingsMutex);
+    stdx::lock_guard<Latch> lk(_balancerSettingsMutex);
     if (_balancerSettings.getMode() == BalancerSettingsType::kOff ||
         _balancerSettings.getMode() == BalancerSettingsType::kAutoSplitOnly) {
         return false;
@@ -134,7 +158,7 @@ bool BalancerConfiguration::shouldBalance() const {
 }
 
 bool BalancerConfiguration::shouldBalanceForAutoSplit() const {
-    stdx::lock_guard<stdx::mutex> lk(_balancerSettingsMutex);
+    stdx::lock_guard<Latch> lk(_balancerSettingsMutex);
     if (_balancerSettings.getMode() == BalancerSettingsType::kOff) {
         return false;
     }
@@ -143,13 +167,18 @@ bool BalancerConfiguration::shouldBalanceForAutoSplit() const {
 }
 
 MigrationSecondaryThrottleOptions BalancerConfiguration::getSecondaryThrottle() const {
-    stdx::lock_guard<stdx::mutex> lk(_balancerSettingsMutex);
+    stdx::lock_guard<Latch> lk(_balancerSettingsMutex);
     return _balancerSettings.getSecondaryThrottle();
 }
 
 bool BalancerConfiguration::waitForDelete() const {
-    stdx::lock_guard<stdx::mutex> lk(_balancerSettingsMutex);
+    stdx::lock_guard<Latch> lk(_balancerSettingsMutex);
     return _balancerSettings.waitForDelete();
+}
+
+bool BalancerConfiguration::attemptToBalanceJumboChunks() const {
+    stdx::lock_guard<Latch> lk(_balancerSettingsMutex);
+    return _balancerSettings.attemptToBalanceJumboChunks();
 }
 
 Status BalancerConfiguration::refreshAndCheck(OperationContext* opCtx) {
@@ -190,7 +219,7 @@ Status BalancerConfiguration::_refreshBalancerSettings(OperationContext* opCtx) 
         return settingsObjStatus.getStatus();
     }
 
-    stdx::lock_guard<stdx::mutex> lk(_balancerSettingsMutex);
+    stdx::lock_guard<Latch> lk(_balancerSettingsMutex);
     _balancerSettings = std::move(settings);
 
     return Status::OK();
@@ -213,8 +242,11 @@ Status BalancerConfiguration::_refreshChunkSizeSettings(OperationContext* opCtx)
     }
 
     if (settings.getMaxChunkSizeBytes() != getMaxChunkSizeBytes()) {
-        log() << "MaxChunkSize changing from " << getMaxChunkSizeBytes() / (1024 * 1024) << "MB"
-              << " to " << settings.getMaxChunkSizeBytes() / (1024 * 1024) << "MB";
+        LOGV2(22640,
+              "Changing MaxChunkSize setting to {newMaxChunkSizeMB}MB from {oldMaxChunkSizeMB}MB",
+              "Changing MaxChunkSize setting",
+              "newMaxChunkSizeMB"_attr = settings.getMaxChunkSizeBytes() / (1024 * 1024),
+              "oldMaxChunkSizeMB"_attr = getMaxChunkSizeBytes() / (1024 * 1024));
 
         _maxChunkSizeBytes.store(settings.getMaxChunkSizeBytes());
     }
@@ -239,8 +271,11 @@ Status BalancerConfiguration::_refreshAutoSplitSettings(OperationContext* opCtx)
     }
 
     if (settings.getShouldAutoSplit() != getShouldAutoSplit()) {
-        log() << "ShouldAutoSplit changing from " << getShouldAutoSplit() << " to "
-              << settings.getShouldAutoSplit();
+        LOGV2(22641,
+              "Changing ShouldAutoSplit setting to {newShouldAutoSplit} from {oldShouldAutoSplit}",
+              "Changing ShouldAutoSplit setting",
+              "newShouldAutoSplit"_attr = settings.getShouldAutoSplit(),
+              "oldShouldAutoSplit"_attr = getShouldAutoSplit());
 
         _shouldAutoSplit.store(settings.getShouldAutoSplit());
     }
@@ -342,6 +377,16 @@ StatusWith<BalancerSettingsType> BalancerSettingsType::fromBSON(const BSONObj& o
         settings._waitForDelete = waitForDelete;
     }
 
+    {
+        bool attemptToBalanceJumboChunks;
+        Status status = bsonExtractBooleanFieldWithDefault(
+            obj, kAttemptToBalanceJumboChunks, false, &attemptToBalanceJumboChunks);
+        if (!status.isOK())
+            return status;
+
+        settings._attemptToBalanceJumboChunks = attemptToBalanceJumboChunks;
+    }
+
     return settings;
 }
 
@@ -352,9 +397,17 @@ bool BalancerSettingsType::isTimeInBalancingWindow(const boost::posix_time::ptim
         return true;
     }
 
-    LOG(1).stream() << "inBalancingWindow: "
-                    << " now: " << now << " startTime: " << *_activeWindowStart
-                    << " stopTime: " << *_activeWindowStop;
+    auto timeToString = [](const boost::posix_time::ptime& time) {
+        std::ostringstream ss;
+        ss << time;
+        return ss.str();
+    };
+    LOGV2_DEBUG(24094,
+                1,
+                "inBalancingWindow",
+                "now"_attr = timeToString(now),
+                "activeWindowStart"_attr = timeToString(*_activeWindowStart),
+                "activeWindowStop"_attr = timeToString(*_activeWindowStop));
 
     if (*_activeWindowStop > *_activeWindowStart) {
         if ((now >= *_activeWindowStart) && (now <= *_activeWindowStop)) {

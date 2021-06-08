@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -35,14 +35,15 @@
 
 #include <pcrecpp.h>
 
+#include "mongo/base/shim.h"
 #include "mongo/client/dbclient_cursor.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/query/cursor_response.h"
 #include "mongo/db/query/getmore_request.h"
-#include "mongo/db/query/query_request.h"
+#include "mongo/db/query/query_request_helper.h"
+#include "mongo/logv2/log.h"
 #include "mongo/scripting/bson_template_evaluator.h"
 #include "mongo/stdx/thread.h"
-#include "mongo/util/log.h"
 #include "mongo/util/md5.h"
 #include "mongo/util/time_support.h"
 #include "mongo/util/timer.h"
@@ -131,6 +132,16 @@ BSONObj fixQuery(const BSONObj& obj, BsonTemplateEvaluator& btl) {
     return b.obj();
 }
 
+/**
+ * Adds a '$orderby' to the query document. Useful when running on the legacy reads path.
+ */
+BSONObj makeQueryLegacyCompatible(const BSONObj& query, const BSONObj& sortSpec) {
+    BSONObjBuilder bob;
+    bob.append("$query", query);
+    bob.append("$orderby", sortSpec);
+    return bob.obj();
+}
+
 bool runCommandWithSession(DBClientBase* conn,
                            const std::string& dbname,
                            const BSONObj& cmdObj,
@@ -206,23 +217,24 @@ void abortTransaction(DBClientBase* conn,
 }
 
 /**
- * Issues the query 'qr' against 'conn' using read commands. Returns the size of the result set
- * returned by the query.
+ * Issues the query 'findCommand' against 'conn' using read commands. Returns the size of the result
+ * set returned by the query.
  *
- * If 'qr' has the 'wantMore' flag set to false and the 'limit' option set to 1LL, then the caller
- * may optionally specify a pointer to an object in 'objOut', which will be filled in with the
- * single object in the query result set (or the empty object, if the result set is empty).
- * If 'qr' doesn't have these options set, then nullptr must be passed for 'objOut'.
+ * If 'findCommand' has the 'wantMore' flag set to false and the 'limit' option set to 1LL, then the
+ * caller may optionally specify a pointer to an object in 'objOut', which will be filled in with
+ * the single object in the query result set (or the empty object, if the result set is empty). If
+ * 'findCommand' doesn't have these options set, then nullptr must be passed for 'objOut'.
  *
  * On error, throws a AssertionException.
  */
 int runQueryWithReadCommands(DBClientBase* conn,
                              const boost::optional<LogicalSessionIdToClient>& lsid,
                              boost::optional<TxnNumber> txnNumber,
-                             std::unique_ptr<QueryRequest> qr,
+                             std::unique_ptr<FindCommandRequest> findCommand,
                              Milliseconds delayBeforeGetMore,
                              BSONObj* objOut) {
-    const auto dbName = qr->nss().db().toString();
+    const auto dbName =
+        findCommand->getNamespaceOrUUID().nss().value_or(NamespaceString()).db().toString();
 
     BSONObj findCommandResult;
     uassert(ErrorCodes::CommandFailed,
@@ -230,7 +242,7 @@ int runQueryWithReadCommands(DBClientBase* conn,
             runCommandWithSession(
                 conn,
                 dbName,
-                qr->asFindCommand(),
+                findCommand->toBSON(BSONObj()),
                 // read command with txnNumber implies performing reads in a
                 // multi-statement transaction
                 txnNumber ? kStartTransactionOption | kMultiStatementTransactionOption : kNoOptions,
@@ -243,7 +255,8 @@ int runQueryWithReadCommands(DBClientBase* conn,
     int count = cursorResponse.getBatch().size();
 
     if (objOut) {
-        invariant(qr->getLimit() && *qr->getLimit() == 1 && !qr->wantMore());
+        invariant(findCommand->getLimit() && *findCommand->getLimit() == 1 &&
+                  findCommand->getSingleBatch());
         // Since this is a "single batch" query, we can simply grab the first item in the result set
         // and return here.
         *objOut = (count > 0) ? cursorResponse.getBatch()[0] : BSONObj();
@@ -254,11 +267,11 @@ int runQueryWithReadCommands(DBClientBase* conn,
         sleepFor(delayBeforeGetMore);
 
         GetMoreRequest getMoreRequest(
-            qr->nss(),
+            findCommand->getNamespaceOrUUID().nss().value_or(NamespaceString()),
             cursorResponse.getCursorId(),
-            qr->getBatchSize()
-                ? boost::optional<std::int64_t>(static_cast<std::int64_t>(*qr->getBatchSize()))
-                : boost::none,
+            findCommand->getBatchSize() ? boost::optional<std::int64_t>(static_cast<std::int64_t>(
+                                              *findCommand->getBatchSize()))
+                                        : boost::none,
             boost::none,   // maxTimeMS
             boost::none,   // term
             boost::none);  // lastKnownCommittedOpTime
@@ -290,16 +303,17 @@ void doNothing(const BSONObj&) {}
 Timestamp getLatestClusterTime(DBClientBase* conn) {
     // Sort by descending 'ts' in the query to the oplog collection. The first entry will have the
     // latest cluster time.
-    auto qr = stdx::make_unique<QueryRequest>(NamespaceString("local.oplog.rs"));
-    qr->setSort(BSON("$natural" << -1));
-    qr->setLimit(1LL);
-    qr->setWantMore(false);
-    invariant(qr->validate());
-    const auto dbName = qr->nss().db().toString();
+    auto findCommand = std::make_unique<FindCommandRequest>(NamespaceString("local.oplog.rs"));
+    findCommand->setSort(BSON("$natural" << -1));
+    findCommand->setLimit(1LL);
+    findCommand->setSingleBatch(true);
+    invariant(query_request_helper::validateFindCommandRequest(*findCommand));
+    const auto dbName =
+        findCommand->getNamespaceOrUUID().nss().value_or(NamespaceString()).db().toString();
 
     BSONObj oplogResult;
     int count = runQueryWithReadCommands(
-        conn, boost::none, boost::none, std::move(qr), Milliseconds(0), &oplogResult);
+        conn, boost::none, boost::none, std::move(findCommand), Milliseconds(0), &oplogResult);
     uassert(ErrorCodes::OperationFailed,
             str::stream() << "Find cmd on the oplog collection failed; reply was: " << oplogResult,
             count == 1);
@@ -541,6 +555,16 @@ BenchRunOp opFromBson(const BSONObj& op) {
                                   << opType,
                     (opType == "find") || (opType == "query"));
             myOp.skip = arg.numberInt();
+        } else if (name == "sort") {
+            uassert(ErrorCodes::BadValue,
+                    str::stream()
+                        << "Field 'sort' is only valid for query, fineOne and find. Op type is "
+                        << opType,
+                    (opType == "findOne") || (opType == "query") || (opType == "find"));
+            uassert(ErrorCodes::BadValue,
+                    "Expected sort to be an object",
+                    arg.type() == BSONType::Object);
+            myOp.sort = arg.Obj();
         } else if (name == "showError") {
             myOp.showError = arg.trueValue();
         } else if (name == "showResult") {
@@ -737,13 +761,17 @@ void BenchRunConfig::initializeFromBson(const BSONObj& args) {
                 ops.push_back(opFromBson(i.next().Obj()));
             }
         } else {
-            log() << "benchRun passed an unsupported field: " << name;
+            LOGV2_INFO(22793, "benchRun passed an unsupported field", "name"_attr = name);
             uassert(34376, "benchRun passed an unsupported configuration field", false);
         }
     }
 }
 
-MONGO_DEFINE_SHIM(BenchRunConfig::createConnectionImpl);
+std::unique_ptr<DBClientBase> BenchRunConfig::createConnectionImpl(
+    const BenchRunConfig& benchRunConfig) {
+    static auto w = MONGO_WEAK_FUNCTION_DEFINITION(BenchRunConfig::createConnectionImpl);
+    return w(benchRunConfig);
+}
 
 std::unique_ptr<DBClientBase> BenchRunConfig::createConnection() const {
     return BenchRunConfig::createConnectionImpl(*this);
@@ -758,13 +786,13 @@ BenchRunState::BenchRunState(unsigned numWorkers)
 
 BenchRunState::~BenchRunState() {
     if (_numActiveWorkers != 0)
-        warning() << "Destroying BenchRunState with active workers";
+        LOGV2_WARNING(22802, "Destroying BenchRunState with active workers");
     if (_numUnstartedWorkers != 0)
-        warning() << "Destroying BenchRunState with unstarted workers";
+        LOGV2_WARNING(22803, "Destroying BenchRunState with unstarted workers");
 }
 
 void BenchRunState::waitForState(State awaitedState) {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    stdx::unique_lock<Latch> lk(_mutex);
 
     switch (awaitedState) {
         case BRS_RUNNING:
@@ -792,7 +820,7 @@ void BenchRunState::tellWorkersToCollectStats() {
 }
 
 void BenchRunState::assertFinished() const {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     verify(0 == _numUnstartedWorkers + _numActiveWorkers);
 }
 
@@ -805,7 +833,7 @@ bool BenchRunState::shouldWorkerCollectStats() const {
 }
 
 void BenchRunState::onWorkerStarted() {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     verify(_numUnstartedWorkers > 0);
     --_numUnstartedWorkers;
     ++_numActiveWorkers;
@@ -815,7 +843,7 @@ void BenchRunState::onWorkerStarted() {
 }
 
 void BenchRunState::onWorkerFinished() {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     verify(_numActiveWorkers > 0);
     --_numActiveWorkers;
     if (_numActiveWorkers + _numUnstartedWorkers == 0) {
@@ -831,12 +859,13 @@ BenchRunWorker::BenchRunWorker(size_t id,
 
 BenchRunWorker::~BenchRunWorker() {
     try {
-        // We explicitly call join() on the started thread to ensure that any thread-local variables
-        // (e.g. 'currentClient' when running through mongoebench) have been destructed before
-        // returning from BenchRunWorker's destructor.
+        // We explicitly call join() on the started thread to ensure
+        // that any thread-local variables have been destructed
+        // before returning from BenchRunWorker's destructor.
         _thread.join();
     } catch (...) {
-        severe() << "caught exception in destructor: " << exceptionToStatus();
+        LOGV2_FATAL_CONTINUE(
+            22807, "Caught exception in destructor", "error"_attr = exceptionToStatus());
         std::terminate();
     }
 }
@@ -910,8 +939,10 @@ void BenchRunWorker::generateLoadOnConnection(DBClientBase* conn) {
                         (!_config->noWatchPattern && _config->watchPattern &&
                          yesWatch) ||  // If we're just watching things
                         (_config->watchPattern && _config->noWatchPattern && yesWatch && !noWatch))
-                        log() << "Error in benchRun thread for op "
-                              << kOpTypeNames.find(op.op)->second << causedBy(ex);
+                        LOGV2_INFO(22794,
+                                   "Error in benchRun thread for op",
+                                   "op"_attr = kOpTypeNames.find(op.op)->second,
+                                   "error"_attr = causedBy(ex));
                 }
 
                 bool yesTrap = (_config->trapPattern && _config->trapPattern->FullMatch(ex.what()));
@@ -924,8 +955,7 @@ void BenchRunWorker::generateLoadOnConnection(DBClientBase* conn) {
                     {
                         opState.stats->trappedErrors.push_back(
                             BSON("error" << ex.what() << "op" << kOpTypeNames.find(op.op)->second
-                                         << "count"
-                                         << count));
+                                         << "count" << count));
                     }
                     if (_config->breakOnTrap)
                         return;
@@ -938,8 +968,9 @@ void BenchRunWorker::generateLoadOnConnection(DBClientBase* conn) {
                 ++opState.stats->errCount;
             } catch (...) {
                 if (!_config->hideErrors || op.showError)
-                    log() << "Error in benchRun thread caused by unknown error for op "
-                          << kOpTypeNames.find(op.op)->second;
+                    LOGV2_INFO(22795,
+                               "Error in benchRun thread caused by unknown error for op",
+                               "op"_attr = kOpTypeNames.find(op.op)->second);
                 if (!_config->handleErrors && !op.handleError)
                     return;
 
@@ -983,15 +1014,16 @@ void BenchRunOp::executeOnce(DBClientBase* conn,
             BSONObj fixedQuery = fixQuery(this->query, *state->bsonTemplateEvaluator);
             BSONObj result;
             if (this->useReadCmd) {
-                auto qr = stdx::make_unique<QueryRequest>(NamespaceString(this->ns));
-                qr->setFilter(fixedQuery);
-                qr->setProj(this->projection);
-                qr->setLimit(1LL);
-                qr->setWantMore(false);
+                auto findCommand = std::make_unique<FindCommandRequest>(NamespaceString(this->ns));
+                findCommand->setFilter(fixedQuery);
+                findCommand->setProjection(this->projection);
+                findCommand->setLimit(1LL);
+                findCommand->setSingleBatch(true);
+                findCommand->setSort(this->sort);
                 if (config.useSnapshotReads) {
-                    qr->setReadConcern(readConcernSnapshot);
+                    findCommand->setReadConcern(readConcernSnapshot);
                 }
-                invariant(qr->validate());
+                invariant(query_request_helper::validateFindCommandRequest(*findCommand));
 
                 BenchRunEventTrace _bret(&state->stats->findOneCounter);
                 boost::optional<TxnNumber> txnNumberForOp;
@@ -1001,15 +1033,18 @@ void BenchRunOp::executeOnce(DBClientBase* conn,
                     state->inProgressMultiStatementTxn = true;
                 }
                 runQueryWithReadCommands(
-                    conn, lsid, txnNumberForOp, std::move(qr), Milliseconds(0), &result);
+                    conn, lsid, txnNumberForOp, std::move(findCommand), Milliseconds(0), &result);
             } else {
+                if (!this->sort.isEmpty()) {
+                    fixedQuery = makeQueryLegacyCompatible(std::move(fixedQuery), this->sort);
+                }
                 BenchRunEventTrace _bret(&state->stats->findOneCounter);
                 result = conn->findOne(
                     this->ns, fixedQuery, nullptr, DBClientCursor::QueryOptionLocal_forceOpQuery);
             }
 
             if (!config.hideResults || this->showResult)
-                log() << "Result from benchRun thread [findOne] : " << result;
+                LOGV2_INFO(22796, "Result from benchRun thread [findOne]", "result"_attr = result);
         } break;
         case OpType::COMMAND: {
             bool ok;
@@ -1040,8 +1075,8 @@ void BenchRunOp::executeOnce(DBClientBase* conn,
                                                   boost::none);  // lastKnownCommittedOpTime
                     BSONObj getMoreCommandResult;
                     uassert(ErrorCodes::CommandFailed,
-                            str::stream() << "getMore command failed; reply was: "
-                                          << getMoreCommandResult,
+                            str::stream()
+                                << "getMore command failed; reply was: " << getMoreCommandResult,
                             runCommandWithSession(conn,
                                                   this->ns,
                                                   getMoreRequest.toBSON(),
@@ -1066,17 +1101,20 @@ void BenchRunOp::executeOnce(DBClientBase* conn,
                         "cannot use 'options' in combination with read commands",
                         !this->options);
 
-                auto qr = stdx::make_unique<QueryRequest>(NamespaceString(this->ns));
-                qr->setFilter(fixedQuery);
-                qr->setProj(this->projection);
+                auto findCommand = std::make_unique<FindCommandRequest>(NamespaceString(this->ns));
+                findCommand->setFilter(fixedQuery);
+                findCommand->setProjection(this->projection);
                 if (this->skip) {
-                    qr->setSkip(this->skip);
+                    findCommand->setSkip(this->skip);
                 }
                 if (this->limit) {
-                    qr->setLimit(this->limit);
+                    findCommand->setLimit(this->limit);
                 }
                 if (this->batchSize) {
-                    qr->setBatchSize(this->batchSize);
+                    findCommand->setBatchSize(this->batchSize);
+                }
+                if (!this->sort.isEmpty()) {
+                    findCommand->setSort(this->sort);
                 }
                 BSONObjBuilder readConcernBuilder;
                 if (config.useSnapshotReads) {
@@ -1090,9 +1128,9 @@ void BenchRunOp::executeOnce(DBClientBase* conn,
                         conn, state->rng->nextInt32(this->useAClusterTimeWithinPastSeconds));
                     readConcernBuilder.append("atClusterTime", atClusterTime);
                 }
-                qr->setReadConcern(readConcernBuilder.obj());
+                findCommand->setReadConcern(readConcernBuilder.obj());
 
-                invariant(qr->validate());
+                invariant(query_request_helper::validateFindCommandRequest(*findCommand));
 
                 BenchRunEventTrace _bret(&state->stats->queryCounter);
                 boost::optional<TxnNumber> txnNumberForOp;
@@ -1109,14 +1147,17 @@ void BenchRunOp::executeOnce(DBClientBase* conn,
                 count = runQueryWithReadCommands(conn,
                                                  lsid,
                                                  txnNumberForOp,
-                                                 std::move(qr),
+                                                 std::move(findCommand),
                                                  Milliseconds(delayBeforeGetMore),
                                                  nullptr);
             } else {
+                if (!this->sort.isEmpty()) {
+                    fixedQuery = makeQueryLegacyCompatible(std::move(fixedQuery), this->sort);
+                }
                 // Use special query function for exhaust query option.
                 if (this->options & QueryOption_Exhaust) {
                     BenchRunEventTrace _bret(&state->stats->queryCounter);
-                    stdx::function<void(const BSONObj&)> castedDoNothing(doNothing);
+                    std::function<void(const BSONObj&)> castedDoNothing(doNothing);
                     count =
                         conn->query(castedDoNothing,
                                     NamespaceString(this->ns),
@@ -1138,13 +1179,17 @@ void BenchRunOp::executeOnce(DBClientBase* conn,
             }
 
             if (this->expected >= 0 && count != this->expected) {
-                log() << "bench query on: " << this->ns << " expected: " << this->expected
-                      << " got: " << count;
+                LOGV2_INFO(22797,
+                           "Bench query on: {namespace} expected: {expected} got: {got}",
+                           "Bench query on namespace got diffrent results then expected",
+                           "namespace"_attr = this->ns,
+                           "expected"_attr = this->expected,
+                           "got"_attr = count);
                 verify(false);
             }
 
             if (!config.hideResults || this->showResult)
-                log() << "Result from benchRun thread [query] : " << count;
+                LOGV2_INFO(22798, "Result from benchRun thread [query]", "count"_attr = count);
         } break;
         case OpType::UPDATE: {
             BSONObj result;
@@ -1175,6 +1220,11 @@ void BenchRunOp::executeOnce(DBClientBase* conn,
                                 pipelineBuilder.doneFast();
                                 break;
                             }
+                            case write_ops::UpdateModification::Type::kDelta:
+                                // It is not possible to run a delta update directly from a client.
+                                // Delta updates are only executed on secondaries as part of oplog
+                                // application.
+                                MONGO_UNREACHABLE;
                         }
                         singleUpdate.append("multi", this->multi);
                         singleUpdate.append("upsert", this->upsert);
@@ -1214,7 +1264,8 @@ void BenchRunOp::executeOnce(DBClientBase* conn,
 
             if (this->safe) {
                 if (!config.hideResults || this->showResult)
-                    log() << "Result from benchRun thread [safe update] : " << result;
+                    LOGV2_INFO(
+                        22799, "Result from benchRun thread [safe update]", "result"_attr = result);
 
                 if (!result["err"].eoo() && result["err"].type() == String &&
                     (config.throwGLE || this->throwGLE))
@@ -1278,7 +1329,8 @@ void BenchRunOp::executeOnce(DBClientBase* conn,
 
             if (this->safe) {
                 if (!config.hideResults || this->showResult)
-                    log() << "Result from benchRun thread [safe insert] : " << result;
+                    LOGV2_INFO(
+                        22800, "Result from benchRun thread [safe insert]", "result"_attr = result);
 
                 if (!result["err"].eoo() && result["err"].type() == String &&
                     (config.throwGLE || this->throwGLE))
@@ -1323,7 +1375,8 @@ void BenchRunOp::executeOnce(DBClientBase* conn,
 
             if (this->safe) {
                 if (!config.hideResults || this->showResult)
-                    log() << "Result from benchRun thread [safe remove] : " << result;
+                    LOGV2_INFO(
+                        22801, "Result from benchRun thread [safe remove]", "result"_attr = result);
 
                 if (!result["err"].eoo() && result["err"].type() == String &&
                     (config.throwGLE || this->throwGLE))
@@ -1366,18 +1419,20 @@ void BenchRunWorker::run() {
         BenchRunWorkerStateGuard workerStateGuard(_brState);
         generateLoadOnConnection(conn.get());
     } catch (const DBException& e) {
-        error() << "DBException not handled in benchRun thread" << causedBy(e);
+        LOGV2_ERROR(
+            22804, "DBException not handled in benchRun thread", "error"_attr = causedBy(e));
     } catch (const std::exception& e) {
-        error() << "std::exception not handled in benchRun thread" << causedBy(e);
+        LOGV2_ERROR(
+            22805, "std::exception not handled in benchRun thread", "error"_attr = causedBy(e));
     } catch (...) {
-        error() << "Unknown exception not handled in benchRun thread.";
+        LOGV2_ERROR(22806, "Unknown exception not handled in benchRun thread.");
     }
 }
 
 BenchRunner::BenchRunner(BenchRunConfig* config) : _brState(config->parallel), _config(config) {
     _oid.init();
 
-    stdx::lock_guard<stdx::mutex> lk(_staticMutex);
+    stdx::lock_guard<Latch> lk(_staticMutex);
     _activeRuns[_oid] = this;
 }
 
@@ -1390,11 +1445,11 @@ void BenchRunner::start() {
         if (_config->username != "") {
             std::string errmsg;
             if (!conn->auth("admin", _config->username, _config->password, errmsg)) {
-                uasserted(
-                    16704,
-                    str::stream() << "User " << _config->username
-                                  << " could not authenticate to admin db; admin db access is "
-                                     "required to use benchRun with auth enabled");
+                uasserted(16704,
+                          str::stream()
+                              << "User " << _config->username
+                              << " could not authenticate to admin db; admin db access is "
+                                 "required to use benchRun with auth enabled");
             }
         }
 
@@ -1403,7 +1458,7 @@ void BenchRunner::start() {
             // Make a unique random seed for the worker.
             const int64_t seed = _config->randomSeed + i;
 
-            auto worker = stdx::make_unique<BenchRunWorker>(i, _config.get(), _brState, seed);
+            auto worker = std::make_unique<BenchRunWorker>(i, _config.get(), _brState, seed);
             worker->start();
 
             _workers.push_back(std::move(worker));
@@ -1429,17 +1484,17 @@ void BenchRunner::stop() {
             std::string errmsg;
             // this can only fail if admin access was revoked since start of run
             if (!conn->auth("admin", _config->username, _config->password, errmsg)) {
-                uasserted(
-                    16705,
-                    str::stream() << "User " << _config->username
-                                  << " could not authenticate to admin db; admin db access is "
-                                     "still required to use benchRun with auth enabled");
+                uasserted(16705,
+                          str::stream()
+                              << "User " << _config->username
+                              << " could not authenticate to admin db; admin db access is "
+                                 "still required to use benchRun with auth enabled");
             }
         }
     }
 
     {
-        stdx::lock_guard<stdx::mutex> lk(_staticMutex);
+        stdx::lock_guard<Latch> lk(_staticMutex);
         _activeRuns.erase(_oid);
     }
 }
@@ -1450,7 +1505,7 @@ BenchRunner* BenchRunner::createWithConfig(const BSONObj& configArgs) {
 }
 
 BenchRunner* BenchRunner::get(OID oid) {
-    stdx::lock_guard<stdx::mutex> lk(_staticMutex);
+    stdx::lock_guard<Latch> lk(_staticMutex);
     return _activeRuns[oid];
 }
 
@@ -1524,7 +1579,7 @@ BSONObj BenchRunner::finish(BenchRunner* runner) {
     return zoo;
 }
 
-stdx::mutex BenchRunner::_staticMutex;
+Mutex BenchRunner::_staticMutex = MONGO_MAKE_LATCH("BenchRunner");
 std::map<OID, BenchRunner*> BenchRunner::_activeRuns;
 
 /**

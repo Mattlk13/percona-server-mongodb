@@ -32,14 +32,14 @@ server_parameters:
     rangeDeleterBatchSize:
         description: >-
           The maximum number of documents in each batch to delete during the cleanup stage of chunk
-          migration (or the cleanupOrphaned command). The default value of 0 indicates that the
-          system chooses an appropriate value, generally 128 documents.
+          migration (or the cleanupOrphaned command). A value of 0 indicates that the system chooses
+          the default value (128).
         set_at: [startup, runtime]
         cpp_vartype: AtomicWord<int>
         cpp_varname: rangeDeleterBatchSize
         validator:
           gte: 0
-        default: 0
+        default: 128
 
     rangeDeleterBatchDelayMS:
         description: >-
@@ -84,9 +84,49 @@ server_parameters:
         cpp_varname: migrationLockAcquisitionMaxWaitMS
         default: 500
 
+    minCatchUpPercentageBeforeBlockingWrites:
+        description: >-
+          The maximum percentage of untrasferred chunk mods at the end of a catch up iteration
+          that may be deferred to the next phase of the migration protocol
+          (where new writes get blocked).
+        set_at: [startup]
+        cpp_vartype: int
+        cpp_varname: minCatchUpPercentageBeforeBlockingWrites
+        validator:
+          gte: 0
+          lte: 100
+        default: 10
+
     orphanCleanupDelaySecs:
         description: 'How long to wait before starting cleanup of an emigrated chunk range.'
         set_at: [startup, runtime]
         cpp_vartype: AtomicWord<int>
         cpp_varname: orphanCleanupDelaySecs
         default: 900
+
+    disableResumableRangeDeleter:
+        description: >-
+          Disable the resumable range deleter. Ranges will not be submitted for deletion, and if an
+          incoming migration sees orphans in the incoming range, the migration will fail. The
+          resumable range deleter replaced the old non-durable range deleter as of FCV 4.4.
+        set_at: [startup]
+        cpp_vartype: AtomicWord<bool>
+        cpp_varname : disableResumableRangeDeleter
+        default: false
+
+    enableShardedIndexConsistencyCheck:
+        description: >-
+          Enable the periodic sharded index consistency check on the config server's primary.
+          The count of sharded collections with inconsistent indexes is exposed via the
+          'shardedIndexConsistency' section in the serverStatus output.
+        set_at: [startup, runtime]
+        cpp_vartype: AtomicWord<bool>
+        cpp_varname: enableShardedIndexConsistencyCheck
+        default: true
+
+    shardedIndexConsistencyCheckIntervalMS:
+        description: 'Time interval in milliseconds between subsequent index checks.'
+        set_at: [startup]
+        cpp_vartype: int
+        cpp_varname: shardedIndexConsistencyCheckIntervalMS
+        default: 600000

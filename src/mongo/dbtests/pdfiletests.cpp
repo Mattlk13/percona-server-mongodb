@@ -59,8 +59,8 @@ protected:
     static NamespaceString nss() {
         return NamespaceString("unittests.pdfiletests.Insert");
     }
-    Collection* collection() {
-        return _context.db()->getCollection(&_opCtx, nss());
+    CollectionPtr collection() {
+        return CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss());
     }
 
     const ServiceContext::UniqueOperationContext _opCtxPtr = cc().makeOperationContext();
@@ -75,15 +75,20 @@ public:
         WriteUnitOfWork wunit(&_opCtx);
         BSONObj x = BSON("x" << 1);
         ASSERT(x["_id"].type() == 0);
-        Collection* collection = _context.db()->getOrCreateCollection(&_opCtx, nss());
+        CollectionPtr coll =
+            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss());
+        if (!coll) {
+            coll = _context.db()->createCollection(&_opCtx, nss());
+        }
+        ASSERT(coll);
         OpDebug* const nullOpDebug = nullptr;
-        ASSERT(!collection->insertDocument(&_opCtx, InsertStatement(x), nullOpDebug, true).isOK());
+        ASSERT(!coll->insertDocument(&_opCtx, InsertStatement(x), nullOpDebug, true).isOK());
 
-        StatusWith<BSONObj> fixed = fixDocumentForInsert(_opCtx.getServiceContext(), x);
+        StatusWith<BSONObj> fixed = fixDocumentForInsert(&_opCtx, x);
         ASSERT(fixed.isOK());
         x = fixed.getValue();
         ASSERT(x["_id"].type() == jstOID);
-        ASSERT(collection->insertDocument(&_opCtx, InsertStatement(x), nullOpDebug, true).isOK());
+        ASSERT(coll->insertDocument(&_opCtx, InsertStatement(x), nullOpDebug, true).isOK());
         wunit.commit();
     }
 };
@@ -96,7 +101,7 @@ public:
         b.append("_id", 1);
         BSONObj o = b.done();
 
-        BSONObj fixed = fixDocumentForInsert(_opCtx.getServiceContext(), o).getValue();
+        BSONObj fixed = fixDocumentForInsert(&_opCtx, o).getValue();
         ASSERT_EQUALS(2, fixed.nFields());
         ASSERT(fixed.firstElement().fieldNameStringData() == "_id");
         ASSERT(fixed.firstElement().number() == 1);
@@ -121,7 +126,7 @@ public:
             o = b.obj();
         }
 
-        BSONObj fixed = fixDocumentForInsert(_opCtx.getServiceContext(), o).getValue();
+        BSONObj fixed = fixDocumentForInsert(&_opCtx, o).getValue();
         ASSERT_EQUALS(3, fixed.nFields());
         ASSERT(fixed.firstElement().fieldNameStringData() == "_id");
         ASSERT(fixed.firstElement().number() == 1);
@@ -143,20 +148,17 @@ public:
 class ValidId : public Base {
 public:
     void run() {
-        ASSERT(fixDocumentForInsert(_opCtx.getServiceContext(), BSON("_id" << 5)).isOK());
-        ASSERT(
-            fixDocumentForInsert(_opCtx.getServiceContext(), BSON("_id" << BSON("x" << 5))).isOK());
-        ASSERT(!fixDocumentForInsert(_opCtx.getServiceContext(), BSON("_id" << BSON("$x" << 5)))
-                    .isOK());
-        ASSERT(!fixDocumentForInsert(_opCtx.getServiceContext(), BSON("_id" << BSON("$oid" << 5)))
-                    .isOK());
+        ASSERT(fixDocumentForInsert(&_opCtx, BSON("_id" << 5)).isOK());
+        ASSERT(fixDocumentForInsert(&_opCtx, BSON("_id" << BSON("x" << 5))).isOK());
+        ASSERT(!fixDocumentForInsert(&_opCtx, BSON("_id" << BSON("$x" << 5))).isOK());
+        ASSERT(!fixDocumentForInsert(&_opCtx, BSON("_id" << BSON("$oid" << 5))).isOK());
     }
 };
 }  // namespace Insert
 
-class All : public Suite {
+class All : public OldStyleSuiteSpecification {
 public:
-    All() : Suite("pdfile") {}
+    All() : OldStyleSuiteSpecification("pdfile") {}
 
     void setupTests() {
         add<Insert::InsertNoId>();
@@ -166,6 +168,6 @@ public:
     }
 };
 
-SuiteInstance<All> myall;
+OldStyleSuiteInitializer<All> myall;
 
 }  // namespace PdfileTests

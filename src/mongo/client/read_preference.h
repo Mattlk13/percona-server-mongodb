@@ -30,44 +30,23 @@
 #pragma once
 
 #include "mongo/bson/simple_bsonobj_comparator.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/client/hedging_mode_gen.h"
+#include "mongo/client/read_preference_gen.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/repl/optime.h"
 #include "mongo/util/duration.h"
 
 namespace mongo {
 template <typename T>
 class StatusWith;
 
-enum class ReadPreference {
-    /**
-     * Read from primary only. All operations produce an error (throw an exception where
-     * applicable) if primary is unavailable. Cannot be combined with tags.
-     */
-    PrimaryOnly = 0,
+using ReadPreference = ReadPreferenceEnum;
 
-    /**
-     * Read from primary if available, otherwise a secondary. Tags will only be applied in the
-     * event that the primary is unavailable and a secondary is read from. In this event only
-     * secondaries matching the tags provided would be read from.
-     */
-    PrimaryPreferred,
-
-    /**
-     * Read from secondary if available, otherwise error.
-     */
-    SecondaryOnly,
-
-    /**
-     * Read from a secondary if available, otherwise read from the primary.
-     */
-    SecondaryPreferred,
-
-    /**
-     * Read from any member.
-     */
-    Nearest,
-};
+/**
+ * Validate a ReadPreference string. This is intended for use as an IDL validator callback.
+ */
+Status validateReadPreferenceMode(const std::string& prefStr);
 
 /**
  * A simple object for representing the list of tags requested by a $readPreference.
@@ -137,15 +116,28 @@ struct ReadPreferenceSetting {
      *     object's copy of tag will have the iterator in the initial
      *     position).
      */
-    ReadPreferenceSetting(ReadPreference pref, TagSet tags, Seconds maxStalenessSeconds);
+    ReadPreferenceSetting(ReadPreference pref,
+                          TagSet tags,
+                          Seconds maxStalenessSeconds,
+                          boost::optional<HedgingMode> hedgingMode = boost::none);
     ReadPreferenceSetting(ReadPreference pref, Seconds maxStalenessSeconds);
     ReadPreferenceSetting(ReadPreference pref, TagSet tags);
     explicit ReadPreferenceSetting(ReadPreference pref);
     ReadPreferenceSetting() : ReadPreferenceSetting(ReadPreference::PrimaryOnly) {}
 
     inline bool equals(const ReadPreferenceSetting& other) const {
+        auto hedgingModeEquals = [](const boost::optional<HedgingMode>& hedgingModeA,
+                                    const boost::optional<HedgingMode>& hedgingModeB) -> bool {
+            if (hedgingModeA && hedgingModeB) {
+                return hedgingModeA->toBSON().woCompare(hedgingModeB->toBSON()) == 0;
+            }
+            return !hedgingModeA && !hedgingModeB;
+        };
+
         return (pref == other.pref) && (tags == other.tags) &&
-            (maxStalenessSeconds == other.maxStalenessSeconds) && (minOpTime == other.minOpTime);
+            (maxStalenessSeconds == other.maxStalenessSeconds) &&
+            hedgingModeEquals(hedgingMode, other.hedgingMode) &&
+            (minClusterTime == other.minClusterTime);
     }
 
     /**
@@ -179,14 +171,21 @@ struct ReadPreferenceSetting {
 
     /**
      * Parses a ReadPreferenceSetting from a BSON document of the form:
-     * { mode: <mode>, tags: <array of tags>, maxStalenessSeconds: Number }. The 'mode' element must
-     * be a string equal to either "primary", "primaryPreferred", "secondary", "secondaryPreferred",
-     * or "nearest". Although the tags array is intended to be an array of unique BSON documents, no
-     * further validation is performed on it other than checking that it is an array, and that it is
-     * empty if 'mode' is 'primary'.
+     * { mode: <mode>, tags: <array of tags>, maxStalenessSeconds: Number, hedge: <hedgingMode>}.
+     * The 'mode' element must be a string equal to either "primary", "primaryPreferred",
+     * "secondary", "secondaryPreferred", or "nearest". Although the tags array is intended to be an
+     * array of unique BSON documents, no further validation is performed on it other than checking
+     * that it is an array, and that it is empty if 'mode' is 'primary'. The 'hedge' element
+     * consists of the optional field "enabled" (default true) and "delay" (default true).
      */
     static StatusWith<ReadPreferenceSetting> fromInnerBSON(const BSONObj& readPrefSettingObj);
     static StatusWith<ReadPreferenceSetting> fromInnerBSON(const BSONElement& readPrefSettingObj);
+
+    /**
+        Utilized by IDL types in order to get the unwrapped ReadPreferenceSetting object.
+        It checks that the status is OK and then if so it will return the underlying object.
+    */
+    static ReadPreferenceSetting fromInnerBSONForIDL(const BSONObj& readPrefSettingObj);
 
     /**
      * Parses a ReadPreference setting from an object that may contain a $readPreference object
@@ -208,7 +207,25 @@ struct ReadPreferenceSetting {
     ReadPreference pref;
     TagSet tags;
     Seconds maxStalenessSeconds{};
-    repl::OpTime minOpTime{};
+    boost::optional<HedgingMode> hedgingMode;
+
+    /**
+     * Used by Server Selection to ensure that the Timestamp component of a node's current opTime
+     * (ie. the opTime but ignoring the term) is at least this value.  Unless there are no known
+     * nodes satisfying this condition, in which case it is ignored.
+     *
+     * It is valid to use ClusterTime values in minClusterTime because if a node has an opTime of X,
+     * then that means it must have either:
+     *
+     * 1. Directly advanced the ClusterTime to X when doing that write as primary, or
+     *
+     * 2. Applied the op with that opTime after receiving it in a message from some other node; that
+     *    message must (by the same recursive logic, if necessary) have gossiped a ClusterTime of at
+     *    least X to this node.
+     *
+     * Either way, it must be that a node opTime of X implies ClusterTime >= X.
+     */
+    Timestamp minClusterTime{};
 };
 
 }  // namespace mongo

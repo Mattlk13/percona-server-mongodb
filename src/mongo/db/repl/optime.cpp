@@ -37,50 +37,31 @@
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/optime_base_gen.h"
 
 namespace mongo {
 namespace repl {
 
-const char OpTime::kTimestampFieldName[] = "ts";
-const char OpTime::kTermFieldName[] = "t";
-const long long OpTime::kInitialTerm = 0;
-
 // static
 OpTime OpTime::max() {
-    return OpTime(Timestamp::max(), std::numeric_limits<decltype(OpTime::_term)>::max());
+    return OpTime(Timestamp::max(), std::numeric_limits<long long>::max());
 }
 
 void OpTime::append(BSONObjBuilder* builder, const std::string& subObjName) const {
     BSONObjBuilder opTimeBuilder(builder->subobjStart(subObjName));
     opTimeBuilder.append(kTimestampFieldName, _timestamp);
-
     opTimeBuilder.append(kTermFieldName, _term);
     opTimeBuilder.doneFast();
 }
 
-StatusWith<Date_t> OpTime::parseWallTimeFromOplogEntry(const BSONObj& obj) {
-    BSONElement wallClockTimeElement;
-    Status status = bsonExtractTypedField(
-        obj, OplogEntryBase::kWallClockTimeFieldName, BSONType::Date, &wallClockTimeElement);
-    if (!status.isOK())
-        return status;
-    auto wallClockTime = wallClockTimeElement.Date();
-    return wallClockTime;
-}
-
 StatusWith<OpTime> OpTime::parseFromOplogEntry(const BSONObj& obj) {
-    Timestamp ts;
-    Status status = bsonExtractTimestampField(obj, kTimestampFieldName, &ts);
-    if (!status.isOK())
-        return status;
-
-    // Default to -1 if the term is absent.
-    long long term;
-    status = bsonExtractIntegerFieldWithDefault(obj, kTermFieldName, kUninitializedTerm, &term);
-    if (!status.isOK())
-        return status;
-
-    return OpTime(ts, term);
+    try {
+        OpTimeBase base = OpTimeBase::parse(IDLParserErrorContext("OpTimeBase"), obj);
+        long long term = base.getTerm().value_or(kUninitializedTerm);
+        return OpTime(base.getTimestamp(), term);
+    } catch (...) {
+        return exceptionToStatus();
+    }
 }
 
 BSONObj OpTime::toBSON() const {
@@ -121,6 +102,29 @@ BSONObj OpTime::asQuery() const {
     BSONObjBuilder builder;
     appendAsQuery(&builder);
     return builder.obj();
+}
+
+StatusWith<OpTimeAndWallTime> OpTimeAndWallTime::parseOpTimeAndWallTimeFromOplogEntry(
+    const BSONObj& obj) {
+
+    auto opTimeStatus = OpTime::parseFromOplogEntry(obj);
+
+    if (!opTimeStatus.isOK()) {
+        return opTimeStatus.getStatus();
+    }
+
+    BSONElement wall;
+    auto wallStatus = bsonExtractTypedField(obj, kWallClockTimeFieldName, BSONType::Date, &wall);
+
+    if (!wallStatus.isOK()) {
+        return wallStatus;
+    }
+
+    return OpTimeAndWallTime(opTimeStatus.getValue(), wall.Date());
+}
+
+OpTimeAndWallTime OpTimeAndWallTime::parse(const BSONObj& obj) {
+    return uassertStatusOK(parseOpTimeAndWallTimeFromOplogEntry(obj));
 }
 
 }  // namespace repl

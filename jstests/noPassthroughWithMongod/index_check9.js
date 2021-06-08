@@ -25,7 +25,7 @@ function doIt() {
         alphas.push(Random.rand() > 0.5);
     }
 
-    t.ensureIndex(idx);
+    t.createIndex(idx);
 
     function obj() {
         var ret = {};
@@ -107,7 +107,7 @@ function doIt() {
         bulk.insert(obj());
         if (Random.rand() > 0.999) {
             print(i);
-            assert.writeOK(bulk.execute());
+            assert.commandWorked(bulk.execute());
             check();
             bulk = t.initializeUnorderedBulkOp();
         }
@@ -122,12 +122,12 @@ function doIt() {
         }
         if (Random.rand() > 0.999) {
             print(i);
-            assert.writeOK(bulk.execute());
+            assert.commandWorked(bulk.execute());
             check();
             bulk = t.initializeUnorderedBulkOp();
         }
     }
-    assert.writeOK(bulk.execute());
+    assert.commandWorked(bulk.execute());
 
     check();
 }

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -38,12 +38,14 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/executor/task_executor_pool.h"
+#include "mongo/logv2/log.h"
+#include "mongo/rpc/warn_deprecated_wire_ops.h"
 #include "mongo/s/client/shard_registry.h"
+#include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/cluster_last_error_info.h"
+#include "mongo/s/commands/batch_downconvert.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/multi_statement_transaction_requests_sender.h"
-#include "mongo/s/write_ops/batch_downconvert.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
@@ -104,9 +106,15 @@ Status enforceLegacyWriteConcern(OperationContext* opCtx,
             return swShard.getStatus();
         }
 
-        LOG(3) << "enforcing write concern " << options << " on " << shardConnStr.toString()
-               << " at opTime " << opTime.getTimestamp().toStringPretty() << " with electionID "
-               << electionId;
+        LOGV2_DEBUG(22752,
+                    3,
+                    "Enforcing write concern {options} on {shardId} at opTime "
+                    "{opTime} with electionID {electionId}",
+                    "Enforcing write concern on shard",
+                    "options"_attr = options,
+                    "shardId"_attr = swShard.getValue()->getId(),
+                    "opTime"_attr = opTime.getTimestamp().toStringPretty(),
+                    "electionId"_attr = electionId);
 
         BSONObj gleCmd = buildGLECmdWithOpTime(options, opTime, electionId);
         requests.emplace_back(swShard.getValue()->getId(), gleCmd);
@@ -239,6 +247,7 @@ public:
         LastError* le = &LastError::get(cc());
         le->disable();
 
+        warnDeprecation(cc(), "getLastError");
 
         // Write commands always have the error stored in the mongos last error
         bool errorOccurred = false;
@@ -251,12 +260,13 @@ public:
         const HostOpTimeMap hostOpTimes(ClusterLastErrorInfo::get(cc())->getPrevHostOpTimes());
 
         std::vector<LegacyWCResponse> wcResponses;
-        auto status =
-            enforceLegacyWriteConcern(opCtx,
-                                      dbname,
-                                      CommandHelpers::filterCommandRequestForPassthrough(cmdObj),
-                                      hostOpTimes,
-                                      &wcResponses);
+        auto status = enforceLegacyWriteConcern(
+            opCtx,
+            dbname,
+            applyReadWriteConcern(
+                opCtx, this, CommandHelpers::filterCommandRequestForPassthrough(cmdObj)),
+            hostOpTimes,
+            &wcResponses);
 
         // Don't forget about our last hosts, reset the client info
         ClusterLastErrorInfo::get(cc())->disableForCommand();
@@ -277,7 +287,7 @@ public:
         BSONArrayBuilder errorRawGLE;
 
         int numWCErrors = 0;
-        const LegacyWCResponse* lastErrResponse = NULL;
+        const LegacyWCResponse* lastErrResponse = nullptr;
 
         for (std::vector<LegacyWCResponse>::const_iterator it = wcResponses.begin();
              it != wcResponses.end();

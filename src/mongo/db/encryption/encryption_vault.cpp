@@ -29,7 +29,7 @@ Copyright (C) 2019-present Percona and/or its affiliates. All rights reserved.
     it in the license file.
 ======= */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 #include "mongo/db/encryption/encryption_vault.h"
 
@@ -37,7 +37,7 @@ Copyright (C) 2019-present Percona and/or its affiliates. All rights reserved.
 
 #include "mongo/db/encryption/encryption_options.h"
 #include "mongo/db/json.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 
@@ -175,7 +175,7 @@ std::string vaultReadKey() {
     // log() << "SSL verifyresult is " << verifyresult;
     // response may contain encryption key
     // log() << std::string(response);
-    LOG(4) << "HTTP code (GET): " << http_code;
+    LOGV2_DEBUG(29031, 4, "HTTP code (GET): {code}", "code"_attr = http_code);
     if (http_code == 404) {
         // requested value does not exist - return empty string
         return {};
@@ -244,7 +244,7 @@ void vaultWriteKey(std::string const& key) {
     }
 
     // log() << std::string(response);
-    LOG(4) << "HTTP code (POST): " << http_code;
+    LOGV2_DEBUG(29032, 4, "HTTP code (POST): {code}", "code"_attr = http_code);
     if (http_code / 100 != 2) {
         // not success - throw error
         throw std::runtime_error(str::stream()

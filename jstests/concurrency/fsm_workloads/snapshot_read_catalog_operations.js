@@ -5,8 +5,7 @@
  * snapshot reads and CRUD operations will all contend for locks on db and collName. Since the
  * snapshot read does not release its locks until the transaction is committed, it is expected that
  * once the read has begun, catalog operations with conflicting locks will block until the read is
- * finished. Additionally, index operations running concurrently with the snapshot read may cause
- * the read to fail with a SnapshotUnavailable error.
+ * finished.
  *
  * @tags: [creates_background_indexes, uses_transactions]
  */
@@ -32,7 +31,6 @@ var $config = (function() {
             const sortByAscending = sortOptions[Random.randInt(2)];
             const readErrorCodes = [
                 ErrorCodes.NoSuchTransaction,
-                ErrorCodes.SnapshotUnavailable,
                 ErrorCodes.SnapshotTooOld,
                 ErrorCodes.StaleChunkHistory,
                 ErrorCodes.LockTimeout,
@@ -46,7 +44,7 @@ var $config = (function() {
         insertDocs: function insertDocs(db, collName) {
             for (let i = 0; i < this.numDocsToInsertPerThread; ++i) {
                 const res = db[collName].insert({value: this.valueToBeInserted});
-                assertWhenOwnColl.writeOK(res);
+                assertWhenOwnColl.commandWorked(res);
                 assertWhenOwnColl.eq(1, res.nInserted);
             }
         },
@@ -146,7 +144,7 @@ var $config = (function() {
         assertWhenOwnColl.commandWorked(db.runCommand({create: collName}));
         for (let i = 0; i < this.numIds; ++i) {
             const res = db[collName].insert({_id: i, value: this.valueToBeInserted});
-            assert.writeOK(res);
+            assert.commandWorked(res);
             assert.eq(1, res.nInserted);
         }
     }
@@ -160,5 +158,4 @@ var $config = (function() {
         setup: setup,
         data: data,
     };
-
 })();

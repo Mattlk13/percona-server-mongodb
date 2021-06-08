@@ -30,13 +30,13 @@
 #pragma once
 
 #include <map>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "mongo/base/string_data.h"
 #include "mongo/db/update/update_leaf_node.h"
-#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
@@ -84,7 +84,7 @@ protected:
      * what kind of update was performed in its return value.
      */
     virtual ModifyResult updateExistingElement(mutablebson::Element* element,
-                                               std::shared_ptr<FieldRef> elementPath) const = 0;
+                                               const FieldRef& elementPath) const = 0;
 
     /**
      * ModifierNode::apply() calls this method when applying an update to a path that does not yet
@@ -116,12 +116,17 @@ protected:
      * - 'recursionLevel' is the document nesting depth of the 'updatedElement' field.
      * - 'modifyResult' is either the value returned by updateExistingElement() or the value
      *    ModifyResult::kCreated.
+     * - If 'validateForStorage' is true, we should verify that the updated element is valid for
+     *   storage.
+     * - 'containsDotsAndDollarsField' is true if 'updatedElement' contains any dots/dollars field.
      */
     virtual void validateUpdate(mutablebson::ConstElement updatedElement,
                                 mutablebson::ConstElement leftSibling,
                                 mutablebson::ConstElement rightSibling,
                                 std::uint32_t recursionLevel,
-                                ModifyResult modifyResult) const;
+                                ModifyResult modifyResult,
+                                const bool validateForStorage,
+                                bool* containsDotsAndDollarsField) const;
 
     /**
      * ModifierNode::apply() calls this method after validation to create an oplog entry for the
@@ -135,11 +140,15 @@ protected:
      *   setValueForNewElement().
      * - 'modifyResult' is either the value returned by updateExistingElement() or the value
      *    ModifyResult::kCreated.
+     * - 'createdFieldIdx' indicates what the first component in 'pathTaken' is that was created as
+     *   part of this update. If the update did not add any new fields, boost::none should be
+     *   provided.
      */
-    virtual void logUpdate(LogBuilder* logBuilder,
-                           StringData pathTaken,
+    virtual void logUpdate(LogBuilderInterface* logBuilder,
+                           const RuntimeUpdatePath& pathTaken,
                            mutablebson::Element element,
-                           ModifyResult modifyResult) const;
+                           ModifyResult modifyResult,
+                           boost::optional<int> createdFieldIdx) const;
 
     /**
      * ModifierNode::apply() calls this method to determine what to do when applying an update to a

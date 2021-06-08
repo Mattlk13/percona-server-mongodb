@@ -31,6 +31,7 @@
 
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/index_catalog.h"
+#include "mongo/platform/atomic_word.h"
 
 namespace mongo {
 
@@ -39,13 +40,33 @@ namespace mongo {
  */
 class CollectionMock : public Collection {
 public:
-    CollectionMock(const NamespaceString& ns) : CollectionMock(ns, {}) {}
+    CollectionMock(const NamespaceString& ns)
+        : CollectionMock(ns, std::unique_ptr<IndexCatalog>()) {}
     CollectionMock(const NamespaceString& ns, std::unique_ptr<IndexCatalog> indexCatalog)
         : _ns(ns), _indexCatalog(std::move(indexCatalog)) {}
+    CollectionMock(const NamespaceString& ns, RecordId catalogId)
+        : _ns(ns), _catalogId(catalogId) {}
     ~CollectionMock() = default;
+
+    std::shared_ptr<Collection> clone() const {
+        return std::make_shared<CollectionMock>(*this);
+    }
+
+
+    SharedCollectionDecorations* getSharedDecorations() const {
+        return nullptr;
+    }
 
     void init(OperationContext* opCtx) {
         std::abort();
+    }
+
+    RecordId getCatalogId() const {
+        return _catalogId;
+    }
+
+    void setCatalogId(RecordId catalogId) {
+        _catalogId = catalogId;
     }
 
     const NamespaceString& ns() const {
@@ -56,23 +77,6 @@ public:
         _ns = std::move(nss);
     }
 
-    bool ok() const {
-        std::abort();
-    }
-
-    CollectionCatalogEntry* getCatalogEntry() {
-        std::abort();
-    }
-    const CollectionCatalogEntry* getCatalogEntry() const {
-        std::abort();
-    }
-
-    CollectionInfoCache* infoCache() {
-        std::abort();
-    }
-    const CollectionInfoCache* infoCache() const {
-        std::abort();
-    }
     const IndexCatalog* getIndexCatalog() const {
         return _indexCatalog.get();
     }
@@ -80,10 +84,14 @@ public:
         return _indexCatalog.get();
     }
 
-    const RecordStore* getRecordStore() const {
+    RecordStore* getRecordStore() const {
         std::abort();
     }
-    RecordStore* getRecordStore() {
+    std::shared_ptr<Ident> getSharedIdent() const {
+        std::abort();
+    }
+
+    const BSONObj getValidatorDoc() const {
         std::abort();
     }
 
@@ -109,7 +117,19 @@ public:
                         OpDebug* opDebug,
                         bool fromMigrate,
                         bool noWarn,
-                        Collection::StoreDeletedDoc storeDeletedDoc) {
+                        Collection::StoreDeletedDoc storeDeletedDoc) const {
+        std::abort();
+    }
+
+    void deleteDocument(
+        OperationContext* opCtx,
+        Snapshotted<BSONObj> doc,
+        StmtId stmtId,
+        RecordId loc,
+        OpDebug* opDebug,
+        bool fromMigrate = false,
+        bool noWarn = false,
+        Collection::StoreDeletedDoc storeDeletedDoc = Collection::StoreDeletedDoc::Off) const {
         std::abort();
     }
 
@@ -117,27 +137,26 @@ public:
                            std::vector<InsertStatement>::const_iterator begin,
                            std::vector<InsertStatement>::const_iterator end,
                            OpDebug* opDebug,
-                           bool fromMigrate) {
+                           bool fromMigrate) const {
         std::abort();
     }
 
     Status insertDocument(OperationContext* opCtx,
                           const InsertStatement& doc,
                           OpDebug* opDebug,
-                          bool fromMigrate) {
+                          bool fromMigrate) const {
         std::abort();
     }
 
     Status insertDocumentsForOplog(OperationContext* opCtx,
-                                   const DocWriter* const* docs,
-                                   Timestamp* timestamps,
-                                   size_t nDocs) {
+                                   std::vector<Record>* records,
+                                   const std::vector<Timestamp>& timestamps) const {
         std::abort();
     }
 
     Status insertDocumentForBulkLoader(OperationContext* opCtx,
                                        const BSONObj& doc,
-                                       const OnRecordInsertedFn& onRecordInserted) {
+                                       const OnRecordInsertedFn& onRecordInserted) const {
         std::abort();
     }
 
@@ -147,7 +166,7 @@ public:
                             const BSONObj& newDoc,
                             bool indexesAffected,
                             OpDebug* opDebug,
-                            CollectionUpdateArgs* args) {
+                            CollectionUpdateArgs* args) const {
         std::abort();
     }
 
@@ -160,7 +179,7 @@ public:
                                                      const Snapshotted<RecordData>& oldRec,
                                                      const char* damageSource,
                                                      const mutablebson::DamageVector& damages,
-                                                     CollectionUpdateArgs* args) {
+                                                     CollectionUpdateArgs* args) const {
         std::abort();
     }
 
@@ -168,56 +187,44 @@ public:
         std::abort();
     }
 
-    Status validate(OperationContext* opCtx,
-                    ValidateCmdLevel level,
-                    bool background,
-                    ValidateResults* results,
-                    BSONObjBuilder* output) {
+    void cappedTruncateAfter(OperationContext* opCtx, RecordId end, bool inclusive) const {
         std::abort();
     }
 
-    Status touch(OperationContext* opCtx,
-                 bool touchData,
-                 bool touchIndexes,
-                 BSONObjBuilder* output) const {
+    Validator parseValidator(OperationContext* opCtx,
+                             const BSONObj& validator,
+                             MatchExpressionParser::AllowedFeatureSet allowedFeatures,
+                             boost::optional<ServerGlobalParams::FeatureCompatibility::Version>
+                                 maxFeatureCompatibilityVersion) const {
         std::abort();
     }
 
-    void cappedTruncateAfter(OperationContext* opCtx, RecordId end, bool inclusive) {
+    void setValidator(OperationContext* opCtx, Validator validator) {
         std::abort();
     }
 
-    StatusWithMatchExpression parseValidator(
-        OperationContext* opCtx,
-        const BSONObj& validator,
-        MatchExpressionParser::AllowedFeatureSet allowedFeatures,
-        boost::optional<ServerGlobalParams::FeatureCompatibility::Version>
-            maxFeatureCompatibilityVersion) const {
+    Status setValidationLevel(OperationContext* opCtx, ValidationLevelEnum newLevel) {
+        std::abort();
+    }
+    Status setValidationAction(OperationContext* opCtx, ValidationActionEnum newAction) {
         std::abort();
     }
 
-    Status setValidator(OperationContext* opCtx, BSONObj validator) {
+    boost::optional<ValidationLevelEnum> getValidationLevel() const {
         std::abort();
     }
-
-    Status setValidationLevel(OperationContext* opCtx, StringData newLevel) {
-        std::abort();
-    }
-    Status setValidationAction(OperationContext* opCtx, StringData newAction) {
-        std::abort();
-    }
-
-    StringData getValidationLevel() const {
-        std::abort();
-    }
-    StringData getValidationAction() const {
+    boost::optional<ValidationActionEnum> getValidationAction() const {
         std::abort();
     }
 
     Status updateValidator(OperationContext* opCtx,
                            BSONObj newValidator,
-                           StringData newLevel,
-                           StringData newAction) {
+                           boost::optional<ValidationLevelEnum> newLevel,
+                           boost::optional<ValidationActionEnum> newAction) {
+        std::abort();
+    }
+
+    Status checkValidatorAPIVersionCompatability(OperationContext* opCtx) const final {
         std::abort();
     }
 
@@ -225,11 +232,38 @@ public:
         std::abort();
     }
 
+    bool isClustered() const {
+        std::abort();
+    }
+
+    Status updateCappedSize(OperationContext* opCtx, long long newCappedSize) {
+        std::abort();
+    }
+
+    bool getRecordPreImages() const {
+        std::abort();
+    }
+
+    void setRecordPreImages(OperationContext* opCtx, bool val) {
+        std::abort();
+    }
+
     bool isCapped() const {
         std::abort();
     }
 
+    long long getCappedMaxDocs() const {
+        std::abort();
+    }
+
+    long long getCappedMaxSize() const {
+        std::abort();
+    }
+
     CappedCallback* getCappedCallback() {
+        std::abort();
+    }
+    const CappedCallback* getCappedCallback() const {
         std::abort();
     }
 
@@ -237,11 +271,15 @@ public:
         std::abort();
     }
 
-    uint64_t numRecords(OperationContext* opCtx) const {
+    long long numRecords(OperationContext* opCtx) const {
         std::abort();
     }
 
-    uint64_t dataSize(OperationContext* opCtx) const {
+    long long dataSize(OperationContext* opCtx) const {
+        std::abort();
+    }
+
+    bool isEmpty(OperationContext* opCtx) const {
         std::abort();
     }
 
@@ -253,11 +291,19 @@ public:
         std::abort();
     }
 
-    boost::optional<Timestamp> getMinimumVisibleSnapshot() {
+    uint64_t getIndexFreeStorageBytes(OperationContext* const opCtx) const {
+        std::abort();
+    }
+
+    boost::optional<Timestamp> getMinimumVisibleSnapshot() const {
         std::abort();
     }
 
     void setMinimumVisibleSnapshot(Timestamp name) {
+        std::abort();
+    }
+
+    boost::optional<TimeseriesOptions> getTimeseriesOptions() const {
         std::abort();
     }
 
@@ -272,8 +318,10 @@ public:
 
     std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> makePlanExecutor(
         OperationContext* opCtx,
-        PlanExecutor::YieldPolicy yieldPolicy,
-        ScanDirection scanDirection) {
+        const CollectionPtr& yieldableCollection,
+        PlanYieldPolicy::YieldPolicy yieldPolicy,
+        ScanDirection scanDirection,
+        boost::optional<RecordId> resumeAfterRecordId) const {
         std::abort();
     }
 
@@ -281,8 +329,18 @@ public:
         std::abort();
     }
 
-    OptionalCollectionUUID uuid() const {
+    void onDeregisterFromCatalog(OperationContext* opCtx) {}
+
+    UUID uuid() const {
         return _uuid;
+    }
+
+    bool isCommitted() const final {
+        return _committed;
+    }
+
+    void setCommitted(bool val) final {
+        _committed = val;
     }
 
     void indexBuildSuccess(OperationContext* opCtx, IndexCatalogEntry* index) {
@@ -290,9 +348,11 @@ public:
     }
 
 private:
-    OptionalCollectionUUID _uuid = UUID::gen();
+    UUID _uuid = UUID::gen();
     NamespaceString _ns;
-    std::unique_ptr<IndexCatalog> _indexCatalog;
+    RecordId _catalogId{0};
+    clonable_ptr<IndexCatalog> _indexCatalog;
+    bool _committed = true;
 };
 
 }  // namespace mongo

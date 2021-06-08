@@ -90,12 +90,6 @@ configs:
         description: 'Quieter output'
         short_name: quiet
         arg_vartype: Switch
-    'net.port':
-        description:
-            expr: 'ServerGlobalParams::getPortSettingHelpText()'
-            is_constexpr: false
-        short_name: port
-        arg_vartype: Int
     logpath:
         # Cannot roll into systemLog.path because canonicalization also sets systemLog.destination.
         description: 'Log file to send write to instead of stdout - has to be a file, not directory'
@@ -128,7 +122,6 @@ configs:
         arg_vartype: String
         condition:
             preprocessor: '!defined(_WIN32)'
-
     'systemLog.logAppend':
         description: 'Append to logpath instead of over-writing'
         short_name: logappend
@@ -138,7 +131,7 @@ configs:
         short_name: logRotate
         arg_vartype: String
     'systemLog.timeStampFormat':
-        description: Desired format for timestamps in log messages. One of ctime, iso8601-utc or iso8601-local
+        description: Desired format for timestamps in log messages. One of iso8601-utc or iso8601-local
         short_name: timeStampFormat
         arg_vartype: String
 

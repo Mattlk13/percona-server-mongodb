@@ -5,7 +5,7 @@ t=__wt.$$
 trap 'rm -f $t' 0 1 2 3 13 15
 
 l=`(cd .. &&
-    find bench/wtperf examples ext src test -name '*.[chisy]' &&
+    find bench/wtperf examples ext src test -name '*.[chsy]' &&
     find dist -name '*.py' &&
     find src -name '*.in') |
     sed -e '/checksum\/power8/d' \
@@ -20,7 +20,7 @@ l=`(cd .. &&
 
 for f in $l ; do
 	expand -t8 < ../$f | awk -- \
-	    "{if(length(\$0) > 80) printf(\"%s:%d\\n\", \"$f\", NR)}"
+	    "{if(length(\$0) > 100) printf(\"%s:%d\\n\", \"$f\", NR)}"
 done
 
 exit 0

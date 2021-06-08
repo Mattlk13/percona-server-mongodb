@@ -2,6 +2,10 @@ test_kind: cpp_integration_test
 
 selector:
   root: build/integration_tests.txt
+  exclude_files:
+  # Tests replica set monitor.
+  - build/**/replica_set_monitor_integration_test*
+  - build/**/network_interface_ssl_test* # Requires SSL
 
 executor:
   archive:
@@ -17,5 +21,7 @@ executor:
     mongod_options:
       auditDestination: console
       set_parameters:
+        logComponentVerbosity:
+          command: 2
         enableTestCommands: 1
         auditAuthorizationSuccess: 1

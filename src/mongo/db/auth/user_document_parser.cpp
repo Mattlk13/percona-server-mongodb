@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kAccessControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kAccessControl
 
 #include "mongo/db/auth/user_document_parser.h"
 
@@ -41,7 +41,7 @@
 #include "mongo/db/auth/user.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -152,8 +152,8 @@ Status V2UserDocumentParser::checkValidUserDocument(const BSONObj& doc) const {
     StringData userDBStr = userDBElement.valueStringData();
     if (!NamespaceString::validDBName(userDBStr, NamespaceString::DollarInDbNameBehavior::Allow) &&
         userDBStr != "$external") {
-        return _badValue(str::stream() << "'" << userDBStr
-                                       << "' is not a valid value for the db field.");
+        return _badValue(str::stream()
+                         << "'" << userDBStr << "' is not a valid value for the db field.");
     }
 
     // Validate the "credentials" element
@@ -184,8 +184,8 @@ Status V2UserDocumentParser::checkValidUserDocument(const BSONObj& doc) const {
                               str::stream() << fieldName << " does not exist");
             }
             if (scramElement.type() != Object) {
-                return _badValue(str::stream() << fieldName
-                                               << " credential must be an object, if present");
+                return _badValue(str::stream()
+                                 << fieldName << " credential must be an object, if present");
             }
             return Status::OK();
         };
@@ -336,7 +336,6 @@ Status V2UserDocumentParser::parseRoleVector(const BSONArray& rolesArray,
 
 Status V2UserDocumentParser::initializeAuthenticationRestrictionsFromUserDocument(
     const BSONObj& privDoc, User* user) const {
-    RestrictionDocuments::sequence_type restrictionVector;
 
     // Restrictions on the user
     const auto authenticationRestrictions = privDoc[AUTHENTICATION_RESTRICTIONS_FIELD_NAME];
@@ -352,7 +351,9 @@ Status V2UserDocumentParser::initializeAuthenticationRestrictionsFromUserDocumen
             return restrictions.getStatus();
         }
 
-        restrictionVector.push_back(restrictions.getValue());
+        if (user) {
+            user->setRestrictions(RestrictionDocuments({std::move(restrictions.getValue())}));
+        }
     }
 
     // Restrictions from roles
@@ -363,6 +364,7 @@ Status V2UserDocumentParser::initializeAuthenticationRestrictionsFromUserDocumen
                           "'inheritedAuthenticationRestrictions' field must be an array");
         }
 
+        RestrictionDocuments::sequence_type authRest;
         for (const auto& roleRestriction : BSONArray(inherited.Obj())) {
             if (roleRestriction.type() != Array) {
                 return Status(ErrorCodes::UnsupportedFormat,
@@ -375,12 +377,14 @@ Status V2UserDocumentParser::initializeAuthenticationRestrictionsFromUserDocumen
                 return roleRestrictionDoc.getStatus();
             }
 
-            restrictionVector.push_back(roleRestrictionDoc.getValue());
+            if (user) {
+                authRest.push_back(std::move(roleRestrictionDoc.getValue()));
+            }
         }
-    }
 
-    if (user) {
-        user->setRestrictions(RestrictionDocuments(restrictionVector));
+        if (user) {
+            user->setIndirectRestrictions(RestrictionDocuments(std::move(authRest)));
+        }
     }
 
     return Status::OK();
@@ -417,6 +421,10 @@ Status V2UserDocumentParser::initializeUserRolesFromUserDocument(const BSONObj& 
 Status V2UserDocumentParser::initializeUserIndirectRolesFromUserDocument(const BSONObj& privDoc,
                                                                          User* user) const {
     BSONElement indirectRolesElement = privDoc[INHERITED_ROLES_FIELD_NAME];
+
+    if (!indirectRolesElement) {
+        return Status::OK();
+    }
 
     if (indirectRolesElement.type() != Array) {
         return Status(ErrorCodes::UnsupportedFormat,
@@ -456,35 +464,66 @@ Status V2UserDocumentParser::initializeUserPrivilegesFromUserDocument(const BSON
     std::string errmsg;
     for (BSONObjIterator it(privilegesElement.Obj()); it.more(); it.next()) {
         if ((*it).type() != Object) {
-            warning() << "Wrong type of element in inheritedPrivileges array for "
-                      << user->getName() << ": " << *it;
+            LOGV2_WARNING(23743,
+                          "Wrong type of element in inheritedPrivileges array",
+                          "user"_attr = user->getName(),
+                          "element"_attr = *it);
             continue;
         }
         Privilege privilege;
         ParsedPrivilege pp;
         if (!pp.parseBSON((*it).Obj(), &errmsg)) {
-            warning() << "Could not parse privilege element in user document for "
-                      << user->getName() << ": " << errmsg;
+            LOGV2_WARNING(23744,
+                          "Could not parse privilege element in user document",
+                          "user"_attr = user->getName(),
+                          "error"_attr = errmsg);
             continue;
         }
         std::vector<std::string> unrecognizedActions;
         Status status =
             ParsedPrivilege::parsedPrivilegeToPrivilege(pp, &privilege, &unrecognizedActions);
         if (!status.isOK()) {
-            warning() << "Could not parse privilege element in user document for "
-                      << user->getName() << causedBy(status);
+            LOGV2_WARNING(23745,
+                          "Could not parse privilege element in user document",
+                          "user"_attr = user->getName(),
+                          "error"_attr = causedBy(status));
             continue;
         }
         if (unrecognizedActions.size()) {
             std::string unrecognizedActionsString;
             str::joinStringDelim(unrecognizedActions, &unrecognizedActionsString, ',');
-            warning() << "Encountered unrecognized actions \" " << unrecognizedActionsString
-                      << "\" while parsing user document for " << user->getName();
+            LOGV2_WARNING(23746,
+                          "Encountered unrecognized actions \"{action}\" while "
+                          "parsing user document for {user}",
+                          "Encountered unrecognized actions while parsing user document",
+                          "action"_attr = unrecognizedActionsString,
+                          "user"_attr = user->getName());
         }
         privileges.push_back(privilege);
     }
     user->setPrivileges(privileges);
     return Status::OK();
+}
+
+Status V2UserDocumentParser::initializeUserFromUserDocument(const BSONObj& privDoc,
+                                                            User* user) const try {
+    auto userName = extractUserNameFromUserDocument(privDoc);
+    uassert(ErrorCodes::BadValue,
+            str::stream() << "User name from privilege document \"" << userName
+                          << "\" doesn't match name of provided User \""
+                          << user->getName().getUser() << "\"",
+            userName == user->getName().getUser());
+
+    user->setID(extractUserIDFromUserDocument(privDoc));
+    uassertStatusOK(initializeUserCredentialsFromUserDocument(user, privDoc));
+    uassertStatusOK(initializeUserRolesFromUserDocument(privDoc, user));
+    uassertStatusOK(initializeUserIndirectRolesFromUserDocument(privDoc, user));
+    uassertStatusOK(initializeUserPrivilegesFromUserDocument(privDoc, user));
+    uassertStatusOK(initializeAuthenticationRestrictionsFromUserDocument(privDoc, user));
+
+    return Status::OK();
+} catch (const AssertionException& ex) {
+    return ex.toStatus();
 }
 
 }  // namespace mongo

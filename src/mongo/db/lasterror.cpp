@@ -29,6 +29,8 @@
 
 #include "mongo/platform/basic.h"
 
+#include <boost/algorithm/string.hpp>
+
 #include "mongo/db/lasterror.h"
 
 #include "mongo/db/jsobj.h"
@@ -39,6 +41,19 @@ namespace mongo {
 LastError LastError::noError;
 
 const Client::Decoration<LastError> LastError::get = Client::declareDecoration<LastError>();
+
+namespace {
+void appendDupKeyFields(BSONObjBuilder& builder, std::string errMsg) {
+    // errMsg format for duplicate key errors:
+    // "E11000 duplicate key error collection: test.coll index: a_1 dup key: { a: 1.0 }",
+    std::vector<std::string> results;
+    boost::split(results, errMsg, [](char c) { return c == ' '; });
+    auto collName = results[5];
+    auto indexName = results[7];
+    builder.append("ns", collName);
+    builder.append("index", indexName);
+}
+}  // namespace
 
 void LastError::reset(bool valid) {
     *this = LastError();
@@ -53,8 +68,8 @@ void LastError::setLastError(int code, std::string msg) {
     _code = code;
     _msg = std::move(msg);
 
-    if (ErrorCodes::isNotMasterError(ErrorCodes::Error(_code)))
-        _hadNotMasterError = true;
+    if (ErrorCodes::isNotPrimaryError(ErrorCodes::Error(_code)))
+        _hadNotPrimaryError = true;
 }
 
 void LastError::recordUpdate(bool updateObjects, long long nObjects, BSONObj upsertedId) {
@@ -62,9 +77,8 @@ void LastError::recordUpdate(bool updateObjects, long long nObjects, BSONObj ups
     _nObjects = nObjects;
     _updatedExisting = updateObjects ? True : False;
 
-    // Use the latest BSON validation version. We record updates containing decimal data even if
-    // decimal is disabled.
-    if (upsertedId.valid(BSONVersion::kLatest) && upsertedId.hasField(kUpsertedFieldName))
+    // We record updates containing decimal data even if decimal is disabled.
+    if (upsertedId.valid() && upsertedId.hasField(kUpsertedFieldName))
         _upsertedId = upsertedId;
 }
 
@@ -87,6 +101,9 @@ bool LastError::appendSelf(BSONObjBuilder& b, bool blankErr) const {
         }
     } else {
         b.append("err", _msg);
+        if (_msg.find("E11000 duplicate key error") != std::string::npos) {
+            appendDupKeyFields(b, _msg);
+        }
     }
 
     if (_code) {
@@ -113,7 +130,7 @@ void LastError::disable() {
 void LastError::startRequest() {
     _disabled = false;
     ++_nPrev;
-    _hadNotMasterError = false;
+    _hadNotPrimaryError = false;
 }
 
 }  // namespace mongo

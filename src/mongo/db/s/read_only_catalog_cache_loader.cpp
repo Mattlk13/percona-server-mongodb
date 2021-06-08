@@ -35,6 +35,10 @@ namespace mongo {
 
 using CollectionAndChangedChunks = CatalogCacheLoader::CollectionAndChangedChunks;
 
+ReadOnlyCatalogCacheLoader::~ReadOnlyCatalogCacheLoader() {
+    shutDown();
+}
+
 void ReadOnlyCatalogCacheLoader::waitForCollectionFlush(OperationContext* opCtx,
                                                         const NamespaceString& nss) {
     MONGO_UNREACHABLE;
@@ -44,15 +48,17 @@ void ReadOnlyCatalogCacheLoader::waitForDatabaseFlush(OperationContext* opCtx, S
     MONGO_UNREACHABLE;
 }
 
-std::shared_ptr<Notification<void>> ReadOnlyCatalogCacheLoader::getChunksSince(
-    const NamespaceString& nss, ChunkVersion version, GetChunksSinceCallbackFn callbackFn) {
-    return _configServerLoader.getChunksSince(nss, version, callbackFn);
+void ReadOnlyCatalogCacheLoader::shutDown() {
+    _configServerLoader.shutDown();
 }
 
-void ReadOnlyCatalogCacheLoader::getDatabase(
-    StringData dbName,
-    stdx::function<void(OperationContext*, StatusWith<DatabaseType>)> callbackFn) {
-    return _configServerLoader.getDatabase(dbName, callbackFn);
+SemiFuture<CollectionAndChangedChunks> ReadOnlyCatalogCacheLoader::getChunksSince(
+    const NamespaceString& nss, ChunkVersion version) {
+    return _configServerLoader.getChunksSince(nss, version);
+}
+
+SemiFuture<DatabaseType> ReadOnlyCatalogCacheLoader::getDatabase(StringData dbName) {
+    return _configServerLoader.getDatabase(dbName);
 }
 
 }  // namespace mongo

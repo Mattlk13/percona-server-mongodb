@@ -9,8 +9,8 @@
  *
  * This workload was designed to reproduce SERVER-24761.
  */
+load("jstests/concurrency/fsm_workload_helpers/assert_handle_fail_in_transaction.js");
 var $config = (function() {
-
     // Use the workload name as the collection name, since the workload name is assumed to be
     // unique. Note that we choose our own collection name instead of using the collection provided
     // by the concurrency framework, because this workload drops its collection.
@@ -37,7 +37,9 @@ var $config = (function() {
             } catch (e) {
                 // We expect to see errors caused by the plan executor being killed, because of the
                 // collection getting dropped on another thread.
-                if (ErrorCodes.QueryPlanKilled != e.code) {
+                const kAllowedErrorCodes =
+                    [ErrorCodes.QueryPlanKilled, ErrorCodes.NamespaceNotFound];
+                if (!kAllowedErrorCodes.includes(e.code)) {
                     throw e;
                 }
             }
@@ -60,8 +62,19 @@ var $config = (function() {
 
             // Recreate the index that was dropped. (See populateIndexes() for why we ignore the
             // CannotImplicitlyCreateCollection error.)
-            assertAlways.commandWorkedOrFailedWithCode(db[this.collName].createIndex(indexSpec),
-                                                       ErrorCodes.CannotImplicitlyCreateCollection);
+            let res = db[this.collName].createIndex(indexSpec);
+            assertWorkedOrFailedHandleTxnErrors(res,
+                                                [
+                                                    ErrorCodes.CannotImplicitlyCreateCollection,
+                                                    ErrorCodes.IndexBuildAborted,
+                                                    ErrorCodes.IndexBuildAlreadyInProgress,
+                                                    ErrorCodes.NoMatchingDocument,
+                                                ],
+                                                [
+                                                    ErrorCodes.CannotImplicitlyCreateCollection,
+                                                    ErrorCodes.IndexBuildAborted,
+                                                    ErrorCodes.NoMatchingDocument,
+                                                ]);
         }
     };
 
@@ -79,8 +92,16 @@ var $config = (function() {
             // collection (as in the 'dropCollection' state of this test), then we run out of
             // retries and get a CannotImplicitlyCreateCollection error once in a while, which we
             // have to ignore.
-            assertAlways.commandWorkedOrFailedWithCode(coll.createIndex(indexSpec),
-                                                       ErrorCodes.CannotImplicitlyCreateCollection);
+            assertWorkedOrFailedHandleTxnErrors(coll.createIndex(indexSpec),
+                                                [
+                                                    ErrorCodes.CannotImplicitlyCreateCollection,
+                                                    ErrorCodes.IndexBuildAlreadyInProgress,
+                                                    ErrorCodes.NoMatchingDocument,
+                                                ],
+                                                [
+                                                    ErrorCodes.CannotImplicitlyCreateCollection,
+                                                    ErrorCodes.NoMatchingDocument,
+                                                ]);
         });
     }
 
@@ -110,5 +131,4 @@ var $config = (function() {
         transitions: transitions,
         setup: setup
     };
-
 })();

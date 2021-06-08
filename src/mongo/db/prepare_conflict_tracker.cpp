@@ -39,14 +39,37 @@ bool PrepareConflictTracker::isWaitingOnPrepareConflict() const {
     return _waitOnPrepareConflict.load();
 }
 
-void PrepareConflictTracker::beginPrepareConflict() {
+void PrepareConflictTracker::beginPrepareConflict(OperationContext* opCtx) {
     // Implies that the current read operation is blocked on a prepared transaction.
     _waitOnPrepareConflict.store(true);
+    invariant(_prepareConflictStartTime == 0);
+    _prepareConflictStartTime = opCtx->getServiceContext()->getTickSource()->getTicks();
 }
 
-void PrepareConflictTracker::endPrepareConflict() {
-    // Implies that the current read operation is not blocked on a prepared transaction.
-    _waitOnPrepareConflict.store(false);
+void PrepareConflictTracker::endPrepareConflict(OperationContext* opCtx) {
+    if (_waitOnPrepareConflict.load()) {
+        auto tickSource = opCtx->getServiceContext()->getTickSource();
+        auto curTick = tickSource->getTicks();
+
+        invariant(_prepareConflictStartTime <= curTick,
+                  str::stream() << "Prepare conflict start time ("
+                                << tickSource->ticksTo<Microseconds>(_prepareConflictStartTime)
+                                << ") is somehow greater than current time ("
+                                << tickSource->ticksTo<Microseconds>(curTick) << ")");
+
+        auto curConflictDuration =
+            tickSource->ticksTo<Microseconds>(curTick - _prepareConflictStartTime);
+        _prepareConflictDuration.store(_prepareConflictDuration.load() + curConflictDuration);
+        _prepareConflictStartTime = 0;
+
+        // Implies that the current read operation is not blocked on a prepared transaction.
+        _waitOnPrepareConflict.store(false);
+    }
+    invariant(_prepareConflictStartTime == 0);
+}
+
+Microseconds PrepareConflictTracker::getPrepareConflictDuration() {
+    return _prepareConflictDuration.load();
 }
 
 }  // namespace mongo

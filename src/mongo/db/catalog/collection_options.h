@@ -34,12 +34,16 @@
 #include <boost/optional.hpp>
 
 #include "mongo/base/status.h"
+#include "mongo/db/catalog/clustered_index_options_gen.h"
+#include "mongo/db/catalog/collection_options_gen.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/timeseries/timeseries_gen.h"
 #include "mongo/util/uuid.h"
 
 namespace mongo {
 
 class CollatorFactoryInterface;
+class CreateCommand;
 
 /**
  * A CollectionUUID is a 128-bit unique identifier, per RFC 4122, v4. for a database collection.
@@ -71,18 +75,24 @@ struct CollectionOptions {
     Status validateForStorage() const;
 
     /**
-     * Parses the "options" subfield of the collection info object.
+     * Parses the collection 'options' into the appropriate struct fields.
+     *
+     * When 'kind' is set to ParseKind::parseForStorage, the 'uuid' field is parsed,
+     * otherwise the 'uuid' field is not parsed.
+     *
+     * When 'kind' is set to ParseKind::parseForCommand, the 'idIndex' field is parsed,
+     * otherwise the 'idIndex' field is not parsed.
      */
-    Status parse(const BSONObj& obj, ParseKind kind = parseForCommand);
+    static StatusWith<CollectionOptions> parse(const BSONObj& options,
+                                               ParseKind kind = parseForCommand);
+
+    /**
+     * Converts a client "create" command invocation.
+     */
+    static CollectionOptions fromCreateCommand(const CreateCommand& cmd);
 
     void appendBSON(BSONObjBuilder* builder) const;
     BSONObj toBSON() const;
-
-    /**
-     * @param max in and out, will be adjusted
-     * @return if the value is valid at all
-     */
-    static bool validMaxCappedDocs(long long* max);
 
     /**
      * Returns true if given options matches to this.
@@ -94,18 +104,13 @@ struct CollectionOptions {
     bool matchesStorageOptions(const CollectionOptions& other,
                                CollatorFactoryInterface* collatorFactory) const;
 
-    // ----
-
-    // Collection UUID. Present for all CollectionOptions parsed for storage.
+    // Collection UUID. If not set, specifies that the storage engine should generate the UUID (for
+    // a new collection). For an existing collection parsed for storage, it will always be present.
     OptionalCollectionUUID uuid;
 
     bool capped = false;
     long long cappedSize = 0;
     long long cappedMaxDocs = 0;
-
-    // (MMAPv1) The following 2 are mutually exclusive, can only have one set.
-    long long initialNumExtents = 0;
-    std::vector<long long> initialExtentSizes;
 
     // The behavior of _id index creation when collection created
     void setNoIdIndex() {
@@ -118,23 +123,27 @@ struct CollectionOptions {
     } autoIndexId = DEFAULT;
 
     bool temp = false;
+    bool recordPreImages = false;
 
     // Storage engine collection options. Always owned or empty.
     BSONObj storageEngine;
 
-    // Default options for indexes created on the collection. Always owned or empty.
-    BSONObj indexOptionDefaults;
+    // Default options for indexes created on the collection.
+    IndexOptionDefaults indexOptionDefaults;
 
     // Index specs for the _id index.
     BSONObj idIndex;
 
     // Always owned or empty.
     BSONObj validator;
-    std::string validationAction;
-    std::string validationLevel;
+    boost::optional<ValidationActionEnum> validationAction;
+    boost::optional<ValidationLevelEnum> validationLevel;
 
     // The namespace's default collation.
     BSONObj collation;
+
+    // If present, defines how this collection is clustered on _id.
+    boost::optional<ClusteredIndexOptions> clusteredIndex;
 
     // View-related options.
     // The namespace of the view or collection that "backs" this view, or the empty string if this
@@ -142,5 +151,9 @@ struct CollectionOptions {
     std::string viewOn;
     // The aggregation pipeline that defines this view.
     BSONObj pipeline;
+
+    // The options that define the time-series collection, or boost::none if not a time-series
+    // collection.
+    boost::optional<TimeseriesOptions> timeseries;
 };
-}
+}  // namespace mongo

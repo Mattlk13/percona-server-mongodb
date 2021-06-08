@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -42,32 +42,30 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
-#include "mongo/s/catalog/type_database.h"
-#include "mongo/s/catalog_cache.h"
 #include "mongo/s/grid.h"
-#include "mongo/s/request_types/create_database_gen.h"
-#include "mongo/util/log.h"
+#include "mongo/s/request_types/sharded_ddl_commands_gen.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
 namespace {
 
-/**
- * Internal sharding command run on config servers to create a database.
- * Call with { _configsvrCreateDatabase: <string dbName> }
- */
 class ConfigSvrCreateDatabaseCommand final : public TypedCommand<ConfigSvrCreateDatabaseCommand> {
 public:
     using Request = ConfigsvrCreateDatabase;
+    using Response = ConfigsvrCreateDatabaseResponse;
 
     class Invocation final : public InvocationBase {
     public:
         using InvocationBase::InvocationBase;
 
-        void typedRun(OperationContext* opCtx) {
+        Response typedRun(OperationContext* opCtx) {
             uassert(ErrorCodes::IllegalOperation,
                     "_configsvrCreateDatabase can only be run on config servers",
                     serverGlobalParams.clusterRole == ClusterRole::ConfigServer);
+            uassert(ErrorCodes::InvalidOptions,
+                    str::stream()
+                        << "_configsvrCreateDatabase must be called with majority writeConcern",
+                    opCtx->getWriteConcern().wMode == WriteConcernOptions::kMajority);
 
             // Set the operation context read concern level to local for reads into the config
             // database.
@@ -76,27 +74,23 @@ public:
 
             auto dbname = request().getCommandParameter();
 
-            uassert(ErrorCodes::InvalidNamespace,
-                    str::stream() << "invalid db name specified: " << dbname,
-                    NamespaceString::validDBName(dbname,
-                                                 NamespaceString::DollarInDbNameBehavior::Allow));
+            if (request().getEnableSharding()) {
+                uassert(ErrorCodes::BadValue,
+                        str::stream() << "Enable sharding can only be set to `true`",
+                        *request().getEnableSharding());
 
-            uassert(ErrorCodes::InvalidOptions,
-                    str::stream() << "createDatabase must be called with majority writeConcern",
-                    opCtx->getWriteConcern().wMode == WriteConcernOptions::kMajority);
+                audit::logEnableSharding(opCtx->getClient(), dbname);
+            }
 
-            // Make sure to force update of any stale metadata
-            ON_BLOCK_EXIT(
-                [opCtx, dbname] { Grid::get(opCtx)->catalogCache()->purgeDatabase(dbname); });
+            auto dbt = ShardingCatalogManager::get(opCtx)->createDatabase(
+                opCtx,
+                dbname,
+                request().getPrimaryShardId()
+                    ? boost::optional<ShardId>(request().getPrimaryShardId()->toString())
+                    : boost::optional<ShardId>(),
+                request().getEnableSharding().value_or(false));
 
-            auto scopedLock =
-                ShardingCatalogManager::get(opCtx)->serializeCreateOrDropDatabase(opCtx, dbname);
-
-            auto dbDistLock =
-                uassertStatusOK(Grid::get(opCtx)->catalogClient()->getDistLockManager()->lock(
-                    opCtx, dbname, "createDatabase", DistLockManager::kDefaultLockTimeout));
-
-            ShardingCatalogManager::get(opCtx)->createDatabase(opCtx, dbname.toString());
+            return {dbt.getVersion()};
         }
 
     private:

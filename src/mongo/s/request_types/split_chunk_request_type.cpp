@@ -33,6 +33,7 @@
 
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/util/bson_extract.h"
+#include "mongo/db/write_concern_options.h"
 
 namespace mongo {
 
@@ -120,7 +121,7 @@ BSONObj SplitChunkRequest::toConfigCommandBSON(const BSONObj& writeConcern) {
     appendAsConfigCommand(&cmdBuilder);
 
     // Tack on passed-in writeConcern
-    cmdBuilder.appendElements(writeConcern);
+    cmdBuilder.append(WriteConcernOptions::kWriteConcernField, writeConcern);
 
     return cmdBuilder.obj();
 }
@@ -161,8 +162,8 @@ const string& SplitChunkRequest::getShardName() const {
 Status SplitChunkRequest::_validate() {
     if (!getNamespace().isValid()) {
         return Status(ErrorCodes::InvalidNamespace,
-                      str::stream() << "invalid namespace '" << _nss.ns()
-                                    << "' specified for request");
+                      str::stream()
+                          << "invalid namespace '" << _nss.ns() << "' specified for request");
     }
 
     if (getSplitPoints().empty()) {

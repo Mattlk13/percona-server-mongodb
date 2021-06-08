@@ -36,25 +36,19 @@
 namespace mongo {
 namespace count_request {
 /**
- * Parses a limit for a CountCommand. If the limit is negative, returns the absolute value.
+ * Parses a limit for a CountCommandRequest. If the limit is negative, returns the absolute value.
  * Throws on invalid values.
  */
 long long countParseLimit(const BSONElement& element);
 
 /**
- * Parses a skip for a CountCommand. Errors if the value passed is negative.
+ * Parses a skip for a CountCommandRequest. Errors if the value passed is negative.
  * Throws on invalid values.
  */
 long long countParseSkip(const BSONElement& element);
 
 /**
- * Parses a hint for a CountCommand. Returns the hint object, or if the element was a string the
- * string wrapped in an object of the form {"$hint": <index_name>}.
- */
-BSONObj countParseHint(const BSONElement& element);
-
-/**
- * Parses a maxTimeMS for a CountCommand. Errors if the value passed is negative.
+ * Parses a maxTimeMS for a CountCommandRequest. Errors if the value passed is negative.
  * Throws on invalid values.
  */
 long long countParseMaxTime(const BSONElement& element);

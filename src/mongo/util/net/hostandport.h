@@ -36,7 +36,6 @@
 #include <boost/optional.hpp>
 
 #include "mongo/bson/util/builder.h"
-#include "mongo/util/net/sockaddr.h"
 
 namespace mongo {
 
@@ -51,8 +50,6 @@ class StringData;
  * Composed of some name component, followed optionally by a colon and a numeric port.  The name
  * might be an IPv4 or IPv6 address or a relative or fully qualified host name, or an absolute
  * path to a unix socket.
- *
- * Hostnames are converted to lowercase.
  */
 struct HostAndPort {
     /**
@@ -87,14 +84,6 @@ struct HostAndPort {
     HostAndPort(const std::string& h, int p);
 
     /**
-     * Constructs a HostAndPort from a SockAddr
-     *
-     * Used by the TransportLayer to convert raw socket addresses into HostAndPorts to be
-     * accessed via tranport::Session
-     */
-    explicit HostAndPort(SockAddr addr);
-
-    /**
      * (Re-)initializes this HostAndPort by parsing "s".  Returns
      * Status::OK on success.  The state of this HostAndPort is unspecified
      * after initialize() returns a non-OK status, though it is safe to
@@ -127,23 +116,9 @@ struct HostAndPort {
     std::string toString() const;
 
     /**
-     * Like toString(), but writes to various `sink` instead.
-     */
-    void append(StringBuilder& sink) const;
-    void append(fmt::writer& sink) const;
-
-    /**
      * Returns true if this object represents no valid HostAndPort.
      */
     bool empty() const;
-
-    /**
-     * Returns the SockAddr representation of this address, if available
-     */
-    const boost::optional<SockAddr>& sockAddr() const& {
-        return _addr;
-    }
-    void sockAddr() && = delete;
 
     const std::string& host() const {
         return _host;
@@ -160,30 +135,69 @@ struct HostAndPort {
     }
 
 private:
-    boost::optional<SockAddr> _addr;
+    friend struct fmt::formatter<HostAndPort>;
+
+    struct AppendVisitor {
+        virtual void operator()(StringData v) = 0;
+        virtual void operator()(std::uint16_t v) = 0;
+        virtual ~AppendVisitor() = default;
+    };
+
+    void _appendToVisitor(AppendVisitor& sink) const;
+
+    template <typename F>
+    void _appendToPolymorphicFunc(F f) const;
+
+    template <typename Stream>
+    Stream& _appendToStream(Stream& os) const {
+        _appendToPolymorphicFunc([&](const auto& v) { os << v; });
+        return os;
+    }
+
+    friend std::ostream& operator<<(std::ostream& os, const HostAndPort& hp) {
+        return hp._appendToStream(os);
+    }
+    friend StringBuilder& operator<<(StringBuilder& os, const HostAndPort& hp) {
+        return hp._appendToStream(os);
+    }
+    friend StackStringBuilder& operator<<(StackStringBuilder& os, const HostAndPort& hp) {
+        return hp._appendToStream(os);
+    }
+
     std::string _host;
     int _port;  // -1 indicates unspecified
 };
 
-std::ostream& operator<<(std::ostream& os, const HostAndPort& hp);
-
-StringBuilder& operator<<(StringBuilder& os, const HostAndPort& hp);
-
-StackStringBuilder& operator<<(StackStringBuilder& os, const HostAndPort& hp);
+template <typename F>
+void HostAndPort::_appendToPolymorphicFunc(F f) const {
+    struct Vis : AppendVisitor {
+        explicit Vis(F f) : _f{std::move(f)} {}
+        void operator()(StringData v) override {
+            _f(v);
+        }
+        void operator()(std::uint16_t v) override {
+            _f(v);
+        }
+        F _f;
+    };
+    Vis visitor(std::move(f));
+    _appendToVisitor(visitor);
+}
 
 }  // namespace mongo
 
+namespace fmt {
 template <>
-struct fmt::formatter<mongo::HostAndPort> {
+struct formatter<mongo::HostAndPort> {
     template <typename ParseContext>
-    auto parse(ParseContext& ctx) -> decltype(ctx.begin()) {
+    constexpr auto parse(ParseContext& ctx) {
         return ctx.begin();
     }
-
     template <typename FormatContext>
-    auto format(const mongo::HostAndPort& hp, FormatContext& ctx) -> decltype(ctx.out()) {
-        fmt::writer w(ctx.out());
-        hp.append(w);
-        return ctx.out();
+    auto format(const mongo::HostAndPort& hp, FormatContext& ctx) {
+        auto&& it = ctx.out();
+        hp._appendToPolymorphicFunc([&](const auto& v) { it = fmt::format_to(it, "{}", v); });
+        return it;
     }
 };
+}  // namespace fmt

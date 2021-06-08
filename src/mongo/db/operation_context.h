@@ -36,22 +36,27 @@
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/locker.h"
 #include "mongo/db/logical_session_id.h"
+#include "mongo/db/operation_id.h"
+#include "mongo/db/query/datetime/date_time_support.h"
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/storage/write_unit_of_work.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/platform/atomic_word.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/transport/session.h"
+#include "mongo/util/cancellation.h"
+#include "mongo/util/concurrency/with_lock.h"
 #include "mongo/util/decorable.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/interruptible.h"
+#include "mongo/util/lockable_adapter.h"
 #include "mongo/util/time_support.h"
 #include "mongo/util/timer.h"
 
 namespace mongo {
 
-class Client;
 class CurOp;
 class ProgressMeter;
 class ServiceContext;
@@ -60,6 +65,19 @@ class StringData;
 namespace repl {
 class UnreplicatedWritesBlock;
 }  // namespace repl
+
+// Enabling the maxTimeAlwaysTimeOut fail point will cause any query or command run with a
+// valid non-zero max time to fail immediately.  Any getmore operation on a cursor already
+// created with a valid non-zero max time will also fail immediately.
+//
+// This fail point cannot be used with the maxTimeNeverTimeOut fail point.
+extern FailPoint maxTimeAlwaysTimeOut;
+
+// Enabling the maxTimeNeverTimeOut fail point will cause the server to never time out any
+// query, command, or getmore operation, regardless of whether a max time is set.
+//
+// This fail point cannot be used with the maxTimeAlwaysTimeOut fail point.
+extern FailPoint maxTimeNeverTimeOut;
 
 /**
  * This class encompasses the state required by an operation and lives from the time a network
@@ -77,7 +95,14 @@ class OperationContext : public Interruptible, public Decorable<OperationContext
     OperationContext& operator=(const OperationContext&) = delete;
 
 public:
-    OperationContext(Client* client, unsigned int opId);
+    static constexpr auto kDefaultOperationContextTimeoutError = ErrorCodes::ExceededTimeLimit;
+
+    /**
+     * Creates an op context with no unique operation ID tracking - prefer using the OperationIdSlot
+     * CTOR if possible to avoid OperationId collisions.
+     */
+    OperationContext(Client* client, OperationId opId);
+    OperationContext(Client* client, OperationIdSlot&& opIdSlot);
     virtual ~OperationContext();
 
     bool shouldParticipateInFlowControl() const {
@@ -132,9 +157,10 @@ public:
     void setLockState(std::unique_ptr<Locker> locker);
 
     /**
-     * Swaps the locker, releasing the old locker to the caller.
+     * Swaps the locker, releasing the old locker to the caller.  The Client lock is required to
+     * call this function.
      */
-    std::unique_ptr<Locker> swapLockState(std::unique_ptr<Locker> locker);
+    std::unique_ptr<Locker> swapLockState(std::unique_ptr<Locker> locker, WithLock);
 
     /**
      * Returns Status::OK() unless this operation is in a killed state.
@@ -163,9 +189,29 @@ public:
     /**
      * Returns the operation ID associated with this operation.
      */
-    unsigned int getOpID() const {
-        return _opId;
+    OperationId getOpID() const {
+        return _opId.getId();
     }
+
+    /**
+     * Returns the operation UUID associated with this operation or boost::none.
+     */
+    const boost::optional<OperationKey>& getOperationKey() const {
+        return _opKey;
+    }
+
+    /**
+     * Sets the operation UUID associated with this operation.
+     *
+     * This function may only be called once per OperationContext.
+     */
+    void setOperationKey(OperationKey opKey);
+
+    /**
+     * Removes the operation UUID associated with this operation.
+     * DO NOT call this function outside `~OperationContext()` and `killAndDelistOperation()`.
+     */
+    void releaseOperationKey();
 
     /**
      * Returns the session ID associated with this operation, if there is one.
@@ -186,6 +232,15 @@ public:
      */
     boost::optional<TxnNumber> getTxnNumber() const {
         return _txnNumber;
+    }
+
+    /**
+     * Returns a CancellationToken that will be canceled when the OperationContext is killed via
+     * markKilled (including for internal reasons, like the OperationContext deadline being
+     * reached).
+     */
+    CancellationToken getCancellationToken() {
+        return _cancelSource.token();
     }
 
     /**
@@ -242,6 +297,27 @@ public:
      */
     bool writesAreReplicated() const {
         return _writesAreReplicated;
+    }
+
+    /**
+     * Returns true if the operation is running lock-free.
+     */
+    bool isLockFreeReadsOp() const {
+        return _lockFreeReadOpCount;
+    }
+
+    /**
+     * Returns true if operations' durations should be added to serverStatus latency metrics.
+     */
+    bool shouldIncrementLatencyStats() const {
+        return _shouldIncrementLatencyStats;
+    }
+
+    /**
+     * Sets the shouldIncrementLatencyStats flag.
+     */
+    void setShouldIncrementLatencyStats(bool shouldIncrementLatencyStats) {
+        _shouldIncrementLatencyStats = shouldIncrementLatencyStats;
     }
 
     void markKillOnClientDisconnect();
@@ -351,12 +427,133 @@ public:
      */
     Microseconds getRemainingMaxTimeMicros() const;
 
-    StatusWith<stdx::cv_status> waitForConditionOrInterruptNoAssertUntil(
-        stdx::condition_variable& cv,
-        stdx::unique_lock<stdx::mutex>& m,
-        Date_t deadline) noexcept override;
+    bool isIgnoringInterrupts() const;
+
+    /**
+     * Returns whether this operation is part of a multi-document transaction. Specifically, it
+     * indicates whether the user asked for a multi-document transaction.
+     */
+    bool inMultiDocumentTransaction() const {
+        return _inMultiDocumentTransaction;
+    }
+
+    /**
+     * Sets that this operation is part of a multi-document transaction. Once this is set, it cannot
+     * be unset.
+     */
+    void setInMultiDocumentTransaction() {
+        _inMultiDocumentTransaction = true;
+    }
+
+    /**
+     * Some operations coming into the system must be validated to ensure they meet constraints,
+     * such as collection namespace length limits or unique index key constraints. However,
+     * operations being performed from a source of truth such as during initial sync and oplog
+     * application often must ignore constraint violations.
+     *
+     * Initial sync and oplog application opt in to relaxed constraint checking by setting this
+     * value to false.
+     */
+    void setEnforceConstraints(bool enforceConstraints) {
+        _enforceConstraints = enforceConstraints;
+    }
+
+    /**
+     * This method can be used to tell if an operation requires validation of constraints. This
+     * should be preferred to alternatives such as checking if a node is primary or if a client is
+     * from a user connection as those have nuances (e.g: primary catch up and client disassociation
+     * due to task executors).
+     */
+    bool isEnforcingConstraints() {
+        return _enforceConstraints;
+    }
+
+    /**
+     * Sets that this operation should always get killed during stepDown and stepUp, regardless of
+     * whether or not it's taken a write lock.
+     */
+    void setAlwaysInterruptAtStepDownOrUp() {
+        _alwaysInterruptAtStepDownOrUp.store(true);
+    }
+
+    /**
+     * Indicates that this operation should always get killed during stepDown and stepUp, regardless
+     * of whether or not it's taken a write lock.
+     */
+    bool shouldAlwaysInterruptAtStepDownOrUp() {
+        return _alwaysInterruptAtStepDownOrUp.load();
+    }
+
+    /**
+     * Clears metadata associated with a multi-document transaction.
+     */
+    void resetMultiDocumentTransactionState() {
+        invariant(_inMultiDocumentTransaction);
+        invariant(!_writeUnitOfWork);
+        invariant(_ruState == WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
+        _inMultiDocumentTransaction = false;
+        _isStartingMultiDocumentTransaction = false;
+        _lsid = boost::none;
+        _txnNumber = boost::none;
+    }
+
+    /**
+     * Returns whether this operation is starting a multi-document transaction.
+     */
+    bool isStartingMultiDocumentTransaction() const {
+        return _isStartingMultiDocumentTransaction;
+    }
+
+    /**
+     * Returns whether this operation is continuing (not starting) a multi-document transaction.
+     */
+    bool isContinuingMultiDocumentTransaction() const {
+        return inMultiDocumentTransaction() && !isStartingMultiDocumentTransaction();
+    }
+
+    /**
+     * Sets whether this operation is starting a multi-document transaction.
+     */
+    void setIsStartingMultiDocumentTransaction(bool isStartingMultiDocumentTransaction) {
+        _isStartingMultiDocumentTransaction = isStartingMultiDocumentTransaction;
+    }
+
+    void setComment(const BSONObj& comment) {
+        _comment = comment.getOwned();
+    }
+
+    boost::optional<BSONElement> getComment() {
+        // The '_comment' object, if present, will only ever have one field.
+        return _comment ? boost::optional<BSONElement>(_comment->firstElement()) : boost::none;
+    }
+
+    /**
+     * Sets whether this operation is an exhaust command.
+     */
+    void setExhaust(bool exhaust) {
+        _exhaust = exhaust;
+    }
+
+    /**
+     * Returns whether this operation is an exhaust command.
+     */
+    bool isExhaust() const {
+        return _exhaust;
+    }
+
+    void storeMaxTimeMS(Microseconds maxTime) {
+        _storedMaxTime = maxTime;
+    }
+
+    /**
+     * Restore deadline to match the value stored in _storedMaxTime.
+     */
+    void restoreMaxTimeMS();
 
 private:
+    StatusWith<stdx::cv_status> waitForConditionOrInterruptNoAssertUntil(
+        stdx::condition_variable& cv, BasicLockableAdapter m, Date_t deadline) noexcept override;
+
     IgnoreInterruptsState pushIgnoreInterrupts() override {
         IgnoreInterruptsState iis{_ignoreInterrupts,
                                   {_deadline, _timeoutError, _hasArtificialDeadline}};
@@ -429,12 +626,24 @@ private:
         _writesAreReplicated = writesAreReplicated;
     }
 
+    /**
+     * Increment a count to indicate that the operation is running lock-free.
+     */
+    void incrementLockFreeReadOpCount() {
+        ++_lockFreeReadOpCount;
+    }
+    void decrementLockFreeReadOpCount() {
+        --_lockFreeReadOpCount;
+    }
+
     friend class WriteUnitOfWork;
     friend class repl::UnreplicatedWritesBlock;
+    friend class LockFreeReadsBlock;
 
     Client* const _client;
 
-    const unsigned int _opId;
+    const OperationIdSlot _opId;
+    boost::optional<OperationKey> _opKey;
 
     boost::optional<LogicalSessionId> _lsid;
     boost::optional<TxnNumber> _txnNumber;
@@ -454,6 +663,10 @@ private:
     // once from OK to some kill code.
     AtomicWord<ErrorCodes::Error> _killCode{ErrorCodes::OK};
 
+    // Used to cancel all tokens obtained via getCancellationToken() when this OperationContext is
+    // killed.
+    CancellationSource _cancelSource;
+
     BatonHandle _baton;
 
     WriteConcernOptions _writeConcern;
@@ -461,7 +674,7 @@ private:
     // The timepoint at which this operation exceeds its time limit.
     Date_t _deadline = Date_t::max();
 
-    ErrorCodes::Error _timeoutError = ErrorCodes::ExceededTimeLimit;
+    ErrorCodes::Error _timeoutError = kDefaultOperationContextTimeoutError;
     bool _ignoreInterrupts = false;
     bool _hasArtificialDeadline = false;
     bool _markKillOnClientDisconnect = false;
@@ -469,18 +682,50 @@ private:
     bool _isExecutingShutdown = false;
 
     // Max operation time requested by the user or by the cursor in the case of a getMore with no
-    // user-specified maxTime. This is tracked with microsecond granularity for the purpose of
+    // user-specified maxTimeMS. This is tracked with microsecond granularity for the purpose of
     // assigning unused execution time back to a cursor at the end of an operation, only. The
     // _deadline and the service context's fast clock are the only values consulted for determining
     // if the operation's timelimit has been exceeded.
     Microseconds _maxTime = Microseconds::max();
 
+    // The value of the maxTimeMS requested by user in the case it was overwritten.
+    boost::optional<Microseconds> _storedMaxTime;
+
     // Timer counting the elapsed time since the construction of this OperationContext.
     Timer _elapsedTime;
 
     bool _writesAreReplicated = true;
+    bool _shouldIncrementLatencyStats = true;
     bool _shouldParticipateInFlowControl = true;
+    bool _inMultiDocumentTransaction = false;
+    bool _isStartingMultiDocumentTransaction = false;
+    // Commands from user applications must run validations and enforce constraints. Operations from
+    // a trusted source, such as initial sync or consuming an oplog entry generated by a primary
+    // typically desire to ignore constraints.
+    bool _enforceConstraints = true;
+
+    // Counts how many lock-free read operations are running nested.
+    // Necessary to use a counter rather than a boolean because there is existing code that
+    // destructs lock helpers out of order.
+    int _lockFreeReadOpCount = 0;
+
+    // If true, this OpCtx will get interrupted during replica set stepUp and stepDown, regardless
+    // of what locks it's taken.
+    AtomicWord<bool> _alwaysInterruptAtStepDownOrUp{false};
+
+    // If populated, this is an owned singleton BSONObj whose only field, 'comment', is a copy of
+    // the 'comment' field from the input command object.
+    boost::optional<BSONObj> _comment;
+
+    // Whether this operation is an exhaust command.
+    bool _exhaust = false;
 };
+
+// Gets a TimeZoneDatabase pointer from the ServiceContext.
+inline const TimeZoneDatabase* getTimeZoneDatabase(OperationContext* opCtx) {
+    return opCtx && opCtx->getServiceContext() ? TimeZoneDatabase::get(opCtx->getServiceContext())
+                                               : nullptr;
+}
 
 namespace repl {
 /**
@@ -506,4 +751,25 @@ private:
     const bool _shouldReplicateWrites;
 };
 }  // namespace repl
+
+/**
+ * RAII-style class to indicate the operation is lock-free and code should behave accordingly.
+ */
+class LockFreeReadsBlock {
+    LockFreeReadsBlock(const LockFreeReadsBlock&) = delete;
+    LockFreeReadsBlock& operator=(const LockFreeReadsBlock&) = delete;
+
+public:
+    LockFreeReadsBlock(OperationContext* opCtx) : _opCtx(opCtx) {
+        _opCtx->incrementLockFreeReadOpCount();
+    }
+
+    ~LockFreeReadsBlock() {
+        _opCtx->decrementLockFreeReadOpCount();
+    }
+
+private:
+    OperationContext* _opCtx;
+};
+
 }  // namespace mongo

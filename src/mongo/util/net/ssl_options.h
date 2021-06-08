@@ -29,12 +29,18 @@
 
 #pragma once
 
+#include <boost/optional.hpp>
+#include <map>
+#include <set>
 #include <string>
 #include <vector>
 
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
+#include "mongo/client/connection_string.h"
 #include "mongo/config.h"
+#include "mongo/crypto/sha256_block.h"
+#include "mongo/db/auth/role_name.h"
 
 namespace mongo {
 
@@ -48,7 +54,11 @@ class OptionSection;
 class Environment;
 }  // namespace optionenvironment
 
+constexpr auto kSSLCipherConfigDefault = "HIGH:!EXPORT:!aNULL@STRENGTH"_sd;
+
 struct SSLParams {
+    using TLSCATrusts = std::map<SHA256Block, std::set<RoleName>>;
+
     enum class Protocols { TLS1_0, TLS1_1, TLS1_2, TLS1_3 };
     AtomicWord<int> sslMode;        // --tlsMode - the TLS operation mode, see enum SSLModes
     std::string sslPEMTempDHParam;  // --setParameter OpenSSLDiffieHellmanParameters=file : PEM file
@@ -56,11 +66,14 @@ struct SSLParams {
     std::string sslPEMKeyFile;      // --tlsCertificateKeyFile
     std::string sslPEMKeyPassword;  // --tlsCertificateKeyFilePassword
     std::string sslClusterFile;     // --tlsInternalKeyFile
-    std::string sslClusterPassword;  // --tlsInternalKeyPassword
-    std::string sslCAFile;           // --tlsCAFile
-    std::string sslClusterCAFile;    // --tlsClusterCAFile
-    std::string sslCRLFile;          // --tlsCRLFile
-    std::string sslCipherConfig;     // --tlsCipherConfig
+    std::string sslClusterPassword;    // --tlsInternalKeyPassword
+    std::string sslCAFile;             // --tlsCAFile
+    std::string sslClusterCAFile;      // --tlsClusterCAFile
+    std::string sslCRLFile;            // --tlsCRLFile
+    std::string sslCipherConfig;       // --tlsCipherConfig
+    std::string sslCipherSuiteConfig;  // --tlsCipherSuiteConfig
+
+    boost::optional<TLSCATrusts> tlsCATrusts;  // --setParameter tlsCATrusts
 
     struct CertificateSelector {
         std::string subject;
@@ -87,29 +100,29 @@ struct SSLParams {
         false;  // --setParameter suppressNoTLSPeerCertificateWarning
     bool tlsWithholdClientCertificate = false;  // --setParameter tlsWithholdClientCertificate
 
-    SSLParams() {
+    SSLParams() : sslCipherConfig(kSSLCipherConfigDefault) {
         sslMode.store(SSLMode_disabled);
     }
 
     enum SSLModes : int {
         /**
-        * Make unencrypted outgoing connections and do not accept incoming SSL-connections.
-        */
+         * Make unencrypted outgoing connections and do not accept incoming SSL-connections.
+         */
         SSLMode_disabled,
 
         /**
-        * Make unencrypted outgoing connections and accept both unencrypted and SSL-connections.
-        */
+         * Make unencrypted outgoing connections and accept both unencrypted and SSL-connections.
+         */
         SSLMode_allowSSL,
 
         /**
-        * Make outgoing SSL-connections and accept both unecrypted and SSL-connections.
-        */
+         * Make outgoing SSL-connections and accept both unecrypted and SSL-connections.
+         */
         SSLMode_preferSSL,
 
         /**
-        * Make outgoing SSL-connections and only accept incoming SSL-connections.
-        */
+         * Make outgoing SSL-connections and only accept incoming SSL-connections.
+         */
         SSLMode_requireSSL
     };
 
@@ -120,6 +133,14 @@ struct SSLParams {
 };
 
 extern SSLParams sslGlobalParams;
+
+// Additional SSL Params that could be used to augment a particular connection
+// or have limited lifetime. In all cases, the fields stored here are not appropriate
+// to be part of sslGlobalParams.
+struct TransientSSLParams {
+    ConnectionString targetedClusterConnectionString;
+    std::string sslClusterPEMPayload;
+};
 
 /**
  * Older versions of mongod/mongos accepted --sslDisabledProtocols values
@@ -137,10 +158,10 @@ Status storeSSLDisabledProtocols(
     SSLDisabledProtocolsMode mode = SSLDisabledProtocolsMode::kStandardFormat);
 
 /**
-* The global SSL configuration. This should be accessed only after global initialization has
-* completed. If it must be accessed in an initializer, the initializer should have
-* "EndStartupOptionStorage" as a prerequisite.
-*/
+ * The global SSL configuration. This should be accessed only after global initialization has
+ * completed. If it must be accessed in an initializer, the initializer should have
+ * "EndStartupOptionStorage" as a prerequisite.
+ */
 const SSLParams& getSSLGlobalParams();
 
 Status parseCertificateSelector(SSLParams::CertificateSelector* selector,

@@ -26,7 +26,7 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include <numeric>
 
@@ -34,14 +34,16 @@
 
 #include "mongo/db/repl/storage_interface_mock.h"
 
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
 namespace repl {
 
+StorageInterfaceMock::StorageInterfaceMock() = default;
+
 StatusWith<int> StorageInterfaceMock::getRollbackID(OperationContext* opCtx) {
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    stdx::lock_guard<Latch> lock(_mutex);
     if (!_rbidInitialized) {
         return Status(ErrorCodes::NamespaceNotFound, "Rollback ID not initialized");
     }
@@ -49,7 +51,7 @@ StatusWith<int> StorageInterfaceMock::getRollbackID(OperationContext* opCtx) {
 }
 
 StatusWith<int> StorageInterfaceMock::initializeRollbackID(OperationContext* opCtx) {
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    stdx::lock_guard<Latch> lock(_mutex);
     if (_rbidInitialized) {
         return Status(ErrorCodes::NamespaceExists, "Rollback ID already initialized");
     }
@@ -61,7 +63,7 @@ StatusWith<int> StorageInterfaceMock::initializeRollbackID(OperationContext* opC
 }
 
 StatusWith<int> StorageInterfaceMock::incrementRollbackID(OperationContext* opCtx) {
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    stdx::lock_guard<Latch> lock(_mutex);
     if (!_rbidInitialized) {
         return Status(ErrorCodes::NamespaceNotFound, "Rollback ID not initialized");
     }
@@ -69,48 +71,42 @@ StatusWith<int> StorageInterfaceMock::incrementRollbackID(OperationContext* opCt
     return _rbid;
 }
 
-void StorageInterfaceMock::setStableTimestamp(ServiceContext* serviceCtx, Timestamp snapshotName) {
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
+void StorageInterfaceMock::setStableTimestamp(ServiceContext* serviceCtx,
+                                              Timestamp snapshotName,
+                                              bool force) {
+    stdx::lock_guard<Latch> lock(_mutex);
     _stableTimestamp = snapshotName;
 }
 
 void StorageInterfaceMock::setInitialDataTimestamp(ServiceContext* serviceCtx,
                                                    Timestamp snapshotName) {
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    stdx::lock_guard<Latch> lock(_mutex);
     _initialDataTimestamp = snapshotName;
 }
 
 Timestamp StorageInterfaceMock::getStableTimestamp() const {
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    stdx::lock_guard<Latch> lock(_mutex);
     return _stableTimestamp;
 }
 
 Timestamp StorageInterfaceMock::getInitialDataTimestamp() const {
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    stdx::lock_guard<Latch> lock(_mutex);
     return _initialDataTimestamp;
 }
 
-Timestamp StorageInterfaceMock::getAllCommittedTimestamp(ServiceContext* serviceCtx) const {
-    return allCommittedTimestamp;
-}
-
-Timestamp StorageInterfaceMock::getOldestOpenReadTimestamp(ServiceContext* serviceCtx) const {
-    return oldestOpenReadTimestamp;
-}
-
-bool StorageInterfaceMock::supportsDocLocking(ServiceContext* serviceCtx) const {
-    return supportsDocLockingBool;
+Timestamp StorageInterfaceMock::getAllDurableTimestamp(ServiceContext* serviceCtx) const {
+    return allDurableTimestamp;
 }
 
 Status CollectionBulkLoaderMock::init(const std::vector<BSONObj>& secondaryIndexSpecs) {
-    LOG(1) << "CollectionBulkLoaderMock::init called";
+    LOGV2_DEBUG(21757, 1, "CollectionBulkLoaderMock::init called");
     stats->initCalled = true;
     return Status::OK();
-};
+}
 
 Status CollectionBulkLoaderMock::insertDocuments(const std::vector<BSONObj>::const_iterator begin,
                                                  const std::vector<BSONObj>::const_iterator end) {
-    LOG(1) << "CollectionBulkLoaderMock::insertDocuments called";
+    LOGV2_DEBUG(21758, 1, "CollectionBulkLoaderMock::insertDocuments called");
     const auto status = insertDocsFn(begin, end);
 
     // Only count if it succeeds.
@@ -118,13 +114,13 @@ Status CollectionBulkLoaderMock::insertDocuments(const std::vector<BSONObj>::con
         stats->insertCount += std::distance(begin, end);
     }
     return status;
-};
+}
 
 Status CollectionBulkLoaderMock::commit() {
-    LOG(1) << "CollectionBulkLoaderMock::commit called";
+    LOGV2_DEBUG(21759, 1, "CollectionBulkLoaderMock::commit called");
     stats->commitCalled = true;
     return commitFn();
-};
+}
 
 }  // namespace repl
 }  // namespace mongo

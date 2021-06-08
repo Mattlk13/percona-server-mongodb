@@ -34,8 +34,9 @@
 #include <set>
 #include <string>
 
+#include "mongo/client/mongo_uri.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/util/concurrency/mutex.h"
 
 namespace mongo {
@@ -45,6 +46,8 @@ class DBClientBase;
 
 namespace shell_utils {
 
+bool isBalanced(const std::string& code);
+
 extern std::string dbConnect;
 using EnterpriseShellCallback = void(Scope&);
 
@@ -52,7 +55,7 @@ void RecordMyLocation(const char* _argv0);
 void installShellUtils(Scope& scope);
 
 void initScope(Scope& scope);
-void onConnect(DBClientBase& c);
+void onConnect(DBClientBase& c, StringData uri);
 
 boost::filesystem::path getHistoryFilePath();
 void setEnterpriseShellCallback(EnterpriseShellCallback* callback);
@@ -77,22 +80,22 @@ private:
 class ConnectionRegistry {
 public:
     ConnectionRegistry();
-    void registerConnection(DBClientBase& client);
+    void registerConnection(DBClientBase& client, StringData uri);
     void killOperationsOnAllConnections(bool withPrompt) const;
 
 private:
     std::map<std::string, std::set<std::string>> _connectionUris;
-    mutable stdx::mutex _mutex;
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("ConnectionRegistry::_mutex");
 };
 
 extern ConnectionRegistry connectionRegistry;
 
 // This mutex helps the shell serialize output on exit, to avoid deadlocks at shutdown. So
 // it also protects the global dbexitCalled.
-extern stdx::mutex& mongoProgramOutputMutex;
+extern Mutex& mongoProgramOutputMutex;
 
 // Helper to tell if a file exists cross platform
 // TODO: Remove this when we have a cross platform file utility library
 bool fileExists(const std::string& file);
-}
-}
+}  // namespace shell_utils
+}  // namespace mongo

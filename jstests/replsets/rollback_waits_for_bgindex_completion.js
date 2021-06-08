@@ -2,90 +2,95 @@
  * Test to ensure that rollback waits for in-progress background index builds to finish before
  * starting the rollback process. Only applies to Recoverable Rollback via WiredTiger checkpoints.
  *
- * @tags: [requires_wiredtiger, requires_journaling, requires_majority_read_concern]
+ * @tags: [
+ *     requires_wiredtiger,
+ *     requires_journaling,
+ *     requires_majority_read_concern,
+ * ]
  */
 (function() {
-    'use strict';
+'use strict';
 
-    load('jstests/libs/check_log.js');
-    load("jstests/replsets/rslib.js");
-    load('jstests/replsets/libs/rollback_test.js');
+load('jstests/noPassthrough/libs/index_build.js');
+load("jstests/replsets/rslib.js");
+load('jstests/replsets/libs/rollback_test.js');
 
-    const dbName = "dbWithBgIndex";
-    const collName = 'coll';
-    let bgIndexThread;
+let bgIndexThread;
 
-    function hangIndexBuildsFailpoint(node, fpMode) {
-        assert.commandWorked(node.adminCommand(
-            {configureFailPoint: 'hangAfterStartingIndexBuildUnlocked', mode: fpMode}));
-    }
+const dbName = "dbWithBgIndex";
+const collName = "coll";
 
-    /**
-     * A function to create a background index on the test collection in a parallel shell.
-     */
-    function createBgIndexFn() {
-        // Re-define constants, since they are not shared between shells.
-        const dbName = "dbWithBgIndex";
-        const collName = "coll";
-        let testDB = db.getSiblingDB(dbName);
-        jsTestLog("Starting background index build from parallel shell.");
-        assert.commandWorked(testDB[collName].createIndex({x: 1}, {background: true}));
-    }
+/**
+ * Operations that will get replicated to both replica set nodes before rollback.
+ *
+ * These common operations are run against the node that will eventually go into rollback, so
+ * the failpoints will only be enabled on the rollback node.
+ */
+function CommonOps(node) {
+    // Create a collection on both data bearing nodes, so we can create an index on it.
+    const testDB = node.getDB(dbName);
+    assert.commandWorked(testDB.createCollection(collName));
 
-    /**
-     * Operations that will get replicated to both replica set nodes before rollback.
-     *
-     * These common operations are run against the node that will eventually go into rollback, so
-     * the failpoints will only be enabled on the rollback node.
-     */
-    function CommonOps(node) {
-        // Create a collection on both data bearing nodes, so we can create an index on it.
-        const testDB = node.getDB(dbName);
-        assert.commandWorked(testDB.createCollection(collName));
+    // Insert document into collection to avoid optimization for index creation on an empty
+    // collection. This allows us to pause index builds on the collection using a fail point.
+    const testColl = testDB.getCollection(collName);
+    assert.commandWorked(testColl.insert({a: 1}));
 
-        // Hang background index builds.
-        hangIndexBuildsFailpoint(node, "alwaysOn");
+    // Pause all index builds.
+    IndexBuildTest.pauseIndexBuilds(node);
 
-        jsTestLog("Starting background index build parallel shell.");
-        bgIndexThread = startParallelShell(createBgIndexFn, node.port);
+    jsTestLog("Starting background index build in parallel shell.");
+    bgIndexThread = IndexBuildTest.startIndexBuild(node, testColl.getFullName(), {x: 1});
 
-        // Make sure the index build started and hit the failpoint.
-        jsTestLog("Waiting for background index build to start and hang due to failpoint.");
-        checkLog.contains(node, "index build: starting on " + testDB[collName].getFullName());
-        checkLog.contains(node, "Hanging index build with no locks");
-    }
+    jsTestLog("Waiting for background index build to start.");
+    IndexBuildTest.waitForIndexBuildToStart(testDB, collName, "x_1");
+}
 
-    const rollbackTest = new RollbackTest();
-    const originalPrimary = rollbackTest.getPrimary();
-    CommonOps(originalPrimary);
+const replTest = new ReplSetTest({
+    name: jsTestName(),
+    nodes: 3,
+    useBridge: true,
+});
+replTest.startSet();
+let config = replTest.getReplSetConfig();
+config.members[2].priority = 0;
+config.settings = {
+    chainingAllowed: false
+};
+replTest.initiateWithHighElectionTimeout(config);
 
-    // Insert a document so that there is an operation to rollback.
-    const rollbackNode = rollbackTest.transitionToRollbackOperations();
-    assert.writeOK(rollbackNode.getDB(dbName)["rollbackColl"].insert({x: 1}));
+const rollbackTest = new RollbackTest(jsTestName(), replTest);
+const originalPrimary = rollbackTest.getPrimary();
+const testDB = originalPrimary.getDB(dbName);
+CommonOps(originalPrimary);
 
-    // Allow rollback to start. There are no sync source ops.
-    rollbackTest.transitionToSyncSourceOperationsBeforeRollback();
-    rollbackTest.transitionToSyncSourceOperationsDuringRollback();
+// Insert a document so that there is an operation to rollback.
+const rollbackNode = rollbackTest.transitionToRollbackOperations();
+assert.commandWorked(rollbackNode.getDB(dbName)["rollbackColl"].insert({x: 1}));
 
-    // Make sure that rollback is hung waiting for the background index operation to complete.
-    jsTestLog("Waiting for rollback to block on the background index build completion.");
-    let msg1 = "Waiting for all background operations to complete before starting rollback";
-    let msg2 = "Waiting for 1 background operations to complete on database '" + dbName + "'";
-    checkLog.contains(rollbackNode, msg1);
-    checkLog.contains(rollbackNode, msg2);
+// Allow rollback to start. There are no sync source ops.
+rollbackTest.transitionToSyncSourceOperationsBeforeRollback();
+rollbackTest.transitionToSyncSourceOperationsDuringRollback();
 
-    // Now turn off the index build failpoint, allowing rollback to continue and finish.
-    jsTestLog(
-        "Disabling 'hangAfterStartingIndexBuildUnlocked' failpoint on the rollback node so background index build can complete.");
-    hangIndexBuildsFailpoint(rollbackNode, "off");
+// Make sure that rollback is hung waiting for the background index operation to complete.
+jsTestLog("Waiting for rollback to block on the background index build completion.");
+let msg1 = "Waiting for all background operations to complete before starting rollback";
+checkLog.contains(rollbackNode, msg1);
 
-    // Make sure the background index build completed before rollback started.
-    checkLog.contains(rollbackNode,
-                      "Finished waiting for background operations to complete before rollback");
+jsTestLog("Resuming index builds on the original primary.");
+reconnect(originalPrimary);
+IndexBuildTest.resumeIndexBuilds(originalPrimary);
 
-    // Wait for rollback to finish.
-    rollbackTest.transitionToSteadyStateOperations();
+// Make sure the background index build completed before rollback started.
+checkLog.contains(rollbackNode,
+                  "Finished waiting for background operations to complete before rollback");
 
-    // Check the replica set.
-    rollbackTest.stop();
+// Wait for rollback to finish.
+rollbackTest.transitionToSteadyStateOperations();
+
+// Ensure index build is not running.
+IndexBuildTest.waitForIndexBuildToStop(testDB, collName, "x_1");
+
+// Check the replica set.
+rollbackTest.stop();
 }());

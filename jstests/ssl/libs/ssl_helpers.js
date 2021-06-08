@@ -59,7 +59,14 @@ var replShouldFail = function(name, opt1, opt2) {
     ssl_options1 = opt1;
     ssl_options2 = opt2;
     ssl_name = name;
-    assert.throws(load, [replSetTestFile], "This setup should have failed");
+    // This will cause an assert.soon() in ReplSetTest to fail. This normally triggers the hang
+    // analyzer, but since we do not want to run it on expected timeouts, we temporarily disable it.
+    MongoRunner.runHangAnalyzer.disable();
+    try {
+        assert.throws(load, [replSetTestFile], "This setup should have failed");
+    } finally {
+        MongoRunner.runHangAnalyzer.enable();
+    }
     // Note: this leaves running mongod processes.
 };
 
@@ -85,8 +92,8 @@ function testShardedLookup(shardingTest) {
         barBulk.insert({_id: i});
         lookupShouldReturn.push({_id: i, bar_docs: [{_id: i}]});
     }
-    assert.writeOK(fooBulk.execute());
-    assert.writeOK(barBulk.execute());
+    assert.commandWorked(fooBulk.execute());
+    assert.commandWorked(barBulk.execute());
 
     var docs =
         lookupdb.foo
@@ -115,12 +122,29 @@ function mixedShardTest(options1, options2, shouldSucceed) {
         // authorized to do if auth is enabled.
         //
         // Once SERVER-14017 is fixed the "enableBalancer" line can be removed.
-        // TODO: Remove 'shardAsReplicaSet: false' when SERVER-32672 is fixed.
+
+        // The mongo shell cannot authenticate as the internal __system user in tests that use x509
+        // for cluster authentication. Choosing the default value for wcMajorityJournalDefault in
+        // ReplSetTest cannot be done automatically without the shell performing such
+        // authentication, so in this test we must make the choice explicitly, based on the global
+        // test options.
+        let wcMajorityJournalDefault;
+        if (jsTestOptions().noJournal || jsTestOptions().storageEngine == "ephemeralForTest" ||
+            jsTestOptions().storageEngine == "inMemory") {
+            wcMajorityJournalDefault = false;
+        } else {
+            wcMajorityJournalDefault = true;
+        }
+
         var st = new ShardingTest({
             mongos: [options1],
-            config: [options1],
+            config: 1,
             shards: [options1, options2],
-            other: {enableBalancer: true, shardAsReplicaSet: false}
+            other: {
+                enableBalancer: true,
+                configOptions: options1,
+                writeConcernMajorityJournalDefault: wcMajorityJournalDefault
+            },
         });
 
         // Create admin user in case the options include auth
@@ -154,7 +178,7 @@ function mixedShardTest(options1, options2, shouldSucceed) {
         for (var i = 0; i < 128; i++) {
             bulk.insert({_id: i, string: bigstr});
         }
-        assert.writeOK(bulk.execute());
+        assert.commandWorked(bulk.execute());
         assert.eq(128, db1.col.count(), "error retrieving documents from cluster");
 
         // Split chunk to make it small enough to move
@@ -179,9 +203,18 @@ function mixedShardTest(options1, options2, shouldSucceed) {
                 node.getDB('admin').auth('admin', 'pwd');
             });
         }
+
         // This has to be done in order for failure
         // to not prevent future tests from running...
         if (st) {
+            if (st.s.fullOptions.clusterAuthMode === 'x509') {
+                // Index consistency check during shutdown needs a privileged user to auth as.
+                const x509User =
+                    'CN=client,OU=KernelUser,O=MongoDB,L=New York City,ST=New York,C=US';
+                st.s.getDB('$external')
+                    .createUser({user: x509User, roles: [{role: '__system', db: 'admin'}]});
+            }
+
             st.stop();
         }
     }
@@ -200,6 +233,33 @@ function determineSSLProvider() {
     } else {
         return null;
     }
+}
+
+function isMacOS(minVersion) {
+    'use strict';
+
+    function parseVersion(version) {
+        // Intentionally leave the end of string unanchored.
+        // This allows vesions like: 10.15.7-pl2 or other extra data.
+        const v = version.match(/^(\d+)\.(\d+)\.(\d+)/);
+        assert(v !== null, "Invalid version string '" + version + "'");
+        return (v[1] << 16) | (v[2] << 8) | (v[3]);
+    }
+
+    const macOS = getBuildInfo().macOS;
+    if (macOS === undefined) {
+        // Not macOS at all.
+        return false;
+    }
+
+    if (minVersion === undefined) {
+        // Don't care what version, but it's macOS.
+        return true;
+    }
+
+    assert(macOS.osProductVersion !== undefined,
+           "Expected getBuildInfo() field 'macOS.osProductVersion' not present");
+    return parseVersion(minVersion) <= parseVersion(macOS.osProductVersion);
 }
 
 function requireSSLProvider(required, fn) {
@@ -256,4 +316,113 @@ function detectDefaultTLSProtocol() {
     } else {
         return "TLS1_3";
     }
+}
+
+function isRHEL8() {
+    if (_isWindows()) {
+        return false;
+    }
+
+    // RHEL 8 disables TLS 1.0 and TLS 1.1 as part their default crypto policy
+    // We skip tests on RHEL 8 that require these versions as a result.
+    const grep_result = runProgram('grep', 'Ootpa', '/etc/redhat-release');
+    if (grep_result == 0) {
+        return true;
+    }
+
+    return false;
+}
+
+function isUbuntu2004() {
+    if (_isWindows()) {
+        return false;
+    }
+
+    // Ubuntu 20.04 disables TLS 1.0 and TLS 1.1 as part their default crypto policy
+    // We skip tests on Ubuntu 20.04 that require these versions as a result.
+    const grep_result = runProgram('grep', 'focal', '/etc/os-release');
+    if (grep_result == 0) {
+        return true;
+    }
+
+    return false;
+}
+
+function isUbuntu1804() {
+    if (_isWindows()) {
+        return false;
+    }
+
+    // Ubuntu 18.04's TLS 1.3 implementation has an issue with OCSP stapling. We have disabled
+    // stapling on this build variant, so we need to ensure that tests that require stapling
+    // do not run on this machine.
+    const grep_result = runProgram('grep', 'bionic', '/etc/os-release');
+    if (grep_result === 0) {
+        return true;
+    }
+
+    return false;
+}
+
+function isDebian10() {
+    if (_isWindows()) {
+        return false;
+    }
+
+    // Debian 10 disables TLS 1.0 and TLS 1.1 as part their default crypto policy
+    // We skip tests on Debian 10 that require these versions as a result.
+    try {
+        // this file exists on systemd-based systems, necessary to avoid mischaracterizing debian
+        // derivatives as stock debian
+        const releaseFile = cat("/etc/os-release").toLowerCase();
+        const prettyName = releaseFile.split('\n').find(function(line) {
+            return line.startsWith("pretty_name");
+        });
+        return prettyName.includes("debian") &&
+            (prettyName.includes("10") || prettyName.includes("buster") ||
+             prettyName.includes("bullseye"));
+    } catch (e) {
+        return false;
+    }
+}
+
+function sslProviderSupportsTLS1_0() {
+    if (isRHEL8()) {
+        const cryptoPolicy = cat("/etc/crypto-policies/config");
+        return cryptoPolicy.includes("LEGACY");
+    }
+    return !isDebian10() && !isUbuntu2004();
+}
+
+function sslProviderSupportsTLS1_1() {
+    if (isRHEL8()) {
+        const cryptoPolicy = cat("/etc/crypto-policies/config");
+        return cryptoPolicy.includes("LEGACY");
+    }
+    return !isDebian10() && !isUbuntu2004();
+}
+
+function opensslVersionAsInt() {
+    const opensslInfo = getBuildInfo().openssl;
+    if (!opensslInfo) {
+        return null;
+    }
+
+    const matches = opensslInfo.running.match(/OpenSSL\s+(\d+)\.(\d+)\.(\d+)([a-z]?)/);
+    assert.neq(matches, null);
+
+    let version = (matches[1] << 24) | (matches[2] << 16) | (matches[3] << 8);
+
+    return version;
+}
+
+function copyCertificateFile(a, b) {
+    if (_isWindows()) {
+        // correctly replace forward slashes for Windows
+        a = a.replace(/\//g, "\\");
+        b = b.replace(/\//g, "\\");
+        assert.eq(0, runProgram("cmd.exe", "/c", "copy", a, b));
+        return;
+    }
+    assert.eq(0, runProgram("cp", a, b));
 }

@@ -96,10 +96,9 @@ public:
     static void checkIn(OperationContext* opCtx);
 
     /**
-     * May only be called if the session is not checked out already. 'cmdType' is used to validate
-     * that the expected transaction flow control is being obeyed.
+     * May only be called if the session is not checked out already.
      */
-    static void checkOut(OperationContext* opCtx, const std::string& cmdName);
+    static void checkOut(OperationContext* opCtx);
 
 private:
     OperationContextSession _operationContextSession;
@@ -116,6 +115,23 @@ class MongoDOperationContextSessionWithoutRefresh {
 public:
     MongoDOperationContextSessionWithoutRefresh(OperationContext* opCtx);
     ~MongoDOperationContextSessionWithoutRefresh();
+
+private:
+    OperationContextSession _operationContextSession;
+    OperationContext* const _opCtx;
+};
+
+/**
+ * Similar to MongoDOperationContextSession, but marks the TransactionParticipant as valid without
+ * loading the retryable write oplog history.  If the last operation was a multi-document
+ * transaction, is equivalent to MongoDOperationContextSession.
+ *
+ * NOTE: Should only be used when reading the oplog history is not possible.
+ */
+class MongoDOperationContextSessionWithoutOplogRead {
+public:
+    MongoDOperationContextSessionWithoutOplogRead(OperationContext* opCtx);
+    ~MongoDOperationContextSessionWithoutOplogRead();
 
 private:
     OperationContextSession _operationContextSession;

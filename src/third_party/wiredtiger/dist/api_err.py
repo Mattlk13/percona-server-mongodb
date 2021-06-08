@@ -2,7 +2,7 @@
 # message code in strerror.c.
 
 import re, textwrap
-from dist import compare_srcfile
+from dist import compare_srcfile, format_srcfile
 
 class Error:
     def __init__(self, name, value, desc, long_desc=None, **flags):
@@ -55,9 +55,10 @@ errors = [
         'operation would overflow cache', '''
         This error is only generated when wiredtiger_open is configured
         to run in-memory, and an insert or update operation requires
-        more than the configured cache size to complete. The operation
-        may be retried; if a transaction is in progress, it should be
-        rolled back and the operation retried in a new transaction.'''),
+        more than the configured cache size to complete, or when an
+        application thread fails to do eviction within cache_max_wait_ms.
+        The operation may be retried; if a transaction is in progress, it
+        should be rolled back and the operation retried in a new transaction.'''),
     Error('WT_PREPARE_CONFLICT', -31808,
         'conflict with a prepared update', '''
         This error is generated when the application attempts to update
@@ -167,6 +168,7 @@ wiredtiger_strerror(int error)
 }
 ''')
 tfile.close()
+format_srcfile(tmp_file)
 compare_srcfile(tmp_file, '../src/conn/api_strerror.c')
 
 # Update the error documentation block.
@@ -191,4 +193,5 @@ for line in open(doc, 'r'):
                 '@par <code>' + err.name.upper() + '</code>\n' +
                 " ".join(err.long_desc.split()) + '\n\n')
 tfile.close()
+format_srcfile(tmp_file)
 compare_srcfile(tmp_file, doc)

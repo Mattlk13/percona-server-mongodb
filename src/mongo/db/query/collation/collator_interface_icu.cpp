@@ -31,20 +31,20 @@
 
 #include "mongo/db/query/collation/collator_interface_icu.h"
 
+#include <memory>
+
 #include <unicode/coll.h>
 #include <unicode/sortkey.h>
 
-#include "mongo/stdx/memory.h"
 #include "mongo/util/assert_util.h"
 
 namespace mongo {
 
-CollatorInterfaceICU::CollatorInterfaceICU(CollationSpec spec,
-                                           std::unique_ptr<icu::Collator> collator)
+CollatorInterfaceICU::CollatorInterfaceICU(Collation spec, std::unique_ptr<icu::Collator> collator)
     : CollatorInterface(std::move(spec)), _collator(std::move(collator)) {}
 
 std::unique_ptr<CollatorInterface> CollatorInterfaceICU::clone() const {
-    auto clone = stdx::make_unique<CollatorInterfaceICU>(
+    auto clone = std::make_unique<CollatorInterfaceICU>(
         getSpec(), std::unique_ptr<icu::Collator>(_collator->clone()));
     return {std::move(clone)};
 }

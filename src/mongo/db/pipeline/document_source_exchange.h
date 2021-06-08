@@ -36,8 +36,8 @@
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/exchange_spec_gen.h"
 #include "mongo/db/pipeline/field_path.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/mutex.h"
 
 namespace mongo {
 
@@ -170,8 +170,8 @@ private:
     std::unique_ptr<Pipeline, PipelineDeleter> _pipeline;
 
     // Synchronization.
-    stdx::mutex _mutex;
-    stdx::condition_variable_any _haveBufferSpace;
+    Mutex _mutex = MONGO_MAKE_LATCH("Exchange::_mutex");
+    stdx::condition_variable _haveBufferSpace;
 
     // A thread that is currently loading the exchange buffers.
     size_t _loadingThreadId{kInvalidThreadId};
@@ -191,6 +191,8 @@ private:
 
 class DocumentSourceExchange final : public DocumentSource {
 public:
+    static constexpr StringData kStageName = "$_internalExchange"_sd;
+
     /**
      * Create an Exchange consumer. 'resourceYielder' is so the exchange may temporarily yield
      * resources (such as the Session) while waiting for other threads to do
@@ -202,8 +204,6 @@ public:
                            size_t consumerId,
                            std::unique_ptr<ResourceYielder> yielder);
 
-    GetNextResult getNext() final;
-
     StageConstraints constraints(Pipeline::SplitState pipeState) const final {
         return {StreamType::kStreaming,
                 PositionRequirement::kNone,
@@ -211,7 +211,8 @@ public:
                 DiskUseRequirement::kNoDiskUse,
                 FacetRequirement::kAllowed,
                 TransactionRequirement::kAllowed,
-                LookupRequirement::kNotAllowed};
+                LookupRequirement::kNotAllowed,
+                UnionRequirement::kNotAllowed};
     }
 
     boost::optional<DistributedPlanLogic> distributedPlanLogic() final {
@@ -230,8 +231,6 @@ public:
         invariant(!source);
     }
 
-    GetNextResult getNext(size_t consumerId);
-
     size_t getConsumers() const {
         return _exchange->getConsumers();
     }
@@ -249,6 +248,8 @@ public:
     }
 
 private:
+    GetNextResult doGetNext() final;
+
     boost::intrusive_ptr<Exchange> _exchange;
 
     const size_t _consumerId;

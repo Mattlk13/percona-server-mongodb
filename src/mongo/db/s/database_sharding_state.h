@@ -29,10 +29,10 @@
 
 #pragma once
 
-#include "mongo/db/catalog/database.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/s/sharding_migration_critical_section.h"
 #include "mongo/db/s/sharding_state_lock.h"
-#include "mongo/s/database_version_gen.h"
+#include "mongo/s/catalog/type_database.h"
 
 namespace mongo {
 
@@ -53,20 +53,43 @@ public:
      */
     using DSSLock = ShardingStateLock<DatabaseShardingState>;
 
-    static const Database::Decoration<DatabaseShardingState> get;
-
-    DatabaseShardingState();
+    DatabaseShardingState(const StringData dbName);
     ~DatabaseShardingState() = default;
+
+    /**
+     * Obtains the sharding state for the specified database. If it does not exist, it will be
+     * created and will remain in memory until the database is dropped.
+     *
+     * Must be called with some lock held on the database being looked up and the returned
+     * pointer must not be stored.
+     */
+    static DatabaseShardingState* get(OperationContext* opCtx, const StringData dbName);
+
+    /**
+     * Obtain a pointer to the DatabaseShardingState that remains safe to access without holding
+     * a database lock. Should be called instead of the regular get() if no database lock is held.
+     * The returned DatabaseShardingState instance should not be modified!
+     */
+    static std::shared_ptr<DatabaseShardingState> getSharedForLockFreeReads(
+        OperationContext* opCtx, const StringData dbName);
+
+    /**
+     * Checks if this shard is the primary shard for the given DB.
+     *
+     * Throws an IllegalOperation exception otherwise.
+     *
+     * Assumes the operation context has a DB version attached to it for the given @dbName.
+     */
+    static void checkIsPrimaryShardForDb(OperationContext* opCtx, StringData dbName);
+
 
     /**
      * Methods to control the databases's critical section. Must be called with the database X lock
      * held.
      */
-    void enterCriticalSectionCatchUpPhase(OperationContext* opCtx, DSSLock&);
-    void enterCriticalSectionCommitPhase(OperationContext* opCtx, DSSLock&);
-    void exitCriticalSection(OperationContext* opCtx,
-                             boost::optional<DatabaseVersion> newDbVersion,
-                             DSSLock&);
+    void enterCriticalSectionCatchUpPhase(OperationContext* opCtx, DSSLock&, const BSONObj& reason);
+    void enterCriticalSectionCommitPhase(OperationContext* opCtx, DSSLock&, const BSONObj& reason);
+    void exitCriticalSection(OperationContext* opCtx, const BSONObj& reason);
 
     auto getCriticalSectionSignal(ShardingMigrationCriticalSection::Operation op, DSSLock&) const {
         return _critSec.getSignal(op);
@@ -80,13 +103,23 @@ public:
     boost::optional<DatabaseVersion> getDbVersion(OperationContext* opCtx, DSSLock&) const;
 
     /**
-     * Sets this shard server's cached dbVersion to newVersion.
+     * Sets this shard server's cached database info.
      *
      * Invariants that the caller holds the DBLock in X mode.
      */
-    void setDbVersion(OperationContext* opCtx,
-                      boost::optional<DatabaseVersion> newVersion,
-                      DSSLock&);
+    void setDatabaseInfo(OperationContext* opCtx, DatabaseType&& newDatabaseInfo, DSSLock&);
+
+    /**
+     * Resets this shard server's cached database info.
+     */
+    void clearDatabaseInfo(OperationContext* opCtx);
+
+    /**
+     * Returns this shard server's cached database info.
+     * Internally performs the same checks of checkDbVersion(),
+     * so it will throws for the same reasons.
+     */
+    DatabaseType getDatabaseInfo(OperationContext* opCtx, DSSLock&) const;
 
     /**
      * If _critSecSignal is non-null, always throws StaleDbVersion.
@@ -114,7 +147,7 @@ public:
      * with the database lock in X mode. May not be called if there isn't a movePrimary source
      * manager installed already through a previous call to setMovePrimarySourceManager.
      */
-    void clearMovePrimarySourceManager(OperationContext* opCtx, DSSLock&);
+    void clearMovePrimarySourceManager(OperationContext* opCtx);
 
 private:
     friend DSSLock;
@@ -123,15 +156,16 @@ private:
     // within.
     Lock::ResourceMutex _stateChangeMutex{"DatabaseShardingState"};
 
+    const std::string _dbName;
+
     // Modifying the state below requires holding the DBLock in X mode; holding the DBLock in any
     // mode is acceptable for reading it. (Note: accessing this class at all requires holding the
-    // DBLock in some mode, since it requires having a pointer to the Database).
+    // DBLock in some mode).
 
     ShardingMigrationCriticalSection _critSec;
 
-    // This shard server's cached dbVersion. If boost::none, indicates this shard server does not
-    // know the dbVersion.
-    boost::optional<DatabaseVersion> _dbVersion = boost::none;
+    // This shard server's cached database info. If boost::none
+    boost::optional<DatabaseType> _optDatabaseInfo;
 
     // If this database is serving as a source shard for a movePrimary, the source manager will be
     // non-null. To write this value, there needs to be X-lock on the database in order to

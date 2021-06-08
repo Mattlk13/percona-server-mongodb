@@ -35,9 +35,11 @@
 #include <boost/optional.hpp>
 
 #include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/client.h"
 #include "mongo/db/repl/repl_set_tag.h"
 #include "mongo/util/net/hostandport.h"
+#include "mongo/util/string_map.h"
 
 namespace mongo {
 namespace repl {
@@ -46,7 +48,7 @@ namespace repl {
  * Every Replica Set member has several views under which it can respond.  The Split Horizon class
  * represents the unification of all of those views.  For example, a member might be reachable under
  * "internal.example.com:27017" and "external.example.com:25000".  The replica set needs to be able
- * to respond, as a group, with the correct view, when `isMaster` requests come in.  Each member of
+ * to respond, as a group, with the correct view, when hello requests come in.  Each member of
  * the replica set has its own `SplitHorizon` class to manage the mapping between server names and
  * horizon names.  `SplitHorizon` models a single member's view across all horizons, not views for
  * all of the members.
@@ -70,7 +72,7 @@ public:
     };
 
     /**
-     * Set the split horizon connection parameters, for use by future `isMaster` commands.
+     * Set the split horizon connection parameters, for use by future `hello/isMaster` commands.
      */
     static void setParameters(Client* client, boost::optional<std::string> sniName);
 
@@ -80,8 +82,7 @@ public:
     static Parameters getParameters(const Client*);
 
     explicit SplitHorizon() = default;
-    explicit SplitHorizon(const HostAndPort& host,
-                          const boost::optional<BSONElement>& horizonsElement);
+    explicit SplitHorizon(const HostAndPort& host, const boost::optional<BSONObj>& horizonsObject);
 
     // This constructor is for testing and internal use only
     explicit SplitHorizon(ForwardMapping forward);
@@ -96,7 +97,7 @@ public:
         invariant(!_forwardMapping.empty());
         invariant(!horizon.empty());
         auto found = _forwardMapping.find(horizon);
-        if (found == end(_forwardMapping))
+        if (found == _forwardMapping.end())
             uasserted(ErrorCodes::NoSuchKey, str::stream() << "No horizon named " << horizon);
         return found->second;
     }

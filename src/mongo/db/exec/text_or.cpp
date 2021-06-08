@@ -30,6 +30,7 @@
 #include "mongo/db/exec/text_or.h"
 
 #include <map>
+#include <memory>
 #include <vector>
 
 #include "mongo/db/concurrency/write_conflict_exception.h"
@@ -38,29 +39,26 @@
 #include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/exec/working_set_common.h"
-#include "mongo/db/exec/working_set_computed_data.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/record_id.h"
-#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
+using std::string;
 using std::unique_ptr;
 using std::vector;
-using std::string;
-using stdx::make_unique;
 
 using fts::FTSSpec;
 
 const char* TextOrStage::kStageType = "TEXT_OR";
 
-TextOrStage::TextOrStage(OperationContext* opCtx,
-                         const FTSSpec& ftsSpec,
+TextOrStage::TextOrStage(ExpressionContext* expCtx,
+                         size_t keyPrefixSize,
                          WorkingSet* ws,
                          const MatchExpression* filter,
-                         const Collection* collection)
-    : RequiresCollectionStage(kStageType, opCtx, collection),
-      _ftsSpec(ftsSpec),
+                         const CollectionPtr& collection)
+    : RequiresCollectionStage(kStageType, expCtx, collection),
+      _keyPrefixSize(keyPrefixSize),
       _ws(ws),
       _scoreIterator(_scores.end()),
       _filter(filter),
@@ -99,7 +97,7 @@ void TextOrStage::doDetachFromOperationContext() {
 
 void TextOrStage::doReattachToOperationContext() {
     if (_recordCursor)
-        _recordCursor->reattachToOperationContext(getOpCtx());
+        _recordCursor->reattachToOperationContext(opCtx());
 }
 
 std::unique_ptr<PlanStageStats> TextOrStage::getStats() {
@@ -111,8 +109,8 @@ std::unique_ptr<PlanStageStats> TextOrStage::getStats() {
         _commonStats.filter = bob.obj();
     }
 
-    unique_ptr<PlanStageStats> ret = make_unique<PlanStageStats>(_commonStats, STAGE_TEXT_OR);
-    ret->specific = make_unique<TextOrStats>(_specificStats);
+    unique_ptr<PlanStageStats> ret = std::make_unique<PlanStageStats>(_commonStats, STAGE_TEXT_OR);
+    ret->specific = std::make_unique<TextOrStats>(_specificStats);
 
     for (auto&& child : _children) {
         ret->children.emplace_back(child->getStats());
@@ -154,7 +152,7 @@ PlanStage::StageState TextOrStage::doWork(WorkingSetID* out) {
 PlanStage::StageState TextOrStage::initStage(WorkingSetID* out) {
     *out = WorkingSet::INVALID_ID;
     try {
-        _recordCursor = collection()->getCursor(getOpCtx());
+        _recordCursor = collection()->getCursor(opCtx());
         _internalState = State::kReadingTerms;
         return PlanStage::NEED_TIME;
     } catch (const WriteConflictException&) {
@@ -199,19 +197,6 @@ PlanStage::StageState TextOrStage::readFromChildren(WorkingSetID* out) {
         _internalState = State::kReturningResults;
 
         return PlanStage::NEED_TIME;
-    } else if (PlanStage::FAILURE == childState) {
-        // If a stage fails, it may create a status WSM to indicate why it
-        // failed, in which case 'id' is valid.  If ID is invalid, we
-        // create our own error message.
-        if (WorkingSet::INVALID_ID == id) {
-            str::stream ss;
-            ss << "TEXT_OR stage failed to read in results from child";
-            Status status(ErrorCodes::InternalError, ss);
-            *out = WorkingSetCommon::allocateStatusMember(_ws, status);
-        } else {
-            *out = id;
-        }
-        return PlanStage::FAILURE;
     } else {
         // Propagate WSID from below.
         *out = id;
@@ -237,8 +222,8 @@ PlanStage::StageState TextOrStage::returnResults(WorkingSetID* out) {
 
     WorkingSetMember* wsm = _ws->get(textRecordData.wsid);
 
-    // Populate the working set member with the text score and return it.
-    wsm->addComputed(new TextScoreComputedData(textRecordData.score));
+    // Populate the working set member with the text score metadata and return it.
+    wsm->metadata().setTextScore(textRecordData.score);
     *out = textRecordData.wsid;
     return PlanStage::ADVANCED;
 }
@@ -270,7 +255,8 @@ PlanStage::StageState TextOrStage::addTerm(WorkingSetID wsid, WorkingSetID* out)
         // Our parent expects RID_AND_OBJ members, so we fetch the document here if we haven't
         // already.
         try {
-            if (!WorkingSetCommon::fetch(getOpCtx(), _ws, wsid, _recordCursor)) {
+            if (!WorkingSetCommon::fetch(
+                    opCtx(), _ws, wsid, _recordCursor.get(), collection()->ns())) {
                 _ws->free(wsid);
                 textRecordData->score = -1;
                 return NEED_TIME;
@@ -299,7 +285,7 @@ PlanStage::StageState TextOrStage::addTerm(WorkingSetID wsid, WorkingSetID* out)
 
     // Locate score within possibly compound key: {prefix,term,score,suffix}.
     BSONObjIterator keyIt(newKeyData.keyData);
-    for (unsigned i = 0; i < _ftsSpec.numExtraBefore(); i++) {
+    for (unsigned i = 0; i < _keyPrefixSize; i++) {
         keyIt.next();
     }
 

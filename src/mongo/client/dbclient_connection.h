@@ -30,6 +30,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 
 #include "mongo/base/string_data.h"
 #include "mongo/client/connection_string.h"
@@ -38,21 +39,22 @@
 #include "mongo/client/mongo_uri.h"
 #include "mongo/client/query.h"
 #include "mongo/client/read_preference.h"
+#include "mongo/config.h"
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/write_concern_options.h"
-#include "mongo/logger/log_severity.h"
+#include "mongo/logv2/log_severity.h"
 #include "mongo/platform/atomic_word.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/rpc/message.h"
 #include "mongo/rpc/metadata.h"
 #include "mongo/rpc/op_msg.h"
 #include "mongo/rpc/protocol.h"
 #include "mongo/rpc/unique_message.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/transport/message_compressor_manager.h"
 #include "mongo/transport/session.h"
 #include "mongo/transport/transport_layer.h"
+#include "mongo/util/hierarchical_acquisition.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -83,7 +85,7 @@ public:
      * status.
      */
     using HandshakeValidationHook =
-        stdx::function<Status(const executor::RemoteCommandResponse& isMasterReply)>;
+        std::function<Status(const executor::RemoteCommandResponse& isMasterReply)>;
 
     /**
        @param _autoReconnect if true, automatically reconnect on a connection failure
@@ -93,7 +95,8 @@ public:
     DBClientConnection(bool _autoReconnect = false,
                        double so_timeout = 0,
                        MongoURI uri = {},
-                       const HandshakeValidationHook& hook = HandshakeValidationHook());
+                       const HandshakeValidationHook& hook = HandshakeValidationHook(),
+                       const ClientAPIVersionParameters* apiParameters = nullptr);
 
     virtual ~DBClientConnection() {
         _numConnections.fetchAndAdd(-1);
@@ -109,18 +112,20 @@ public:
      * @param errmsg any relevant error message will appended to the string
      * @return false if fails to connect.
      */
-    bool connect(const HostAndPort& server, StringData applicationName, std::string& errmsg);
+    bool connect(const HostAndPort& server,
+                 StringData applicationName,
+                 std::string& errmsg,
+                 boost::optional<TransientSSLParams> transientSSLParams);
 
     /**
      * Semantically equivalent to the previous connect method, but returns a Status
-     * instead of taking an errmsg out parameter. Also allows optional validation of the reply to
-     * the 'isMaster' command executed during connection.
+     * instead of taking an errmsg out parameter.
      *
      * @param server The server to connect to.
-     * @param a hook to validate the 'isMaster' reply received during connection. If the hook
-     * fails, the connection will be terminated and a non-OK status will be returned.
      */
-    virtual Status connect(const HostAndPort& server, StringData applicationName);
+    virtual Status connect(const HostAndPort& server,
+                           StringData applicationName,
+                           boost::optional<TransientSSLParams> transientSSLParams);
 
     /**
      * This version of connect does not run 'isMaster' after creating a TCP connection to the
@@ -129,17 +134,8 @@ public:
      *
      * @param server The server to connect to.
      */
-    Status connectSocketOnly(const HostAndPort& server);
-
-    /** Connect to a Mongo database server.  Exception throwing version.
-        Throws a AssertionException if cannot connect.
-
-       If autoReconnect is true, you can try to use the DBClientConnection even when
-       false was returned -- it will try to connect again.
-
-       @param serverHostname host to connect to.  can include port number ( 127.0.0.1 ,
-                               127.0.0.1:5555 )
-    */
+    Status connectSocketOnly(const HostAndPort& server,
+                             boost::optional<TransientSSLParams> transientSSLParams);
 
     /**
      * Logs out the connection for the given database.
@@ -150,24 +146,33 @@ public:
      */
     void logout(const std::string& dbname, BSONObj& info) override;
 
-    std::unique_ptr<DBClientCursor> query(const NamespaceStringOrUUID& nsOrUuid,
-                                          Query query = Query(),
-                                          int nToReturn = 0,
-                                          int nToSkip = 0,
-                                          const BSONObj* fieldsToReturn = 0,
-                                          int queryOptions = 0,
-                                          int batchSize = 0) override {
+    std::unique_ptr<DBClientCursor> query(
+        const NamespaceStringOrUUID& nsOrUuid,
+        Query query = Query(),
+        int nToReturn = 0,
+        int nToSkip = 0,
+        const BSONObj* fieldsToReturn = nullptr,
+        int queryOptions = 0,
+        int batchSize = 0,
+        boost::optional<BSONObj> readConcernObj = boost::none) override {
         checkConnection();
-        return DBClientBase::query(
-            nsOrUuid, query, nToReturn, nToSkip, fieldsToReturn, queryOptions, batchSize);
+        return DBClientBase::query(nsOrUuid,
+                                   query,
+                                   nToReturn,
+                                   nToSkip,
+                                   fieldsToReturn,
+                                   queryOptions,
+                                   batchSize,
+                                   readConcernObj);
     }
 
-    unsigned long long query(stdx::function<void(DBClientCursorBatchIterator&)> f,
+    unsigned long long query(std::function<void(DBClientCursorBatchIterator&)> f,
                              const NamespaceStringOrUUID& nsOrUuid,
                              Query query,
                              const BSONObj* fieldsToReturn,
                              int queryOptions,
-                             int batchSize = 0) override;
+                             int batchSize = 0,
+                             boost::optional<BSONObj> readConcernObj = boost::none) override;
 
     using DBClientBase::runCommandWithTarget;
     std::pair<rpc::UniqueReply, DBClientBase*> runCommandWithTarget(OpMsgRequest request) override;
@@ -189,13 +194,20 @@ public:
 
     void setTags(transport::Session::TagMask tag);
 
+
+    /**
+     * Disconnects the client and interrupts operations if they are currently blocked waiting for
+     * the network. If autoreconnect is on, a connection will be re-established after reconnecting.
+     */
+    virtual void shutdown();
+
     /**
      * Causes an error to be reported the next time the connection is used. Will interrupt
      * operations if they are currently blocked waiting for the network.
      *
      * This is the only method that is allowed to be called from other threads.
      */
-    void shutdownAndDisallowReconnect();
+    virtual void shutdownAndDisallowReconnect();
 
     void setWireVersions(int minWireVersion, int maxWireVersion) {
         _minWireVersion = minWireVersion;
@@ -223,26 +235,30 @@ public:
     std::string getServerAddress() const override {
         return _serverAddress.toString();
     }
-    const HostAndPort& getServerHostAndPort() const {
+    virtual const HostAndPort& getServerHostAndPort() const {
         return _serverAddress;
     }
 
-    void say(Message& toSend, bool isRetry = false, std::string* actualServer = 0) override;
-    bool recv(Message& m, int lastRequestId) override;
+    void say(Message& toSend, bool isRetry = false, std::string* actualServer = nullptr) override;
+    Status recv(Message& m, int lastRequestId) override;
     void checkResponse(const std::vector<BSONObj>& batch,
                        bool networkError,
-                       bool* retry = NULL,
-                       std::string* host = NULL) override;
+                       bool* retry = nullptr,
+                       std::string* host = nullptr) override;
     bool call(Message& toSend,
               Message& response,
               bool assertOk,
               std::string* actualServer) override;
     ConnectionString::ConnectionType type() const override {
-        return ConnectionString::MASTER;
+        return ConnectionString::ConnectionType::kStandalone;
     }
     void setSoTimeout(double timeout);
     double getSoTimeout() const override {
         return _socketTimeout.value_or(Milliseconds{0}).count() / 1000.0;
+    }
+
+    void setHandshakeValidationHook(const HandshakeValidationHook& hook) {
+        _hook = hook;
     }
 
     bool lazySupported() const override {
@@ -279,7 +295,20 @@ public:
         return _isMongos;
     }
 
-    Status authenticateInternalUser() override;
+    Status authenticateInternalUser(
+        auth::StepDownBehavior stepDownBehavior = auth::StepDownBehavior::kKillConnection) override;
+
+    bool authenticatedDuringConnect() const override {
+        return _authenticatedDuringConnect;
+    }
+
+#ifdef MONGO_CONFIG_SSL
+    const SSLConfiguration* getSSLConfiguration() override;
+
+    bool isUsingTransientSSLParams() const override;
+
+    bool isTLS();
+#endif
 
 protected:
     int _minWireVersion{0};
@@ -293,7 +322,8 @@ protected:
     // rebind the handle from the owning thread. The thread that owns this DBClientConnection is
     // allowed to use the _session without locking the mutex. This mutex also guards writes to
     // _stayFailed, although reads are allowed outside the mutex.
-    stdx::mutex _sessionMutex;
+    Mutex _sessionMutex =
+        MONGO_MAKE_LATCH(HierarchicalAcquisitionLevel(0), "DBClientConnection::_sessionMutex");
     transport::SessionHandle _session;
     boost::optional<Milliseconds> _socketTimeout;
     transport::Session::TagMask _tagMask = transport::Session::kEmptyTagMask;
@@ -308,10 +338,14 @@ protected:
     HostAndPort _serverAddress;
     std::string _resolvedAddress;
     std::string _applicationName;
+    boost::optional<TransientSSLParams> _transientSSLParams;
 
     void _checkConnection();
 
     bool _internalAuthOnReconnect = false;
+
+    auth::StepDownBehavior _internalAuthStepDownBehavior = auth::StepDownBehavior::kKillConnection;
+
     std::map<std::string, BSONObj> authCache;
 
     static AtomicWord<int> _numConnections;
@@ -319,10 +353,10 @@ protected:
 private:
     /**
      * Inspects the contents of 'replyBody' and informs the replica set monitor that the host 'this'
-     * is connected with is no longer the primary if a "not master" error message or error code was
+     * is connected with is no longer the primary if a "not primary" error message or error code was
      * returned.
      */
-    void handleNotMasterResponse(const BSONObj& replyBody, StringData errorMsgFieldName);
+    void handleNotPrimaryResponse(const BSONObj& replyBody, StringData errorMsgFieldName);
     enum FailAction { kSetFlag, kEndSession, kReleaseSession };
     void _markFailed(FailAction action);
 
@@ -336,6 +370,8 @@ private:
     MessageCompressorManager _compressorManager;
 
     MongoURI _uri;
+
+    bool _authenticatedDuringConnect = false;
 };
 
 BSONElement getErrField(const BSONObj& result);

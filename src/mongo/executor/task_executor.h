@@ -39,8 +39,8 @@
 #include "mongo/executor/remote_command_request.h"
 #include "mongo/executor/remote_command_response.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/functional.h"
 #include "mongo/transport/baton.h"
+#include "mongo/util/cancellation.h"
 #include "mongo/util/future.h"
 #include "mongo/util/out_of_line_executor.h"
 #include "mongo/util/time_support.h"
@@ -72,19 +72,28 @@ struct ConnectionPoolStats;
  * If an event is unsignaled when shutdown is called, the executor will ensure that any threads
  * blocked in waitForEvent() eventually return.
  */
-class TaskExecutor : public OutOfLineExecutor {
+class TaskExecutor : public OutOfLineExecutor, public std::enable_shared_from_this<TaskExecutor> {
     TaskExecutor(const TaskExecutor&) = delete;
     TaskExecutor& operator=(const TaskExecutor&) = delete;
 
 public:
+    /**
+     * Error status that should be used by implementations of TaskExecutor when
+     * a callback is canceled.
+     */
+    static const inline Status kCallbackCanceledErrorStatus{ErrorCodes::CallbackCanceled,
+                                                            "Callback canceled"};
+
     struct CallbackArgs;
     struct RemoteCommandCallbackArgs;
+    struct RemoteCommandOnAnyCallbackArgs;
     class CallbackState;
     class CallbackHandle;
     class EventState;
     class EventHandle;
 
     using ResponseStatus = RemoteCommandResponse;
+    using ResponseOnAnyStatus = RemoteCommandOnAnyResponse;
 
     /**
      * Type of a regular callback function.
@@ -104,7 +113,9 @@ public:
      * the BSONObj returned by the command, with the "ok" field indicating the success of the
      * command in the usual way.
      */
-    using RemoteCommandCallbackFn = stdx::function<void(const RemoteCommandCallbackArgs&)>;
+    using RemoteCommandCallbackFn = std::function<void(const RemoteCommandCallbackArgs&)>;
+
+    using RemoteCommandOnAnyCallbackFn = std::function<void(const RemoteCommandOnAnyCallbackArgs&)>;
 
     /**
      * Destroys the task executor. Implicitly performs the equivalent of shutdown() and join()
@@ -137,6 +148,17 @@ public:
      * shutdown to complete.
      */
     virtual void join() = 0;
+
+    /**
+     * Returns a future that becomes ready when shutdown() has been called and all outstanding
+     * callbacks have finished running.
+     */
+    virtual SharedSemiFuture<void> joinAsync() = 0;
+
+    /**
+     * Returns true if the executor is no longer active (i.e, no longer new tasks can be scheduled).
+     */
+    virtual bool isShuttingDown() const = 0;
 
     /**
      * Writes diagnostic information into "b".
@@ -204,6 +226,10 @@ public:
                                                      Date_t deadline = Date_t::max()) = 0;
 
 
+    /**
+     * Schedules the given Task to run in this executor.
+     * Note that 'func' is implicitly noexcept and should not ever leak exceptions.
+     */
     void schedule(OutOfLineExecutor::Task func) final override;
 
     /**
@@ -215,6 +241,8 @@ public:
      * error, make sure it is an actual CallbackFn, not a lambda or other value that implicitly
      * converts to CallbackFn, since such a value would be moved from and invalidated during
      * conversion with no way to recover it.
+     *
+     * "work" should be considered implicitly 'noexcept' and thus should not throw any exceptions.
      *
      * May be called by client threads or callbacks running in the executor.
      *
@@ -235,12 +263,39 @@ public:
      * converts to CallbackFn, since such a value would be moved from and invalidated during
      * conversion with no way to recover it.
      *
+     * "work" should be considered implicitly 'noexcept' and thus should not throw any exceptions.
+     *
      * May be called by client threads or callbacks running in the executor.
      *
      * Contract: Implementations should guarantee that callback should be called *after* doing any
      * processing related to the callback.
      */
     virtual StatusWith<CallbackHandle> scheduleWorkAt(Date_t when, CallbackFn&& work) = 0;
+
+    /**
+     * Returns an ExecutorFuture that will be resolved with success when the given date is reached.
+     *
+     * If the executor is already shut down when this is called, the resulting future will be set
+     * with ErrorCodes::ShutdownInProgress.
+     *
+     * Otherwise, if the executor shuts down or the token is canceled prior to the deadline being
+     * reached, the resulting ExecutorFuture will be set with ErrorCodes::CallbackCanceled.
+     */
+    ExecutorFuture<void> sleepUntil(Date_t when, const CancellationToken& token);
+
+    /**
+     * Returns an ExecutorFuture that will be resolved with success after the given duration has
+     * passed.
+     *
+     * If the executor is already shut down when this is called, the resulting future will be set
+     * with ErrorCodes::ShutdownInProgress.
+     *
+     * Otherwise, if the executor shuts down or the token is canceled prior to the deadline being
+     * reached, the resulting ExecutorFuture will be set with ErrorCodes::CallbackCanceled.
+     */
+    ExecutorFuture<void> sleepFor(Milliseconds duration, const CancellationToken& token) {
+        return sleepUntil(now() + duration, token);
+    }
 
     /**
      * Schedules "cb" to be run by the executor with the result of executing the remote command
@@ -254,10 +309,89 @@ public:
      * Contract: Implementations should guarantee that callback should be called *after* doing any
      * processing related to the callback.
      */
-    virtual StatusWith<CallbackHandle> scheduleRemoteCommand(
+    virtual StatusWith<CallbackHandle> scheduleRemoteCommand(const RemoteCommandRequest& request,
+                                                             const RemoteCommandCallbackFn& cb,
+                                                             const BatonHandle& baton = nullptr);
+
+    /**
+     * Schedules the given request to be sent and returns a future containing the response. The
+     * resulting future will be set with an error only if there is a failure to send the request.
+     * Errors from the remote node will be contained in the ResponseStatus object.
+     *
+     * The input CancellationToken may be used to cancel sending the request. There is no guarantee
+     * that this will succeed in canceling the request and the resulting ExecutorFuture may contain
+     * either success or error. If cancellation is successful, the resulting ExecutorFuture will be
+     * set with an error.
+     */
+    ExecutorFuture<TaskExecutor::ResponseStatus> scheduleRemoteCommand(
+        const RemoteCommandRequest& request,
+        const CancellationToken& token,
+        const BatonHandle& baton = nullptr);
+
+    virtual StatusWith<CallbackHandle> scheduleRemoteCommandOnAny(
+        const RemoteCommandRequestOnAny& request,
+        const RemoteCommandOnAnyCallbackFn& cb,
+        const BatonHandle& baton = nullptr) = 0;
+
+    ExecutorFuture<TaskExecutor::ResponseOnAnyStatus> scheduleRemoteCommandOnAny(
+        const RemoteCommandRequestOnAny& request,
+        const CancellationToken& token,
+        const BatonHandle& baton = nullptr);
+
+
+    /**
+     * Schedules "cb" to be run by the executor on each reply received from executing the exhaust
+     * remote command described by "request".
+     *
+     * Returns a handle for waiting on or canceling the callback, or
+     * ErrorCodes::ShutdownInProgress.
+     *
+     * May be called by client threads or callbacks running in the executor.
+     *
+     * Contract: Implementations should guarantee that callback should be called *after* doing any
+     * processing related to the callback.
+     */
+    virtual StatusWith<CallbackHandle> scheduleExhaustRemoteCommand(
         const RemoteCommandRequest& request,
         const RemoteCommandCallbackFn& cb,
+        const BatonHandle& baton = nullptr);
+
+    virtual StatusWith<CallbackHandle> scheduleExhaustRemoteCommandOnAny(
+        const RemoteCommandRequestOnAny& request,
+        const RemoteCommandOnAnyCallbackFn& cb,
         const BatonHandle& baton = nullptr) = 0;
+
+    /**
+     * Schedules "cb" to be run by the executor on each reply received from executing the exhaust
+     * remote command described by "request", as above, but returns a future containing the
+     * last response.
+     *
+     * May be called by client threads or callbacks running in the executor.
+     *
+     * The input CancellationToken may be used to cancel sending the request. There is no guarantee
+     * that this will succeed in canceling the request and the resulting ExecutorFuture may contain
+     * either success or error. If cancellation is successful, the resulting ExecutorFuture will be
+     * set with a CallbackCanceled error.
+     *
+     * Cancelling the future will also result in cancelling any outstanding invocations of the
+     * callback.
+     */
+    ExecutorFuture<TaskExecutor::ResponseStatus> scheduleExhaustRemoteCommand(
+        const RemoteCommandRequest& request,
+        const RemoteCommandCallbackFn& cb,
+        const CancellationToken& token,
+        const BatonHandle& baton = nullptr);
+
+    ExecutorFuture<TaskExecutor::ResponseOnAnyStatus> scheduleExhaustRemoteCommandOnAny(
+        const RemoteCommandRequestOnAny& request,
+        const RemoteCommandOnAnyCallbackFn& cb,
+        const CancellationToken& token,
+        const BatonHandle& baton = nullptr);
+
+    /**
+     * Returns true if there are any tasks scheduled on the executor.
+     */
+    virtual bool hasTasks() = 0;
 
     /**
      * If the callback referenced by "cbHandle" hasn't already executed, marks it as
@@ -440,7 +574,7 @@ struct TaskExecutor::CallbackArgs {
     CallbackArgs(TaskExecutor* theExecutor,
                  CallbackHandle theHandle,
                  Status theStatus,
-                 OperationContext* opCtx = NULL);
+                 OperationContext* opCtx = nullptr);
 
     TaskExecutor* executor;
     CallbackHandle myHandle;
@@ -457,10 +591,24 @@ struct TaskExecutor::RemoteCommandCallbackArgs {
                               const RemoteCommandRequest& theRequest,
                               const ResponseStatus& theResponse);
 
+    RemoteCommandCallbackArgs(const RemoteCommandOnAnyCallbackArgs& other, size_t idx);
+
     TaskExecutor* executor;
     CallbackHandle myHandle;
     RemoteCommandRequest request;
     ResponseStatus response;
+};
+
+struct TaskExecutor::RemoteCommandOnAnyCallbackArgs {
+    RemoteCommandOnAnyCallbackArgs(TaskExecutor* theExecutor,
+                                   const CallbackHandle& theHandle,
+                                   const RemoteCommandRequestOnAny& theRequest,
+                                   const ResponseOnAnyStatus& theResponse);
+
+    TaskExecutor* executor;
+    CallbackHandle myHandle;
+    RemoteCommandRequestOnAny request;
+    ResponseOnAnyStatus response;
 };
 
 }  // namespace executor

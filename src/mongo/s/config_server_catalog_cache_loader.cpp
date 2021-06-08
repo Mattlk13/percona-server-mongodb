@@ -27,20 +27,20 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/s/config_server_catalog_cache_loader.h"
 
+#include <memory>
+
 #include "mongo/db/client.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
-#include "mongo/s/database_version_helpers.h"
 #include "mongo/s/grid.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/fail_point_service.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -49,101 +49,49 @@ using CollectionAndChangedChunks = CatalogCacheLoader::CollectionAndChangedChunk
 namespace {
 
 /**
- * Constructs the default options for the thread pool used by the cache loader.
- */
-ThreadPool::Options makeDefaultThreadPoolOptions() {
-    ThreadPool::Options options;
-    options.poolName = "ConfigServerCatalogCacheLoader";
-    options.minThreads = 0;
-    options.maxThreads = 6;
-
-    // Ensure all threads have a client
-    options.onCreateThread = [](const std::string& threadName) {
-        Client::initThread(threadName.c_str());
-    };
-
-    return options;
-}
-
-/**
- * Structure repsenting the generated query and sort order for a chunk diffing operation.
- */
-struct QueryAndSort {
-    const BSONObj query;
-    const BSONObj sort;
-};
-
-/**
- * Returns the query needed to find incremental changes to a collection from the config server.
- *
- * The query has to find all the chunks $gte the current max version. Currently, any splits and
- * merges will increment the current max version.
- *
- * The sort needs to be by ascending version in order to pick up the chunks which changed most
- * recent and also in order to handle cursor yields between chunks being migrated/split/merged. This
- * ensures that changes to chunk version (which will always be higher) will always come *after* our
- * current position in the chunk cursor.
- */
-QueryAndSort createConfigDiffQuery(const NamespaceString& nss, ChunkVersion collectionVersion) {
-    return {BSON(ChunkType::ns() << nss.ns() << ChunkType::lastmod() << GTE
-                                 << Timestamp(collectionVersion.toLong())),
-            BSON(ChunkType::lastmod() << 1)};
-}
-
-/**
  * Blocking method, which returns the chunks which changed since the specified version.
  */
 CollectionAndChangedChunks getChangedChunks(OperationContext* opCtx,
                                             const NamespaceString& nss,
-                                            ChunkVersion sinceVersion) {
+                                            ChunkVersion sinceVersion,
+                                            bool avoidSnapshotForRefresh) {
     const auto catalogClient = Grid::get(opCtx)->catalogClient();
 
-    // Decide whether to do a full or partial load based on the state of the collection
-    const auto coll = uassertStatusOK(catalogClient->getCollection(opCtx, nss)).value;
-    uassert(ErrorCodes::NamespaceNotFound,
-            str::stream() << "Collection " << nss.ns() << " is dropped.",
-            !coll.getDropped());
+    const auto readConcernLevel = !avoidSnapshotForRefresh
+        ? repl::ReadConcernLevel::kSnapshotReadConcern
+        : repl::ReadConcernLevel::kLocalReadConcern;
+    const auto afterClusterTime = (serverGlobalParams.clusterRole == ClusterRole::ConfigServer)
+        ? repl::ReplicationCoordinator::get(opCtx)->getMyLastAppliedOpTime()
+        : Grid::get(opCtx)->configOpTime();
+    const auto readConcern =
+        repl::ReadConcernArgs(LogicalTime(afterClusterTime.getTimestamp()), readConcernLevel);
 
-    // If the collection's epoch has changed, do a full refresh
-    const ChunkVersion startingCollectionVersion = (sinceVersion.epoch() == coll.getEpoch())
-        ? sinceVersion
-        : ChunkVersion(0, 0, coll.getEpoch());
-
-    // Diff tracker should *always* find at least one chunk if collection exists
-    const auto diffQuery = createConfigDiffQuery(nss, startingCollectionVersion);
-
-    // Query the chunks which have changed
-    repl::OpTime opTime;
-    const std::vector<ChunkType> changedChunks = uassertStatusOK(
-        Grid::get(opCtx)->catalogClient()->getChunks(opCtx,
-                                                     diffQuery.query,
-                                                     diffQuery.sort,
-                                                     boost::none,
-                                                     &opTime,
-                                                     repl::ReadConcernLevel::kMajorityReadConcern));
-
-    uassert(ErrorCodes::ConflictingOperationInProgress,
-            "No chunks were found for the collection",
-            !changedChunks.empty());
-
-    return CollectionAndChangedChunks(coll.getUUID(),
-                                      coll.getEpoch(),
+    auto collAndChunks =
+        catalogClient->getCollectionAndChunks(opCtx, nss, sinceVersion, readConcern);
+    const auto& coll = collAndChunks.first;
+    return CollectionAndChangedChunks{coll.getEpoch(),
+                                      coll.getTimestamp(),
+                                      coll.getUuid(),
                                       coll.getKeyPattern().toBSON(),
                                       coll.getDefaultCollation(),
                                       coll.getUnique(),
-                                      std::move(changedChunks));
+                                      coll.getTimeseriesFields(),
+                                      coll.getReshardingFields(),
+                                      coll.getAllowMigrations(),
+                                      std::move(collAndChunks.second)};
 }
 
 }  // namespace
 
 ConfigServerCatalogCacheLoader::ConfigServerCatalogCacheLoader()
-    : _threadPool(makeDefaultThreadPoolOptions()) {
-    _threadPool.startup();
-}
-
-ConfigServerCatalogCacheLoader::~ConfigServerCatalogCacheLoader() {
-    _threadPool.shutdown();
-    _threadPool.join();
+    : _executor(std::make_shared<ThreadPool>([] {
+          ThreadPool::Options options;
+          options.poolName = "ConfigServerCatalogCacheLoader";
+          options.minThreads = 0;
+          options.maxThreads = 6;
+          return options;
+      }())) {
+    _executor->startup();
 }
 
 void ConfigServerCatalogCacheLoader::initializeReplicaSetRole(bool isPrimary) {
@@ -156,6 +104,11 @@ void ConfigServerCatalogCacheLoader::onStepDown() {
 
 void ConfigServerCatalogCacheLoader::onStepUp() {
     MONGO_UNREACHABLE;
+}
+
+void ConfigServerCatalogCacheLoader::shutDown() {
+    _executor->shutdown();
+    _executor->join();
 }
 
 void ConfigServerCatalogCacheLoader::notifyOfCollectionVersionUpdate(const NamespaceString& nss) {
@@ -172,53 +125,35 @@ void ConfigServerCatalogCacheLoader::waitForDatabaseFlush(OperationContext* opCt
     MONGO_UNREACHABLE;
 }
 
-std::shared_ptr<Notification<void>> ConfigServerCatalogCacheLoader::getChunksSince(
-    const NamespaceString& nss, ChunkVersion version, GetChunksSinceCallbackFn callbackFn) {
-    auto notify = std::make_shared<Notification<void>>();
+SemiFuture<CollectionAndChangedChunks> ConfigServerCatalogCacheLoader::getChunksSince(
+    const NamespaceString& nss, ChunkVersion version) {
 
-    _threadPool.schedule([ nss, version, notify, callbackFn ](auto status) noexcept {
-        invariant(status);
+    return ExecutorFuture<void>(_executor)
+        .then([=]() {
+            ThreadClient tc("ConfigServerCatalogCacheLoader::getChunksSince",
+                            getGlobalServiceContext());
+            auto opCtx = tc->makeOperationContext();
 
-        auto opCtx = Client::getCurrent()->makeOperationContext();
-
-        auto swCollAndChunks = [&]() -> StatusWith<CollectionAndChangedChunks> {
-            try {
-                return getChangedChunks(opCtx.get(), nss, version);
-            } catch (const DBException& ex) {
-                return ex.toStatus();
-            }
-        }();
-
-        callbackFn(opCtx.get(), std::move(swCollAndChunks));
-        notify->set();
-    });
-
-    return notify;
+            return getChangedChunks(opCtx.get(), nss, version, _avoidSnapshotForRefresh);
+        })
+        .semi();
 }
 
-void ConfigServerCatalogCacheLoader::getDatabase(
-    StringData dbName,
-    stdx::function<void(OperationContext*, StatusWith<DatabaseType>)> callbackFn) {
-    _threadPool.schedule([ name = dbName.toString(), callbackFn ](auto status) noexcept {
-        invariant(status);
+SemiFuture<DatabaseType> ConfigServerCatalogCacheLoader::getDatabase(StringData dbName) {
+    return ExecutorFuture<void>(_executor)
+        .then([name = dbName.toString()] {
+            ThreadClient tc("ConfigServerCatalogCacheLoader::getDatabase",
+                            getGlobalServiceContext());
+            auto opCtx = tc->makeOperationContext();
+            return Grid::get(opCtx.get())
+                ->catalogClient()
+                ->getDatabase(opCtx.get(), name, repl::ReadConcernLevel::kMajorityReadConcern);
+        })
+        .semi();
+}
 
-        auto opCtx = Client::getCurrent()->makeOperationContext();
-
-        auto swDbt = [&]() -> StatusWith<DatabaseType> {
-            try {
-                return uassertStatusOK(
-                           Grid::get(opCtx.get())
-                               ->catalogClient()
-                               ->getDatabase(
-                                   opCtx.get(), name, repl::ReadConcernLevel::kMajorityReadConcern))
-                    .value;
-            } catch (const DBException& ex) {
-                return ex.toStatus();
-            }
-        }();
-
-        callbackFn(opCtx.get(), std::move(swDbt));
-    });
+void ConfigServerCatalogCacheLoader::setAvoidSnapshotForRefresh_ForTest() {
+    _avoidSnapshotForRefresh = true;
 }
 
 }  // namespace mongo

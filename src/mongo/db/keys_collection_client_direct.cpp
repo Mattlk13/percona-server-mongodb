@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/platform/basic.h"
 
@@ -40,16 +40,15 @@
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/client/read_preference.h"
 #include "mongo/db/dbdirectclient.h"
-#include "mongo/db/keys_collection_document.h"
-#include "mongo/db/logical_clock.h"
+#include "mongo/db/keys_collection_document_gen.h"
 #include "mongo/db/logical_time.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/s/write_ops/batched_command_response.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
@@ -73,18 +72,48 @@ bool isRetriableError(ErrorCodes::Error code, Shard::RetryPolicy options) {
 
 KeysCollectionClientDirect::KeysCollectionClientDirect() : _rsLocalClient() {}
 
-StatusWith<std::vector<KeysCollectionDocument>> KeysCollectionClientDirect::getNewKeys(
-    OperationContext* opCtx, StringData purpose, const LogicalTime& newerThanThis) {
+StatusWith<std::vector<KeysCollectionDocument>> KeysCollectionClientDirect::getNewInternalKeys(
+    OperationContext* opCtx,
+    StringData purpose,
+    const LogicalTime& newerThanThis,
+    bool useMajority) {
+    return _getNewKeys<KeysCollectionDocument>(
+        opCtx, NamespaceString::kKeysCollectionNamespace, purpose, newerThanThis, useMajority);
+}
 
+StatusWith<std::vector<ExternalKeysCollectionDocument>>
+KeysCollectionClientDirect::getAllExternalKeys(OperationContext* opCtx, StringData purpose) {
+    return _getNewKeys<ExternalKeysCollectionDocument>(
+        opCtx,
+        NamespaceString::kExternalKeysCollectionNamespace,
+        purpose,
+        LogicalTime(),
+        // It is safe to read external keys with local read concern because they are only used to
+        // validate incoming signatures, not to sign them. If a cached key is rolled back, it will
+        // eventually be reaped from the cache.
+        false /* useMajority */);
+}
 
+template <typename KeyDocumentType>
+StatusWith<std::vector<KeyDocumentType>> KeysCollectionClientDirect::_getNewKeys(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    StringData purpose,
+    const LogicalTime& newerThanThis,
+    bool useMajority) {
     BSONObjBuilder queryBuilder;
     queryBuilder.append("purpose", purpose);
     queryBuilder.append("expiresAt", BSON("$gt" << newerThanThis.asTimestamp()));
 
+    auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
+    auto readConcern = storageEngine->supportsReadConcernMajority() && useMajority
+        ? repl::ReadConcernLevel::kMajorityReadConcern
+        : repl::ReadConcernLevel::kLocalReadConcern;
+
     auto findStatus = _query(opCtx,
                              ReadPreferenceSetting(ReadPreference::Nearest, TagSet{}),
-                             repl::ReadConcernLevel::kLocalReadConcern,
-                             KeysCollectionDocument::ConfigNS,
+                             readConcern,
+                             nss,
                              queryBuilder.obj(),
                              BSON("expiresAt" << 1),
                              boost::none);
@@ -94,14 +123,15 @@ StatusWith<std::vector<KeysCollectionDocument>> KeysCollectionClientDirect::getN
     }
 
     const auto& keyDocs = findStatus.getValue().docs;
-    std::vector<KeysCollectionDocument> keys;
+    std::vector<KeyDocumentType> keys;
     for (auto&& keyDoc : keyDocs) {
-        auto parseStatus = KeysCollectionDocument::fromBSON(keyDoc);
-        if (!parseStatus.isOK()) {
-            return parseStatus.getStatus();
+        KeyDocumentType key;
+        try {
+            key = KeyDocumentType::parse(IDLParserErrorContext("keyDoc"), keyDoc);
+        } catch (...) {
+            return exceptionToStatus();
         }
-
-        keys.push_back(std::move(parseStatus.getValue()));
+        keys.push_back(std::move(key));
     }
 
     return keys;
@@ -135,7 +165,7 @@ Status KeysCollectionClientDirect::_insert(OperationContext* opCtx,
                                            const BSONObj& doc,
                                            const WriteConcernOptions& writeConcern) {
     BatchedCommandRequest request([&] {
-        write_ops::Insert insertOp(nss);
+        write_ops::InsertCommandRequest insertOp(nss);
         insertOp.setDocuments({doc});
         return insertOp;
     }());
@@ -151,9 +181,12 @@ Status KeysCollectionClientDirect::_insert(OperationContext* opCtx,
             Shard::CommandResponse::processBatchWriteResponse(swResponse, &batchResponse);
         if (retry < kOnErrorNumRetries &&
             isRetriableError(writeStatus.code(), Shard::RetryPolicy::kIdempotent)) {
-            LOG(2) << "Batch write command to " << nss.db()
-                   << "failed with retriable error and will be retried"
-                   << causedBy(redact(writeStatus));
+            LOGV2_DEBUG(20704,
+                        2,
+                        "Batch write command to {nss_db}failed with retriable error and will be "
+                        "retried{causedBy_writeStatus}",
+                        "nss_db"_attr = nss.db(),
+                        "causedBy_writeStatus"_attr = causedBy(redact(writeStatus)));
             continue;
         }
 
@@ -163,8 +196,10 @@ Status KeysCollectionClientDirect::_insert(OperationContext* opCtx,
 }
 
 Status KeysCollectionClientDirect::insertNewKey(OperationContext* opCtx, const BSONObj& doc) {
-    return _insert(
-        opCtx, KeysCollectionDocument::ConfigNS, doc, ShardingCatalogClient::kMajorityWriteConcern);
+    return _insert(opCtx,
+                   NamespaceString::kKeysCollectionNamespace,
+                   doc,
+                   ShardingCatalogClient::kMajorityWriteConcern);
 }
 
 }  // namespace mongo

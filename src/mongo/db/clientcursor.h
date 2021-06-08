@@ -30,7 +30,9 @@
 #pragma once
 
 #include <boost/optional.hpp>
+#include <functional>
 
+#include "mongo/db/api_parameters.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/auth/user_name.h"
 #include "mongo/db/cursor_id.h"
@@ -39,11 +41,9 @@
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/db/record_id.h"
 #include "mongo/db/repl/read_concern_level.h"
-#include "mongo/stdx/functional.h"
 
 namespace mongo {
 
-class Collection;
 class CursorManager;
 class RecoveryUnit;
 
@@ -55,43 +55,21 @@ class RecoveryUnit;
  * using a CursorManager. See cursor_manager.h for more details.
  */
 struct ClientCursorParams {
-    // Describes whether callers should acquire locks when using a ClientCursor. Not all cursors
-    // have the same locking behavior. In particular, find cursors require the caller to lock the
-    // collection in MODE_IS before calling methods on the underlying plan executor. Aggregate
-    // cursors, on the other hand, may access multiple collections and acquire their own locks on
-    // any involved collections while producing query results. Therefore, the caller need not
-    // explicitly acquire any locks when using a ClientCursor which houses execution machinery for
-    // an aggregate.
-    //
-    // The policy is consulted on getMore in order to determine locking behavior, since during
-    // getMore we otherwise could not easily know what flavor of cursor we're using.
-    enum class LockPolicy {
-        // The caller is responsible for locking the collection over which this ClientCursor
-        // executes.
-        kLockExternally,
-
-        // The caller need not hold no locks; this ClientCursor's plan executor acquires any
-        // necessary locks itself.
-        kLocksInternally,
-    };
-
     ClientCursorParams(std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> planExecutor,
                        NamespaceString nss,
                        UserNameIterator authenticatedUsersIter,
+                       APIParameters apiParameters,
                        WriteConcernOptions writeConcernOptions,
                        repl::ReadConcernArgs readConcernArgs,
                        BSONObj originatingCommandObj,
-                       LockPolicy lockPolicy,
                        PrivilegeVector originatingPrivileges)
         : exec(std::move(planExecutor)),
           nss(std::move(nss)),
+          apiParameters(std::move(apiParameters)),
           writeConcernOptions(std::move(writeConcernOptions)),
           readConcernArgs(std::move(readConcernArgs)),
-          queryOptions(exec->getCanonicalQuery()
-                           ? exec->getCanonicalQuery()->getQueryRequest().getOptions()
-                           : 0),
+          queryOptions(exec->getCanonicalQuery() ? exec->getCanonicalQuery()->getOptions() : 0),
           originatingCommandObj(originatingCommandObj.getOwned()),
-          lockPolicy(lockPolicy),
           originatingPrivileges(std::move(originatingPrivileges)) {
         while (authenticatedUsersIter.more()) {
             authenticatedUsers.emplace_back(authenticatedUsersIter.next());
@@ -115,11 +93,11 @@ struct ClientCursorParams {
     std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec;
     const NamespaceString nss;
     std::vector<UserName> authenticatedUsers;
+    const APIParameters apiParameters;
     const WriteConcernOptions writeConcernOptions;
     const repl::ReadConcernArgs readConcernArgs;
     int queryOptions = 0;
     BSONObj originatingCommandObj;
-    const LockPolicy lockPolicy;
     PrivilegeVector originatingPrivileges;
 };
 
@@ -164,12 +142,16 @@ public:
         return _txnNumber;
     }
 
-    repl::ReadConcernArgs getReadConcernArgs() const {
-        return _readConcernArgs;
+    APIParameters getAPIParameters() const {
+        return _apiParameters;
     }
 
     WriteConcernOptions getWriteConcernOptions() const {
         return _writeConcernOptions;
+    }
+
+    repl::ReadConcernArgs getReadConcernArgs() const {
+        return _readConcernArgs;
     }
 
     /**
@@ -265,19 +247,11 @@ public:
         return StringData(_planSummary);
     }
 
-    ClientCursorParams::LockPolicy lockPolicy() const {
-        return _lockPolicy;
-    }
-
     /**
      * Returns a generic cursor containing diagnostics about this cursor.
      * The caller must either have this cursor pinned or hold a mutex from the cursor manager.
      */
     GenericCursor toGenericCursor() const;
-
-    //
-    // Timing.
-    //
 
     /**
      * Returns the amount of time execution time available to this cursor. Only valid at the
@@ -300,13 +274,25 @@ public:
     }
 
     /**
-     * Returns the server-wide the count of living cursors. Such a cursor is called an "open
-     * cursor".
+     * Returns the commit point at the time the last batch was returned.
      */
-    static long long totalOpen();
+    boost::optional<repl::OpTime> getLastKnownCommittedOpTime() const {
+        return _lastKnownCommittedOpTime;
+    }
+
+    /**
+     * Sets the commit point at the time the last batch was returned.
+     */
+    void setLastKnownCommittedOpTime(boost::optional<repl::OpTime> lastCommittedOpTime) {
+        _lastKnownCommittedOpTime = std::move(lastCommittedOpTime);
+    }
 
     friend std::size_t partitionOf(const ClientCursor* cursor) {
         return cursor->cursorid();
+    }
+
+    boost::optional<OperationKey> getOperationKey() const {
+        return _opKey;
     }
 
 private:
@@ -377,6 +363,7 @@ private:
     // A transaction number for this cursor, if it was provided in the originating command.
     const boost::optional<TxnNumber> _txnNumber;
 
+    const APIParameters _apiParameters;
     const WriteConcernOptions _writeConcernOptions;
     const repl::ReadConcernArgs _readConcernArgs;
 
@@ -398,8 +385,6 @@ private:
 
     // See the QueryOptions enum in dbclientinterface.h.
     const int _queryOptions = 0;
-
-    const ClientCursorParams::LockPolicy _lockPolicy;
 
     // Unused maxTime budget for this cursor.
     Microseconds _leftoverMaxTimeMicros = Microseconds::max();
@@ -429,6 +414,13 @@ private:
 
     // A string with the plan summary of the cursor's query.
     std::string _planSummary;
+
+    // Commit point at the time the last batch was returned. This is only used by internal exhaust
+    // oplog fetching. Also see lastKnownCommittedOpTime in GetMoreRequest.
+    boost::optional<repl::OpTime> _lastKnownCommittedOpTime;
+
+    // The client OperationKey associated with this cursor.
+    boost::optional<OperationKey> _opKey;
 };
 
 /**

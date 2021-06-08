@@ -30,10 +30,12 @@
 #include "mongo/db/catalog/collection_catalog_helper.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_catalog.h"
-#include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 
 namespace mongo {
+
+MONGO_FAIL_POINT_DEFINE(hangBeforeGettingNextCollection);
+
 namespace catalog {
 
 void forEachCollectionFromDb(OperationContext* opCtx,
@@ -42,29 +44,43 @@ void forEachCollectionFromDb(OperationContext* opCtx,
                              CollectionCatalog::CollectionInfoFn callback,
                              CollectionCatalog::CollectionInfoFn predicate) {
 
-    CollectionCatalog& catalog = CollectionCatalog::get(opCtx);
-    for (auto collectionIt = catalog.begin(dbName); collectionIt != catalog.end(); ++collectionIt) {
+    auto catalogForIteration = CollectionCatalog::get(opCtx);
+    for (auto collectionIt = catalogForIteration->begin(opCtx, dbName);
+         collectionIt != catalogForIteration->end(opCtx);
+         ++collectionIt) {
         auto uuid = collectionIt.uuid().get();
-        if (predicate && !catalog.checkIfCollectionSatisfiable(uuid, predicate)) {
+        if (predicate && !catalogForIteration->checkIfCollectionSatisfiable(uuid, predicate)) {
             continue;
         }
 
-        auto nss = catalog.lookupNSSByUUID(uuid);
+        boost::optional<Lock::CollectionLock> clk;
+        CollectionPtr collection;
 
-        // If the NamespaceString can't be resolved from the uuid, then the collection was dropped.
-        if (!nss) {
-            continue;
+        auto catalog = CollectionCatalog::get(opCtx);
+        while (auto nss = catalog->lookupNSSByUUID(opCtx, uuid)) {
+            // Get a fresh snapshot for each locked collection to see any catalog changes.
+            clk.emplace(opCtx, *nss, collLockMode);
+            opCtx->recoveryUnit()->abandonSnapshot();
+            catalog = CollectionCatalog::get(opCtx);
+
+            if (catalog->lookupNSSByUUID(opCtx, uuid) == nss) {
+                // Success: locked the namespace and the UUID still maps to it.
+                collection = catalog->lookupCollectionByUUID(opCtx, uuid);
+                invariant(collection);
+                break;
+            }
+            // Failed: collection got renamed before locking it, so unlock and try again.
+            clk.reset();
         }
 
-        Lock::CollectionLock clk(opCtx, *nss, collLockMode);
-
-        auto collection = catalog.lookupCollectionByUUID(uuid);
-        auto catalogEntry = catalog.lookupCollectionCatalogEntryByUUID(uuid);
-        if (!collection || !catalogEntry || catalogEntry->ns() != *nss)
+        // The NamespaceString couldn't be resolved from the uuid, so the collection was dropped.
+        if (!collection)
             continue;
 
-        if (!callback(collection, catalogEntry))
+        if (!callback(collection))
             break;
+
+        hangBeforeGettingNextCollection.pauseWhileSet();
     }
 }
 

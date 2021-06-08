@@ -33,10 +33,12 @@ imports:
 
 commands:
     _cloneCollectionOptionsFromPrimaryShard:
+        command_name: _cloneCollectionOptionsFromPrimaryShard
         cpp_name: cloneCollectionOptionsFromPrimaryShard
         description: "Internal command to create a collection on a non-primary shard with the collection options from the primary shard."
         strict: true
         namespace: type
+        api_version: ""
         type: namespacestring
         fields:
             primaryShard:

@@ -29,6 +29,8 @@
 
 #pragma once
 
+#include <functional>
+
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
 #include "mongo/bson/bsonobj.h"
@@ -36,8 +38,7 @@
 #include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/repl/oplog_interface.h"
 #include "mongo/db/repl/optime.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 
 namespace mongo {
 namespace repl {
@@ -47,11 +48,11 @@ namespace repl {
 // two separate files, rs_rollback and rs_rollback_no_uuid. However, after
 // MongoDB 3.8 is released, we no longer need to maintain rs_rollback_no_uuid
 // code and these forward declares can be removed. See SERVER-29766.
-MONGO_FAIL_POINT_DECLARE(rollbackHangBeforeFinish);
-MONGO_FAIL_POINT_DECLARE(rollbackHangThenFailAfterWritingMinValid);
+extern FailPoint rollbackHangBeforeFinish;
+extern FailPoint rollbackHangThenFailAfterWritingMinValid;
 
 // This is needed by rs_rollback and rollback_impl.
-MONGO_FAIL_POINT_DECLARE(rollbackHangAfterTransitionToRollback);
+extern FailPoint rollbackHangAfterTransitionToRollback;
 
 class RollBackLocalOperations {
     RollBackLocalOperations(const RollBackLocalOperations&) = delete;
@@ -61,7 +62,7 @@ public:
     class RollbackCommonPoint {
 
     public:
-        RollbackCommonPoint(BSONObj oplogBSON, RecordId recordId);
+        RollbackCommonPoint(BSONObj oplogBSON, RecordId recordId, BSONObj nextOplogBSON);
 
         RecordId getRecordId() const {
             return _recordId;
@@ -71,21 +72,27 @@ public:
             return _opTime;
         }
 
-        boost::optional<Date_t> getWallClockTime() const {
+        Date_t getWallClockTime() const {
             return _wallClockTime;
+        }
+
+        Date_t getFirstOpWallClockTimeAfterCommonPoint() {
+            return _firstWallClockTimeAfterCommonPoint;
         }
 
     private:
         RecordId _recordId;
         OpTime _opTime;
-        boost::optional<Date_t> _wallClockTime;
+        Date_t _wallClockTime;
+        // The wall clock time of the first operation after the common point if it exists.
+        Date_t _firstWallClockTimeAfterCommonPoint;
     };
 
     /**
      * Type of function to roll back an operation or process it for future use.
      * It can return any status except ErrorCodes::NoSuchKey. See onRemoteOperation().
      */
-    using RollbackOperationFn = stdx::function<Status(const BSONObj&)>;
+    using RollbackOperationFn = std::function<Status(const BSONObj&)>;
 
     /**
      * Initializes rollback processor with a valid local oplog.

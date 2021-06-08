@@ -1,8 +1,8 @@
 """The unittest.TestCase for C++ integration tests."""
 
-from . import interface
-from ... import core
-from ... import utils
+from buildscripts.resmokelib import core
+from buildscripts.resmokelib import utils
+from buildscripts.resmokelib.testing.testcases import interface
 
 
 class CPPIntegrationTestCase(interface.ProcessTestCase):
@@ -26,4 +26,5 @@ class CPPIntegrationTestCase(interface.ProcessTestCase):
 
     def _make_process(self):
         return core.programs.generic_program(self.logger, [self.program_executable],
+                                             self.fixture.job_num, test_id=self._id,
                                              **self.program_options)

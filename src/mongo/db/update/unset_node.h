@@ -29,9 +29,10 @@
 
 #pragma once
 
+#include <memory>
+
 #include "mongo/base/string_data.h"
 #include "mongo/db/update/modifier_node.h"
-#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
@@ -43,24 +44,27 @@ public:
     Status init(BSONElement modExpr, const boost::intrusive_ptr<ExpressionContext>& expCtx) final;
 
     std::unique_ptr<UpdateNode> clone() const final {
-        return stdx::make_unique<UnsetNode>(*this);
+        return std::make_unique<UnsetNode>(*this);
     }
 
     void setCollator(const CollatorInterface* collator) final {}
 
     ModifyResult updateExistingElement(mutablebson::Element* element,
-                                       std::shared_ptr<FieldRef> elementPath) const final;
+                                       const FieldRef& elementPath) const final;
 
     void validateUpdate(mutablebson::ConstElement updatedElement,
                         mutablebson::ConstElement leftSibling,
                         mutablebson::ConstElement rightSibling,
                         std::uint32_t recursionLevel,
-                        ModifyResult modifyResult) const final;
+                        ModifyResult modifyResult,
+                        bool validateForStorage,
+                        bool* containsDotsAndDollarsField) const final;
 
-    void logUpdate(LogBuilder* logBuilder,
-                   StringData pathTaken,
+    void logUpdate(LogBuilderInterface* logBuilder,
+                   const RuntimeUpdatePath& pathTaken,
                    mutablebson::Element element,
-                   ModifyResult modifyResult) const final;
+                   ModifyResult modifyResult,
+                   boost::optional<int> createdFieldIdx) const final;
 
     bool allowNonViablePath() const final {
         return true;

@@ -29,6 +29,7 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/base/shim.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/embedded/not_implemented.h"
 #include "mongo/util/assert_util.h"
@@ -67,6 +68,8 @@ public:
         // It is always okay to start a request in embedded.
     }
 
+    void startContractTracking() override {}
+
     Status addAndAuthorizeUser(OperationContext*, const UserName&) override {
         UASSERT_NOT_IMPLEMENTED;
     }
@@ -77,6 +80,10 @@ public:
 
     User* getSingleUser() override {
         UASSERT_NOT_IMPLEMENTED;
+    }
+
+    bool shouldIgnoreAuthChecks() override {
+        return true;
     }
 
     bool isAuthenticated() override {
@@ -93,10 +100,6 @@ public:
         UASSERT_NOT_IMPLEMENTED;
     }
 
-    std::string getAuthenticatedUserNamesToken() override {
-        UASSERT_NOT_IMPLEMENTED;
-    }
-
     void grantInternalAuthorization(Client* client) override {
         // Always okay to do something, on embedded.
     }
@@ -105,62 +108,12 @@ public:
         // Always okay to do something, on embedded.
     }
 
-    void logoutDatabase(OperationContext* opCtx, const StringData) override {
+    void logoutAllDatabases(Client*, StringData) override {
+        // Since we didn't actively authorize, we do not actively deauthorize.
+    }
+
+    void logoutDatabase(Client*, StringData, StringData) override {
         UASSERT_NOT_IMPLEMENTED;
-    }
-
-    PrivilegeVector getDefaultPrivileges() override {
-        UASSERT_NOT_IMPLEMENTED;
-    }
-
-    Status checkAuthForFind(const NamespaceString&, bool) override {
-        return Status::OK();
-    }
-
-    Status checkAuthForGetMore(const NamespaceString&, long long, bool) override {
-        return Status::OK();
-    }
-
-    Status checkAuthForUpdate(OperationContext*,
-                              const NamespaceString&,
-                              const BSONObj&,
-                              const write_ops::UpdateModification&,
-                              bool) override {
-        return Status::OK();
-    }
-
-    Status checkAuthForInsert(OperationContext*, const NamespaceString&) override {
-        return Status::OK();
-    }
-
-    Status checkAuthForDelete(OperationContext*, const NamespaceString&, const BSONObj&) override {
-        return Status::OK();
-    }
-
-    Status checkAuthForKillCursors(const NamespaceString&, UserNameIterator) override {
-        return Status::OK();
-    }
-
-    StatusWith<PrivilegeVector> getPrivilegesForAggregate(const NamespaceString&,
-                                                          const BSONObj&,
-                                                          bool) override {
-        return PrivilegeVector();
-    }
-
-    Status checkAuthForCreate(const NamespaceString&, const BSONObj&, bool) override {
-        return Status::OK();
-    }
-
-    Status checkAuthForCollMod(const NamespaceString&, const BSONObj&, bool) override {
-        return Status::OK();
-    }
-
-    Status checkAuthorizedToGrantPrivilege(const Privilege&) override {
-        return Status::OK();
-    }
-
-    Status checkAuthorizedToRevokePrivilege(const Privilege&) override {
-        return Status::OK();
     }
 
     StatusWith<PrivilegeVector> checkAuthorizedToListCollections(StringData,
@@ -176,27 +129,15 @@ public:
         return true;
     }
 
-    bool isAuthorizedToCreateRole(const auth::CreateOrUpdateRoleArgs&) override {
+    bool isAuthorizedToParseNamespaceElement(const NamespaceStringOrUUID&) override {
         return true;
     }
 
-    bool isAuthorizedToGrantRole(const RoleName&) override {
-        return true;
-    }
-
-    bool isAuthorizedToRevokeRole(const RoleName&) override {
+    bool isAuthorizedToCreateRole(const RoleName&) override {
         return true;
     }
 
     bool isAuthorizedToChangeAsUser(const UserName&, ActionType) override {
-        return true;
-    }
-
-    bool isAuthorizedToChangeOwnPasswordAsUser(const UserName&) override {
-        return true;
-    }
-
-    bool isAuthorizedToChangeOwnCustomDataAsUser(const UserName&) override {
         return true;
     }
 
@@ -228,7 +169,8 @@ public:
         return true;
     }
 
-    void setImpersonatedUserData(std::vector<UserName>, std::vector<RoleName>) override {
+    void setImpersonatedUserData(const std::vector<UserName>&,
+                                 const std::vector<RoleName>&) override {
         UASSERT_NOT_IMPLEMENTED;
     }
 
@@ -269,6 +211,10 @@ public:
         return true;
     }
 
+    void verifyContract(const AuthorizationContract* contract) const override {
+        // Do nothing
+    }
+
 protected:
     std::tuple<std::vector<UserName>*, std::vector<RoleName>*> _getImpersonations() override {
         UASSERT_NOT_IMPLEMENTED;
@@ -281,9 +227,16 @@ private:
 }  // namespace
 }  // namespace embedded
 
-MONGO_REGISTER_SHIM(AuthorizationSession::create)
-(AuthorizationManager* const authzManager)->std::unique_ptr<AuthorizationSession> {
+namespace {
+
+std::unique_ptr<AuthorizationSession> authorizationSessionCreateImpl(
+    AuthorizationManager* authzManager) {
     return std::make_unique<embedded::AuthorizationSession>(authzManager);
 }
+
+auto authorizationSessionCreateRegistration =
+    MONGO_WEAK_FUNCTION_REGISTRATION(AuthorizationSession::create, authorizationSessionCreateImpl);
+
+}  // namespace
 
 }  // namespace mongo

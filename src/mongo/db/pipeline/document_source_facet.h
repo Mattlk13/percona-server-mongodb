@@ -58,6 +58,7 @@ class NamespaceString;
  */
 class DocumentSourceFacet final : public DocumentSource {
 public:
+    static constexpr StringData kStageName = "$facet"_sd;
     struct FacetPipeline {
         FacetPipeline(std::string name, std::unique_ptr<Pipeline, PipelineDeleter> pipeline)
             : name(std::move(name)), pipeline(std::move(pipeline)) {}
@@ -66,26 +67,25 @@ public:
         std::unique_ptr<Pipeline, PipelineDeleter> pipeline;
     };
 
-    class LiteParsed : public LiteParsedDocumentSource {
+    class LiteParsed final : public LiteParsedDocumentSourceNestedPipelines {
     public:
-        static std::unique_ptr<LiteParsed> parse(const AggregationRequest& request,
+        static std::unique_ptr<LiteParsed> parse(const NamespaceString& nss,
                                                  const BSONElement& spec);
 
-        LiteParsed(std::vector<LiteParsedPipeline> liteParsedPipelines, PrivilegeVector privileges)
-            : _liteParsedPipelines(std::move(liteParsedPipelines)),
-              _requiredPrivileges(std::move(privileges)) {}
+        LiteParsed(std::string parseTimeName, std::vector<LiteParsedPipeline> pipelines)
+            : LiteParsedDocumentSourceNestedPipelines(
+                  std::move(parseTimeName), boost::none, std::move(pipelines)) {}
 
-        PrivilegeVector requiredPrivileges(bool isMongos) const final {
-            return _requiredPrivileges;
+        PrivilegeVector requiredPrivileges(bool isMongos,
+                                           bool bypassDocumentValidation) const override final {
+            PrivilegeVector requiredPrivileges;
+            for (auto&& pipeline : _pipelines) {
+                Privilege::addPrivilegesToPrivilegeVector(
+                    &requiredPrivileges,
+                    pipeline.requiredPrivileges(isMongos, bypassDocumentValidation));
+            }
+            return requiredPrivileges;
         }
-
-        stdx::unordered_set<NamespaceString> getInvolvedNamespaces() const final;
-
-        bool allowShardedForeignCollection(NamespaceString nss) const final;
-
-    private:
-        const std::vector<LiteParsedPipeline> _liteParsedPipelines;
-        const PrivilegeVector _requiredPrivileges;
     };
 
     static boost::intrusive_ptr<DocumentSource> createFromBson(
@@ -93,12 +93,9 @@ public:
 
     static boost::intrusive_ptr<DocumentSourceFacet> create(
         std::vector<FacetPipeline> facetPipelines,
-        const boost::intrusive_ptr<ExpressionContext>& expCtx);
-
-    /**
-     * Blocking call. Will consume all input and produces one output document.
-     */
-    GetNextResult getNext() final;
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        size_t bufferSizeBytes = internalQueryFacetBufferSizeBytes.load(),
+        size_t maxOutputDocBytes = internalQueryFacetMaxOutputDocSizeBytes.load());
 
     /**
      * Optimizes inner pipelines.
@@ -111,7 +108,7 @@ public:
     DepsTracker::State getDependencies(DepsTracker* deps) const final;
 
     const char* getSourceName() const final {
-        return "$facet";
+        return DocumentSourceFacet::kStageName.rawData();
     }
 
     /**
@@ -146,16 +143,24 @@ public:
     bool usedDisk() final;
 
 protected:
+    /**
+     * Blocking call. Will consume all input and produces one output document.
+     */
+    GetNextResult doGetNext() final;
     void doDispose() final;
 
 private:
     DocumentSourceFacet(std::vector<FacetPipeline> facetPipelines,
-                        const boost::intrusive_ptr<ExpressionContext>& expCtx);
+                        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                        size_t bufferSizeBytes,
+                        size_t maxOutputDocBytes);
 
     Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
 
     boost::intrusive_ptr<TeeBuffer> _teeBuffer;
     std::vector<FacetPipeline> _facets;
+
+    const size_t _maxOutputDocSizeBytes;
 
     bool _done = false;
 };

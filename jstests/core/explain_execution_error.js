@@ -1,4 +1,7 @@
-// @tags: [requires_getmore, assumes_balancer_off]
+// @tags: [
+//   assumes_balancer_off,
+//   requires_getmore,
+// ]
 
 // Test that even when the execution of a query fails, explain reports query
 // planner information.
@@ -69,10 +72,10 @@ while (bigStr.length < (1024 * 1024)) {
     bigStr += bigStr;
 }
 
-// Make a collection that is about 40 MB * number of shards.
+// Make a collection that is about 120 MB * number of shards.
 const numShards = FixtureHelpers.numberOfShardsForCollection(t);
-for (var i = 0; i < 40 * numShards; i++) {
-    assert.writeOK(t.insert({a: bigStr, b: 1, c: i}));
+for (var i = 0; i < 120 * numShards; i++) {
+    assert.commandWorked(t.insert({a: bigStr, b: 1, c: i}));
 }
 
 // A query which sorts the whole collection by "b" should throw an error due to hitting the
@@ -113,8 +116,8 @@ assertExecError(result);
 
 // Now we introduce two indices. One provides the requested sort order, and
 // the other does not.
-t.ensureIndex({b: 1});
-t.ensureIndex({c: 1});
+t.createIndex({b: 1});
+t.createIndex({c: 1});
 
 // The query should no longer fail with a memory limit error because the planner can obtain
 // the sort by scanning an index.

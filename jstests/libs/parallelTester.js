@@ -42,16 +42,6 @@ if (typeof _threadInject != "undefined") {
     };
     _threadInject(Thread.prototype);
 
-    ScopedThread = function() {
-        var args = Array.prototype.slice.call(arguments);
-        // Always pass TestData as the first argument.
-        args.unshift(TestData);
-        args.unshift(_threadStartWrapper);
-        this.init.apply(this, args);
-    };
-    ScopedThread.prototype = new Thread(function() {});
-    _scopedThreadInject(ScopedThread.prototype);
-
     fork = function() {
         var t = new Thread(function() {});
         Thread.apply(t, arguments);
@@ -135,9 +125,8 @@ if (typeof _threadInject != "undefined") {
         this.params.push(args);
     };
 
-    ParallelTester.prototype.run = function(msg, newScopes) {
-        newScopes = newScopes || false;
-        assert.parallelTests(this.params, msg, newScopes);
+    ParallelTester.prototype.run = function(msg) {
+        assert.parallelTests(this.params, msg);
     };
 
     // creates lists of tests from jstests dir in a format suitable for use by
@@ -166,10 +155,13 @@ if (typeof _threadInject != "undefined") {
             "index_bigkeys_nofail.js",
             "index_bigkeys_validation.js",
 
-            "mr3.js",
-            "evald.js",
-            "run_program1.js",
+            // Tests that set the notablescan parameter, which makes queries fail rather than use a
+            // non-indexed plan.
             "notablescan.js",
+            "notablescan_capped.js",
+
+            "mr_fail_invalid_js.js",
+            "run_program1.js",
             "bench_test1.js",
 
             // These tests use the getLastError command, which is unsafe to use in this environment,
@@ -182,9 +174,11 @@ if (typeof _threadInject != "undefined") {
             // this suite because any test being run at the same time could conceivably spam the
             // logs so much that the line they are looking for has been rotated off the server's
             // in-memory buffer of log messages, which only stores the 1024 most recent operations.
+            "comment_field.js",
             "getlog2.js",
             "logprocessdetails.js",
             "queryoptimizera.js",
+            "log_remote_op_wait.js",
 
             "connections_opened.js",  // counts connections, globally
             "opcounters_write_cmd.js",
@@ -201,28 +195,39 @@ if (typeof _threadInject != "undefined") {
             // Assumes that other tests are not creating cursors.
             "kill_cursors.js",
 
+            // Assumes that other tests are not starting operations.
+            "currentop_shell.js",
+
+            // These tests check global command counters.
+            "find_and_modify_metrics.js",
+            "update_metrics.js",
+
             // Views tests
             "views/invalid_system_views.js",      // Puts invalid view definitions in system.views.
             "views/views_all_commands.js",        // Drops test DB.
             "views/view_with_invalid_dbname.js",  // Puts invalid view definitions in system.views.
 
-            // Destroys and recreates the catalog, which will interfere with other tests.
-            "restart_catalog.js",
-        ]);
+            // This test works close to the BSON document limit for entries in the durable catalog,
+            // so running it in parallel with other tests will cause failures.
+            "long_collection_names.js",
 
-        // The following tests cannot run when shell readMode is legacy.
-        if (db.getMongo().readMode() === "legacy") {
-            var requires_find_command = [
-                "update_pipeline_shell_helpers.js",
-                "update_with_pipeline.js",
-                "views/views_aggregation.js",
-                "views/views_change.js",
-                "views/views_drop.js",
-                "views/views_find.js",
-                "wildcard_index_collation.js"
-            ];
-            Object.assign(skipTests, makeKeys(requires_find_command));
-        }
+            // This test causes collMod commands to hang, which interferes with other tests running
+            // collMod.
+            "crud_ops_do_not_throw_locktimeout.js",
+
+            // Can fail if isMaster takes too long on a loaded machine.
+            "dbadmin.js",
+
+            // Other tests will fail while the requireApiVersion server parameter is set.
+            "require_api_version.js",
+
+            // This test updates global memory usage counters in the bucket catalog in a way that
+            // may affect other time-series tests running concurrently.
+            "timeseries/timeseries_idle_buckets.js",
+
+            // Assumes that other tests are not creating API version 1 incompatible data.
+            "validate_db_metadata_command.js",
+        ]);
 
         // Get files, including files in subdirectories.
         var getFilesRecursive = function(dir) {
@@ -237,6 +242,33 @@ if (typeof _threadInject != "undefined") {
             });
             return fileList;
         };
+
+        // The following tests cannot run when shell readMode is legacy.
+        if (db.getMongo().readMode() === "legacy") {
+            var requires_find_command = [
+                "apply_ops_system_dot_views.js",
+                "command_let_variables.js",
+                "doc_validation_error.js",
+                "merge_sort_collation.js",
+                "explode_for_sort_fetch.js",
+                "update_pipeline_shell_helpers.js",
+                "update_with_pipeline.js",
+                "verify_update_mods.js",
+                "views/dbref_projection.js",
+                "views/views_aggregation.js",
+                "views/views_change.js",
+                "views/views_drop.js",
+                "views/views_find.js",
+                "wildcard_index_collation.js"
+            ];
+            Object.assign(skipTests, makeKeys(requires_find_command));
+
+            // Time-series collections require support for views, so are incompatible with legacy
+            // readMode.
+            const timeseriesTestFiles =
+                getFilesRecursive('jstests/core/timeseries').map(f => ('timeseries/' + f.baseName));
+            Object.assign(skipTests, makeKeys(timeseriesTestFiles));
+        }
 
         // Transactions are not supported on standalone nodes so we do not run them here.
         let txnsTestFiles = getFilesRecursive("jstests/core/txns").map(f => ("txns/" + f.baseName));
@@ -270,22 +302,15 @@ if (typeof _threadInject != "undefined") {
             parallelFilesDir + "/profile_find.js",
             parallelFilesDir + "/profile_findandmodify.js",
             parallelFilesDir + "/profile_getmore.js",
+            parallelFilesDir + "/profile_hide_index.js",
             parallelFilesDir + "/profile_insert.js",
             parallelFilesDir + "/profile_list_collections.js",
             parallelFilesDir + "/profile_list_indexes.js",
             parallelFilesDir + "/profile_mapreduce.js",
             parallelFilesDir + "/profile_no_such_db.js",
             parallelFilesDir + "/profile_query_hash.js",
-            parallelFilesDir + "/profile_repair_cursor.js",
             parallelFilesDir + "/profile_sampling.js",
             parallelFilesDir + "/profile_update.js",
-
-            // These tests can't be run in parallel because they expect an awaitData cursor to
-            // return after maxTimeMS, however this doesn't work if a long running blocking
-            // operation is running in parallel.
-            // TODO: Remove this restriction as part of SERVER-33942.
-            parallelFilesDir + "/compact_keeps_indexes.js",
-            parallelFilesDir + "/awaitdata_getmore_cmd.js",
 
             // These tests rely on a deterministically refreshable logical session cache. If they
             // run in parallel, they could interfere with the cache and cause failures.
@@ -347,9 +372,7 @@ if (typeof _threadInject != "undefined") {
     // by zero or more arguments to that function.  Each function and its arguments will
     // be called in a separate thread.
     // msg: failure message
-    // newScopes: if true, each thread starts in a fresh scope
-    assert.parallelTests = function(params, msg, newScopes) {
-        newScopes = newScopes || false;
+    assert.parallelTests = function(params, msg) {
         function wrapper(fun, argv, globals) {
             if (globals.hasOwnProperty("TestData")) {
                 TestData = globals.TestData;
@@ -371,11 +394,13 @@ if (typeof _threadInject != "undefined") {
         for (var i in params) {
             var param = params[i];
             var test = param.shift();
-            var t;
-            if (newScopes)
-                t = new ScopedThread(wrapper, test, param, {TestData: TestData});
-            else
-                t = new Thread(wrapper, test, param, {TestData: TestData});
+
+            // Make a shallow copy of TestData so we can override the test name to
+            // prevent tests on different threads that to use jsTestName() as the
+            // collection name from colliding.
+            const clonedTestData = Object.assign({}, TestData);
+            clonedTestData.testName = `ParallelTesterThread${i}`;
+            var t = new Thread(wrapper, test, param, {TestData: clonedTestData});
             runners.push(t);
         }
 

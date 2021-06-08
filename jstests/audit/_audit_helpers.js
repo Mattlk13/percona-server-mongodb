@@ -134,48 +134,28 @@ var getAuditEventsCollection = function(m, dbname, primary, useAuth) {
     return loadAuditEventsIntoCollection(m, auditPath, dbname, auditCollectionName, primary, auth);
 }
 
-// Load any file into a named collection.
+// Load audit log events into a named collection
 var loadAuditEventsIntoCollection = function(m, filename, dbname, collname, primary, auth) {
     var db = primary !== undefined ? primary.getDB(dbname) : m.getDB(dbname);
-    // the audit log is specifically parsable by mongoimport,
-    // so we use that to conveniently read its contents.
-    var exitCode = -1;
-    if (auth) {
-        exitCode = MongoRunner.runMongoTool("mongoimport",
-                                            {
-                                                username: 'admin',
-                                                password: 'admin',
-                                                authenticationDatabase: 'admin',
-                                                db: dbname,
-                                                collection: collname,
-                                                drop: '',
-                                                host: db.hostInfo().system.hostname,
-                                                file: filename,
-                                            });
-    } else {
-        exitCode = MongoRunner.runMongoTool("mongoimport",
-                                            {
-                                                db: dbname,
-                                                collection: collname,
-                                                drop: '',
-                                                host: db.hostInfo().system.hostname,
-                                                file: filename,
-                                            });
-    }
-    assert.eq(0, exitCode, "mongoimport failed to import '" + filename + "' into '" + dbname + "." + collname + "'");
 
-    // should get as many entries back as there are non-empty
-    // strings in the audit log
-    auditCollection = db.getCollection(collname)
-    // some records are added to audit log as side effects of
-    // mongoimport activity. sometimes such records are added before
-    // mongoimport reads log file, sometimes after that.
-    // thus number of entries in created collection never matches
-    // number of non-empty strings in the audit log after mongoimport call.
-    // the open question is how this assert worked prior to MongoDB 3.0
-    //assert.eq(auditCollection.count(),
-    //          cat(filename).split('\n').filter(function(o) { return o != "" }).length,
-    //          "getAuditEventsCollection has different count than the audit log length");
+    // Make all audit events durable
+    // To make "non-durable" events like auth checks or app messages durable
+    // we need to put some "durable" events after them.
+    // Those extra events won't affect our tests because all tests search
+    // events only in strict time range  (beforeCmd, beforeLoad).
+    var fooColl = db.getCollection('foo' + Date.now());
+    fooColl.insert({a:1});
+    fooColl.drop();
+    sleep(110);
+
+    // drop collection
+    db[collname].drop();
+    // load data from audit log file
+    var auditCollection = db.getCollection(collname);
+    cat(filename)
+        .split('\n')
+        .filter(line => line.length > 0)
+        .forEach(ev => auditCollection.insert(parseJsonCanonical(ev)));
 
     // there should be no duplicate audit log lines
     assert.commandWorked(auditCollection.createIndex(

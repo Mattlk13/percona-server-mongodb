@@ -29,20 +29,28 @@
 
 #pragma once
 
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/db/commands.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/rpc/write_concern_error_detail.h"
 #include "mongo/s/async_requests_sender.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/commands/strategy.h"
-#include "mongo/stdx/memory.h"
 
 namespace mongo {
+
+struct RawResponsesResult {
+    bool responseOK;
+    std::set<ShardId> shardsWithSuccessResponses;
+    std::vector<AsyncRequestsSender::Response> successResponses;
+    boost::optional<Status> firstStaleConfigError;
+};
 
 /**
  * This function appends the provided writeConcernError BSONElement to the sharded response.
@@ -57,6 +65,35 @@ void appendWriteConcernErrorToCmdResponse(const ShardId& shardID,
 std::unique_ptr<WriteConcernErrorDetail> getWriteConcernErrorDetailFromBSONObj(const BSONObj& obj);
 
 /**
+ * Makes an expression context suitable for canonicalization of queries that contain let parameters
+ * and runtimeConstants on mongos.
+ */
+boost::intrusive_ptr<ExpressionContext> makeExpressionContextWithDefaultsForTargeter(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    const BSONObj& collation,
+    const boost::optional<ExplainOptions::Verbosity>& verbosity,
+    const boost::optional<BSONObj>& letParameters,
+    const boost::optional<LegacyRuntimeConstants>& runtimeConstants);
+
+/**
+ * Consults the routing info to build requests for:
+ * 1. If sharded, shards that own chunks for the namespace, or
+ * 2. If unsharded, the primary shard for the database.
+ *
+ * If a shard is included in shardsToSkip, it will be excluded from the list returned to the
+ * caller.
+ */
+std::vector<AsyncRequestsSender::Request> buildVersionedRequestsForTargetedShards(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    const ChunkManager& cm,
+    const std::set<ShardId>& shardsToSkip,
+    const BSONObj& cmdObj,
+    const BSONObj& query,
+    const BSONObj& collation);
+
+/**
  * Dispatches all the specified requests in parallel and waits until all complete, returning a
  * vector of the same size and positions as that of 'requests'.
  *
@@ -67,8 +104,28 @@ std::vector<AsyncRequestsSender::Response> gatherResponses(
     StringData dbName,
     const ReadPreferenceSetting& readPref,
     Shard::RetryPolicy retryPolicy,
-    const std::vector<AsyncRequestsSender::Request>& requests,
-    const std::set<ErrorCodes::Error>& ignorableErrors = {});
+    const std::vector<AsyncRequestsSender::Request>& requests);
+
+/**
+ * Dispatches all the specified requests in parallel and waits until all complete, returning a
+ * vector of the same size and positions as that of 'requests'.
+ */
+std::vector<AsyncRequestsSender::Response> gatherResponsesNoThrowOnStaleShardVersionErrors(
+    OperationContext* opCtx,
+    StringData dbName,
+    const ReadPreferenceSetting& readPref,
+    Shard::RetryPolicy retryPolicy,
+    const std::vector<AsyncRequestsSender::Request>& requests);
+
+/**
+ * Returns a copy of 'cmdObj' with dbVersion appended if it exists in 'dbInfo'
+ */
+BSONObj appendDbVersionIfPresent(BSONObj cmdObj, const CachedDatabaseInfo& dbInfo);
+
+/**
+ * Returns a copy of 'cmdObj' with 'databaseVersion' appended.
+ */
+BSONObj appendDbVersionIfPresent(BSONObj cmdObj, DatabaseVersion dbVersion);
 
 /**
  * Returns a copy of 'cmdObj' with 'version' appended.
@@ -76,9 +133,30 @@ std::vector<AsyncRequestsSender::Response> gatherResponses(
 BSONObj appendShardVersion(BSONObj cmdObj, ChunkVersion version);
 
 /**
- * Returns a copy of 'cmdObj' with 'allowImplicitCollectionCreation' appended.
+ * Returns a copy of 'cmdObj' with the read/writeConcern from the OpCtx appended, unless the
+ * cmdObj explicitly specifies read/writeConcern.
  */
-BSONObj appendAllowImplicitCreate(BSONObj cmdObj, bool allow);
+BSONObj applyReadWriteConcern(OperationContext* opCtx,
+                              bool appendRC,
+                              bool appendWC,
+                              const BSONObj& cmdObj);
+
+/**
+ * Convenience versions of applyReadWriteConcern() for calling from within
+ * CommandInvocation, BasicCommand or BasicCommandWithRequestParser.
+ */
+BSONObj applyReadWriteConcern(OperationContext* opCtx,
+                              CommandInvocation* invocation,
+                              const BSONObj& cmdObj);
+
+BSONObj applyReadWriteConcern(OperationContext* opCtx,
+                              BasicCommandWithReplyBuilderInterface* cmd,
+                              const BSONObj& cmdObj);
+
+/**
+ * Returns a copy of 'cmdObj' with the writeConcern removed.
+ */
+BSONObj stripWriteConcern(const BSONObj& cmdObj);
 
 /**
  * Utility for dispatching unversioned commands to all shards in a cluster.
@@ -112,7 +190,31 @@ std::vector<AsyncRequestsSender::Response> scatterGatherVersionedTargetByRouting
     OperationContext* opCtx,
     StringData dbName,
     const NamespaceString& nss,
-    const CachedCollectionRoutingInfo& routingInfo,
+    const ChunkManager& cm,
+    const BSONObj& cmdObj,
+    const ReadPreferenceSetting& readPref,
+    Shard::RetryPolicy retryPolicy,
+    const BSONObj& query,
+    const BSONObj& collation);
+
+
+/**
+ * Utility for dispatching versioned commands on a namespace, deciding which shards to
+ * target by applying the passed-in query and collation to the local routing table cache.
+ *
+ * Callers can specify shards to skip, even if these shards would be otherwise targeted.
+ *
+ * Allows StaleConfigException errors to append to the response list.
+ *
+ * Return value is the same as scatterGatherUnversionedTargetAllShards().
+ */
+std::vector<AsyncRequestsSender::Response>
+scatterGatherVersionedTargetByRoutingTableNoThrowOnStaleShardVersionErrors(
+    OperationContext* opCtx,
+    StringData dbName,
+    const NamespaceString& nss,
+    const ChunkManager& cm,
+    const std::set<ShardId>& shardsToSkip,
     const BSONObj& cmdObj,
     const ReadPreferenceSetting& readPref,
     Shard::RetryPolicy retryPolicy,
@@ -139,10 +241,8 @@ std::vector<AsyncRequestsSender::Response> scatterGatherOnlyVersionIfUnsharded(
     const std::set<ErrorCodes::Error>& ignorableErrors = {});
 
 /**
- * Utility for dispatching commands against the primary of a database and attach the appropriate
- * database version.
- *
- * Does not retry on StaleDbVersion.
+ * Utility for dispatching commands against the primary of a database and attaching the appropriate
+ * database version. Also attaches UNSHARDED to the command. Does not retry on stale version.
  */
 AsyncRequestsSender::Response executeCommandAgainstDatabasePrimary(
     OperationContext* opCtx,
@@ -153,20 +253,54 @@ AsyncRequestsSender::Response executeCommandAgainstDatabasePrimary(
     Shard::RetryPolicy retryPolicy);
 
 /**
+ * Utility for dispatching commands against the primary of a database. Does not attach a database or
+ * shard version to the command object, but instead issues it exactly as provided. Does not retry.
+ */
+AsyncRequestsSender::Response executeRawCommandAgainstDatabasePrimary(
+    OperationContext* opCtx,
+    StringData dbName,
+    const CachedDatabaseInfo& dbInfo,
+    const BSONObj& cmdObj,
+    const ReadPreferenceSetting& readPref,
+    Shard::RetryPolicy retryPolicy);
+
+/**
+ * Utility for dispatching commands against the shard with the MinKey chunk for the namespace and
+ * attaching the appropriate shard version.
+ *
+ * Does not retry on StaleConfigException.
+ */
+AsyncRequestsSender::Response executeCommandAgainstShardWithMinKeyChunk(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    const ChunkManager& cm,
+    const BSONObj& cmdObj,
+    const ReadPreferenceSetting& readPref,
+    Shard::RetryPolicy retryPolicy);
+
+/**
  * Attaches each shard's response or error status by the shard's connection string in a top-level
  * field called 'raw' in 'output'.
  *
  * If all shards that errored had the same error, writes the common error code to 'output'. Writes a
- * string representation of all errors to 'errmsg.' Errors codes in 'ignoredErrors' are not treated
- * as errors if any shard returned success.
+ * string representation of all errors to 'errmsg.'
  *
- * Returns true if any shard reports success and only ignored errors occur.
+ * ShardNotFound responses are not treated as errors if any shard returned success. We allow
+ * ShardNotFound errors to be ignored as errors since this node may not heave realized that a
+ * shard has been removed.
+ *
+ * Returns:
+ * 1. A boolean indicating whether any shards reported success and only ShardNotFound errors occur.
+ * 2. A set containing the list of shards that reported success or a ShardNotFound error. For shard
+ *    tracking purposes, a shard with a writeConcernError is not considered to be successful.
+ * 3. The list of AsyncRequestsSender::Responses that were successful.
+ * 4. The first stale config error received, if such an error exists.
  */
-bool appendRawResponses(OperationContext* opCtx,
-                        std::string* errmsg,
-                        BSONObjBuilder* output,
-                        const std::vector<AsyncRequestsSender::Response>& shardResponses,
-                        std::set<ErrorCodes::Error> ignoredErrors = {});
+RawResponsesResult appendRawResponses(
+    OperationContext* opCtx,
+    std::string* errmsg,
+    BSONObjBuilder* output,
+    const std::vector<AsyncRequestsSender::Response>& shardResponses);
 
 /**
  * Extracts the query from a query-embedding command ('query' or 'q' fields). If the command does
@@ -182,14 +316,6 @@ BSONObj extractQuery(const BSONObj& cmdObj);
 BSONObj extractCollation(const BSONObj& cmdObj);
 
 /**
- * Utility function to compute a single error code from a vector of command results.
- *
- * @return If there is an error code common to all of the error results, returns that error
- *          code; otherwise, returns 0.
- */
-int getUniqueCodeFromCommandResults(const std::vector<Strategy::CommandResult>& results);
-
-/**
  * Utility function to return an empty result set from a command.
  */
 bool appendEmptyResultSet(OperationContext* opCtx,
@@ -198,19 +324,25 @@ bool appendEmptyResultSet(OperationContext* opCtx,
                           const std::string& ns);
 
 /**
- * If the specified database exists already, loads it in the cache (if not already there) and
- * returns it. Otherwise, if it does not exist, this call will implicitly create it as non-sharded.
- */
-StatusWith<CachedDatabaseInfo> createShardDatabase(OperationContext* opCtx, StringData dbName);
-
-/**
  * Returns the shards that would be targeted for the given query according to the given routing
  * info.
  */
-std::set<ShardId> getTargetedShardsForQuery(OperationContext* opCtx,
-                                            const CachedCollectionRoutingInfo& routingInfo,
+std::set<ShardId> getTargetedShardsForQuery(boost::intrusive_ptr<ExpressionContext> expCtx,
+                                            const ChunkManager& cm,
                                             const BSONObj& query,
                                             const BSONObj& collation);
+
+/**
+ * Determines the shard(s) to which the given query will be targeted, and builds a separate
+ * versioned copy of the command object for each such shard.
+ */
+std::vector<std::pair<ShardId, BSONObj>> getVersionedRequestsForTargetedShards(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    const ChunkManager& cm,
+    const BSONObj& cmdObj,
+    const BSONObj& query,
+    const BSONObj& collation);
 
 /**
  * If the command is running in a transaction, returns the proper routing table to use for targeting
@@ -220,7 +352,17 @@ std::set<ShardId> getTargetedShardsForQuery(OperationContext* opCtx,
  *
  * Should be used by all router commands that can be run in a transaction when targeting shards.
  */
-StatusWith<CachedCollectionRoutingInfo> getCollectionRoutingInfoForTxnCmd(
-    OperationContext* opCtx, const NamespaceString& nss);
+StatusWith<ChunkManager> getCollectionRoutingInfoForTxnCmd(OperationContext* opCtx,
+                                                           const NamespaceString& nss);
+
+/**
+ * Loads all of the indexes for the given namespace from the appropriate shard. For unsharded
+ * collections will read from the primary shard and for sharded collections will read from the shard
+ * that owns the chunk containing the minimum key for the collection's shard key.
+ *
+ * Will not retry on StaleConfig or StaleDbVersion errors.
+ */
+StatusWith<Shard::QueryResponse> loadIndexesFromAuthoritativeShard(OperationContext* opCtx,
+                                                                   const NamespaceString& nss);
 
 }  // namespace mongo

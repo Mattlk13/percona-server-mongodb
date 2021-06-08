@@ -29,10 +29,14 @@
 
 #include "mongo/platform/basic.h"
 
+#include <utility>
+
+#include "mongo/db/pipeline/aggregate_command_gen.h"
 #include "mongo/db/pipeline/expression_context.h"
-#include "mongo/db/pipeline/stub_mongo_process_interface.h"
+#include "mongo/db/pipeline/process_interface/stub_mongo_process_interface.h"
 #include "mongo/db/query/collation/collation_spec.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 
@@ -43,91 +47,131 @@ ExpressionContext::ResolvedNamespace::ResolvedNamespace(NamespaceString ns,
     : ns(std::move(ns)), pipeline(std::move(pipeline)) {}
 
 ExpressionContext::ExpressionContext(OperationContext* opCtx,
-                                     const AggregationRequest& request,
+                                     const AggregateCommandRequest& request,
                                      std::unique_ptr<CollatorInterface> collator,
                                      std::shared_ptr<MongoProcessInterface> processInterface,
                                      StringMap<ResolvedNamespace> resolvedNamespaces,
-                                     boost::optional<UUID> collUUID)
-    : ExpressionContext(opCtx, collator.get()) {
-    explain = request.getExplain();
-    comment = request.getComment();
-    fromMongos = request.isFromMongos();
-    needsMerge = request.needsMerge();
-    mergeByPBRT = request.mergeByPBRT();
-    allowDiskUse = request.shouldAllowDiskUse();
-    bypassDocumentValidation = request.shouldBypassDocumentValidation();
-    ns = request.getNamespaceString();
-    mongoProcessInterface = std::move(processInterface);
-    collation = request.getCollation();
-    _ownedCollator = std::move(collator);
-    _resolvedNamespaces = std::move(resolvedNamespaces);
-    uuid = std::move(collUUID);
-    if (request.getRuntimeConstants()) {
-        variables.setRuntimeConstants(request.getRuntimeConstants().get());
-    } else {
-        variables.setDefaultRuntimeConstants(opCtx);
+                                     boost::optional<UUID> collUUID,
+                                     bool mayDbProfile)
+    : ExpressionContext(opCtx,
+                        request.getExplain(),
+                        request.getFromMongos(),
+                        request.getNeedsMerge(),
+                        request.getAllowDiskUse(),
+                        request.getBypassDocumentValidation().value_or(false),
+                        request.getIsMapReduceCommand(),
+                        request.getNamespace(),
+                        request.getLegacyRuntimeConstants(),
+                        std::move(collator),
+                        std::move(processInterface),
+                        std::move(resolvedNamespaces),
+                        std::move(collUUID),
+                        request.getLet(),
+                        mayDbProfile) {
+
+    if (request.getIsMapReduceCommand()) {
+        // mapReduce command JavaScript invocation is only subject to the server global
+        // 'jsHeapLimitMB' limit.
+        jsHeapLimitMB = boost::none;
     }
 }
 
-ExpressionContext::ExpressionContext(OperationContext* opCtx,
-                                     const CollatorInterface* collator,
-                                     const boost::optional<RuntimeConstants>& runtimeConstants)
-    : opCtx(opCtx),
+ExpressionContext::ExpressionContext(
+    OperationContext* opCtx,
+    const boost::optional<ExplainOptions::Verbosity>& explain,
+    bool fromMongos,
+    bool needsMerge,
+    bool allowDiskUse,
+    bool bypassDocumentValidation,
+    bool isMapReduce,
+    const NamespaceString& ns,
+    const boost::optional<LegacyRuntimeConstants>& runtimeConstants,
+    std::unique_ptr<CollatorInterface> collator,
+    const std::shared_ptr<MongoProcessInterface>& mongoProcessInterface,
+    StringMap<ExpressionContext::ResolvedNamespace> resolvedNamespaces,
+    boost::optional<UUID> collUUID,
+    const boost::optional<BSONObj>& letParameters,
+    bool mayDbProfile)
+    : explain(explain),
+      fromMongos(fromMongos),
+      needsMerge(needsMerge),
+      allowDiskUse(allowDiskUse),
+      bypassDocumentValidation(bypassDocumentValidation),
+      ns(ns),
+      uuid(std::move(collUUID)),
+      opCtx(opCtx),
+      mongoProcessInterface(mongoProcessInterface),
+      timeZoneDatabase(getTimeZoneDatabase(opCtx)),
+      variablesParseState(variables.useIdGenerator()),
+      mayDbProfile(mayDbProfile),
+      _collator(std::move(collator)),
+      _documentComparator(_collator.get()),
+      _valueComparator(_collator.get()),
+      _resolvedNamespaces(std::move(resolvedNamespaces)) {
+
+    if (runtimeConstants && runtimeConstants->getClusterTime().isNull()) {
+        // Try to get a default value for clusterTime if a logical clock exists.
+        auto genConsts = variables.generateRuntimeConstants(opCtx);
+        genConsts.setJsScope(runtimeConstants->getJsScope());
+        genConsts.setIsMapReduce(runtimeConstants->getIsMapReduce());
+        variables.setLegacyRuntimeConstants(genConsts);
+    } else if (runtimeConstants) {
+        variables.setLegacyRuntimeConstants(*runtimeConstants);
+    } else {
+        variables.setDefaultRuntimeConstants(opCtx);
+    }
+
+    if (!isMapReduce) {
+        jsHeapLimitMB = internalQueryJavaScriptHeapSizeLimitMB.load();
+    }
+    if (letParameters)
+        variables.seedVariablesWithLetParameters(this, *letParameters);
+}
+
+ExpressionContext::ExpressionContext(
+    OperationContext* opCtx,
+    std::unique_ptr<CollatorInterface> collator,
+    const NamespaceString& nss,
+    const boost::optional<LegacyRuntimeConstants>& runtimeConstants,
+    const boost::optional<BSONObj>& letParameters,
+    bool mayDbProfile,
+    boost::optional<ExplainOptions::Verbosity> explain)
+    : explain(explain),
+      ns(nss),
+      opCtx(opCtx),
       mongoProcessInterface(std::make_shared<StubMongoProcessInterface>()),
       timeZoneDatabase(opCtx && opCtx->getServiceContext()
                            ? TimeZoneDatabase::get(opCtx->getServiceContext())
                            : nullptr),
       variablesParseState(variables.useIdGenerator()),
-      _collator(collator),
-      _documentComparator(_collator),
-      _valueComparator(_collator) {
+      mayDbProfile(mayDbProfile),
+      _collator(std::move(collator)),
+      _documentComparator(_collator.get()),
+      _valueComparator(_collator.get()) {
     if (runtimeConstants) {
-        variables.setRuntimeConstants(*runtimeConstants);
+        variables.setLegacyRuntimeConstants(*runtimeConstants);
     }
+
+    jsHeapLimitMB = internalQueryJavaScriptHeapSizeLimitMB.load();
+    if (letParameters)
+        variables.seedVariablesWithLetParameters(this, *letParameters);
 }
 
-ExpressionContext::ExpressionContext(NamespaceString nss,
-                                     std::shared_ptr<MongoProcessInterface> processInterface,
-                                     const TimeZoneDatabase* tzDb)
-    : ns(std::move(nss)),
-      mongoProcessInterface(std::move(processInterface)),
-      timeZoneDatabase(tzDb),
-      variablesParseState(variables.useIdGenerator()) {}
-
-void ExpressionContext::checkForInterrupt() {
+void ExpressionContext::checkForInterruptSlow() {
     // This check could be expensive, at least in relative terms, so don't check every time.
-    if (--_interruptCounter == 0) {
-        invariant(opCtx);
-        _interruptCounter = kInterruptCheckPeriod;
-        opCtx->checkForInterrupt();
-    }
+    invariant(opCtx);
+    _interruptCounter = kInterruptCheckPeriod;
+    opCtx->checkForInterrupt();
 }
 
-ExpressionContext::CollatorStash::CollatorStash(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx,
-    std::unique_ptr<CollatorInterface> newCollator)
-    : _expCtx(expCtx),
-      _originalCollation(_expCtx->collation),
-      _originalCollatorOwned(std::move(_expCtx->_ownedCollator)),
-      _originalCollatorUnowned(_expCtx->_collator) {
+ExpressionContext::CollatorStash::CollatorStash(ExpressionContext* const expCtx,
+                                                std::unique_ptr<CollatorInterface> newCollator)
+    : _expCtx(expCtx), _originalCollator(std::move(_expCtx->_collator)) {
     _expCtx->setCollator(std::move(newCollator));
-    _expCtx->collation =
-        _expCtx->getCollator() ? _expCtx->getCollator()->getSpec().toBSON().getOwned() : BSONObj();
 }
 
 ExpressionContext::CollatorStash::~CollatorStash() {
-    if (_originalCollatorOwned) {
-        _expCtx->setCollator(std::move(_originalCollatorOwned));
-    } else {
-        _expCtx->setCollator(_originalCollatorUnowned);
-        if (!_originalCollatorUnowned && _expCtx->_ownedCollator) {
-            // If the original collation was 'nullptr', we cannot distinguish whether it was owned
-            // or not. We always set '_ownedCollator' with the stash, so should reset it to null
-            // here.
-            _expCtx->_ownedCollator = nullptr;
-        }
-    }
-    _expCtx->collation = _originalCollation;
+    _expCtx->setCollator(std::move(_originalCollator));
 }
 
 std::unique_ptr<ExpressionContext::CollatorStash> ExpressionContext::temporarilyChangeCollator(
@@ -136,54 +180,42 @@ std::unique_ptr<ExpressionContext::CollatorStash> ExpressionContext::temporarily
     return std::unique_ptr<CollatorStash>(new CollatorStash(this, std::move(newCollator)));
 }
 
-void ExpressionContext::setCollator(const CollatorInterface* collator) {
-    _collator = collator;
-
-    // Document/Value comparisons must be aware of the collation.
-    _documentComparator = DocumentComparator(_collator);
-    _valueComparator = ValueComparator(_collator);
-}
-
 intrusive_ptr<ExpressionContext> ExpressionContext::copyWith(
     NamespaceString ns,
     boost::optional<UUID> uuid,
-    boost::optional<std::unique_ptr<CollatorInterface>> collator) const {
-    intrusive_ptr<ExpressionContext> expCtx =
-        new ExpressionContext(std::move(ns), mongoProcessInterface, timeZoneDatabase);
+    boost::optional<std::unique_ptr<CollatorInterface>> updatedCollator) const {
 
-    expCtx->uuid = std::move(uuid);
-    expCtx->explain = explain;
-    expCtx->comment = comment;
-    expCtx->needsMerge = needsMerge;
-    expCtx->mergeByPBRT = mergeByPBRT;
-    expCtx->fromMongos = fromMongos;
+    auto collator = updatedCollator
+        ? std::move(*updatedCollator)
+        : (_collator ? _collator->clone() : std::unique_ptr<CollatorInterface>{});
+
+    auto expCtx = make_intrusive<ExpressionContext>(opCtx,
+                                                    explain,
+                                                    fromMongos,
+                                                    needsMerge,
+                                                    allowDiskUse,
+                                                    bypassDocumentValidation,
+                                                    false,  // isMapReduce
+                                                    ns,
+                                                    boost::none,  // runtimeConstants
+                                                    std::move(collator),
+                                                    mongoProcessInterface,
+                                                    _resolvedNamespaces,
+                                                    uuid);
+
     expCtx->inMongos = inMongos;
-    expCtx->allowDiskUse = allowDiskUse;
-    expCtx->bypassDocumentValidation = bypassDocumentValidation;
     expCtx->maxFeatureCompatibilityVersion = maxFeatureCompatibilityVersion;
     expCtx->subPipelineDepth = subPipelineDepth;
-
     expCtx->tempDir = tempDir;
-
-    expCtx->opCtx = opCtx;
-
-    if (collator) {
-        expCtx->collation =
-            *collator ? (*collator)->getSpec().toBSON() : CollationSpec::kSimpleSpec;
-        expCtx->setCollator(std::move(*collator));
-    } else {
-        expCtx->collation = collation;
-        if (_ownedCollator) {
-            expCtx->setCollator(_ownedCollator->clone());
-        } else if (_collator) {
-            expCtx->setCollator(_collator);
-        }
-    }
-
-    expCtx->_resolvedNamespaces = _resolvedNamespaces;
+    expCtx->jsHeapLimitMB = jsHeapLimitMB;
 
     expCtx->variables = variables;
     expCtx->variablesParseState = variablesParseState.copyWith(expCtx->variables.useIdGenerator());
+    expCtx->exprUnstableForApiV1 = exprUnstableForApiV1;
+    expCtx->exprDeprectedForApiV1 = exprDeprectedForApiV1;
+
+    expCtx->initialPostBatchResumeToken = initialPostBatchResumeToken.getOwned();
+    expCtx->originalAggregateCommand = originalAggregateCommand.getOwned();
 
     // Note that we intentionally skip copying the value of '_interruptCounter' because 'expCtx' is
     // intended to be used for executing a separate aggregation pipeline.

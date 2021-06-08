@@ -31,10 +31,10 @@
 
 #include "mongo/client/read_preference.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/s/config/config_server_test_fixture.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/client/shard.h"
-#include "mongo/s/config_server_test_fixture.h"
 
 namespace mongo {
 namespace {
@@ -49,7 +49,7 @@ TEST_F(AddShardToZoneTest, AddSingleZoneToExistingShardShouldSucceed) {
     shard.setName("a");
     shard.setHost("a:1234");
 
-    setupShards({shard}).transitional_ignore();
+    setupShards({shard});
 
     ASSERT_OK(ShardingCatalogManager::get(operationContext())
                   ->addShardToZone(operationContext(), shard.getName(), "z"));
@@ -68,7 +68,7 @@ TEST_F(AddShardToZoneTest, AddZoneToShardWithSameTagShouldSucceed) {
     shard.setHost("a:1234");
     shard.setTags({"x", "y"});
 
-    setupShards({shard}).transitional_ignore();
+    setupShards({shard});
 
     ASSERT_OK(ShardingCatalogManager::get(operationContext())
                   ->addShardToZone(operationContext(), shard.getName(), "x"));
@@ -89,7 +89,7 @@ TEST_F(AddShardToZoneTest, AddZoneToShardWithNewTagShouldAppend) {
     shard.setHost("a:1234");
     shard.setTags({"x"});
 
-    setupShards({shard}).transitional_ignore();
+    setupShards({shard});
 
     ASSERT_OK(ShardingCatalogManager::get(operationContext())
                   ->addShardToZone(operationContext(), shard.getName(), "y"));
@@ -109,7 +109,7 @@ TEST_F(AddShardToZoneTest, AddSingleZoneToNonExistingShardShouldFail) {
     shard.setName("a");
     shard.setHost("a:1234");
 
-    setupShards({shard}).transitional_ignore();
+    setupShards({shard});
 
     auto status = ShardingCatalogManager::get(operationContext())
                       ->addShardToZone(operationContext(), "b", "z");

@@ -11,7 +11,6 @@ load('jstests/concurrency/fsm_libs/extend_workload.js');  // for extendWorkload
 load('jstests/concurrency/fsm_workloads/yield.js');       // for $config
 
 var $config = extendWorkload($config, function($config, $super) {
-
     /*
      * Issue a query with an or stage as the root.
      */
@@ -38,8 +37,8 @@ var $config = extendWorkload($config, function($config, $super) {
     $config.setup = function setup(db, collName, cluster) {
         $super.setup.apply(this, arguments);
 
-        assertAlways.commandWorked(db[collName].ensureIndex({c: 1}));
-        assertAlways.commandWorked(db[collName].ensureIndex({d: 1}));
+        assertAlways.commandWorked(db[collName].createIndex({c: 1}));
+        assertAlways.commandWorked(db[collName].createIndex({d: 1}));
     };
 
     return $config;

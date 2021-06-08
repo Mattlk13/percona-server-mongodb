@@ -108,7 +108,7 @@ public:
 
     void cloneMap(UsageMap& out) const;
 
-    void collectionDropped(const NamespaceString& nss, bool databaseDropped = false);
+    void collectionDropped(const NamespaceString& nss);
 
     /**
      * Appends the collection-level latency statistics
@@ -132,7 +132,9 @@ public:
     /**
      * Appends the global latency statistics.
      */
-    void appendGlobalLatencyStats(bool includeHistograms, BSONObjBuilder* builder);
+    void appendGlobalLatencyStats(bool includeHistograms,
+                                  bool slowMSBucketsOnly,
+                                  BSONObjBuilder* builder);
 
 private:
     void _appendToUsageMap(BSONObjBuilder& b, const UsageMap& map) const;
@@ -154,7 +156,6 @@ private:
     mutable SimpleMutex _lock;
     OperationLatencyHistogram _globalHistogramStats;
     UsageMap _usage;
-    std::set<std::string> _collDropNs;
 };
 
 }  // namespace mongo

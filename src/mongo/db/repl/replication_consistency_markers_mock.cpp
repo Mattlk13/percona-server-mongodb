@@ -36,12 +36,12 @@ namespace repl {
 
 void ReplicationConsistencyMarkersMock::initializeMinValidDocument(OperationContext* opCtx) {
     {
-        stdx::lock_guard<stdx::mutex> lock(_initialSyncFlagMutex);
+        stdx::lock_guard<Latch> lock(_initialSyncFlagMutex);
         _initialSyncFlag = false;
     }
 
     {
-        stdx::lock_guard<stdx::mutex> lock(_minValidBoundariesMutex);
+        stdx::lock_guard<Latch> lock(_minValidBoundariesMutex);
         _minValid = {};
         _oplogTruncateAfterPoint = {};
         _appliedThrough = {};
@@ -49,69 +49,98 @@ void ReplicationConsistencyMarkersMock::initializeMinValidDocument(OperationCont
 }
 
 bool ReplicationConsistencyMarkersMock::getInitialSyncFlag(OperationContext* opCtx) const {
-    stdx::lock_guard<stdx::mutex> lock(_initialSyncFlagMutex);
+    stdx::lock_guard<Latch> lock(_initialSyncFlagMutex);
     return _initialSyncFlag;
 }
 
 void ReplicationConsistencyMarkersMock::setInitialSyncFlag(OperationContext* opCtx) {
-    stdx::lock_guard<stdx::mutex> lock(_initialSyncFlagMutex);
+    stdx::lock_guard<Latch> lock(_initialSyncFlagMutex);
     _initialSyncFlag = true;
 }
 
 void ReplicationConsistencyMarkersMock::clearInitialSyncFlag(OperationContext* opCtx) {
-    stdx::lock_guard<stdx::mutex> lock(_initialSyncFlagMutex);
+    stdx::lock_guard<Latch> lock(_initialSyncFlagMutex);
     _initialSyncFlag = false;
 }
 
 OpTime ReplicationConsistencyMarkersMock::getMinValid(OperationContext* opCtx) const {
-    stdx::lock_guard<stdx::mutex> lock(_minValidBoundariesMutex);
+    stdx::lock_guard<Latch> lock(_minValidBoundariesMutex);
     return _minValid;
 }
 
 void ReplicationConsistencyMarkersMock::setMinValid(OperationContext* opCtx,
                                                     const OpTime& minValid) {
-    stdx::lock_guard<stdx::mutex> lock(_minValidBoundariesMutex);
+    stdx::lock_guard<Latch> lock(_minValidBoundariesMutex);
     _minValid = minValid;
 }
 
 void ReplicationConsistencyMarkersMock::setMinValidToAtLeast(OperationContext* opCtx,
                                                              const OpTime& minValid) {
-    stdx::lock_guard<stdx::mutex> lock(_minValidBoundariesMutex);
+    stdx::lock_guard<Latch> lock(_minValidBoundariesMutex);
     _minValid = std::max(_minValid, minValid);
 }
 
+void ReplicationConsistencyMarkersMock::ensureFastCountOnOplogTruncateAfterPoint(
+    OperationContext* opCtx) {}
+
 void ReplicationConsistencyMarkersMock::setOplogTruncateAfterPoint(OperationContext* opCtx,
                                                                    const Timestamp& timestamp) {
-    stdx::lock_guard<stdx::mutex> lock(_minValidBoundariesMutex);
+    stdx::lock_guard<Latch> lock(_minValidBoundariesMutex);
     _oplogTruncateAfterPoint = timestamp;
 }
 
 Timestamp ReplicationConsistencyMarkersMock::getOplogTruncateAfterPoint(
     OperationContext* opCtx) const {
-    stdx::lock_guard<stdx::mutex> lock(_minValidBoundariesMutex);
+    stdx::lock_guard<Latch> lock(_minValidBoundariesMutex);
     return _oplogTruncateAfterPoint;
+}
+
+void ReplicationConsistencyMarkersMock::startUsingOplogTruncateAfterPointForPrimary() {}
+
+void ReplicationConsistencyMarkersMock::stopUsingOplogTruncateAfterPointForPrimary() {}
+
+bool ReplicationConsistencyMarkersMock::isOplogTruncateAfterPointBeingUsedForPrimary() const {
+    return true;
+}
+
+void ReplicationConsistencyMarkersMock::setOplogTruncateAfterPointToTopOfOplog(
+    OperationContext* opCtx){};
+
+boost::optional<OpTimeAndWallTime>
+ReplicationConsistencyMarkersMock::refreshOplogTruncateAfterPointIfPrimary(
+    OperationContext* opCtx) {
+    return boost::none;
 }
 
 void ReplicationConsistencyMarkersMock::setAppliedThrough(OperationContext* opCtx,
                                                           const OpTime& optime,
                                                           bool setTimestamp) {
-    stdx::lock_guard<stdx::mutex> lock(_minValidBoundariesMutex);
+    invariant(!optime.isNull());
+    stdx::lock_guard<Latch> lock(_minValidBoundariesMutex);
     _appliedThrough = optime;
 }
 
 void ReplicationConsistencyMarkersMock::clearAppliedThrough(OperationContext* opCtx,
                                                             const Timestamp& writeTimestamp) {
-    stdx::lock_guard<stdx::mutex> lock(_minValidBoundariesMutex);
+    stdx::lock_guard<Latch> lock(_minValidBoundariesMutex);
     _appliedThrough = {};
 }
 
 OpTime ReplicationConsistencyMarkersMock::getAppliedThrough(OperationContext* opCtx) const {
-    stdx::lock_guard<stdx::mutex> lock(_minValidBoundariesMutex);
+    stdx::lock_guard<Latch> lock(_minValidBoundariesMutex);
     return _appliedThrough;
 }
 
 Status ReplicationConsistencyMarkersMock::createInternalCollections(OperationContext* opCtx) {
     return Status::OK();
+}
+
+void ReplicationConsistencyMarkersMock::setInitialSyncIdIfNotSet(OperationContext* opCtx) {}
+
+void ReplicationConsistencyMarkersMock::clearInitialSyncId(OperationContext* opCtx) {}
+
+BSONObj ReplicationConsistencyMarkersMock::getInitialSyncId(OperationContext* opCtx) {
+    return BSONObj();
 }
 
 }  // namespace repl

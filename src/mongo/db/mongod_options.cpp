@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 #include "mongo/db/mongod_options.h"
 
@@ -36,14 +36,18 @@
 #include <string>
 #include <vector>
 
+#include "mongo/base/init.h"
 #include "mongo/base/status.h"
 #include "mongo/bson/json.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/config.h"
+#include "mongo/db/cluster_auth_mode_option_gen.h"
 #include "mongo/db/encryption/encryption_options.h"
 #include "mongo/db/global_settings.h"
+#include "mongo/db/keyfile_option_gen.h"
 #include "mongo/db/mongod_options_encryption_gen.h"
 #include "mongo/db/mongod_options_general_gen.h"
+#include "mongo/db/mongod_options_ldapauthz_gen.h"
 #include "mongo/db/mongod_options_legacy_gen.h"
 #include "mongo/db/mongod_options_replication_gen.h"
 #include "mongo/db/mongod_options_sharding_gen.h"
@@ -53,7 +57,10 @@
 #include "mongo/db/server_options_base.h"
 #include "mongo/db/server_options_nongeneral_gen.h"
 #include "mongo/db/server_options_server_helpers.h"
-#include "mongo/util/log.h"
+#include "mongo/db/storage/storage_parameters_gen.h"
+#include "mongo/logv2/log.h"
+#include "mongo/logv2/log_domain_global.h"
+#include "mongo/logv2/log_manager.h"
 #include "mongo/util/net/ssl_options.h"
 #include "mongo/util/options_parser/startup_options.h"
 #include "mongo/util/str.h"
@@ -86,7 +93,10 @@ Status addMongodOptions(moe::OptionSection* options) try {
     uassertStatusOK(addMongodShardingOptions(options));
     uassertStatusOK(addMongodStorageOptions(options));
     uassertStatusOK(addMongodEncryptionOptions(options));
+    uassertStatusOK(addMongodLDAPAuthzOptions(options));
     uassertStatusOK(addMongodLegacyOptions(options));
+    uassertStatusOK(addKeyfileServerOption(options));
+    uassertStatusOK(addClusterAuthModeServerOption(options));
 
     return Status::OK();
 } catch (const AssertionException& ex) {
@@ -98,17 +108,20 @@ void printMongodHelp(const moe::OptionSection& options) {
 };
 
 namespace {
-void sysRuntimeInfo() {
+
+void appendSysInfo(BSONObjBuilder* obj) {
+    auto o = BSONObjBuilder(obj->subobjStart("sysinfo"));
 #if defined(_SC_PAGE_SIZE)
-    log() << "  page size: " << (int)sysconf(_SC_PAGE_SIZE);
+    o.append("_SC_PAGE_SIZE", (long long)sysconf(_SC_PAGE_SIZE));
 #endif
 #if defined(_SC_PHYS_PAGES)
-    log() << "  _SC_PHYS_PAGES: " << sysconf(_SC_PHYS_PAGES);
+    o.append("_SC_PHYS_PAGES", (long long)sysconf(_SC_PHYS_PAGES));
 #endif
 #if defined(_SC_AVPHYS_PAGES)
-    log() << "  _SC_AVPHYS_PAGES: " << sysconf(_SC_AVPHYS_PAGES);
+    o.append("_SC_AVPHYS_PAGES", (long long)sysconf(_SC_AVPHYS_PAGES));
 #endif
 }
+
 }  // namespace
 
 bool handlePreValidationMongodOptions(const moe::Environment& params,
@@ -118,20 +131,26 @@ bool handlePreValidationMongodOptions(const moe::Environment& params,
         return false;
     }
     if (params.count("version") && params["version"].as<bool>() == true) {
-        setPlainConsoleLogger();
         auto&& vii = VersionInfoInterface::instance();
-        log() << mongodVersion(vii);
-        vii.logBuildInfo();
+        std::cout << mongodVersion(vii) << std::endl;
+        vii.logBuildInfo(&std::cout);
         return false;
     }
     if (params.count("sysinfo") && params["sysinfo"].as<bool>() == true) {
-        setPlainConsoleLogger();
-        sysRuntimeInfo();
+        BSONObjBuilder obj;
+        appendSysInfo(&obj);
+        std::cout << tojson(obj.done(), ExtendedRelaxedV2_0_0, true) << std::endl;
         return false;
     }
 
     if (params.count("master") || params.count("slave")) {
-        severe() << "Master/slave replication is no longer supported";
+        LOGV2_FATAL_CONTINUE(20881, "Master/slave replication is no longer supported");
+        return false;
+    }
+
+    if (params.count("replication.enableMajorityReadConcern") &&
+        params["replication.enableMajorityReadConcern"].as<bool>() == false) {
+        LOGV2_FATAL_CONTINUE(5324700, "enableMajorityReadConcern:false is no longer supported");
         return false;
     }
 
@@ -250,20 +269,6 @@ Status canonicalizeMongodOptions(moe::Environment* params) {
             return ret;
         }
         ret = params->remove("moveParanoia");
-        if (!ret.isOK()) {
-            return ret;
-        }
-    }
-
-    // "storage.indexBuildRetry" comes from the config file, so override it if "noIndexBuildRetry"
-    // is set since that comes from the command line.
-    if (params->count("noIndexBuildRetry")) {
-        Status ret = params->set("storage.indexBuildRetry",
-                                 moe::Value(!(*params)["noIndexBuildRetry"].as<bool>()));
-        if (!ret.isOK()) {
-            return ret;
-        }
-        ret = params->remove("noIndexBuildRetry");
         if (!ret.isOK()) {
             return ret;
         }
@@ -421,12 +426,14 @@ Status storeMongodOptions(const moe::Environment& params) {
 
     if (params.count("storage.syncPeriodSecs")) {
         storageGlobalParams.syncdelay = params["storage.syncPeriodSecs"].as<double>();
+        storageGlobalParams.checkpointDelaySecs =
+            static_cast<size_t>(params["storage.syncPeriodSecs"].as<double>());
+
         if (storageGlobalParams.syncdelay < 0 ||
             storageGlobalParams.syncdelay > StorageGlobalParams::kMaxSyncdelaySecs) {
             return Status(ErrorCodes::BadValue,
                           str::stream() << "syncdelay out of allowed range (0-"
-                                        << StorageGlobalParams::kMaxSyncdelaySecs
-                                        << "s)");
+                                        << StorageGlobalParams::kMaxSyncdelaySecs << "s)");
         }
     }
 
@@ -437,7 +444,6 @@ Status storeMongodOptions(const moe::Environment& params) {
     if (params.count("storage.queryableBackupMode") &&
         params["storage.queryableBackupMode"].as<bool>()) {
         storageGlobalParams.readOnly = true;
-        storageGlobalParams.dur = false;
     }
 
     if (params.count("storage.groupCollections")) {
@@ -484,12 +490,12 @@ Status storeMongodOptions(const moe::Environment& params) {
         encryptionGlobalParams.vaultDisableTLS = params["security.vault.disableTLSForTesting"].as<bool>();
     }
 
-    if (params.count("cpu")) {
-        serverGlobalParams.cpu = params["cpu"].as<bool>();
+    if (params.count("security.ldap.authz.queryTemplate")) {
+        ldapGlobalParams.ldapQueryTemplate = params["security.ldap.authz.queryTemplate"].as<std::string>();
     }
 
-    if (params.count("storage.indexBuildRetry")) {
-        serverGlobalParams.indexBuildRetry = params["storage.indexBuildRetry"].as<bool>();
+    if (params.count("cpu")) {
+        serverGlobalParams.cpu = params["cpu"].as<bool>();
     }
 
     if (params.count("storage.journal.enabled")) {
@@ -505,9 +511,9 @@ Status storeMongodOptions(const moe::Environment& params) {
         if (journalCommitIntervalMs < 1 ||
             journalCommitIntervalMs > StorageGlobalParams::kMaxJournalCommitIntervalMs) {
             return Status(ErrorCodes::BadValue,
-                          str::stream() << "--journalCommitInterval out of allowed range (1-"
-                                        << StorageGlobalParams::kMaxJournalCommitIntervalMs
-                                        << "ms)");
+                          str::stream()
+                              << "--journalCommitInterval out of allowed range (1-"
+                              << StorageGlobalParams::kMaxJournalCommitIntervalMs << "ms)");
         }
     }
 
@@ -515,15 +521,15 @@ Status storeMongodOptions(const moe::Environment& params) {
         mongodGlobalParams.scriptingEnabled = params["security.javascriptEnabled"].as<bool>();
     }
 
-    if (params.count("security.clusterIpSourceWhitelist")) {
-        mongodGlobalParams.whitelistedClusterNetwork = std::vector<std::string>();
-        for (const std::string& whitelistEntry :
-             params["security.clusterIpSourceWhitelist"].as<std::vector<std::string>>()) {
+    if (params.count("security.clusterIpSourceAllowlist")) {
+        mongodGlobalParams.allowlistedClusterNetwork = std::vector<std::string>();
+        for (const std::string& allowlistEntry :
+             params["security.clusterIpSourceAllowlist"].as<std::vector<std::string>>()) {
             std::vector<std::string> intermediates;
-            str::splitStringDelim(whitelistEntry, &intermediates, ',');
+            str::splitStringDelim(allowlistEntry, &intermediates, ',');
             std::copy(intermediates.begin(),
                       intermediates.end(),
-                      std::back_inserter(*mongodGlobalParams.whitelistedClusterNetwork));
+                      std::back_inserter(*mongodGlobalParams.allowlistedClusterNetwork));
         }
     }
 
@@ -537,6 +543,11 @@ Status storeMongodOptions(const moe::Environment& params) {
     if (params.count("notablescan")) {
         storageGlobalParams.noTableScan.store(params["notablescan"].as<bool>());
     }
+
+    // Initialize lock-free reads support from feature flag. This may be adjusted later based on
+    // replica set config.
+    storageGlobalParams.disableLockFreeReads =
+        !feature_flags::gLockFreeReads.isEnabledAndIgnoreFCV();
 
     repl::ReplSettings replSettings;
     if (params.count("replication.replSet")) {
@@ -564,9 +575,40 @@ Status storeMongodOptions(const moe::Environment& params) {
         storageGlobalParams.allowOplogTruncation = false;
     }
 
-    if (params.count("replication.enableMajorityReadConcern")) {
-        serverGlobalParams.enableMajorityReadConcern =
-            params["replication.enableMajorityReadConcern"].as<bool>();
+    if (!replSettings.getReplSetString().empty() &&
+        (params.count("security.authorization") &&
+         params["security.authorization"].as<std::string>() == "enabled") &&
+        serverGlobalParams.clusterAuthMode.load() != ServerGlobalParams::ClusterAuthMode_x509 &&
+        !params.count("security.keyFile")) {
+        return Status(
+            ErrorCodes::BadValue,
+            str::stream()
+                << "security.keyFile is required when authorization is enabled with replica sets");
+    }
+
+    serverGlobalParams.enableMajorityReadConcern = true;
+
+    if (storageGlobalParams.engineSetByUser &&
+        (storageGlobalParams.engine == "ephemeralForTest" ||
+         storageGlobalParams.engine == "devnull")) {
+        LOGV2(5324701,
+              "Test storage engine does not support enableMajorityReadConcern=true, forcibly "
+              "setting to false",
+              "storageEngine"_attr = storageGlobalParams.engine);
+        serverGlobalParams.enableMajorityReadConcern = false;
+    }
+
+    if (!serverGlobalParams.enableMajorityReadConcern) {
+        // Lock-free reads are not supported with enableMajorityReadConcern=false, so we disable
+        // them. If the user tries to explicitly enable lock-free reads by specifying
+        // disableLockFreeReads=false, log a warning so that the user knows these are not
+        // compatible settings.
+        if (!storageGlobalParams.disableLockFreeReads) {
+            LOGV2_WARNING(4788401,
+                          "Lock-free reads is not compatible with "
+                          "enableMajorityReadConcern=false: disabling lock-free reads.");
+            storageGlobalParams.disableLockFreeReads = true;
+        }
     }
 
     if (params.count("replication.oplogSizeMB")) {
@@ -586,6 +628,16 @@ Status storeMongodOptions(const moe::Environment& params) {
         }
         replSettings.setOplogSizeBytes(x * 1024 * 1024);
         invariant(replSettings.getOplogSizeBytes() > 0);
+    }
+
+    if (params.count("storage.oplogMinRetentionHours")) {
+        storageGlobalParams.oplogMinRetentionHours.store(
+            params["storage.oplogMinRetentionHours"].as<double>());
+        if (storageGlobalParams.oplogMinRetentionHours.load() < 0) {
+            return Status(ErrorCodes::BadValue,
+                          "bad --oplogMinRetentionHours, argument must be greater or equal to 0");
+        }
+        invariant(storageGlobalParams.oplogMinRetentionHours.load() >= 0);
     }
 
     if (params.count("cacheSize")) {
@@ -618,15 +670,11 @@ Status storeMongodOptions(const moe::Environment& params) {
         auto clusterRoleParam = params["sharding.clusterRole"].as<std::string>();
         if (clusterRoleParam == "configsvr") {
             serverGlobalParams.clusterRole = ClusterRole::ConfigServer;
-
-            if (params.count("replication.enableMajorityReadConcern") &&
-                !params["replication.enableMajorityReadConcern"].as<bool>()) {
-                warning()
-                    << "Config servers require majority read concern, but it was explicitly "
-                       "disabled. The override is being ignored and the process is continuing "
-                       "with majority read concern enabled.";
-            }
-            serverGlobalParams.enableMajorityReadConcern = true;
+            // Config server requires majority read concern.
+            uassert(5324702,
+                    str::stream() << "Cannot initialize config server with "
+                                  << "enableMajorityReadConcern=false",
+                    serverGlobalParams.enableMajorityReadConcern);
 
             // If we haven't explicitly specified a journal option, default journaling to true for
             // the config server role
@@ -678,11 +726,9 @@ Status storeMongodOptions(const moe::Environment& params) {
 
     // Check if we are 32 bit and have not explicitly specified any journaling options
     if (sizeof(void*) == 4 && !params.count("storage.journal.enabled")) {
-        // trying to make this stand out more like startup warnings
-        log() << endl;
-        warning() << "32-bit servers don't have journaling enabled by default. "
-                  << "Please use --journal if you want durability.";
-        log() << endl;
+        LOGV2_WARNING(20880,
+                      "32-bit servers don't have journaling enabled by default. Please use "
+                      "--journal if you want durability");
     }
 
     bool isClusterRoleShard = params.count("shardsvr");
@@ -698,6 +744,26 @@ Status storeMongodOptions(const moe::Environment& params) {
         return Status(ErrorCodes::BadValue,
                       str::stream() << "Can not specify " << clusterRoleStr
                                     << " and set skipShardingConfigurationChecks=true");
+    }
+
+    if ((isClusterRoleShard || isClusterRoleConfig) && params.count("setParameter")) {
+        std::map<std::string, std::string> parameters =
+            params["setParameter"].as<std::map<std::string, std::string>>();
+        const bool requireApiVersionValue = ([&parameters] {
+            const auto requireApiVersionParam = parameters.find("requireApiVersion");
+            if (requireApiVersionParam == parameters.end()) {
+                return false;
+            }
+            const auto& val = requireApiVersionParam->second;
+            return (0 == val.compare("1")) || (0 == val.compare("true"));
+        })();
+
+        if (requireApiVersionValue) {
+            auto clusterRoleStr = isClusterRoleConfig ? "--configsvr" : "--shardsvr";
+            return Status(ErrorCodes::BadValue,
+                          str::stream() << "Can not specify " << clusterRoleStr
+                                        << " and set requireApiVersion=true");
+        }
     }
 
     setGlobalReplSettings(replSettings);

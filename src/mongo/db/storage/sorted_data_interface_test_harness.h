@@ -38,8 +38,6 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/sorted_data_interface.h"
 #include "mongo/db/storage/test_harness_helper.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/unowned_ptr.h"
 
 namespace mongo {
 
@@ -52,6 +50,7 @@ const BSONObj key5 = BSON("" << 5);
 const BSONObj key6 = BSON("" << 6);
 const BSONObj key7 = BSON(""
                           << "\x00");
+
 const BSONObj key8 = BSON(""
                           << "\xff");
 
@@ -90,8 +89,14 @@ class RecoveryUnit;
 class SortedDataInterfaceHarnessHelper : public virtual HarnessHelper {
 public:
     virtual std::unique_ptr<SortedDataInterface> newSortedDataInterface(bool unique,
-                                                                        bool partial) = 0;
+                                                                        bool partial,
+                                                                        KeyFormat keyFormat) = 0;
 
+    std::unique_ptr<SortedDataInterface> newSortedDataInterface(bool unique, bool partial) {
+        return newSortedDataInterface(unique, partial, KeyFormat::Long);
+    }
+
+    virtual std::unique_ptr<SortedDataInterface> newIdIndexSortedDataInterface() = 0;
     /**
      * Creates a new SDI with some initial data.
      *
@@ -101,6 +106,20 @@ public:
         bool unique, bool partial, std::initializer_list<IndexKeyEntry> toInsert);
 };
 
+void registerSortedDataInterfaceHarnessHelperFactory(
+    std::function<std::unique_ptr<SortedDataInterfaceHarnessHelper>()> factory);
+
+std::unique_ptr<SortedDataInterfaceHarnessHelper> newSortedDataInterfaceHarnessHelper();
+
+KeyString::Value makeKeyString(SortedDataInterface* sorted,
+                               BSONObj bsonKey,
+                               boost::optional<RecordId> rid = boost::none);
+
+KeyString::Value makeKeyStringForSeek(SortedDataInterface* sorted,
+                                      BSONObj bsonKey,
+                                      bool isForward,
+                                      bool inclusive);
+
 /**
  * Inserts all entries in toInsert into index.
  * ASSERT_OKs the inserts.
@@ -108,15 +127,15 @@ public:
  *
  * Should be used for declaring and changing conditions, not for testing inserts.
  */
-void insertToIndex(unowned_ptr<OperationContext> opCtx,
-                   unowned_ptr<SortedDataInterface> index,
+void insertToIndex(OperationContext* opCtx,
+                   SortedDataInterface* index,
                    std::initializer_list<IndexKeyEntry> toInsert);
 
-inline void insertToIndex(unowned_ptr<HarnessHelper> harness,
-                          unowned_ptr<SortedDataInterface> index,
+inline void insertToIndex(HarnessHelper* harness,
+                          SortedDataInterface* index,
                           std::initializer_list<IndexKeyEntry> toInsert) {
     auto client = harness->serviceContext()->makeClient("insertToIndex");
-    insertToIndex(harness->newOperationContext(client.get()), index, toInsert);
+    insertToIndex(harness->newOperationContext(client.get()).get(), index, toInsert);
 }
 
 /**
@@ -125,18 +144,15 @@ inline void insertToIndex(unowned_ptr<HarnessHelper> harness,
  *
  * Should be used for declaring and changing conditions, not for testing removes.
  */
-void removeFromIndex(unowned_ptr<OperationContext> opCtx,
-                     unowned_ptr<SortedDataInterface> index,
+void removeFromIndex(OperationContext* opCtx,
+                     SortedDataInterface* index,
                      std::initializer_list<IndexKeyEntry> toRemove);
 
-inline void removeFromIndex(unowned_ptr<HarnessHelper> harness,
-                            unowned_ptr<SortedDataInterface> index,
+inline void removeFromIndex(HarnessHelper* harness,
+                            SortedDataInterface* index,
                             std::initializer_list<IndexKeyEntry> toRemove) {
     auto client = harness->serviceContext()->makeClient("removeFromIndex");
-    removeFromIndex(harness->newOperationContext(client.get()), index, toRemove);
+    removeFromIndex(harness->newOperationContext(client.get()).get(), index, toRemove);
 }
 
-inline std::unique_ptr<SortedDataInterfaceHarnessHelper> newSortedDataInterfaceHarnessHelper() {
-    return dynamic_ptr_cast<SortedDataInterfaceHarnessHelper>(newHarnessHelper());
-}
 }  // namespace mongo

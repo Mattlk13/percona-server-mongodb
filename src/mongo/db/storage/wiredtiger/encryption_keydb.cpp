@@ -29,7 +29,7 @@ Copyright (C) 2018-present Percona and/or its affiliates. All rights reserved.
     it in the license file.
 ======= */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include <sys/stat.h>
 
@@ -40,10 +40,11 @@ Copyright (C) 2018-present Percona and/or its affiliates. All rights reserved.
 #include "mongo/db/encryption/encryption_vault.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/storage/wiredtiger/encryption_keydb.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/base64.h"
 #include "mongo/util/debug_util.h"
-#include "mongo/util/log.h"
 
 #include <third_party/wiredtiger/ext/encryptors/percona/encryption_keydb_c_api.h>
 
@@ -68,15 +69,15 @@ static void dump_key(unsigned char *key, const int _key_len, const char * msg) {
         ++key;
     }
     *p = 0;
-    log() << msg << ": " << buf;
+    LOGV2(29033, "{msg}: {buf}", "msg"_attr = msg, "buf"_attr = static_cast<const char*>(buf));
 }
 
 static void dump_table(WT_SESSION* _sess, const int _key_len, const char* msg) {
-    log() << msg;
+    LOGV2(29034, "{msg}", "msg"_attr = msg);
     WT_CURSOR *cursor;
     int res = _sess->open_cursor(_sess, "table:key", nullptr, nullptr, &cursor);
     if (res) {
-        log() << wiredtiger_strerror(res);
+        LOGV2(29035, "{e}", "e"_attr = wiredtiger_strerror(res));
         return;
     }
     while ((res = cursor->next(cursor)) == 0) {
@@ -107,16 +108,7 @@ EncryptionKeyDB::EncryptionKeyDB(const bool just_created, const std::string& pat
 }
 
 EncryptionKeyDB::~EncryptionKeyDB() {
-    DEV if (_sess)
-        dump_table(_sess, _key_len, "dump_table from destructor");
-    if (_sess) {
-        _gcm_iv_reserved = _gcm_iv;
-        store_gcm_iv_reserved();
-    }
-    if (_sess)
-        _sess->close(_sess, nullptr);
-    if (_conn)
-        _conn->close(_conn, nullptr);
+    close_handles();
     // should be the last line because closing wiredTiger's handles may write to DB
     if (!_rotation)
         encryptionKeyDB = nullptr;
@@ -124,12 +116,30 @@ EncryptionKeyDB::~EncryptionKeyDB() {
         rotationKeyDB = nullptr;
 }
 
+void EncryptionKeyDB::close_handles() {
+    if (kDebugBuild && _sess)
+        dump_table(_sess, _key_len, "dump_table from destructor");
+    if (_sess) {
+        _gcm_iv_reserved = _gcm_iv;
+        store_gcm_iv_reserved();
+        _sess->close(_sess, nullptr);
+        _sess = nullptr;
+    }
+    if (_conn) {
+        _conn->close(_conn, nullptr);
+        _conn = nullptr;
+    }
+}
+
+void EncryptionKeyDB::generate_secure_key(unsigned char* key) {
+    stdx::lock_guard<Latch> lk(_lock_key);
+    _srng->fill(key, _key_len);
+}
+
 // this function uses _srng without synchronization
 // caller must ensure it is safe
-void EncryptionKeyDB::generate_secure_key(char key[]) {
-    for (int i = 0; i < 4; ++i) {
-        ((int64_t*)key)[i] = _srng->nextInt64();
-    }
+void EncryptionKeyDB::generate_secure_key_inlock(char key[]) {
+    _srng->fill(key, _key_len);
 }
 
 void EncryptionKeyDB::init_masterkey() {
@@ -164,8 +174,8 @@ void EncryptionKeyDB::init_masterkey() {
         if (_rotation) {
             // generate new key
             char newkey[_key_len];
-            generate_secure_key(newkey);
-            encoded_key = base64::encode(newkey, _key_len);
+            generate_secure_key_inlock(newkey);
+            encoded_key = base64::encode(StringData{newkey, _key_len});
         } else {
             // read key from the Vault
             encoded_key = vaultReadKey();
@@ -176,10 +186,10 @@ void EncryptionKeyDB::init_masterkey() {
                 if (!_just_created) {
                     throw std::runtime_error("Cannot start. Master encryption key is absent in the Vault. Check configuration options.");
                 }
-                log() << "Master key is absent in the Vault. Generating and writing one.";
+                LOGV2(29036, "Master key is absent in the Vault. Generating and writing one.");
                 char newkey[_key_len];
-                generate_secure_key(newkey);
-                encoded_key = base64::encode(newkey, _key_len);
+                generate_secure_key_inlock(newkey);
+                encoded_key = base64::encode(StringData{newkey, _key_len});
                 vaultWriteKey(encoded_key);
             }
         }
@@ -218,8 +228,51 @@ void EncryptionKeyDB::init_masterkey() {
     memcpy(_masterkey, key.c_str(), _key_len);
 }
 
+// Open db with correct compatibility mode
+// Based on WiredTigerKVEngine::_openWiredTiger
+// Should be synced with changes in WiredTigerKVEngine::_openWiredTiger
+int EncryptionKeyDB::_openWiredTiger(const std::string& path, const std::string& wtOpenConfig) {
+    // For now we don't use event handler in EncryptionKeyDB
+    WT_EVENT_HANDLER* wtEventHandler = nullptr;
+
+    // MongoDB 4.4 will always run in compatibility version 10.0.
+    std::string configStr = wtOpenConfig + ",compatibility=(require_min=\"10.0.0\")";
+    int ret = wiredtiger_open(path.c_str(), wtEventHandler, configStr.c_str(), &_conn);
+    if (!ret) {
+        //_fileVersion = {WiredTigerFileVersion::StartupVersion::IS_44_FCV_44};
+        return ret;
+    }
+
+    // MongoDB 4.4 doing clean shutdown in FCV 4.2 will use compatibility version 3.3.
+    configStr = wtOpenConfig + ",compatibility=(require_min=\"3.3.0\")";
+    ret = wiredtiger_open(path.c_str(), wtEventHandler, configStr.c_str(), &_conn);
+    if (!ret) {
+        //_fileVersion = {WiredTigerFileVersion::StartupVersion::IS_44_FCV_42};
+        return ret;
+    }
+
+    // MongoDB 4.2 uses compatibility version 3.2.
+    configStr = wtOpenConfig + ",compatibility=(require_min=\"3.2.0\")";
+    ret = wiredtiger_open(path.c_str(), wtEventHandler, configStr.c_str(), &_conn);
+    if (!ret) {
+        //_fileVersion = {WiredTigerFileVersion::StartupVersion::IS_42};
+        return ret;
+    }
+
+    LOGV2_WARNING(29054,
+        "EncryptionKeyDB: Failed to start up WiredTiger under any compatibility version.");
+    if (ret == WT_TRY_SALVAGE)
+        LOGV2_WARNING(29055, "EncryptionKeyDB: WiredTiger metadata corruption detected");
+
+    LOGV2_FATAL(29056,
+                "Reason: {wtRCToStatus_ret_reason}",
+                "wtRCToStatus_ret_reason"_attr = wtRCToStatus(ret).reason());
+
+    return ret;
+}
+
 void EncryptionKeyDB::init() {
-    _srng = SecureRandom::create();
+    _srng = std::make_unique<SecureRandom>();
     _prng = std::make_unique<PseudoRandom>(_srng->nextInt64());
     try {
         init_masterkey();
@@ -237,11 +290,12 @@ void EncryptionKeyDB::init() {
         // https://source.wiredtiger.com/3.0.0/tune_durability.html
         ss << "log=(enabled,file_max=5MB),transaction_sync=(enabled=true,method=fsync),";
         std::string config = ss.str();
-        log() << "Initializing KeyDB with wiredtiger_open config: " << config;
-        int res = wiredtiger_open(_path.c_str(), nullptr, config.c_str(), &_conn);
+        LOGV2(29037, "Initializing KeyDB with wiredtiger_open config: {cfg}", "cfg"_attr = config);
+        int res = _openWiredTiger(_path, config);
         if (res) {
             throw std::runtime_error(std::string("error opening keys DB at '") + _path + "': " + wiredtiger_strerror(res));
         }
+        _wtOpenConfig = config;
 
         // empty keyid means masterkey
         res = _conn->open_session(_conn, nullptr, nullptr, &_sess);
@@ -249,14 +303,14 @@ void EncryptionKeyDB::init() {
             throw std::runtime_error(std::string("error opening wiredTiger session: ") + wiredtiger_strerror(res));
         }
 
-        DEV dump_table(_sess, _key_len, "before create");
+        if (kDebugBuild) dump_table(_sess, _key_len, "before create");
         // try to create 'key' table
         // ignore error if table already exists
         res = _sess->create(_sess, "table:key", "key_format=S,value_format=u,access_pattern_hint=random");
         if (res) {
             throw std::runtime_error(std::string("error creating/opening key table: ") + wiredtiger_strerror(res));
         }
-        DEV dump_table(_sess, _key_len, "after create");
+        if (kDebugBuild) dump_table(_sess, _key_len, "after create");
 
         // try to create 'parameters' table
         // ignore error if table already exists
@@ -291,10 +345,10 @@ void EncryptionKeyDB::init() {
             }
         }
     } catch (std::exception& e) {
-        error() << e.what();
+        LOGV2_ERROR(29038, "Exception in EncryptionKeyDB::init: {e}", "e"_attr = e.what());
         throw;
     }
-    log() << "Encryption keys DB is initialized successfully";
+    LOGV2(29039, "Encryption keys DB is initialized successfully");
 }
 
 void EncryptionKeyDB::clone(EncryptionKeyDB *old) {
@@ -334,21 +388,21 @@ void EncryptionKeyDB::clone(EncryptionKeyDB *old) {
         if (res != WT_NOTFOUND)
             throw std::runtime_error(std::string("clone: error reading key table: ") + wiredtiger_strerror(res));
     } catch (std::exception& e) {
-        error() << e.what();
+        LOGV2_ERROR(29049, "Exception in EncryptionKeyDB::clone: {e}", "e"_attr = e.what());
         throw;
     }
 }
 
 void EncryptionKeyDB::store_masterkey() {
-    vaultWriteKey(base64::encode((const char*)_masterkey, _key_len));
+    vaultWriteKey(base64::encode(StringData{(const char*)_masterkey, _key_len}));
 }
 
 int EncryptionKeyDB::get_key_by_id(const char *keyid, size_t len, unsigned char *key, void *pe) {
-    LOG(4) << "get_key_by_id for keyid: '" << std::string(keyid, len) << "'";
+    LOGV2_DEBUG(29050, 4, "get_key_by_id for keyid: '{id}'", "id"_attr = std::string{keyid, len});
     // return key from keyfile if len == 0
     if (len == 0) {
         memcpy(key, _masterkey, _key_len);
-        DEV dump_key(key, _key_len, "returning masterkey");
+        if (kDebugBuild) dump_key(key, _key_len, "returning masterkey");
         return 0;
     }
 
@@ -356,10 +410,10 @@ int EncryptionKeyDB::get_key_by_id(const char *keyid, size_t len, unsigned char 
     // open cursor
     WT_CURSOR *cursor;
     {
-        stdx::lock_guard<stdx::mutex> lk(_lock_sess);
+        stdx::lock_guard<Latch> lk(_lock_sess);
         res = _sess->open_cursor(_sess, "table:key", nullptr, nullptr, &cursor);
         if (res){
-            error() << "get_key_by_id: error opening cursor: " << wiredtiger_strerror(res);
+            LOGV2_ERROR(29040, "get_key_by_id: error opening cursor: {err}", "err"_attr = wiredtiger_strerror(res));
             return res;
         }
     }
@@ -371,10 +425,10 @@ int EncryptionKeyDB::get_key_by_id(const char *keyid, size_t len, unsigned char 
         });
 
     // search/write of db encryption key should be atomic
-    stdx::lock_guard<stdx::mutex> lk(_lock_key);
+    stdx::lock_guard<Latch> lk(_lock_key);
     // read key from DB
     std::string c_str(keyid, len);
-    LOG(4) << "trying to load encryption key for keyid: " << c_str;
+    LOGV2_DEBUG(29041, 4, "trying to load encryption key for keyid: {id}", "id"_attr = c_str);
     cursor->set_key(cursor, c_str.c_str());
     res = cursor->search(cursor);
     if (res == 0) {
@@ -382,20 +436,19 @@ int EncryptionKeyDB::get_key_by_id(const char *keyid, size_t len, unsigned char 
         cursor->get_value(cursor, &v);
         invariant(v.size == _key_len);
         memcpy(key, v.data, _key_len);
-        DEV dump_key(key, _key_len, "loaded key from key DB");
+        if (kDebugBuild) dump_key(key, _key_len, "loaded key from key DB");
         _encryptors[c_str] = pe;
         return 0;
     }
     if (res != WT_NOTFOUND) {
-        error() << "cursor->search error " << res << " : " <<wiredtiger_strerror(res);
+        LOGV2_ERROR(29042, "cursor->search error {code}: {desc}",
+                    "code"_attr = res, "desc"_attr = wiredtiger_strerror(res));
         return res;
     }
 
     // create key if it does not exist
-    for (int i = 0; i < 4; ++i) {
-        // call to nextInt64() is protected by _lock_key above
-        ((int64_t*)key)[i] = _srng->nextInt64();
-    }
+    // call to fill() is protected by _lock_key above
+    _srng->fill(key, _key_len);
     WT_ITEM v;
     v.size = _key_len;
     v.data = key;
@@ -403,26 +456,27 @@ int EncryptionKeyDB::get_key_by_id(const char *keyid, size_t len, unsigned char 
     cursor->set_value(cursor, &v);
     res = cursor->insert(cursor);
     if (res) {
-        error() << "cursor->insert error " << res << " : " <<wiredtiger_strerror(res);
+        LOGV2_ERROR(29043, "cursor->insert error {code}: {desc}",
+                    "code"_attr = res, "desc"_attr = wiredtiger_strerror(res));
         return res;
     }
 
-    DEV dump_key(key, _key_len, "generated and stored key");
+    if (kDebugBuild) dump_key(key, _key_len, "generated and stored key");
     _encryptors[c_str] = pe;
     return 0;
 }
 
 int EncryptionKeyDB::delete_key_by_id(const std::string&  keyid) {
-    LOG(4) << "delete_key_by_id for keyid: '" << keyid << "'";
+    LOGV2_DEBUG(29044, 4, "delete_key_by_id for keyid: '{id}'", "id"_attr = keyid);
 
     int res;
     // open cursor
     WT_CURSOR *cursor;
     {
-        stdx::lock_guard<stdx::mutex> lk(_lock_sess);
+        stdx::lock_guard<Latch> lk(_lock_sess);
         res = _sess->open_cursor(_sess, "table:key", nullptr, nullptr, &cursor);
         if (res){
-            error() << "delete_key_by_id: error opening cursor: " << wiredtiger_strerror(res);
+            LOGV2_ERROR(29045, "delete_key_by_id: error opening cursor: {desc}", "desc"_attr = wiredtiger_strerror(res));
             return res;
         }
     }
@@ -437,7 +491,8 @@ int EncryptionKeyDB::delete_key_by_id(const std::string&  keyid) {
     cursor->set_key(cursor, keyid.c_str());
     res = cursor->remove(cursor);
     if (res) {
-        error() << "cursor->remove error " << res << " : " << wiredtiger_strerror(res);
+        LOGV2_ERROR(29046, "cursor->remove error {code}: {desc}",
+                    "code"_attr = res, "desc"_attr = wiredtiger_strerror(res));
     }
 
     // prepare encryptor for reuse in case DB with the same name will be recreated
@@ -461,10 +516,11 @@ int EncryptionKeyDB::store_gcm_iv_reserved() {
     // open cursor
     WT_CURSOR *cursor;
     {
-        stdx::lock_guard<stdx::mutex> lk(_lock_sess);
+        stdx::lock_guard<Latch> lk(_lock_sess);
         res = _sess->open_cursor(_sess, "table:parameters", nullptr, nullptr, &cursor);
         if (res){
-            error() << "store_gcm_iv_reserved: error opening cursor: " << wiredtiger_strerror(res);
+            LOGV2_ERROR(29047, "store_gcm_iv_reserved: error opening cursor: {desc}",
+                       "desc"_attr = wiredtiger_strerror(res));
             return res;
         }
     }
@@ -483,7 +539,8 @@ int EncryptionKeyDB::store_gcm_iv_reserved() {
     cursor->set_value(cursor, &v);
     res = cursor->insert(cursor);
     if (res) {
-        error() << "cursor->insert error " << res << " : " <<wiredtiger_strerror(res);
+        LOGV2_ERROR(29048, "cursor->insert error {code}: {desc}",
+                    "code"_attr = res, "desc"_attr = wiredtiger_strerror(res));
         return res;
     }
     return 0;
@@ -517,6 +574,25 @@ void EncryptionKeyDB::store_pseudo_bytes(uint8_t *buf, int len) {
     }
 }
 
+void EncryptionKeyDB::reconfigure(const char *newCfg) {
+    // For now we don't use event handler in EncryptionKeyDB
+    WT_EVENT_HANDLER* wtEventHandler = nullptr;
+
+    auto startTime = Date_t::now();
+    LOGV2(29075, "Closing KeyDB in preparation for reconfiguring");
+    close_handles();
+    LOGV2(29076, "KeyDB closed", "duration"_attr = Date_t::now() - startTime);
+
+    startTime = Date_t::now();
+    invariantWTOK(wiredtiger_open(_path.c_str(), wtEventHandler, _wtOpenConfig.c_str(), &_conn));
+    LOGV2(29077, "KeyDB re-opened", "duration"_attr = Date_t::now() - startTime);
+
+    startTime = Date_t::now();
+    LOGV2(29078, "Reconfiguring KeyDB", "newConfig"_attr = newCfg);
+    invariantWTOK(_conn->reconfigure(_conn, newCfg));
+    LOGV2(29079, "KeyDB reconfigure complete", "duration"_attr = Date_t::now() - startTime);
+}
+
 extern "C" void store_pseudo_bytes(uint8_t *buf, int len) {
     invariant(encryptionKeyDB);
     encryptionKeyDB->store_pseudo_bytes(buf, len);
@@ -548,6 +624,11 @@ extern "C" int get_key_by_id(const char *keyid, size_t len, unsigned char *key, 
 extern "C" int rotation_get_key_by_id(const char *keyid, size_t len, unsigned char *key, void *pe) {
     invariant(rotationKeyDB);
     return rotationKeyDB->get_key_by_id(keyid, len, key, pe);
+}
+
+extern "C" void generate_secure_key(unsigned char* key) {
+    invariant(encryptionKeyDB);
+    encryptionKeyDB->generate_secure_key(key);
 }
 
 }  // namespace mongo

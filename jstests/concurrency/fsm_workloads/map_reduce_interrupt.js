@@ -10,11 +10,12 @@
  * @tags: [
  *   # mapReduce does not support afterClusterTime.
  *   does_not_support_causal_consistency,
- *   uses_curop_agg_stage,
+ *   uses_curop_agg_stage
  * ]
  */
 load('jstests/concurrency/fsm_libs/extend_workload.js');                      // for extendWorkload
 load('jstests/concurrency/fsm_workloads/map_reduce_replace_nonexistent.js');  // for $config
+load("jstests/libs/write_concern_util.js");  // For isDefaultWriteConcernMajorityFlagEnabled.
 
 var $config = extendWorkload($config, function($config, $super) {
     $config.data.prefix = 'map_reduce_interrupt';
@@ -43,6 +44,11 @@ var $config = extendWorkload($config, function($config, $super) {
     };
 
     $config.states.mapReduce = function mapReduce(db, collName) {
+        // TODO (SERVER-56640): Fix the test to work with the new default write concern.
+        if (isDefaultWriteConcernMajorityFlagEnabled(db)) {
+            jsTestLog("Skipping test because the default WC majority feature flag is enabled.");
+            return;
+        }
         try {
             $super.states.mapReduce.apply(this, arguments);
         } catch (err) {

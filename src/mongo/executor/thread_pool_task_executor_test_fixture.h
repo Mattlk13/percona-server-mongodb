@@ -46,6 +46,10 @@ std::unique_ptr<ThreadPoolTaskExecutor> makeThreadPoolTestExecutor(
     std::unique_ptr<NetworkInterfaceMock> net,
     executor::ThreadPoolMock::Options options = executor::ThreadPoolMock::Options());
 
+std::shared_ptr<ThreadPoolTaskExecutor> makeSharedThreadPoolTestExecutor(
+    std::unique_ptr<NetworkInterfaceMock> net,
+    executor::ThreadPoolMock::Options options = executor::ThreadPoolMock::Options());
+
 /**
  * Useful fixture class for tests that use a ThreadPoolTaskExecutor.
  */
@@ -65,7 +69,7 @@ public:
 
 private:
     virtual ThreadPoolMock::Options makeThreadPoolMockOptions() const;
-    std::unique_ptr<TaskExecutor> makeTaskExecutor(
+    std::shared_ptr<TaskExecutor> makeTaskExecutor(
         std::unique_ptr<NetworkInterfaceMock> net) override;
 
     // Returned by makeThreadPoolMockOptions().

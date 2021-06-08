@@ -41,6 +41,7 @@ namespace mongo {
 
 class AScopedConnection;
 class DBClientBase;
+class AggregateCommandRequest;
 
 /** Queries return a cursor object */
 class DBClientCursor {
@@ -94,7 +95,7 @@ public:
     /**
      * peek ahead and see if an error occurred, and get the error if so.
      */
-    bool peekError(BSONObj* error = NULL);
+    bool peekError(BSONObj* error = nullptr);
 
     /**
        iterate the rest of the cursor and return the number if items
@@ -119,6 +120,10 @@ public:
 
     bool tailable() const {
         return (opts & QueryOption_CursorTailable) != 0;
+    }
+
+    bool tailableAwaitData() const {
+        return tailable() && (opts & QueryOption_AwaitData);
     }
 
     /** see ResultFlagType (constants.h) for flag values
@@ -148,7 +153,8 @@ public:
                    int nToSkip,
                    const BSONObj* fieldsToReturn,
                    int queryOptions,
-                   int bs);
+                   int bs,
+                   boost::optional<BSONObj> readConcernObj = boost::none);
 
     DBClientCursor(DBClientBase* client,
                    const NamespaceStringOrUUID& nsOrUuid,
@@ -156,6 +162,12 @@ public:
                    int nToReturn,
                    int options,
                    std::vector<BSONObj> initialBatch = {});
+
+    static StatusWith<std::unique_ptr<DBClientCursor>> fromAggregationRequest(
+        DBClientBase* client,
+        AggregateCommandRequest aggRequest,
+        bool secondaryOk,
+        bool useExhaust);
 
     virtual ~DBClientCursor();
 
@@ -221,6 +233,39 @@ public:
         return _connectionHasPendingReplies;
     }
 
+    Milliseconds getAwaitDataTimeoutMS() const {
+        return _awaitDataTimeout;
+    }
+
+    void setAwaitDataTimeoutMS(Milliseconds timeout) {
+        // It only makes sense to set awaitData timeout if the cursor is in tailable awaitData mode.
+        invariant(tailableAwaitData());
+        _awaitDataTimeout = timeout;
+    }
+
+    // Only used for tailable awaitData oplog fetching requests.
+    void setCurrentTermAndLastCommittedOpTime(
+        const boost::optional<long long>& term,
+        const boost::optional<repl::OpTime>& lastCommittedOpTime) {
+        invariant(tailableAwaitData());
+        _term = term;
+        _lastKnownCommittedOpTime = lastCommittedOpTime;
+    }
+
+    /**
+     * Returns the resume token for the latest batch, it set.
+     */
+    virtual boost::optional<BSONObj> getPostBatchResumeToken() const {
+        return _postBatchResumeToken;
+    }
+
+    /**
+     * Returns the operation time for the latest batch, if set.
+     */
+    virtual boost::optional<Timestamp> getOperationTime() const {
+        return _operationTime;
+    }
+
 protected:
     struct Batch {
         // TODO remove constructors after c++17 toolchain upgrade
@@ -243,7 +288,8 @@ private:
                    const BSONObj* fieldsToReturn,
                    int queryOptions,
                    int bs,
-                   std::vector<BSONObj> initialBatch);
+                   std::vector<BSONObj> initialBatch,
+                   boost::optional<BSONObj> readConcernObj);
 
     int nextBatchSize();
 
@@ -269,10 +315,15 @@ private:
     std::string _scopedHost;
     std::string _lazyHost;
     bool wasError;
-    BSONVersion _enabledBSONVersion;
     bool _useFindCommand = true;
     bool _connectionHasPendingReplies = false;
     int _lastRequestId = 0;
+    Milliseconds _awaitDataTimeout = Milliseconds{0};
+    boost::optional<long long> _term;
+    boost::optional<repl::OpTime> _lastKnownCommittedOpTime;
+    boost::optional<BSONObj> _postBatchResumeToken;
+    boost::optional<BSONObj> _readConcernObj;
+    boost::optional<Timestamp> _operationTime;
 
     void dataReceived(const Message& reply) {
         bool retry;
@@ -313,6 +364,14 @@ public:
     // getNamespaceString() will return the NamespaceString returned by the 'find' command.
     const NamespaceString& getNamespaceString() {
         return _c.getNamespaceString();
+    }
+
+    const long long getCursorId() const {
+        return _c.getCursorId();
+    }
+
+    boost::optional<BSONObj> getPostBatchResumeToken() const {
+        return _c.getPostBatchResumeToken();
     }
 
 private:

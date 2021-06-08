@@ -39,14 +39,13 @@
 namespace mongo {
 
 TEST(WriteOpsDocSeq, InsertDocStreamWorks) {
-    std::string errMsg;
-    auto conn = std::unique_ptr<DBClientBase>(
-        unittest::getFixtureConnectionString().connect("integration_test", errMsg));
-    uassert(ErrorCodes::SocketException, errMsg, conn);
+    auto swConn = unittest::getFixtureConnectionString().connect("integration_test");
+    uassertStatusOK(swConn.getStatus());
+    auto conn = std::move(swConn.getValue());
 
     NamespaceString ns("test", "doc_seq");
     conn->dropCollection(ns.ns());
-    ASSERT_EQ(conn->count(ns.ns()), 0u);
+    ASSERT_EQ(conn->count(ns), 0u);
 
     OpMsgRequest request;
     request.body = BSON("insert" << ns.coll() << "$db" << ns.db());
@@ -64,7 +63,7 @@ TEST(WriteOpsDocSeq, InsertDocStreamWorks) {
     auto body = reply->getCommandReply();
     ASSERT_OK(getStatusFromCommandResult(body));
     ASSERT_EQ(body["n"].Int(), 5);
-    ASSERT_EQ(conn->count(ns.ns()), 5u);
+    ASSERT_EQ(conn->count(ns), 5u);
 }
 
 }  // namespace mongo

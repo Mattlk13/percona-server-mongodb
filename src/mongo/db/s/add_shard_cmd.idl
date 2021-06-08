@@ -57,9 +57,11 @@ structs:
 
 commands:
     _addShard:
+        command_name: _addShard
         cpp_name: AddShard
         description: "_addShard Command"
         namespace: ignored
+        api_version: ""
         fields:
             shardIdentity:
                 description: "Identity metadata for the new shard"

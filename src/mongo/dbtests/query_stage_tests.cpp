@@ -29,6 +29,8 @@
 
 #include "mongo/platform/basic.h"
 
+#include <memory>
+
 #include "mongo/client/dbclient_cursor.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
@@ -41,9 +43,8 @@
 #include "mongo/db/json.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/query/plan_executor.h"
+#include "mongo/db/query/plan_executor_factory.h"
 #include "mongo/dbtests/dbtests.h"
-#include "mongo/stdx/memory.h"
 
 /**
  * This file tests db/exec/index_scan.cpp
@@ -82,26 +83,29 @@ public:
     int countResults(const IndexScanParams& params, BSONObj filterObj = BSONObj()) {
         AutoGetCollectionForReadCommand ctx(&_opCtx, NamespaceString(ns()));
 
-        const CollatorInterface* collator = nullptr;
-        const boost::intrusive_ptr<ExpressionContext> expCtx(
-            new ExpressionContext(&_opCtx, collator));
         StatusWithMatchExpression statusWithMatcher =
-            MatchExpressionParser::parse(filterObj, expCtx);
+            MatchExpressionParser::parse(filterObj, _expCtx);
         verify(statusWithMatcher.isOK());
         unique_ptr<MatchExpression> filterExpr = std::move(statusWithMatcher.getValue());
 
-        unique_ptr<WorkingSet> ws = stdx::make_unique<WorkingSet>();
-        unique_ptr<IndexScan> ix =
-            stdx::make_unique<IndexScan>(&_opCtx, params, ws.get(), filterExpr.get());
+        unique_ptr<WorkingSet> ws = std::make_unique<WorkingSet>();
+        unique_ptr<IndexScan> ix = std::make_unique<IndexScan>(
+            _expCtx.get(), ctx.getCollection(), params, ws.get(), filterExpr.get());
 
-        auto statusWithPlanExecutor = PlanExecutor::make(
-            &_opCtx, std::move(ws), std::move(ix), ctx.getCollection(), PlanExecutor::NO_YIELD);
+        auto statusWithPlanExecutor =
+            plan_executor_factory::make(_expCtx,
+                                        std::move(ws),
+                                        std::move(ix),
+                                        &ctx.getCollection(),
+                                        PlanYieldPolicy::YieldPolicy::NO_YIELD,
+                                        QueryPlannerParams::DEFAULT);
         ASSERT_OK(statusWithPlanExecutor.getStatus());
         auto exec = std::move(statusWithPlanExecutor.getValue());
 
         int count = 0;
         PlanExecutor::ExecState state;
-        for (RecordId dl; PlanExecutor::ADVANCED == (state = exec->getNext(NULL, &dl));) {
+        for (RecordId dl; PlanExecutor::ADVANCED ==
+             (state = exec->getNext(static_cast<BSONObj*>(nullptr), &dl));) {
             ++count;
         }
         ASSERT_EQUALS(PlanExecutor::IS_EOF, state);
@@ -120,8 +124,7 @@ public:
     }
 
     const IndexDescriptor* getIndex(const BSONObj& obj) {
-        AutoGetCollectionForReadCommand ctx(&_opCtx, NamespaceString(ns()));
-        Collection* collection = ctx.getCollection();
+        AutoGetCollectionForReadCommand collection(&_opCtx, NamespaceString(ns()));
         std::vector<const IndexDescriptor*> indexes;
         collection->getIndexCatalog()->findIndexesByKeyPattern(&_opCtx, obj, false, &indexes);
         return indexes.empty() ? nullptr : indexes[0];
@@ -147,6 +150,9 @@ public:
 protected:
     const ServiceContext::UniqueOperationContext _txnPtr = cc().makeOperationContext();
     OperationContext& _opCtx = *_txnPtr;
+
+    boost::intrusive_ptr<ExpressionContext> _expCtx =
+        new ExpressionContext(&_opCtx, nullptr, NamespaceString(ns()));
 
 private:
     DBDirectClient _client;
@@ -226,9 +232,9 @@ public:
     }
 };
 
-class All : public Suite {
+class All : public OldStyleSuiteSpecification {
 public:
-    All() : Suite("query_stage_tests") {}
+    All() : OldStyleSuiteSpecification("query_stage_tests") {}
 
     void setupTests() {
         add<QueryStageIXScanBasic>();
@@ -239,6 +245,6 @@ public:
     }
 };
 
-SuiteInstance<All> queryStageTestsAll;
+OldStyleSuiteInitializer<All> queryStageTestsAll;
 
-}  // namespace
+}  // namespace QueryStageTests

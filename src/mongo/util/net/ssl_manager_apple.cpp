@@ -27,32 +27,34 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 #include "mongo/platform/basic.h"
 
 #include <boost/optional/optional.hpp>
 #include <fstream>
+#include <memory>
 #include <stdlib.h>
 
 #include "mongo/base/checked_cast.h"
 #include "mongo/base/init.h"
-#include "mongo/base/initializer_context.h"
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
 #include "mongo/crypto/sha1_block.h"
 #include "mongo/crypto/sha256_block.h"
+#include "mongo/logv2/log.h"
 #include "mongo/platform/random.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/base64.h"
 #include "mongo/util/concurrency/mutex.h"
-#include "mongo/util/log.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/net/cidr.h"
 #include "mongo/util/net/private/ssl_expiration.h"
 #include "mongo/util/net/socket_exception.h"
 #include "mongo/util/net/ssl/apple.hpp"
 #include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/net/ssl_options.h"
+#include "mongo/util/net/ssl_parameters_gen.h"
+#include "mongo/util/net/ssl_peer_info.h"
 
 using asio::ssl::apple::CFUniquePtr;
 
@@ -68,6 +70,9 @@ extern "C" SecIdentityRef SecIdentityCreate(CFAllocatorRef, SecCertificateRef, S
 namespace mongo {
 
 namespace {
+
+// This failpoint is a no-op on OSX.
+MONGO_FAIL_POINT_DEFINE(disableStapling);
 
 template <typename T>
 constexpr T cf_cast(::CFTypeRef val) {
@@ -327,15 +332,14 @@ StatusWith<SSLX509Name::Entry> extractSingleOIDEntry(::CFDictionaryRef entry) {
         std::move(swLabelStr.getValue()), 19, std::move(swValueStr.getValue()));
 }
 
-// Translate a raw DER subject sequence into a structured subject name.
-StatusWith<SSLX509Name> extractSubjectName(::CFDictionaryRef dict) {
-    auto swSubject = extractDictionaryValue<::CFDictionaryRef>(dict, ::kSecOIDX509V1SubjectName);
-    if (!swSubject.isOK()) {
-        return swSubject.getStatus();
+// Extract a name value from the dictionary for the given property key.
+StatusWith<SSLX509Name> extractPropertyName(::CFDictionaryRef dict, CFStringRef property) {
+    auto swProp = extractDictionaryValue<::CFDictionaryRef>(dict, property);
+    if (!swProp.isOK()) {
+        return swProp.getStatus();
     }
 
-    auto swElems =
-        extractDictionaryValue<::CFArrayRef>(swSubject.getValue(), ::kSecPropertyKeyValue);
+    auto swElems = extractDictionaryValue<::CFArrayRef>(swProp.getValue(), ::kSecPropertyKeyValue);
     if (!swElems.isOK()) {
         return swElems.getStatus();
     }
@@ -348,7 +352,7 @@ StatusWith<SSLX509Name> extractSubjectName(::CFDictionaryRef dict) {
         invariant(elem);
         if (::CFGetTypeID(elem) != ::CFDictionaryGetTypeID()) {
             return {ErrorCodes::InvalidSSLConfiguration,
-                    "Subject name element is not a dictionary"};
+                    str::stream() << toString(property) << " element is not a dictionary"};
         }
 
         auto swType = extractDictionaryValue<::CFStringRef>(elem, ::kSecPropertyKeyType);
@@ -370,7 +374,8 @@ StatusWith<SSLX509Name> extractSubjectName(::CFDictionaryRef dict) {
                 invariant(rdnElem);
                 if (::CFGetTypeID(rdnElem) != ::CFDictionaryGetTypeID()) {
                     return {ErrorCodes::InvalidSSLConfiguration,
-                            "Subject name sub-element is not a dictionary"};
+                            str::stream()
+                                << toString(property) << " sub-element is not a dictionary"};
                 }
                 auto swEntry = extractSingleOIDEntry(rdnElem);
                 if (!swEntry.isOK()) {
@@ -390,12 +395,17 @@ StatusWith<SSLX509Name> extractSubjectName(::CFDictionaryRef dict) {
         }
     }
 
-    SSLX509Name subjectName = SSLX509Name(std::move(ret));
-    Status normalize = subjectName.normalizeStrings();
+    SSLX509Name propertyName = SSLX509Name(std::move(ret));
+    Status normalize = propertyName.normalizeStrings();
     if (!normalize.isOK()) {
         return normalize;
     }
-    return subjectName;
+    return propertyName;
+}
+
+// Translate a raw DER subject sequence into a structured subject name.
+StatusWith<SSLX509Name> extractSubjectName(::CFDictionaryRef dict) {
+    return extractPropertyName(dict, ::kSecOIDX509V1SubjectName);
 }
 
 StatusWith<mongo::Date_t> extractValidityDate(::CFDictionaryRef dict,
@@ -526,13 +536,37 @@ StatusWith<std::vector<std::string>> extractSubjectAlternateNames(::CFDictionary
         if (swCIDRValue.isOK()) {
             swNameStr = swCIDRValue.getValue().toString();
             if (san == kDNS) {
-                warning() << "You have an IP Address in the DNS Name field on your "
-                             "certificate. This formulation is deprecated.";
+                LOGV2_WARNING(23208,
+                              "You have an IP Address in the DNS Name field on your "
+                              "certificate. This formulation is deprecated.");
             }
         }
         ret.push_back(swNameStr.getValue());
     }
     return ret;
+}
+
+StatusWith<::SecCertificateRef> getCertificate(::CFArrayRef certs);
+
+StatusWith<std::vector<std::string>> extractSubjectAlternateNames(::CFArrayRef certs) {
+    auto swCert = getCertificate(certs);
+    if (!swCert.isOK()) {
+        return swCert.getStatus();
+    }
+    CFUniquePtr<::SecCertificateRef> cert(swCert.getValue());
+
+    CFUniquePtr<::CFMutableArrayRef> oids(
+        ::CFArrayCreateMutable(nullptr, 1, &::kCFTypeArrayCallBacks));
+    ::CFArrayAppendValue(oids.get(), ::kSecOIDSubjectAltName);
+
+    ::CFErrorRef err = nullptr;
+    CFUniquePtr<::CFDictionaryRef> cfdict(::SecCertificateCopyValues(cert.get(), oids.get(), &err));
+    CFUniquePtr<::CFErrorRef> cferror(err);
+    if (cferror) {
+        return Status(ErrorCodes::NoSuchKey, "Could not find Subject Alternative Name");
+    }
+
+    return extractSubjectAlternateNames(cfdict.get());
 }
 
 bool isCFDataEqual(::CFDataRef a, ::CFDataRef b) {
@@ -725,8 +759,7 @@ StatusWith<CFUniquePtr<::CFArrayRef>> loadPEM(const std::string& keyfilepath,
         return Status(ErrorCodes::InvalidSSLConfiguration,
                       str::stream() << "Unable to load PEM from '" << keyfilepath << "'"
                                     << (passphrase.empty() ? "" : " with passphrase")
-                                    << (msg.empty() ? "" : ": ")
-                                    << msg);
+                                    << (msg.empty() ? "" : ": ") << msg);
     };
 
     std::ifstream pemFile(keyfilepath, std::ios::binary);
@@ -736,6 +769,18 @@ StatusWith<CFUniquePtr<::CFArrayRef>> loadPEM(const std::string& keyfilepath,
 
     std::vector<uint8_t> pemdata((std::istreambuf_iterator<char>(pemFile)),
                                  std::istreambuf_iterator<char>());
+    if (!passphrase.empty()) {
+        // Encrypted PKCS#1 and PKCS#8 is not supported on macOS.
+        // Attempt to detect early and give a useful error message.
+        // We'll use the key marker as a tombstone to determine that we're
+        // not actually looking at a PKCS#12.
+        StringData pemDataView(reinterpret_cast<char*>(pemdata.data()), pemdata.size());
+        if (pemDataView.find("PRIVATE KEY-----") != std::string::npos) {
+            return {ErrorCodes::InvalidSSLConfiguration,
+                    "Using encrypted PKCS#1/PKCS#8 PEM files is not supported on this platform"};
+        }
+    }
+
     CFUniquePtr<CFDataRef> cfdata(::CFDataCreate(nullptr, pemdata.data(), pemdata.size()));
     invariant(cfdata);
     pemdata.clear();
@@ -746,7 +791,9 @@ StatusWith<CFUniquePtr<::CFArrayRef>> loadPEM(const std::string& keyfilepath,
             nullptr, reinterpret_cast<const uint8_t*>(passphrase.c_str()), passphrase.size()));
     }
     ::SecItemImportExportKeyParameters params = {
-        SEC_KEY_IMPORT_EXPORT_PARAMS_VERSION, 0, cfpass.get(),
+        SEC_KEY_IMPORT_EXPORT_PARAMS_VERSION,
+        0,
+        cfpass.get(),
     };
 
     CFUniquePtr<CFStringRef> cfkeyfile(
@@ -771,8 +818,8 @@ StatusWith<CFUniquePtr<::CFArrayRef>> loadPEM(const std::string& keyfilepath,
                       "key. Consider using a certificate selector or PKCS#12 instead");
     }
     if (status != ::errSecSuccess) {
-        return retFail(str::stream() << "Failing importing certificate(s): "
-                                     << stringFromOSStatus(status));
+        return retFail(str::stream()
+                       << "Failing importing certificate(s): " << stringFromOSStatus(status));
     }
 
     if (mode == kLoadPEMBindIdentities) {
@@ -799,11 +846,13 @@ StatusWith<CFUniquePtr<::CFArrayRef>> loadPEM(const std::string& keyfilepath,
     return std::move(cfcerts);
 }
 
-StatusWith<SSLX509Name> certificateGetSubject(::SecCertificateRef cert, Date_t* expire = nullptr) {
-    // Fetch expiry range and full subject name.
+StatusWith<SSLX509Name> certificateGetPropertyName(::SecCertificateRef cert,
+                                                   CFStringRef property,
+                                                   Date_t* expire = nullptr) {
+    // Fetch expiry range and property name.
     CFUniquePtr<::CFMutableArrayRef> oids(
         ::CFArrayCreateMutable(nullptr, expire ? 3 : 1, &::kCFTypeArrayCallBacks));
-    ::CFArrayAppendValue(oids.get(), ::kSecOIDX509V1SubjectName);
+    ::CFArrayAppendValue(oids.get(), property);
     if (expire) {
         ::CFArrayAppendValue(oids.get(), ::kSecOIDX509V1ValidityNotBefore);
         ::CFArrayAppendValue(oids.get(), ::kSecOIDX509V1ValidityNotAfter);
@@ -817,14 +866,14 @@ StatusWith<SSLX509Name> certificateGetSubject(::SecCertificateRef cert, Date_t* 
                 str::stream() << "Unable to determine certificate validity: " << cferror};
     }
 
-    auto swSubjectName = extractSubjectName(cfdict.get());
-    if (!swSubjectName.isOK()) {
-        return swSubjectName.getStatus();
+    auto swPropertyName = extractPropertyName(cfdict.get(), property);
+    if (!swPropertyName.isOK()) {
+        return swPropertyName.getStatus();
     }
-    auto subject = swSubjectName.getValue();
+    auto propertyName = swPropertyName.getValue();
 
     if (!expire) {
-        return subject;
+        return propertyName;
     }
 
     // Marshal expiration.
@@ -843,10 +892,11 @@ StatusWith<SSLX509Name> certificateGetSubject(::SecCertificateRef cert, Date_t* 
                 "The provided SSL certificate is expired or not yet valid"};
     }
 
-    return subject;
+    return propertyName;
 }
 
-StatusWith<SSLX509Name> certificateGetSubject(::CFArrayRef certs, Date_t* expire = nullptr) {
+// Get the root certificate from an array of certs.
+StatusWith<::SecCertificateRef> getCertificate(::CFArrayRef certs) {
     if (::CFArrayGetCount(certs) <= 0) {
         return {ErrorCodes::InvalidSSLConfiguration, "No certificates in certificate list"};
     }
@@ -863,8 +913,26 @@ StatusWith<SSLX509Name> certificateGetSubject(::CFArrayRef certs, Date_t* expire
                 str::stream() << "Unable to get certificate from identity: "
                               << stringFromOSStatus(status)};
     }
-    CFUniquePtr<::SecCertificateRef> cert(idcert);
-    return certificateGetSubject(cert.get(), expire);
+    return idcert;
+}
+
+StatusWith<SSLX509Name> certificateGetPropertyName(::CFArrayRef certs,
+                                                   CFStringRef property,
+                                                   Date_t* expire = nullptr) {
+    auto swCert = getCertificate(certs);
+    if (!swCert.isOK()) {
+        return swCert.getStatus();
+    }
+    CFUniquePtr<::SecCertificateRef> cert(swCert.getValue());
+    return certificateGetPropertyName(cert.get(), property, expire);
+}
+
+StatusWith<SSLX509Name> certificateGetSubject(::SecCertificateRef cert, Date_t* expire = nullptr) {
+    return certificateGetPropertyName(cert, ::kSecOIDX509V1SubjectName, expire);
+}
+
+StatusWith<SSLX509Name> certificateGetSubject(::CFArrayRef certs, Date_t* expire = nullptr) {
+    return certificateGetPropertyName(certs, ::kSecOIDX509V1SubjectName, expire);
 }
 
 StatusWith<CFUniquePtr<::CFArrayRef>> copyMatchingCertificate(
@@ -1062,22 +1130,6 @@ std::string explainTrustFailure(::SecTrustRef trust, ::SecTrustResultType result
     return ret("No trust failure reason available");
 }
 
-boost::optional<std::string> getRawSNIServerName(::SSLContextRef _ssl) {
-    size_t len = 0;
-    auto status = ::SSLCopyRequestedPeerNameLength(_ssl, &len);
-    if (status != ::errSecSuccess) {
-        return boost::none;
-    }
-    std::string ret;
-    ret.resize(len + 1);
-    status = ::SSLCopyRequestedPeerName(_ssl, &ret[0], &len);
-    if (status != ::errSecSuccess) {
-        return boost::none;
-    }
-    ret.resize(len);
-    return ret;
-}
-
 }  // namespace
 
 /////////////////////////////////////////////////////////////////////////////
@@ -1125,10 +1177,6 @@ public:
         } while ((status == ::errSSLServerAuthCompleted) ||
                  (status == ::errSSLClientAuthCompleted));
         uassertOSStatusOK(status, ErrorCodes::SSLHandshakeFailed);
-    }
-
-    std::string getSNIServerName() const final {
-        return getRawSNIServerName(get()).value_or("");
     }
 
     ::SSLContextRef get() const {
@@ -1193,6 +1241,26 @@ private:
     CFUniquePtr<::SSLContextRef> _ssl;
 };
 
+CFUniquePtr<::CFArrayRef> CreateSecTrustPolicies(const std::string& remoteHost,
+                                                 bool allowInvalidCertificates) {
+    CFUniquePtr<::CFMutableArrayRef> policiesMutable(
+        ::CFArrayCreateMutable(nullptr, 2, &::kCFTypeArrayCallBacks));
+
+    // Basic X509 policy.
+    CFUniquePtr<::SecPolicyRef> cfX509Policy(::SecPolicyCreateBasicX509());
+    ::CFArrayAppendValue(policiesMutable.get(), cfX509Policy.get());
+
+    // Set Revocation policy.
+    auto policy = ::kSecRevocationNetworkAccessDisabled;
+    if (tlsOCSPEnabled && !remoteHost.empty() && !allowInvalidCertificates) {
+        policy = ::kSecRevocationOCSPMethod;
+    }
+    CFUniquePtr<::SecPolicyRef> cfRevPolicy(::SecPolicyCreateRevocation(policy));
+    ::CFArrayAppendValue(policiesMutable.get(), cfRevPolicy.get());
+
+    return CFUniquePtr<::CFArrayRef>(policiesMutable.release());
+}
+
 }  // namespace
 
 /////////////////////////////////////////////////////////////////////////////
@@ -1214,10 +1282,13 @@ public:
                                                           const std::string& remoteHost,
                                                           const HostAndPort& hostForLogging) final;
 
-    StatusWith<SSLPeerInfo> parseAndValidatePeerCertificate(
-        ::SSLContextRef conn,
-        const std::string& remoteHost,
-        const HostAndPort& hostForLogging) final;
+    Future<SSLPeerInfo> parseAndValidatePeerCertificate(::SSLContextRef conn,
+                                                        boost::optional<std::string> sniName,
+                                                        const std::string& remoteHost,
+                                                        const HostAndPort& hostForLogging,
+                                                        const ExecutorPtr& reactor) final;
+
+    Status stapleOCSPResponse(asio::ssl::apple::Context* context, bool asyncOCSPStaple) final;
 
     const SSLConfiguration& getSSLConfiguration() const final {
         return _sslConfiguration;
@@ -1226,6 +1297,10 @@ public:
     int SSL_read(SSLConnectionInterface* conn, void* buf, int num) final;
     int SSL_write(SSLConnectionInterface* conn, const void* buf, int num) final;
     int SSL_shutdown(SSLConnectionInterface* conn) final;
+
+    SSLInformationToLog getSSLInformationToLog() const final;
+
+    void stopJobs() final;
 
 private:
     bool _weakValidation;
@@ -1269,8 +1344,18 @@ SSLManagerApple::SSLManagerApple(const SSLParams& params, bool isServer)
             uassertStatusOK(
                 _sslConfiguration.setServerSubjectName(uassertStatusOK(certificateGetSubject(
                     _serverCtx.certs.get(), &_sslConfiguration.serverCertificateExpirationDate))));
-            static auto task =
-                CertificateExpirationMonitor(_sslConfiguration.serverCertificateExpirationDate);
+            CertificateExpirationMonitor::get()->updateExpirationDeadline(
+                _sslConfiguration.serverCertificateExpirationDate);
+
+            auto swSans = extractSubjectAlternateNames(_serverCtx.certs.get());
+            const bool hasSan = swSans.isOK() && (0 != swSans.getValue().size());
+            if (!hasSan) {
+                LOGV2_WARNING_OPTIONS(
+                    551191,
+                    {logv2::LogTag::kStartupWarnings},
+                    "Server certificate has no compatible Subject Alternative Name. "
+                    "This may prevent TLS clients from connecting");
+            }
         }
     }
 
@@ -1339,9 +1424,6 @@ StatusWith<std::pair<::SSLProtocol, ::SSLProtocol>> parseProtocolRange(const SSL
 Status SSLManagerApple::initSSLContext(asio::ssl::apple::Context* context,
                                        const SSLParams& params,
                                        ConnectionDirection direction) {
-    // Options.
-    context->allowInvalidHostnames = _allowInvalidHostnames;
-
     // Protocol Version.
     const auto swProto = parseProtocolRange(params);
     if (!swProto.isOK()) {
@@ -1410,7 +1492,9 @@ SSLPeerInfo SSLManagerApple::parseAndValidatePeerCertificateDeprecated(
     const HostAndPort& hostForLogging) {
     auto ssl = checked_cast<const SSLConnectionApple*>(conn)->get();
 
-    auto swPeerSubjectName = parseAndValidatePeerCertificate(ssl, remoteHost, hostForLogging);
+    auto swPeerSubjectName =
+        parseAndValidatePeerCertificate(ssl, boost::none, remoteHost, hostForLogging, nullptr)
+            .getNoThrow();
     // We can't use uassertStatusOK here because we need to throw a NetworkException.
     if (!swPeerSubjectName.isOK()) {
         throwSocketError(SocketErrorKind::CONNECT_ERROR, swPeerSubjectName.getStatus().reason());
@@ -1435,15 +1519,25 @@ StatusWith<TLSVersion> mapTLSVersion(SSLContextRef ssl) {
     }
 }
 
+Status SSLManagerApple::stapleOCSPResponse(asio::ssl::apple::Context* context,
+                                           bool asyncOCSPStaple) {
+    return Status::OK();
+}
 
-StatusWith<SSLPeerInfo> SSLManagerApple::parseAndValidatePeerCertificate(
-    ::SSLContextRef ssl, const std::string& remoteHost, const HostAndPort& hostForLogging) {
-    auto sniName = getRawSNIServerName(ssl);
+void SSLManagerApple::stopJobs() {}
+
+Future<SSLPeerInfo> SSLManagerApple::parseAndValidatePeerCertificate(
+    ::SSLContextRef ssl,
+    boost::optional<std::string> sniName,
+    const std::string& remoteHost,
+    const HostAndPort& hostForLogging,
+    const ExecutorPtr& reactor) {
+    invariant(!sslGlobalParams.tlsCATrusts);
 
     // Record TLS version stats
     auto tlsVersionStatus = mapTLSVersion(ssl);
     if (!tlsVersionStatus.isOK()) {
-        return tlsVersionStatus.getStatus();
+        return Future<SSLPeerInfo>::makeReady(tlsVersionStatus.getStatus());
     }
 
     recordTLSVersion(tlsVersionStatus.getValue(), hostForLogging);
@@ -1456,18 +1550,22 @@ StatusWith<SSLPeerInfo> SSLManagerApple::parseAndValidatePeerCertificate(
      * so that the validation path runs anyway.
      */
     if (!_sslConfiguration.hasCA && isSSLServer) {
-        return SSLPeerInfo(sniName);
+        return Future<SSLPeerInfo>::makeReady(SSLPeerInfo(sniName));
     }
 
-    const auto badCert = [&](StringData msg, bool warn = false) -> StatusWith<SSLPeerInfo> {
-        constexpr StringData prefix = "SSL peer certificate validation failed: "_sd;
+    const auto badCert = [&](StringData msg, bool warn = false) -> Future<SSLPeerInfo> {
         if (warn) {
-            warning() << prefix << msg;
-            return SSLPeerInfo(sniName);
+            LOGV2_WARNING(23209,
+                          "SSL peer certificate validation failed: {error}",
+                          "SSL peer certificate validation failed",
+                          "error"_attr = msg);
+            return Future<SSLPeerInfo>::makeReady(SSLPeerInfo(sniName));
         } else {
-            std::string m = str::stream() << prefix << msg << "; connection rejected";
-            error() << m;
-            return Status(ErrorCodes::SSLHandshakeFailed, m);
+            LOGV2_ERROR(23212,
+                        "SSL peer certificate validation failed {error}; connection rejected",
+                        "SSL peer certificate validation failed; connection rejected",
+                        "error"_attr = msg);
+            return Status(ErrorCodes::SSLHandshakeFailed, msg);
         }
     };
 
@@ -1515,6 +1613,9 @@ StatusWith<SSLPeerInfo> SSLManagerApple::parseAndValidatePeerCertificate(
         ipv6 = true;
     }
 
+    ::SecTrustSetPolicies(cftrust.get(),
+                          CreateSecTrustPolicies(remoteHost, _allowInvalidCertificates).get());
+
     auto result = ::kSecTrustResultInvalid;
     uassertOSStatusOK(::SecTrustEvaluate(cftrust.get(), &result), ErrorCodes::SSLHandshakeFailed);
 
@@ -1533,9 +1634,10 @@ StatusWith<SSLPeerInfo> SSLManagerApple::parseAndValidatePeerCertificate(
     }
 
     CFUniquePtr<::CFMutableArrayRef> oids(
-        ::CFArrayCreateMutable(nullptr, remoteHost.empty() ? 3 : 2, &::kCFTypeArrayCallBacks));
+        ::CFArrayCreateMutable(nullptr, remoteHost.empty() ? 4 : 3, &::kCFTypeArrayCallBacks));
     ::CFArrayAppendValue(oids.get(), ::kSecOIDX509V1SubjectName);
     ::CFArrayAppendValue(oids.get(), ::kSecOIDSubjectAltName);
+    ::CFArrayAppendValue(oids.get(), ::kSecOIDX509V1ValidityNotAfter);
     if (remoteHost.empty()) {
         ::CFArrayAppendValue(oids.get(), kMongoDBRolesOID);
     }
@@ -1553,21 +1655,44 @@ StatusWith<SSLPeerInfo> SSLManagerApple::parseAndValidatePeerCertificate(
         return swPeerSubjectName.getStatus();
     }
     const auto peerSubjectName = std::move(swPeerSubjectName.getValue());
-    LOG(2) << "Accepted TLS connection from peer: " << peerSubjectName;
+    LOGV2_DEBUG(23207,
+                2,
+                "Accepted TLS connection from peer: {peerSubjectName}",
+                "Accepted TLS connection from peer",
+                "peerSubjectName"_attr = peerSubjectName);
 
-    // If this is a server and client and server certificate are the same, log a warning.
-    if (_sslConfiguration.serverSubjectName() == peerSubjectName) {
-        warning() << "Client connecting with server's own TLS certificate";
-    }
-
+    // Server side.
     if (remoteHost.empty()) {
+        const auto exprThreshold = tlsX509ExpirationWarningThresholdDays;
+        if (exprThreshold > 0) {
+            auto swExpiration =
+                extractValidityDate(cfdict.get(), ::kSecOIDX509V1ValidityNotAfter, "valid-until");
+            if (!swExpiration.isOK()) {
+                return badCert("Unable to parse expiration date from certificate",
+                               _allowInvalidCertificates);
+            }
+            const auto expiration = swExpiration.getValue();
+            const auto now = Date_t::now();
+
+            if ((now + Days(exprThreshold)) > expiration) {
+                tlsEmitWarningExpiringClientCertificate(peerSubjectName,
+                                                        duration_cast<Days>(expiration - now));
+            }
+        }
+
+        // If client and server certificate are the same, log a warning.
+        if (_sslConfiguration.serverSubjectName() == peerSubjectName) {
+            LOGV2_WARNING(23210, "Client connecting with server's own TLS certificate");
+        }
+
         // If this is an SSL server context (on a mongod/mongos)
         // parse any client roles out of the client certificate.
         auto swPeerCertificateRoles = parsePeerRoles(cfdict.get());
         if (!swPeerCertificateRoles.isOK()) {
             return swPeerCertificateRoles.getStatus();
         }
-        return SSLPeerInfo(peerSubjectName, sniName, std::move(swPeerCertificateRoles.getValue()));
+        return Future<SSLPeerInfo>::makeReady(
+            SSLPeerInfo(peerSubjectName, sniName, std::move(swPeerCertificateRoles.getValue())));
     }
 
     // If this is an SSL client context (on a MongoDB server or client)
@@ -1629,21 +1754,25 @@ StatusWith<SSLPeerInfo> SSLManagerApple::parseAndValidatePeerCertificate(
     if (!sanMatch && !cnMatch) {
         const auto msg = certErr.str();
         if (_allowInvalidCertificates || _allowInvalidHostnames || isUnixDomainSocket(remoteHost)) {
-            warning() << msg;
+            LOGV2_WARNING(23211, "{msg}", "msg"_attr = msg);
         } else {
-            error() << msg;
+            LOGV2_ERROR(23213, "{msg}", "msg"_attr = msg);
             return Status(ErrorCodes::SSLHandshakeFailed, msg);
         }
     }
 
-    return SSLPeerInfo(peerSubjectName);
+    return Future<SSLPeerInfo>::makeReady(SSLPeerInfo(peerSubjectName));
 }
 
 int SSLManagerApple::SSL_read(SSLConnectionInterface* conn, void* buf, int num) {
     auto ssl = checked_cast<SSLConnectionApple*>(conn)->get();
     size_t read = 0;
-    uassertOSStatusOK(::SSLRead(ssl, static_cast<uint8_t*>(buf), num, &read),
-                      SocketErrorKind::RECV_ERROR);
+
+    const auto status = ::SSLRead(ssl, static_cast<uint8_t*>(buf), num, &read);
+    if (status != ::errSSLWouldBlock) {
+        uassertOSStatusOK(status, SocketErrorKind::RECV_ERROR);
+    }
+
     return read;
 }
 
@@ -1665,6 +1794,57 @@ int SSLManagerApple::SSL_shutdown(SSLConnectionInterface* conn) {
     return 1;
 }
 
+void getCertInfo(CertInformationToLog* info, const ::CFArrayRef cert) {
+    info->subject = uassertStatusOK(certificateGetSubject(cert));
+    info->issuer = uassertStatusOK(certificateGetPropertyName(cert, ::kSecOIDX509V1IssuerName));
+
+    // Get validity dates via SecCertificateCopyValues
+    CFUniquePtr<::CFMutableArrayRef> oids(
+        ::CFArrayCreateMutable(nullptr, 2, &::kCFTypeArrayCallBacks));
+    ::CFArrayAppendValue(oids.get(), ::kSecOIDX509V1ValidityNotBefore);
+    ::CFArrayAppendValue(oids.get(), ::kSecOIDX509V1ValidityNotAfter);
+
+    CFUniquePtr<::SecCertificateRef> rootCert(uassertStatusOK(getCertificate(cert)));
+    ::CFErrorRef cferror = nullptr;
+    CFUniquePtr<::CFDictionaryRef> cfdict(
+        ::SecCertificateCopyValues(rootCert.get(), oids.get(), &cferror));
+    if (cferror) {
+        CFUniquePtr<::CFErrorRef> deleter(cferror);
+        uasserted(ErrorCodes::InvalidSSLConfiguration,
+                  str::stream() << "Failed to get thumbprint: " << cferror);
+    }
+
+    info->validityNotBefore = uassertStatusOK(
+        extractValidityDate(cfdict.get(), ::kSecOIDX509V1ValidityNotBefore, "valid-from"));
+    info->validityNotAfter = uassertStatusOK(
+        extractValidityDate(cfdict.get(), ::kSecOIDX509V1ValidityNotAfter, "valid-until"));
+
+    // Compute certificate thumbprint
+    CFUniquePtr<::CFDataRef> cfCertData(::SecCertificateCopyData(rootCert.get()));
+    ConstDataRange certData(reinterpret_cast<const char*>(::CFDataGetBytePtr(cfCertData.get())),
+                            ::CFDataGetLength(cfCertData.get()));
+
+    // Comupte hash from bytes of certificate
+    const auto certSha1 = SHA1Block::computeHash({certData});
+    info->thumbprint =
+        std::vector<char>((char*)certSha1.data(), (char*)certSha1.data() + certSha1.kHashLength);
+    info->hexEncodedThumbprint = hexblob::encode(info->thumbprint.data(), info->thumbprint.size());
+}
+
+SSLInformationToLog SSLManagerApple::getSSLInformationToLog() const {
+    SSLInformationToLog info;
+    // server CA should definitely exist, client CA is optional
+    if (_serverCtx.certs.get()) {
+        getCertInfo(&info.server, _serverCtx.certs.get());
+    }
+    if (_clientCtx.certs.get()) {
+        CertInformationToLog clientInfo;
+        getCertInfo(&clientInfo, _clientCtx.certs.get());
+        info.cluster = clientInfo;
+    }
+    return info;
+}
+
 }  // namespace
 
 /////////////////////////////////////////////////////////////////////////////
@@ -1673,10 +1853,18 @@ int SSLManagerApple::SSL_shutdown(SSLConnectionInterface* conn) {
 bool isSSLServer = false;
 
 extern SSLManagerInterface* theSSLManager;
+extern SSLManagerCoordinator* theSSLManagerCoordinator;
 
-std::unique_ptr<SSLManagerInterface> SSLManagerInterface::create(const SSLParams& params,
+std::shared_ptr<SSLManagerInterface> SSLManagerInterface::create(
+    const SSLParams& params,
+    const std::optional<TransientSSLParams>& transientSSLParams,
+    bool isServer) {
+    return std::make_shared<SSLManagerApple>(params, isServer);
+}
+
+std::shared_ptr<SSLManagerInterface> SSLManagerInterface::create(const SSLParams& params,
                                                                  bool isServer) {
-    return stdx::make_unique<SSLManagerApple>(params, isServer);
+    return std::make_shared<SSLManagerApple>(params, isServer);
 }
 
 MONGO_INITIALIZER_WITH_PREREQUISITES(SSLManager, ("EndStartupOptionHandling"))
@@ -1685,9 +1873,8 @@ MONGO_INITIALIZER_WITH_PREREQUISITES(SSLManager, ("EndStartupOptionHandling"))
         nullptr, mongodbRolesOID.identifier.c_str(), ::kCFStringEncodingUTF8);
 
     if (!isSSLServer || (sslGlobalParams.sslMode.load() != SSLParams::SSLMode_disabled)) {
-        theSSLManager = new SSLManagerApple(sslGlobalParams, isSSLServer);
+        theSSLManagerCoordinator = new SSLManagerCoordinator();
     }
-    return Status::OK();
 }
 
 }  // namespace mongo

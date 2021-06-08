@@ -3,14 +3,14 @@
 Exhaustive test for authorization of commands with builtin roles.
 
 The test logic implemented here operates on the test cases defined
-in jstests/auth/commands.js.
+in jstests/auth/lib/commands_lib.js
 
 @tags: [requires_sharding]
 
 */
 
-// TODO SERVER-35447: This test involves killing all sessions, which will not work as expected if
-// the kill command is sent with an implicit session.
+// This test involves killing all sessions, which will not work as expected if the kill command is
+// sent with an implicit session.
 TestData.disableImplicitSessions = true;
 
 load("jstests/auth/lib/commands_lib.js");
@@ -58,25 +58,30 @@ function testProperAuthorization(conn, t, testcase, r) {
     assert(r.db.auth("user|" + r.key, "password"));
     authCommandsLib.authenticatedSetup(t, runOnDb);
     var command = t.command;
-    if (typeof(command) === "function") {
+    if (typeof (command) === "function") {
         command = t.command(state, testcase.commandArgs);
     }
     var res = runOnDb.runCommand(command);
 
     if (testcase.roles[r.key]) {
         if (res.ok == 0 && res.code == authErrCode) {
-            out = "expected authorization success" + " but received " + tojson(res) + " on db " +
-                testcase.runOnDb + " with role " + r.key;
+            out = "expected authorization success" +
+                " but received " + tojson(res) + " on db " + testcase.runOnDb + " with role " +
+                r.key;
         } else if (res.ok == 0 && !testcase.expectFail && res.code != commandNotSupportedCode) {
             // don't error if the test failed with code commandNotSupported since
-            // some storage engines (e.g wiredTiger) don't support some commands (e.g. touch)
+            // some storage engines don't support some commands.
             out = "command failed with " + tojson(res) + " on db " + testcase.runOnDb +
                 " with role " + r.key;
         }
     } else {
-        if (res.ok == 1 || (res.ok == 0 && res.code != authErrCode)) {
-            out = "expected authorization failure" + " but received result " + tojson(res) +
-                " on db " + testcase.runOnDb + " with role " + r.key;
+        // Don't error if the test failed with CommandNotFound rather than an authorization failure
+        // because some commands may be guarded by feature flags.
+        if (res.ok == 1 ||
+            (res.ok == 0 && res.code != authErrCode && res.code !== ErrorCodes.CommandNotFound)) {
+            out = "expected authorization failure" +
+                " but received result " + tojson(res) + " on db " + testcase.runOnDb +
+                " with role " + r.key;
         }
     }
 
@@ -160,16 +165,13 @@ authCommandsLib.runTests(conn, impls);
 MongoRunner.stopMongod(conn);
 
 // run all tests sharded
-// TODO: Remove 'shardAsReplicaSet: false' when SERVER-32672 is fixed.
 conn = new ShardingTest({
-    shards: 2,
+    shards: 1,
     mongos: 1,
+    config: 1,
     keyFile: "jstests/libs/key1",
-    other: {
-        shardOptions: opts,
-        shardAsReplicaSet: false,
-        mongosOptions: {setParameter: "trafficRecordingDirectory=" + dbPath}
-    }
+    other:
+        {shardOptions: opts, mongosOptions: {setParameter: "trafficRecordingDirectory=" + dbPath}}
 });
 authCommandsLib.runTests(conn, impls);
 conn.stop();

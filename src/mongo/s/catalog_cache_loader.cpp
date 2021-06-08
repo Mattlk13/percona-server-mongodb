@@ -42,18 +42,26 @@ const auto catalogCacheLoaderDecoration =
 CatalogCacheLoader::CollectionAndChangedChunks::CollectionAndChangedChunks() = default;
 
 CatalogCacheLoader::CollectionAndChangedChunks::CollectionAndChangedChunks(
-    boost::optional<UUID> collUuid,
-    const OID& collEpoch,
+    OID collEpoch,
+    boost::optional<Timestamp> collCreationTime,
+    UUID collUuid,
     const BSONObj& collShardKeyPattern,
     const BSONObj& collDefaultCollation,
     bool collShardKeyIsUnique,
+    boost::optional<TypeCollectionTimeseriesFields> collTimeseriesFields,
+    boost::optional<TypeCollectionReshardingFields> collReshardingFields,
+    bool allowMigrations,
     std::vector<ChunkType> chunks)
-    : uuid(collUuid),
-      epoch(collEpoch),
+    : epoch(std::move(collEpoch)),
+      creationTime(std::move(collCreationTime)),
+      uuid(std::move(collUuid)),
       shardKeyPattern(collShardKeyPattern),
       defaultCollation(collDefaultCollation),
       shardKeyIsUnique(collShardKeyIsUnique),
-      changedChunks(chunks) {}
+      timeseriesFields(std::move(collTimeseriesFields)),
+      reshardingFields(std::move(collReshardingFields)),
+      allowMigrations(allowMigrations),
+      changedChunks(std::move(chunks)) {}
 
 void CatalogCacheLoader::set(ServiceContext* serviceContext,
                              std::unique_ptr<CatalogCacheLoader> loader) {

@@ -30,11 +30,13 @@
 #pragma once
 
 #include <boost/optional.hpp>
+#include <memory>
 
 #include "mongo/db/ops/write_ops.h"
 #include "mongo/rpc/op_msg.h"
 #include "mongo/s/chunk_version.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/s/database_version.h"
+#include "mongo/util/visit_helper.h"
 
 namespace mongo {
 
@@ -46,17 +48,17 @@ class BatchedCommandRequest {
 public:
     enum BatchType { BatchType_Insert, BatchType_Update, BatchType_Delete };
 
-    BatchedCommandRequest(write_ops::Insert insertOp)
+    BatchedCommandRequest(write_ops::InsertCommandRequest insertOp)
         : _batchType(BatchType_Insert),
-          _insertReq(stdx::make_unique<write_ops::Insert>(std::move(insertOp))) {}
+          _insertReq(std::make_unique<write_ops::InsertCommandRequest>(std::move(insertOp))) {}
 
-    BatchedCommandRequest(write_ops::Update updateOp)
+    BatchedCommandRequest(write_ops::UpdateCommandRequest updateOp)
         : _batchType(BatchType_Update),
-          _updateReq(stdx::make_unique<write_ops::Update>(std::move(updateOp))) {}
+          _updateReq(std::make_unique<write_ops::UpdateCommandRequest>(std::move(updateOp))) {}
 
-    BatchedCommandRequest(write_ops::Delete deleteOp)
+    BatchedCommandRequest(write_ops::DeleteCommandRequest deleteOp)
         : _batchType(BatchType_Delete),
-          _deleteReq(stdx::make_unique<write_ops::Delete>(std::move(deleteOp))) {}
+          _deleteReq(std::make_unique<write_ops::DeleteCommandRequest>(std::move(deleteOp))) {}
 
     BatchedCommandRequest(BatchedCommandRequest&&) = default;
 
@@ -69,6 +71,8 @@ public:
     }
 
     const NamespaceString& getNS() const;
+
+    bool getBypassDocumentValidation() const;
 
     const auto& getInsertRequest() const {
         invariant(_insertReq);
@@ -89,6 +93,10 @@ public:
 
     void setWriteConcern(const BSONObj& writeConcern) {
         _writeConcern = writeConcern.getOwned();
+    }
+
+    void unsetWriteConcern() {
+        _writeConcern = boost::none;
     }
 
     bool hasWriteConcern() const {
@@ -115,40 +123,74 @@ public:
         return *_shardVersion;
     }
 
-    void setRuntimeConstants(RuntimeConstants runtimeConstants) {
-        invariant(_updateReq);
-        _updateReq->setRuntimeConstants(std::move(runtimeConstants));
+    void setDbVersion(DatabaseVersion dbVersion) {
+        _dbVersion = std::move(dbVersion);
     }
 
-    bool hasRuntimeConstants() const {
-        invariant(_updateReq);
-        return _updateReq->getRuntimeConstants().has_value();
+    bool hasDbVersion() const {
+        return _dbVersion.is_initialized();
     }
 
-    const boost::optional<RuntimeConstants>& getRuntimeConstants() const {
-        invariant(_updateReq);
-        return _updateReq->getRuntimeConstants();
+    const DatabaseVersion& getDbVersion() const {
+        invariant(_dbVersion);
+        return *_dbVersion;
     }
 
-    const write_ops::WriteCommandBase& getWriteCommandBase() const;
-    void setWriteCommandBase(write_ops::WriteCommandBase writeCommandBase);
+    void setLegacyRuntimeConstants(LegacyRuntimeConstants runtimeConstants);
+
+    bool hasLegacyRuntimeConstants() const;
+
+    const boost::optional<LegacyRuntimeConstants>& getLegacyRuntimeConstants() const;
+    const boost::optional<BSONObj>& getLet() const;
+
+    const write_ops::WriteCommandRequestBase& getWriteCommandRequestBase() const;
+    void setWriteCommandRequestBase(write_ops::WriteCommandRequestBase writeCommandBase);
 
     void serialize(BSONObjBuilder* builder) const;
     BSONObj toBSON() const;
     std::string toString() const;
 
-    void setAllowImplicitCreate(bool doAllow) {
-        _allowImplicitCollectionCreation = doAllow;
-    }
-
-    bool isImplicitCreateAllowed() const {
-        return _allowImplicitCollectionCreation;
-    }
-
     /**
      * Generates a new request, the same as the old, but with insert _ids if required.
      */
     static BatchedCommandRequest cloneInsertWithIds(BatchedCommandRequest origCmdRequest);
+
+    /**
+     * Returns batch of delete operations to be attached to a transaction
+     */
+    static BatchedCommandRequest buildDeleteOp(const NamespaceString& nss,
+                                               const BSONObj& query,
+                                               bool multiDelete);
+
+    /**
+     * Returns batch of insert operations to be attached to a transaction
+     */
+    static BatchedCommandRequest buildInsertOp(const NamespaceString& nss,
+                                               const std::vector<BSONObj> docs);
+
+    /*
+     * Returns batch of update operations to be attached to a transaction
+     */
+    static BatchedCommandRequest buildUpdateOp(const NamespaceString& nss,
+                                               const BSONObj& query,
+                                               const BSONObj& update,
+                                               bool upsert,
+                                               bool multi);
+
+    /**
+     *  Returns batch of pipeline update operations to be attached to a transaction
+     */
+    static BatchedCommandRequest buildPipelineUpdateOp(const NamespaceString& nss,
+                                                       const BSONObj& query,
+                                                       const std::vector<BSONObj>& updates,
+                                                       bool upsert,
+                                                       bool useMultiUpdate);
+
+    /** These are used to return empty refs from Insert ops that don't carry runtimeConstants
+     * or let parameters in getLet and getLegacyRuntimeConstants.
+     */
+    const static boost::optional<LegacyRuntimeConstants> kEmptyRuntimeConstants;
+    const static boost::optional<BSONObj> kEmptyLet;
 
 private:
     template <typename Req, typename F, typename... As>
@@ -174,57 +216,54 @@ private:
 
     BatchType _batchType;
 
-    std::unique_ptr<write_ops::Insert> _insertReq;
-    std::unique_ptr<write_ops::Update> _updateReq;
-    std::unique_ptr<write_ops::Delete> _deleteReq;
+    std::unique_ptr<write_ops::InsertCommandRequest> _insertReq;
+    std::unique_ptr<write_ops::UpdateCommandRequest> _updateReq;
+    std::unique_ptr<write_ops::DeleteCommandRequest> _deleteReq;
 
     boost::optional<ChunkVersion> _shardVersion;
+    boost::optional<DatabaseVersion> _dbVersion;
 
     boost::optional<BSONObj> _writeConcern;
-    bool _allowImplicitCollectionCreation = true;
 };
 
 /**
- * Similar to above, this class wraps the write items of a command request into a generically
- * usable type.  Very thin wrapper, does not own the write item itself.
- *
- * TODO: Use in BatchedCommandRequest above
+ * Similar to above, this class wraps the write items of a command request into a generically usable
+ * type. Very thin wrapper, does not own the write item itself.
  */
 class BatchItemRef {
 public:
-    BatchItemRef(const BatchedCommandRequest* request, int itemIndex)
-        : _request(request), _itemIndex(itemIndex) {}
+    BatchItemRef(const BatchedCommandRequest* request, int index);
 
-    const BatchedCommandRequest* getRequest() const {
-        return _request;
+    BatchedCommandRequest::BatchType getOpType() const {
+        return _request.getBatchType();
     }
 
     int getItemIndex() const {
-        return _itemIndex;
-    }
-
-    BatchedCommandRequest::BatchType getOpType() const {
-        return _request->getBatchType();
+        return _index;
     }
 
     const auto& getDocument() const {
-        dassert(_itemIndex < static_cast<int>(_request->sizeWriteOps()));
-        return _request->getInsertRequest().getDocuments().at(_itemIndex);
+        return _request.getInsertRequest().getDocuments()[_index];
     }
-
     const auto& getUpdate() const {
-        dassert(_itemIndex < static_cast<int>(_request->sizeWriteOps()));
-        return _request->getUpdateRequest().getUpdates().at(_itemIndex);
+        return _request.getUpdateRequest().getUpdates()[_index];
     }
 
     const auto& getDelete() const {
-        dassert(_itemIndex < static_cast<int>(_request->sizeWriteOps()));
-        return _request->getDeleteRequest().getDeletes().at(_itemIndex);
+        return _request.getDeleteRequest().getDeletes()[_index];
+    }
+
+    auto& getLet() const {
+        return _request.getLet();
+    }
+
+    auto& getLegacyRuntimeConstants() const {
+        return _request.getLegacyRuntimeConstants();
     }
 
 private:
-    const BatchedCommandRequest* _request;
-    const int _itemIndex;
+    const BatchedCommandRequest& _request;
+    const int _index;
 };
 
 }  // namespace mongo

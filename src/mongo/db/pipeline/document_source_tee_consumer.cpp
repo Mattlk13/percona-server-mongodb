@@ -35,7 +35,7 @@
 #include <boost/optional.hpp>
 #include <vector>
 
-#include "mongo/db/pipeline/document.h"
+#include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/pipeline/expression_context.h"
 
 namespace mongo {
@@ -45,7 +45,7 @@ using boost::intrusive_ptr;
 DocumentSourceTeeConsumer::DocumentSourceTeeConsumer(const intrusive_ptr<ExpressionContext>& expCtx,
                                                      size_t facetId,
                                                      const intrusive_ptr<TeeBuffer>& bufferSource)
-    : DocumentSource(expCtx), _facetId(facetId), _bufferSource(bufferSource) {}
+    : DocumentSource(kStageName, expCtx), _facetId(facetId), _bufferSource(bufferSource) {}
 
 boost::intrusive_ptr<DocumentSourceTeeConsumer> DocumentSourceTeeConsumer::create(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
@@ -54,8 +54,7 @@ boost::intrusive_ptr<DocumentSourceTeeConsumer> DocumentSourceTeeConsumer::creat
     return new DocumentSourceTeeConsumer(expCtx, facetId, bufferSource);
 }
 
-DocumentSource::GetNextResult DocumentSourceTeeConsumer::getNext() {
-    pExpCtx->checkForInterrupt();
+DocumentSource::GetNextResult DocumentSourceTeeConsumer::doGetNext() {
     return _bufferSource->getNext(_facetId);
 }
 
@@ -65,8 +64,7 @@ void DocumentSourceTeeConsumer::doDispose() {
 
 Value DocumentSourceTeeConsumer::serialize(
     boost::optional<ExplainOptions::Verbosity> explain) const {
-    // This stage will be inserted into the beginning of a pipeline, but should not show up in the
-    // explain output.
-    return Value();
+    // We only serialize this stage in the context of explain.
+    return explain ? Value(DOC(kStageName << Document())) : Value();
 }
 }  // namespace mongo

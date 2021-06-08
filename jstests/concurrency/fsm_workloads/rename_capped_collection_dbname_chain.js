@@ -11,7 +11,6 @@
  */
 
 var $config = (function() {
-
     var data = {
         // Use the workload name as a prefix for the collection name,
         // since the workload name is assumed to be unique.
@@ -19,7 +18,6 @@ var $config = (function() {
     };
 
     var states = (function() {
-
         function uniqueDBName(prefix, tid, num) {
             return prefix + tid + '_' + num;
         }
@@ -48,15 +46,12 @@ var $config = (function() {
 
             // Remove any files associated with the "from" namespace
             // to avoid having too many files open
-            var res = db.getSiblingDB(this.fromDBName).dropDatabase();
-            assertAlways.commandWorked(res);
-            assertAlways.eq(this.fromDBName, res.dropped);
+            assertAlways.commandWorked(db.getSiblingDB(this.fromDBName).dropDatabase());
 
             this.fromDBName = toDBName;
         }
 
         return {init: init, rename: rename};
-
     })();
 
     var transitions = {init: {rename: 1}, rename: {rename: 1}};
@@ -68,5 +63,4 @@ var $config = (function() {
         states: states,
         transitions: transitions,
     };
-
 })();

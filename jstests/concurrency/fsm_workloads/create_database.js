@@ -13,15 +13,18 @@
  */
 
 load('jstests/concurrency/fsm_workload_helpers/server_types.js');  // for isEphemeralForTest
+load("jstests/concurrency/fsm_workload_helpers/assert_handle_fail_in_transaction.js");
 
 var $config = (function() {
-
     let data = {
         checkCommandResult: function checkCommandResult(mayFailWithDatabaseDifferCase, res) {
             if (mayFailWithDatabaseDifferCase && !res.ok)
-                assertAlways.commandFailedWithCode(res, ErrorCodes.DatabaseDifferCase);
+                assertWorkedOrFailedHandleTxnErrors(
+                    res,
+                    [ErrorCodes.IndexBuildAlreadyInProgress, ErrorCodes.DatabaseDifferCase],
+                    ErrorCodes.DatabaseDifferCase);
             else
-                assertAlways.commandWorked(res);
+                assertWorkedHandleTxnErrors(res, ErrorCodes.IndexBuildAlreadyInProgress);
             return res;
         },
 
@@ -29,7 +32,7 @@ var $config = (function() {
             if (mayFailWithDatabaseDifferCase && res.hasWriteError())
                 assertAlways.writeErrorWithCode(res, ErrorCodes.DatabaseDifferCase);
             else
-                assertAlways.writeOK(res);
+                assertAlways.commandWorked(res);
             return res;
         }
     };
@@ -47,7 +50,6 @@ var $config = (function() {
             this.myDB = db.getSiblingDB(this.uniqueDBName);
             this.created = false;
             this.unique = true;
-
         },
 
         useSemiUniqueDBName: function useSemiUniqueDBName(db, collName) {
@@ -138,6 +140,8 @@ var $config = (function() {
         // We only run a few iterations to reduce the amount of data cumulatively
         // written to disk.
         threadCount: 10,
-        iterations: 120, states, transitions,
+        iterations: 120,
+        states,
+        transitions,
     };
 })();

@@ -34,11 +34,12 @@
 #include "mongo/db/exec/queued_data_stage.h"
 
 #include <boost/optional.hpp>
+#include <memory>
 
 #include "mongo/db/exec/working_set.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context_d_test_fixture.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/clock_source_mock.h"
 
@@ -47,17 +48,18 @@ using namespace mongo;
 namespace {
 
 using std::unique_ptr;
-using stdx::make_unique;
+
+const static NamespaceString kNss("db.dummy");
 
 class QueuedDataStageTest : public ServiceContextMongoDTest {
 public:
     QueuedDataStageTest() {
-        getServiceContext()->setFastClockSource(stdx::make_unique<ClockSourceMock>());
+        getServiceContext()->setFastClockSource(std::make_unique<ClockSourceMock>());
         _opCtx = makeOperationContext();
     }
 
 protected:
-    OperationContext* getOpCtx() {
+    OperationContext* opCtx() {
         return _opCtx.get();
     }
 
@@ -70,7 +72,8 @@ private:
 //
 TEST_F(QueuedDataStageTest, getValidStats) {
     WorkingSet ws;
-    auto mock = make_unique<QueuedDataStage>(getOpCtx(), &ws);
+    auto expCtx = make_intrusive<ExpressionContext>(opCtx(), nullptr, kNss);
+    auto mock = std::make_unique<QueuedDataStage>(expCtx.get(), &ws);
     const CommonStats* commonStats = mock->getCommonStats();
     ASSERT_EQUALS(commonStats->works, static_cast<size_t>(0));
     const SpecificStats* specificStats = mock->getSpecificStats();
@@ -82,10 +85,11 @@ TEST_F(QueuedDataStageTest, getValidStats) {
 //
 // Test that our stats are updated as we perform operations.
 //
-TEST_F(QueuedDataStageTest, validateStats) {
+TEST_F(QueuedDataStageTest, ValidateStats) {
     WorkingSet ws;
     WorkingSetID wsID;
-    auto mock = make_unique<QueuedDataStage>(getOpCtx(), &ws);
+    auto expCtx = make_intrusive<ExpressionContext>(opCtx(), nullptr, kNss);
+    auto mock = std::make_unique<QueuedDataStage>(expCtx.get(), &ws);
 
     // make sure that we're at all zero
     const CommonStats* stats = mock->getCommonStats();
@@ -96,18 +100,11 @@ TEST_F(QueuedDataStageTest, validateStats) {
     ASSERT_EQUALS(stats->advanced, 0U);
     ASSERT_FALSE(stats->isEOF);
 
-    // 'perform' some operations, validate stats
-    // needTime
-    mock->pushBack(PlanStage::NEED_TIME);
-    mock->work(&wsID);
-    ASSERT_EQUALS(stats->works, 1U);
-    ASSERT_EQUALS(stats->needTime, 1U);
-
     // advanced, with pushed data
     WorkingSetID id = ws.allocate();
     mock->pushBack(id);
     mock->work(&wsID);
-    ASSERT_EQUALS(stats->works, 2U);
+    ASSERT_EQUALS(stats->works, 1U);
     ASSERT_EQUALS(stats->advanced, 1U);
 
     // yields
@@ -115,7 +112,7 @@ TEST_F(QueuedDataStageTest, validateStats) {
     ASSERT_EQUALS(stats->yields, 1U);
 
     // unyields
-    mock->restoreState();
+    mock->restoreState({});
     ASSERT_EQUALS(stats->unyields, 1U);
 
 
@@ -124,4 +121,4 @@ TEST_F(QueuedDataStageTest, validateStats) {
     unique_ptr<PlanStageStats> allStats(mock->getStats());
     ASSERT_TRUE(stats->isEOF);
 }
-}
+}  // namespace

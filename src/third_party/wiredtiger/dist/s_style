@@ -17,7 +17,7 @@ if [ $# -ne 1 ]; then
 	cd ..
 
 	find bench examples ext src test \
-	    -name '*.[chisy]' -o -name '*.in' -o -name '*.dox' |
+	    -name '*.[chsy]' -o -name '*.in' -o -name '*.dox' |
 	sed -e '/Makefile.in/d' \
 	    -e '/build_win\/wiredtiger_config.h/d' \
 	    -e '/checksum\/power8/d' \
@@ -32,6 +32,20 @@ else
 	if [ ! -e $f ]; then
 		echo "$0 error $1 does not exist"
 		exit 1;
+	fi
+
+	# For files in the src directory, camel case style is not allowed.
+	# Ignore styling errors of external libraries.
+	if expr "$f" : 'src/' > /dev/null &&
+	  ! expr "$f" : 'src/os_win/' > /dev/null &&
+	  ! expr "$f" : 'src/docs/' > /dev/null &&
+	  ! expr "$f" : 'src/tags' > /dev/null &&
+	  ! expr "$f" : 'src/.*/hash_city.*' > /dev/null &&
+	  ! expr "$f" : 'src/.*/huffman.*' > /dev/null &&
+	  ! expr "$f" : 'src/checksum.*' > /dev/null; then
+		if egrep -r -n '\b[a-z]+[A-Z]' $f | egrep -v ':[     ]+\*|"|UNCHECKED_STRING'; then
+			echo "$f: Styling requires variables that use underscores to separate parts of a name instead of camel casing.";
+		fi
 	fi
 
 	egrep -w 'a a|an an|and and|are are|be be|by by|for for|from from|if if|in in[^-]|is is|it it|of of|the the|this this|to to|was was|were were|when when|with with|a an|an a|a the|the a' $f > $t
@@ -186,24 +200,10 @@ else
 	fi
 
 	tr -cd '[:alnum:][:space:][:punct:]' < $f |
-	unexpand |
-	sed -e 's/){/) {/' \
-	    -e 's/\([	 ]\)for(/\1for (/' \
-	    -e 's/\([	 ]\)if(/\1if (/' \
-	    -e 's/\([	 ]\)index(/\1strchr(/' \
-	    -e 's/\([	 ]\)return(/\1return (/' \
-	    -e 's/\([	 ]\)return \([^()]*\);/\1return (\2);/' \
-	    -e 's/\([	 ]\)rindex(/\1strrchr(/' \
-	    -e 's/\([	 ]\)sizeof (/\1sizeof(/g' \
-	    -e 's/\([	 ]\)switch(/\1switch (/' \
-	    -e 's/\([	 ]\)while(/\1while (/' \
-	    -e 's/\([|&=+-]\)  *\([^*]\)/\1 \2/' \
-	    -e 's/[	 ](void) \([a-zA-Z_]\)/(void)\1/' \
-	    -e '/for /!s/;;$/;/' \
+	sed -e '/for /!s/;;$/;/' \
 	    -e 's/(EOPNOTSUPP)/(ENOTSUP)/' \
 	    -e 's/(unsigned)/(u_int)/' \
-	    -e 's/hazard reference/hazard pointer/' \
-	    -e 's/^#define /#define	/' >$t
+	    -e 's/hazard reference/hazard pointer/' >$t
 
 	cmp $t $f > /dev/null 2>&1 || (echo "modifying $f" && cp $t $f)
 fi

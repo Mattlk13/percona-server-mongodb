@@ -79,6 +79,10 @@ public:
         return _opCtx.get();
     }
 
+    ExpressionContext* expCtx() {
+        return _expCtx.get();
+    }
+
     ServiceContext* serviceContext() {
         return _opCtx->getServiceContext();
     }
@@ -91,13 +95,16 @@ protected:
         BSONObj cmdObj = fromjson(findCmd);
 
         bool isExplain = false;
-        auto qr = unittest::assertGet(QueryRequest::makeFromFindCommand(nss, cmdObj, isExplain));
+        // If there is no '$db', append it.
+        auto cmd = OpMsgRequest::fromDBAndBody("test", cmdObj).body;
+        auto findCommand =
+            query_request_helper::makeFromFindCommandForTests(cmd, NamespaceString());
 
-        boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
         auto cq = unittest::assertGet(
             CanonicalQuery::canonicalize(opCtx(),
-                                         std::move(qr),
-                                         expCtx,
+                                         std::move(findCommand),
+                                         isExplain,
+                                         expCtx(),
                                          ExtensionsCallbackNoop(),
                                          MatchExpressionParser::kAllowAllSpecialFeatures));
         return cq;
@@ -105,6 +112,8 @@ protected:
 
     const ServiceContext::UniqueOperationContext _opCtx = cc().makeOperationContext();
     ClockSource* _clock = _opCtx->getServiceContext()->getFastClockSource();
+    boost::intrusive_ptr<ExpressionContext> _expCtx =
+        make_intrusive<ExpressionContext>(_opCtx.get(), nullptr, nss);
 
 private:
     DBDirectClient _client;
@@ -120,8 +129,7 @@ TEST_F(QueryStageSubplanTest, QueryStageSubplanGeo2dOr) {
     dbtests::WriteContextForTests ctx(opCtx(), nss.ns());
     addIndex(BSON("a"
                   << "2d"
-                  << "b"
-                  << 1));
+                  << "b" << 1));
     addIndex(BSON("a"
                   << "2d"));
 
@@ -129,13 +137,13 @@ TEST_F(QueryStageSubplanTest, QueryStageSubplanGeo2dOr) {
         "{$or: [{a: {$geoWithin: {$centerSphere: [[0,0],10]}}},"
         "{a: {$geoWithin: {$centerSphere: [[1,1],10]}}}]}");
 
-    auto qr = stdx::make_unique<QueryRequest>(nss);
-    qr->setFilter(query);
-    auto statusWithCQ = CanonicalQuery::canonicalize(opCtx(), std::move(qr));
+    auto findCommand = std::make_unique<FindCommandRequest>(nss);
+    findCommand->setFilter(query);
+    auto statusWithCQ = CanonicalQuery::canonicalize(opCtx(), std::move(findCommand));
     ASSERT_OK(statusWithCQ.getStatus());
     std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
-    Collection* collection = ctx.getCollection();
+    CollectionPtr collection = ctx.getCollection();
 
     // Get planner params.
     QueryPlannerParams plannerParams;
@@ -143,10 +151,10 @@ TEST_F(QueryStageSubplanTest, QueryStageSubplanGeo2dOr) {
 
     WorkingSet ws;
     std::unique_ptr<SubplanStage> subplan(
-        new SubplanStage(opCtx(), collection, &ws, plannerParams, cq.get()));
+        new SubplanStage(_expCtx.get(), collection, &ws, plannerParams, cq.get()));
 
     // Plan selection should succeed due to falling back on regular planning.
-    PlanYieldPolicy yieldPolicy(PlanExecutor::NO_YIELD, _clock);
+    NoopYieldPolicy yieldPolicy(_clock);
     ASSERT_OK(subplan->pickBestPlan(&yieldPolicy));
 }
 
@@ -164,11 +172,11 @@ void assertSubplanFromCache(QueryStageSubplanTest* test, const dbtests::WriteCon
         test->insert(BSON("a" << 1 << "b" << i << "c" << i));
     }
 
-    Collection* collection = ctx.getCollection();
+    CollectionPtr collection = ctx.getCollection();
 
-    auto qr = stdx::make_unique<QueryRequest>(nss);
-    qr->setFilter(query);
-    auto statusWithCQ = CanonicalQuery::canonicalize(test->opCtx(), std::move(qr));
+    auto findCommand = std::make_unique<FindCommandRequest>(nss);
+    findCommand->setFilter(query);
+    auto statusWithCQ = CanonicalQuery::canonicalize(test->opCtx(), std::move(findCommand));
     ASSERT_OK(statusWithCQ.getStatus());
     std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
@@ -182,10 +190,9 @@ void assertSubplanFromCache(QueryStageSubplanTest* test, const dbtests::WriteCon
 
     WorkingSet ws;
     std::unique_ptr<SubplanStage> subplan(
-        new SubplanStage(test->opCtx(), collection, &ws, plannerParams, cq.get()));
+        new SubplanStage(test->expCtx(), collection, &ws, plannerParams, cq.get()));
 
-    PlanYieldPolicy yieldPolicy(PlanExecutor::NO_YIELD,
-                                test->serviceContext()->getFastClockSource());
+    NoopYieldPolicy yieldPolicy(test->serviceContext()->getFastClockSource());
     ASSERT_OK(subplan->pickBestPlan(&yieldPolicy));
 
     // Nothing is in the cache yet, so neither branch should have been planned from
@@ -196,7 +203,7 @@ void assertSubplanFromCache(QueryStageSubplanTest* test, const dbtests::WriteCon
     // If we repeat the same query, the plan for the first branch should have come from
     // the cache.
     ws.clear();
-    subplan.reset(new SubplanStage(test->opCtx(), collection, &ws, plannerParams, cq.get()));
+    subplan.reset(new SubplanStage(test->expCtx(), collection, &ws, plannerParams, cq.get()));
 
     ASSERT_OK(subplan->pickBestPlan(&yieldPolicy));
 
@@ -249,11 +256,11 @@ TEST_F(QueryStageSubplanTest, QueryStageSubplanDontCacheZeroResults) {
     // one relevant index.
     BSONObj query = fromjson("{$or: [{a: 1, b: 15}, {c: 1}]}");
 
-    Collection* collection = ctx.getCollection();
+    CollectionPtr collection = ctx.getCollection();
 
-    auto qr = stdx::make_unique<QueryRequest>(nss);
-    qr->setFilter(query);
-    auto statusWithCQ = CanonicalQuery::canonicalize(opCtx(), std::move(qr));
+    auto findCommand = std::make_unique<FindCommandRequest>(nss);
+    findCommand->setFilter(query);
+    auto statusWithCQ = CanonicalQuery::canonicalize(opCtx(), std::move(findCommand));
     ASSERT_OK(statusWithCQ.getStatus());
     std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
@@ -263,9 +270,9 @@ TEST_F(QueryStageSubplanTest, QueryStageSubplanDontCacheZeroResults) {
 
     WorkingSet ws;
     std::unique_ptr<SubplanStage> subplan(
-        new SubplanStage(opCtx(), collection, &ws, plannerParams, cq.get()));
+        new SubplanStage(_expCtx.get(), collection, &ws, plannerParams, cq.get()));
 
-    PlanYieldPolicy yieldPolicy(PlanExecutor::NO_YIELD, _clock);
+    NoopYieldPolicy yieldPolicy(_clock);
     ASSERT_OK(subplan->pickBestPlan(&yieldPolicy));
 
     // Nothing is in the cache yet, so neither branch should have been planned from
@@ -277,7 +284,7 @@ TEST_F(QueryStageSubplanTest, QueryStageSubplanDontCacheZeroResults) {
     // from the cache (because the first call to pickBestPlan() refrained from creating any
     // cache entries).
     ws.clear();
-    subplan.reset(new SubplanStage(opCtx(), collection, &ws, plannerParams, cq.get()));
+    subplan.reset(new SubplanStage(_expCtx.get(), collection, &ws, plannerParams, cq.get()));
 
     ASSERT_OK(subplan->pickBestPlan(&yieldPolicy));
 
@@ -305,11 +312,11 @@ TEST_F(QueryStageSubplanTest, QueryStageSubplanDontCacheTies) {
     // ranking. For the second branch it's because there is only one relevant index.
     BSONObj query = fromjson("{$or: [{a: 1, e: 1}, {d: 1}]}");
 
-    Collection* collection = ctx.getCollection();
+    CollectionPtr collection = ctx.getCollection();
 
-    auto qr = stdx::make_unique<QueryRequest>(nss);
-    qr->setFilter(query);
-    auto statusWithCQ = CanonicalQuery::canonicalize(opCtx(), std::move(qr));
+    auto findCommand = std::make_unique<FindCommandRequest>(nss);
+    findCommand->setFilter(query);
+    auto statusWithCQ = CanonicalQuery::canonicalize(opCtx(), std::move(findCommand));
     ASSERT_OK(statusWithCQ.getStatus());
     std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
@@ -319,9 +326,9 @@ TEST_F(QueryStageSubplanTest, QueryStageSubplanDontCacheTies) {
 
     WorkingSet ws;
     std::unique_ptr<SubplanStage> subplan(
-        new SubplanStage(opCtx(), collection, &ws, plannerParams, cq.get()));
+        new SubplanStage(_expCtx.get(), collection, &ws, plannerParams, cq.get()));
 
-    PlanYieldPolicy yieldPolicy(PlanExecutor::NO_YIELD, _clock);
+    NoopYieldPolicy yieldPolicy(_clock);
     ASSERT_OK(subplan->pickBestPlan(&yieldPolicy));
 
     // Nothing is in the cache yet, so neither branch should have been planned from
@@ -333,7 +340,7 @@ TEST_F(QueryStageSubplanTest, QueryStageSubplanDontCacheTies) {
     // from the cache (because the first call to pickBestPlan() refrained from creating any
     // cache entries).
     ws.clear();
-    subplan.reset(new SubplanStage(opCtx(), collection, &ws, plannerParams, cq.get()));
+    subplan.reset(new SubplanStage(_expCtx.get(), collection, &ws, plannerParams, cq.get()));
 
     ASSERT_OK(subplan->pickBestPlan(&yieldPolicy));
 
@@ -479,21 +486,21 @@ TEST_F(QueryStageSubplanTest, QueryStageSubplanPlanRootedOrNE) {
     insert(BSON("_id" << 3 << "a" << 3));
     insert(BSON("_id" << 4));
 
-    auto qr = stdx::make_unique<QueryRequest>(nss);
-    qr->setFilter(fromjson("{$or: [{a: 1}, {a: {$ne:1}}]}"));
-    qr->setSort(BSON("d" << 1));
-    auto cq = unittest::assertGet(CanonicalQuery::canonicalize(opCtx(), std::move(qr)));
+    auto findCommand = std::make_unique<FindCommandRequest>(nss);
+    findCommand->setFilter(fromjson("{$or: [{a: 1}, {a: {$ne:1}}]}"));
+    findCommand->setSort(BSON("d" << 1));
+    auto cq = unittest::assertGet(CanonicalQuery::canonicalize(opCtx(), std::move(findCommand)));
 
-    Collection* collection = ctx.getCollection();
+    CollectionPtr collection = ctx.getCollection();
 
     QueryPlannerParams plannerParams;
     fillOutPlannerParams(opCtx(), collection, cq.get(), &plannerParams);
 
     WorkingSet ws;
     std::unique_ptr<SubplanStage> subplan(
-        new SubplanStage(opCtx(), collection, &ws, plannerParams, cq.get()));
+        new SubplanStage(_expCtx.get(), collection, &ws, plannerParams, cq.get()));
 
-    PlanYieldPolicy yieldPolicy(PlanExecutor::NO_YIELD, _clock);
+    NoopYieldPolicy yieldPolicy(_clock);
     ASSERT_OK(subplan->pickBestPlan(&yieldPolicy));
 
     size_t numResults = 0;
@@ -501,7 +508,6 @@ TEST_F(QueryStageSubplanTest, QueryStageSubplanPlanRootedOrNE) {
     while (stageState != PlanStage::IS_EOF) {
         WorkingSetID id = WorkingSet::INVALID_ID;
         stageState = subplan->work(&id);
-        ASSERT_NE(stageState, PlanStage::FAILURE);
         if (stageState == PlanStage::ADVANCED) {
             ++numResults;
         }
@@ -513,10 +519,10 @@ TEST_F(QueryStageSubplanTest, QueryStageSubplanPlanRootedOrNE) {
 TEST_F(QueryStageSubplanTest, ShouldReportErrorIfExceedsTimeLimitDuringPlanning) {
     dbtests::WriteContextForTests ctx(opCtx(), nss.ns());
     // Build a query with a rooted $or.
-    auto queryRequest = stdx::make_unique<QueryRequest>(nss);
-    queryRequest->setFilter(BSON("$or" << BSON_ARRAY(BSON("p1" << 1) << BSON("p2" << 2))));
+    auto findCommand = std::make_unique<FindCommandRequest>(nss);
+    findCommand->setFilter(BSON("$or" << BSON_ARRAY(BSON("p1" << 1) << BSON("p2" << 2))));
     auto canonicalQuery =
-        uassertStatusOK(CanonicalQuery::canonicalize(opCtx(), std::move(queryRequest)));
+        uassertStatusOK(CanonicalQuery::canonicalize(opCtx(), std::move(findCommand)));
 
     // Add 4 indices: 2 for each predicate to choose from.
     addIndex(BSON("p1" << 1 << "opt1" << 1));
@@ -536,8 +542,8 @@ TEST_F(QueryStageSubplanTest, ShouldReportErrorIfExceedsTimeLimitDuringPlanning)
 
     // Create the SubplanStage.
     WorkingSet workingSet;
-    SubplanStage subplanStage(
-        opCtx(), ctx.getCollection(), &workingSet, params, canonicalQuery.get());
+    auto coll = ctx.getCollection();
+    SubplanStage subplanStage(_expCtx.get(), coll, &workingSet, params, canonicalQuery.get());
 
     AlwaysTimeOutYieldPolicy alwaysTimeOutPolicy(serviceContext()->getFastClockSource());
     ASSERT_EQ(ErrorCodes::ExceededTimeLimit, subplanStage.pickBestPlan(&alwaysTimeOutPolicy));
@@ -546,10 +552,10 @@ TEST_F(QueryStageSubplanTest, ShouldReportErrorIfExceedsTimeLimitDuringPlanning)
 TEST_F(QueryStageSubplanTest, ShouldReportErrorIfKilledDuringPlanning) {
     dbtests::WriteContextForTests ctx(opCtx(), nss.ns());
     // Build a query with a rooted $or.
-    auto queryRequest = stdx::make_unique<QueryRequest>(nss);
-    queryRequest->setFilter(BSON("$or" << BSON_ARRAY(BSON("p1" << 1) << BSON("p2" << 2))));
+    auto findCommand = std::make_unique<FindCommandRequest>(nss);
+    findCommand->setFilter(BSON("$or" << BSON_ARRAY(BSON("p1" << 1) << BSON("p2" << 2))));
     auto canonicalQuery =
-        uassertStatusOK(CanonicalQuery::canonicalize(opCtx(), std::move(queryRequest)));
+        uassertStatusOK(CanonicalQuery::canonicalize(opCtx(), std::move(findCommand)));
 
     // Add 4 indices: 2 for each predicate to choose from.
     addIndex(BSON("p1" << 1 << "opt1" << 1));
@@ -561,15 +567,15 @@ TEST_F(QueryStageSubplanTest, ShouldReportErrorIfKilledDuringPlanning) {
 
     // Create the SubplanStage.
     WorkingSet workingSet;
-    SubplanStage subplanStage(
-        opCtx(), ctx.getCollection(), &workingSet, params, canonicalQuery.get());
+    auto coll = ctx.getCollection();
+    SubplanStage subplanStage(_expCtx.get(), coll, &workingSet, params, canonicalQuery.get());
 
     AlwaysPlanKilledYieldPolicy alwaysPlanKilledYieldPolicy(serviceContext()->getFastClockSource());
     ASSERT_EQ(ErrorCodes::QueryPlanKilled, subplanStage.pickBestPlan(&alwaysPlanKilledYieldPolicy));
 }
 
 TEST_F(QueryStageSubplanTest, ShouldThrowOnRestoreIfIndexDroppedBeforePlanSelection) {
-    Collection* collection = nullptr;
+    CollectionPtr collection = nullptr;
     {
         dbtests::WriteContextForTests ctx{opCtx(), nss.ns()};
         addIndex(BSON("p1" << 1 << "opt1" << 1));
@@ -583,22 +589,22 @@ TEST_F(QueryStageSubplanTest, ShouldThrowOnRestoreIfIndexDroppedBeforePlanSelect
     }
 
     // Build a query with a rooted $or.
-    auto queryRequest = stdx::make_unique<QueryRequest>(nss);
-    queryRequest->setFilter(BSON("$or" << BSON_ARRAY(BSON("p1" << 1) << BSON("p2" << 2))));
+    auto findCommand = std::make_unique<FindCommandRequest>(nss);
+    findCommand->setFilter(BSON("$or" << BSON_ARRAY(BSON("p1" << 1) << BSON("p2" << 2))));
     auto canonicalQuery =
-        uassertStatusOK(CanonicalQuery::canonicalize(opCtx(), std::move(queryRequest)));
+        uassertStatusOK(CanonicalQuery::canonicalize(opCtx(), std::move(findCommand)));
+
+    boost::optional<AutoGetCollectionForReadCommand> collLock;
+    collLock.emplace(opCtx(), nss);
 
     // Add 4 indices: 2 for each predicate to choose from, and one index which is not relevant to
     // the query.
     QueryPlannerParams params;
     fillOutPlannerParams(opCtx(), collection, canonicalQuery.get(), &params);
 
-    boost::optional<AutoGetCollectionForReadCommand> collLock;
-    collLock.emplace(opCtx(), nss);
-
     // Create the SubplanStage.
     WorkingSet workingSet;
-    SubplanStage subplanStage(opCtx(), collection, &workingSet, params, canonicalQuery.get());
+    SubplanStage subplanStage(_expCtx.get(), collection, &workingSet, params, canonicalQuery.get());
 
     // Mimic a yield by saving the state of the subplan stage. Then, drop an index not being used
     // while yielded.
@@ -609,11 +615,13 @@ TEST_F(QueryStageSubplanTest, ShouldThrowOnRestoreIfIndexDroppedBeforePlanSelect
     // Attempt to restore state. This should throw due the index drop. As a future improvement, we
     // may wish to make the subplan stage tolerate drops of indices it is not using.
     collLock.emplace(opCtx(), nss);
-    ASSERT_THROWS_CODE(subplanStage.restoreState(), DBException, ErrorCodes::QueryPlanKilled);
+    ASSERT_THROWS_CODE(subplanStage.restoreState(&collLock->getCollection()),
+                       DBException,
+                       ErrorCodes::QueryPlanKilled);
 }
 
 TEST_F(QueryStageSubplanTest, ShouldNotThrowOnRestoreIfIndexDroppedAfterPlanSelection) {
-    Collection* collection = nullptr;
+    CollectionPtr collection;
     {
         dbtests::WriteContextForTests ctx{opCtx(), nss.ns()};
         addIndex(BSON("p1" << 1 << "opt1" << 1));
@@ -627,24 +635,25 @@ TEST_F(QueryStageSubplanTest, ShouldNotThrowOnRestoreIfIndexDroppedAfterPlanSele
     }
 
     // Build a query with a rooted $or.
-    auto queryRequest = stdx::make_unique<QueryRequest>(nss);
-    queryRequest->setFilter(BSON("$or" << BSON_ARRAY(BSON("p1" << 1) << BSON("p2" << 2))));
+    auto findCommand = std::make_unique<FindCommandRequest>(nss);
+    findCommand->setFilter(BSON("$or" << BSON_ARRAY(BSON("p1" << 1) << BSON("p2" << 2))));
     auto canonicalQuery =
-        uassertStatusOK(CanonicalQuery::canonicalize(opCtx(), std::move(queryRequest)));
+        uassertStatusOK(CanonicalQuery::canonicalize(opCtx(), std::move(findCommand)));
+
+    boost::optional<AutoGetCollectionForReadCommand> collLock;
+    collLock.emplace(opCtx(), nss);
+
 
     // Add 4 indices: 2 for each predicate to choose from, and one index which is not relevant to
     // the query.
     QueryPlannerParams params;
     fillOutPlannerParams(opCtx(), collection, canonicalQuery.get(), &params);
 
-    boost::optional<AutoGetCollectionForReadCommand> collLock;
-    collLock.emplace(opCtx(), nss);
-
     // Create the SubplanStage.
     WorkingSet workingSet;
-    SubplanStage subplanStage(opCtx(), collection, &workingSet, params, canonicalQuery.get());
+    SubplanStage subplanStage(_expCtx.get(), collection, &workingSet, params, canonicalQuery.get());
 
-    PlanYieldPolicy yieldPolicy(PlanExecutor::YIELD_MANUAL, serviceContext()->getFastClockSource());
+    NoopYieldPolicy yieldPolicy(serviceContext()->getFastClockSource());
     ASSERT_OK(subplanStage.pickBestPlan(&yieldPolicy));
 
     // Mimic a yield by saving the state of the subplan stage and dropping our lock. Then drop an
@@ -656,7 +665,7 @@ TEST_F(QueryStageSubplanTest, ShouldNotThrowOnRestoreIfIndexDroppedAfterPlanSele
     // Restoring state should succeed, since the plan selected by pickBestPlan() does not use the
     // index {irrelevant: 1}.
     collLock.emplace(opCtx(), nss);
-    subplanStage.restoreState();
+    subplanStage.restoreState(&collLock->getCollection());
 }
 
 }  // namespace

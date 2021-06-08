@@ -44,10 +44,12 @@ namespace mongo {
  */
 class DocumentSourceBucketAuto final : public DocumentSource {
 public:
+    static constexpr StringData kStageName = "$bucketAuto"_sd;
     Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
     DepsTracker::State getDependencies(DepsTracker* deps) const final;
-    GetNextResult getNext() final;
+
     const char* getSourceName() const final;
+    boost::intrusive_ptr<DocumentSource> optimize() final;
 
     StageConstraints constraints(Pipeline::SplitState pipeState) const final {
         return {StreamType::kBlocking,
@@ -56,7 +58,8 @@ public:
                 DiskUseRequirement::kWritesTmpData,
                 FacetRequirement::kAllowed,
                 TransactionRequirement::kAllowed,
-                LookupRequirement::kAllowed};
+                LookupRequirement::kAllowed,
+                UnionRequirement::kAllowed};
     }
 
     /**
@@ -89,7 +92,11 @@ public:
     static boost::intrusive_ptr<DocumentSource> createFromBson(
         BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
 
+    const boost::intrusive_ptr<Expression> getGroupByExpression() const;
+    const std::vector<AccumulationStatement>& getAccumulatedFields() const;
+
 protected:
+    GetNextResult doGetNext() final;
     void doDispose() final;
 
 private:
@@ -108,7 +115,14 @@ private:
                const std::vector<AccumulationStatement>& accumulationStatements);
         Value _min;
         Value _max;
-        std::vector<boost::intrusive_ptr<Accumulator>> _accums;
+        std::vector<boost::intrusive_ptr<AccumulatorState>> _accums;
+    };
+
+    struct BucketDetails {
+        int currentBucketNum;
+        long long approxBucketSize = 0;
+        boost::optional<Value> previousMax;
+        boost::optional<std::pair<Value, Document>> currentMin;
     };
 
     /**
@@ -119,25 +133,24 @@ private:
      */
     GetNextResult populateSorter();
 
+    void initalizeBucketIteration();
+
     /**
      * Computes the 'groupBy' expression value for 'doc'.
      */
     Value extractKey(const Document& doc);
 
     /**
-     * Calculates the bucket boundaries for the input documents and places them into buckets.
+     * Returns the next bucket if exists. boost::none if none exist.
      */
-    void populateBuckets();
+    boost::optional<Bucket> populateNextBucket();
 
+    boost::optional<std::pair<Value, Document>> adjustBoundariesAndGetMinForNextBucket(
+        Bucket* currentBucket);
     /**
      * Adds the document in 'entry' to 'bucket' by updating the accumulators in 'bucket'.
      */
     void addDocumentToBucket(const std::pair<Value, Document>& entry, Bucket& bucket);
-
-    /**
-     * Adds 'newBucket' to _buckets and updates any boundaries if necessary.
-     */
-    void addBucket(Bucket& newBucket);
 
     /**
      * Makes a document using the information from bucket. This is what is returned when getNext()
@@ -150,14 +163,13 @@ private:
 
     std::vector<AccumulationStatement> _accumulatedFields;
 
-    int _nBuckets;
     uint64_t _maxMemoryUsageBytes;
     bool _populated = false;
-    std::vector<Bucket> _buckets;
-    std::vector<Bucket>::iterator _bucketsIterator;
     boost::intrusive_ptr<Expression> _groupByExpression;
     boost::intrusive_ptr<GranularityRounder> _granularityRounder;
+    int _nBuckets;
     long long _nDocuments = 0;
+    BucketDetails _currentBucketDetails;
 };
 
 }  // namespace mongo

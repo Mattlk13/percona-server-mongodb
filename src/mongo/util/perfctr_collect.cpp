@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kFTDC
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kFTDC
 
 #include "mongo/platform/basic.h"
 
@@ -35,7 +35,7 @@
 
 #include "mongo/base/init.h"
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/util/log.h"
+#include "mongo/util/errno_util.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/str.h"
 #include "mongo/util/text.h"
@@ -55,12 +55,10 @@ MONGO_INITIALIZER(PdhInit)(InitializerContext* context) {
     hPdhLibrary = LoadLibraryW(L"pdh.dll");
     if (nullptr == hPdhLibrary) {
         DWORD gle = GetLastError();
-        return {ErrorCodes::WindowsPdhError,
-                str::stream() << "LoadLibrary of pdh.dll failed with "
-                              << errnoWithDescription(gle)};
+        uasserted(ErrorCodes::WindowsPdhError,
+                  str::stream() << "LoadLibrary of pdh.dll failed with "
+                                << errnoWithDescription(gle));
     }
-
-    return Status::OK();
 }
 
 /**
@@ -225,17 +223,17 @@ Status PerfCounterCollector::open() {
     return Status::OK();
 }
 
-StatusWith<PerfCounterCollector::CounterInfo> PerfCounterCollector::addCounter(StringData path) {
-
+StatusWith<std::tuple<PDH_HCOUNTER, std::unique_ptr<PDH_COUNTER_INFO>>>
+PerfCounterCollector::addAndGetCounter(StringData path) {
     PDH_HCOUNTER counter{0};
 
-    PDH_STATUS status =
-        PdhAddCounterW(_query, toNativeString(path.toString().c_str()).c_str(), NULL, &counter);
+    PDH_STATUS status = PdhAddEnglishCounterW(
+        _query, toNativeString(path.toString().c_str()).c_str(), NULL, &counter);
 
     if (status != ERROR_SUCCESS) {
-        return {ErrorCodes::WindowsPdhError, formatFunctionCallError("PdhAddCounterW", status)};
+        return {ErrorCodes::WindowsPdhError,
+                formatFunctionCallError("PdhAddEnglishCounterW", status)};
     }
-
     DWORD bufferSize = 0;
 
     status = PdhGetCounterInfoW(counter, false, &bufferSize, nullptr);
@@ -244,14 +242,26 @@ StatusWith<PerfCounterCollector::CounterInfo> PerfCounterCollector::addCounter(S
         return {ErrorCodes::WindowsPdhError, formatFunctionCallError("PdhGetCounterInfoW", status)};
     }
 
-    auto buf = stdx::make_unique<char[]>(bufferSize);
-    auto counterInfo = reinterpret_cast<PPDH_COUNTER_INFO>(buf.get());
-
-    status = PdhGetCounterInfoW(counter, false, &bufferSize, counterInfo);
+    auto buf = std::make_unique<char[]>(bufferSize);
+    std::unique_ptr<PDH_COUNTER_INFO> counterInfo(
+        reinterpret_cast<PPDH_COUNTER_INFO>(buf.release()));
+    status = PdhGetCounterInfoW(counter, false, &bufferSize, counterInfo.get());
 
     if (status != ERROR_SUCCESS) {
         return {ErrorCodes::WindowsPdhError, formatFunctionCallError("PdhGetCounterInfoW", status)};
     }
+
+    return std::tuple<PDH_HCOUNTER, std::unique_ptr<PDH_COUNTER_INFO>>{counter,
+                                                                       std::move(counterInfo)};
+}
+
+StatusWith<PerfCounterCollector::CounterInfo> PerfCounterCollector::addCounter(StringData path) {
+    auto swCounterInfo = addAndGetCounter(path);
+    if (!swCounterInfo.isOK()) {
+        return swCounterInfo.getStatus();
+    }
+
+    auto [counter, counterInfo] = std::move(swCounterInfo.getValue());
 
     // A full qualified path is as such:
     // "\\MYMACHINE\\Processor(0)\\% Idle Time"
@@ -289,21 +299,35 @@ StatusWith<PerfCounterCollector::CounterInfo> PerfCounterCollector::addCounter(S
 
 StatusWith<std::vector<PerfCounterCollector::CounterInfo>> PerfCounterCollector::addCounters(
     StringData path) {
-    std::wstring pathWide = toNativeString(path.toString().c_str());
+
+    auto swCounterInfo = addAndGetCounter(path);
+    if (!swCounterInfo.isOK()) {
+        return swCounterInfo.getStatus();
+    }
+
+    auto [unexpandedCounter, counterInfo] = std::move(swCounterInfo.getValue());
+
+    PDH_STATUS status = PdhRemoveCounter(unexpandedCounter);
+    if (status != ERROR_SUCCESS) {
+        return {ErrorCodes::WindowsPdhError,
+                str::stream() << formatFunctionCallError("PdhRemoveCounter", status)
+                              << " for counter '" << path << "'"};
+    }
+
+    auto localizedPath = counterInfo->szFullPath;
+
     DWORD pathListLength = 0;
-    PDH_STATUS status = PdhExpandCounterPathW(pathWide.c_str(), nullptr, &pathListLength);
+    status = PdhExpandCounterPathW(localizedPath, nullptr, &pathListLength);
 
     if (status != PDH_MORE_DATA) {
         return {ErrorCodes::WindowsPdhError,
                 str::stream() << formatFunctionCallError("PdhExpandCounterPathW", status)
-                              << " for counter '"
-                              << path
-                              << "'"};
+                              << " for counter '" << path << "'"};
     }
 
-    auto buf = stdx::make_unique<wchar_t[]>(pathListLength);
+    auto buf = std::make_unique<wchar_t[]>(pathListLength);
 
-    status = PdhExpandCounterPathW(pathWide.c_str(), buf.get(), &pathListLength);
+    status = PdhExpandCounterPathW(localizedPath, buf.get(), &pathListLength);
 
     if (status != ERROR_SUCCESS) {
         return {ErrorCodes::WindowsPdhError,

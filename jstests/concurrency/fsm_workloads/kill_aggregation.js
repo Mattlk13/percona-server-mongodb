@@ -14,7 +14,6 @@ load('jstests/concurrency/fsm_libs/extend_workload.js');      // for extendWorkl
 load('jstests/concurrency/fsm_workloads/kill_rooted_or.js');  // for $config
 
 var $config = extendWorkload($config, function($config, $super) {
-
     // Use the workload name as the collection name, since the workload name is assumed to be
     // unique. Note that we choose our own collection name instead of using the collection provided
     // by the concurrency framework, because this workload drops its collection.
@@ -33,7 +32,11 @@ var $config = extendWorkload($config, function($config, $super) {
             // We expect to see errors caused by the plan executor being killed, because of the
             // collection getting dropped on another thread.
             assertAlways.contains(aggResult.code,
-                                  [ErrorCodes.OperationFailed, ErrorCodes.QueryPlanKilled],
+                                  [
+                                      ErrorCodes.NamespaceNotFound,
+                                      ErrorCodes.OperationFailed,
+                                      ErrorCodes.QueryPlanKilled
+                                  ],
                                   aggResult);
             return;
         }
@@ -42,9 +45,10 @@ var $config = extendWorkload($config, function($config, $super) {
         try {
             cursor.itcount();
         } catch (e) {
+            const kAllowedErrorCodes = [ErrorCodes.QueryPlanKilled, ErrorCodes.NamespaceNotFound];
             // We expect to see errors caused by the plan executor being killed, because of the
             // collection getting dropped on another thread.
-            if (ErrorCodes.QueryPlanKilled != e.code) {
+            if (!kAllowedErrorCodes.includes(e.code)) {
                 throw e;
             }
         }

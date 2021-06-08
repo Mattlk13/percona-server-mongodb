@@ -23,8 +23,7 @@ var $config = extendWorkload($config, function($config, $super) {
             threadIdInArray: [this.tid],
             nestedThreadId: {threadId: this.tid},
             arrayField: [this.tid, "a string", [1, 2, 3]],
-            fieldWithNestedObject:
-                {nestedDoc: {subNestedDoc: {leaf: "a string"}}, leaf: "a string"}
+            fieldWithNestedObject: {nestedDoc: {subNestedDoc: {leaf: "a string"}}, leaf: "a string"}
         };
     };
 
@@ -37,8 +36,15 @@ var $config = extendWorkload($config, function($config, $super) {
         return {[chosenField]: this.tid};
     };
 
+    $config.data.indexedField = 'indexed_insert_wildcard';
+
     $config.data.getIndexSpec = function getIndexSpec() {
         return {"$**": 1};
+    };
+
+    $config.data.getIndexName = function getIndexName() {
+        // Override default index name '$**_1'.
+        return 'indexed_insert_wildcard_1';
     };
 
     // Remove the shard key, since a wildcard index cannot be used to index the shard key.

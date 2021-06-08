@@ -27,10 +27,9 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kWrite
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kWrite
 
 #include "mongo/db/concurrency/write_conflict_exception.h"
-#include "mongo/util/log.h"
 #include "mongo/util/log_and_backoff.h"
 #include "mongo/util/stacktrace.h"
 
@@ -41,17 +40,21 @@ MONGO_FAIL_POINT_DEFINE(skipWriteConflictRetries);
 AtomicWord<bool> WriteConflictException::trace(false);
 
 WriteConflictException::WriteConflictException()
-    : DBException(Status(ErrorCodes::WriteConflict, "WriteConflict")) {
+    : DBException(Status(ErrorCodes::WriteConflict,
+                         "WriteConflict error: this operation conflicted with another operation. "
+                         "Please retry your operation or multi-document transaction.")) {
     if (trace.load()) {
         printStackTrace();
     }
 }
 
 void WriteConflictException::logAndBackoff(int attempt, StringData operation, StringData ns) {
-    mongo::logAndBackoff(
-        ::mongo::logger::LogComponent::kWrite,
-        logger::LogSeverity::Debug(1),
-        static_cast<size_t>(attempt),
-        str::stream() << "Caught WriteConflictException doing " << operation << " on " << ns);
+    mongo::logAndBackoff(4640401,
+                         ::mongo::logv2::LogComponent::kWrite,
+                         logv2::LogSeverity::Debug(1),
+                         static_cast<size_t>(attempt),
+                         "Caught WriteConflictException",
+                         "operation"_attr = operation,
+                         "ns"_attr = ns);
 }
-}
+}  // namespace mongo

@@ -58,6 +58,8 @@ public:
                            const std::vector<BSONObj>& indexes,
                            bool fromMigrate) final {}
 
+    void onStartIndexBuildSinglePhase(OperationContext* opCtx, const NamespaceString& nss) final {}
+
     void onCommitIndexBuild(OperationContext* opCtx,
                             const NamespaceString& nss,
                             CollectionUUID collUUID,
@@ -70,6 +72,7 @@ public:
                            CollectionUUID collUUID,
                            const UUID& indexBuildUUID,
                            const std::vector<BSONObj>& indexes,
+                           const Status& cause,
                            bool fromMigrate) final {}
 
     void onInserts(OperationContext* opCtx,
@@ -89,17 +92,20 @@ public:
                   const NamespaceString& nss,
                   OptionalCollectionUUID uuid,
                   StmtId stmtId,
-                  bool fromMigrate,
-                  const boost::optional<BSONObj>& deletedDoc) final;
+                  const OplogDeleteEntryArgs& args) final;
 
     void onInternalOpMessage(OperationContext* opCtx,
                              const NamespaceString& nss,
                              const boost::optional<UUID> uuid,
                              const BSONObj& msgObj,
-                             const boost::optional<BSONObj> o2MsgObj) final {}
+                             const boost::optional<BSONObj> o2MsgObj,
+                             const boost::optional<repl::OpTime> preImageOpTime,
+                             const boost::optional<repl::OpTime> postImageOpTime,
+                             const boost::optional<repl::OpTime> prevWriteOpTimeInTransaction,
+                             const boost::optional<OplogSlot> slot) final{};
 
     void onCreateCollection(OperationContext* opCtx,
-                            Collection* coll,
+                            const CollectionPtr& coll,
                             const NamespaceString& collectionName,
                             const CollectionOptions& options,
                             const BSONObj& idIndex,
@@ -107,13 +113,14 @@ public:
 
     void onCollMod(OperationContext* opCtx,
                    const NamespaceString& nss,
-                   OptionalCollectionUUID uuid,
+                   const UUID& uuid,
                    const BSONObj& collModCmd,
                    const CollectionOptions& oldCollOptions,
-                   boost::optional<TTLCollModInfo> ttlInfo) final {}
+                   boost::optional<IndexCollModInfo> indexInfo) final {}
 
     void onDropDatabase(OperationContext* opCtx, const std::string& dbName) final {}
 
+    using OpObserver::onDropCollection;
     repl::OpTime onDropCollection(OperationContext* opCtx,
                                   const NamespaceString& collectionName,
                                   OptionalCollectionUUID uuid,
@@ -126,6 +133,7 @@ public:
                      const std::string& indexName,
                      const BSONObj& indexInfo) final {}
 
+    using OpObserver::onRenameCollection;
     void onRenameCollection(OperationContext* opCtx,
                             const NamespaceString& fromCollection,
                             const NamespaceString& toCollection,
@@ -134,6 +142,16 @@ public:
                             std::uint64_t numRecords,
                             bool stayTemp) final {}
 
+    void onImportCollection(OperationContext* opCtx,
+                            const UUID& importUUID,
+                            const NamespaceString& nss,
+                            long long numRecords,
+                            long long dataSize,
+                            const BSONObj& catalogEntry,
+                            const BSONObj& storageMetadata,
+                            bool isDryRun) final {}
+
+    using OpObserver::preRenameCollection;
     repl::OpTime preRenameCollection(OperationContext* opCtx,
                                      const NamespaceString& fromCollection,
                                      const NamespaceString& toCollection,
@@ -158,7 +176,8 @@ public:
                        OptionalCollectionUUID uuid) final {}
 
     void onUnpreparedTransactionCommit(OperationContext* opCtx,
-                                       const std::vector<repl::ReplOperation>& statements) final {}
+                                       std::vector<repl::ReplOperation>* statements,
+                                       size_t numberOfPreImagesToWrite) final {}
 
     void onPreparedTransactionCommit(
         OperationContext* opCtx,
@@ -168,12 +187,16 @@ public:
 
     void onTransactionPrepare(OperationContext* opCtx,
                               const std::vector<OplogSlot>& reservedSlots,
-                              std::vector<repl::ReplOperation>& statements) final {}
+                              std::vector<repl::ReplOperation>* statements,
+                              size_t numberOfPreImagesToWrite) final {}
 
     void onTransactionAbort(OperationContext* opCtx,
                             boost::optional<OplogSlot> abortOplogEntryOpTime) final {}
 
     void onReplicationRollback(OperationContext* opCtx, const RollbackObserverInfo& rbInfo);
+
+    void onMajorityCommitPointUpdate(ServiceContext* service,
+                                     const repl::OpTime& newCommitPoint) final {}
 };
 
 }  // namespace mongo

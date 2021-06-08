@@ -29,13 +29,12 @@
 
 #pragma once
 
-#include <queue>
-
 #include <boost/optional.hpp>
+#include <functional>
+#include <queue>
 
 #include "mongo/db/logical_session_id.h"
 #include "mongo/s/query/cluster_client_cursor.h"
-#include "mongo/stdx/functional.h"
 
 namespace mongo {
 
@@ -46,7 +45,7 @@ class ClusterClientCursorMock final : public ClusterClientCursor {
 public:
     ClusterClientCursorMock(boost::optional<LogicalSessionId> lsid,
                             boost::optional<TxnNumber> txnNumber,
-                            stdx::function<void(void)> killCallback = stdx::function<void(void)>());
+                            std::function<void(void)> killCallback = {});
 
     ~ClusterClientCursorMock();
 
@@ -75,6 +74,8 @@ public:
     const PrivilegeVector& getOriginatingPrivileges() const& final;
     void getOriginatingPrivileges() && = delete;
 
+    bool partialResultsReturned() const final;
+
     std::size_t getNumRemotes() const final;
 
     BSONObj getPostBatchResumeToken() const final;
@@ -89,7 +90,13 @@ public:
 
     boost::optional<TxnNumber> getTxnNumber() const final;
 
+    void setAPIParameters(APIParameters& apiParameters);
+
+    APIParameters getAPIParameters() const final;
+
     boost::optional<ReadPreferenceSetting> getReadPreference() const final;
+
+    boost::optional<ReadConcernArgs> getReadConcern() const final;
 
     Date_t getCreatedDate() const final;
 
@@ -102,12 +109,9 @@ public:
     void incNBatches() final;
 
     /**
-     * Returns true unless marked as having non-exhausted remote cursors via
-     * markRemotesNotExhausted().
+     * Returns false unless the mock cursor has been fully iterated.
      */
     bool remotesExhausted() final;
-
-    void markRemotesNotExhausted();
 
     /**
      * Queues an error response.
@@ -116,9 +120,8 @@ public:
 
 private:
     bool _killed = false;
-    bool _exhausted = false;
     std::queue<StatusWith<ClusterQueryResult>> _resultsQueue;
-    stdx::function<void(void)> _killCallback;
+    std::function<void(void)> _killCallback;
 
     // Originating command object.
     BSONObj _originatingCommand;
@@ -129,7 +132,7 @@ private:
     // Number of returned documents.
     long long _numReturnedSoFar = 0;
 
-    bool _remotesExhausted = true;
+    bool _remotesExhausted = false;
 
     boost::optional<LogicalSessionId> _lsid;
 
@@ -142,6 +145,8 @@ private:
     Date_t _lastUseDate;
 
     std::uint64_t _nBatchesReturned = 0;
+
+    APIParameters _apiParameters = APIParameters();
 };
 
 }  // namespace mongo

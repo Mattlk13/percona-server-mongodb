@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -43,10 +43,9 @@
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
-#include "mongo/db/auth/user_management_commands_parser.h"
 #include "mongo/db/auth/user_name.h"
-#include "mongo/db/background.h"
 #include "mongo/db/catalog/coll_mod.h"
+#include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/create_collection.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/drop_collection.h"
@@ -74,6 +73,7 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/ops/insert.h"
+#include "mongo/db/profile_filter_impl.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/internal_plans.h"
@@ -86,44 +86,93 @@
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/stats/storage_stats.h"
 #include "mongo/db/write_concern.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/scripting/engine.h"
-#include "mongo/util/fail_point_service.h"
-#include "mongo/util/log.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/md5.hpp"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
-
-using std::ostringstream;
-using std::string;
-using std::stringstream;
-using std::unique_ptr;
+namespace {
 
 // Failpoint for making filemd5 hang.
 MONGO_FAIL_POINT_DEFINE(waitInFilemd5DuringManualYield);
 
-namespace {
+Status _setProfileSettings(OperationContext* opCtx,
+                           Database* db,
+                           StringData dbName,
+                           mongo::CollectionCatalog::ProfileSettings newSettings) {
+    invariant(db);
+
+    auto currSettings = CollectionCatalog::get(opCtx)->getDatabaseProfileSettings(dbName);
+
+    if (currSettings == newSettings) {
+        return Status::OK();
+    }
+
+    if (newSettings.level == 0) {
+        // No need to create the profile collection.
+        CollectionCatalog::write(opCtx, [&](CollectionCatalog& catalog) {
+            catalog.setDatabaseProfileSettings(dbName, newSettings);
+        });
+        return Status::OK();
+    }
+
+    // Can't support profiling without supporting capped collections.
+    if (!opCtx->getServiceContext()->getStorageEngine()->supportsCappedCollections()) {
+        return Status(ErrorCodes::CommandNotSupported,
+                      "the storage engine doesn't support profiling.");
+    }
+
+    Status status = createProfileCollection(opCtx, db);
+    if (!status.isOK()) {
+        return status;
+    }
+
+    CollectionCatalog::write(opCtx, [&](CollectionCatalog& catalog) {
+        catalog.setDatabaseProfileSettings(dbName, newSettings);
+    });
+
+    return Status::OK();
+}
+
 
 /**
  * Sets the profiling level, logging/profiling threshold, and logging/profiling sample rate for the
  * given database.
-*/
+ */
 class CmdProfile : public ProfileCmdBase {
 public:
     CmdProfile() = default;
 
 protected:
-    int _applyProfilingLevel(OperationContext* opCtx,
-                             const std::string& dbName,
-                             int profilingLevel) const final {
-        const bool readOnly = (profilingLevel < 0 || profilingLevel > 2);
+    CollectionCatalog::ProfileSettings _applyProfilingLevel(
+        OperationContext* opCtx,
+        const std::string& dbName,
+        const ProfileCmdRequest& request) const final {
+        const auto profilingLevel = request.getCommandParameter();
+
+        // The system.profile collection is non-replicated, so writes to it do not cause
+        // replication lag. As such, they should be excluded from Flow Control.
+        opCtx->setShouldParticipateInFlowControl(false);
+
+        // An invalid profiling level (outside the range [0, 2]) represents a request to read the
+        // current profiling level. Similarly, if the request does not include a filter, we only
+        // need to read the current filter, if any. If we're not changing either value, then we can
+        // acquire a shared lock instead of exclusive.
+        const bool readOnly = (profilingLevel < 0 || profilingLevel > 2) && !request.getFilter();
         const LockMode dbMode = readOnly ? MODE_S : MODE_X;
 
+        // Accessing system.profile collection should not conflict with oplog application.
+        ShouldNotConflictWithSecondaryBatchApplicationBlock shouldNotConflictBlock(
+            opCtx->lockState());
         AutoGetDb ctx(opCtx, dbName, dbMode);
         Database* db = ctx.getDb();
 
-        auto oldLevel = (db ? db->getProfilingLevel() : serverGlobalParams.defaultProfile);
+        // Fetches the database profiling level + filter or the server default if the db does not
+        // exist.
+        auto oldSettings = CollectionCatalog::get(opCtx)->getDatabaseProfileSettings(dbName);
 
         if (!readOnly) {
             if (!db) {
@@ -132,10 +181,24 @@ protected:
                 auto databaseHolder = DatabaseHolder::get(opCtx);
                 db = databaseHolder->openDb(opCtx, dbName);
             }
-            uassertStatusOK(db->setProfilingLevel(opCtx, profilingLevel));
+
+            auto newSettings = oldSettings;
+            if (profilingLevel >= 0 && profilingLevel <= 2) {
+                newSettings.level = profilingLevel;
+            }
+            if (auto filterOrUnset = request.getFilter()) {
+                if (auto filter = filterOrUnset->obj) {
+                    // filter: <match expression>
+                    newSettings.filter = std::make_shared<ProfileFilterImpl>(*filter);
+                } else {
+                    // filter: "unset"
+                    newSettings.filter = nullptr;
+                }
+            }
+            uassertStatusOK(_setProfileSettings(opCtx, db, dbName, newSettings));
         }
 
-        return oldLevel;
+        return oldSettings;
     }
 
 } cmdProfile;
@@ -155,6 +218,10 @@ public:
 
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
+    }
+
+    bool collectsResourceConsumptionMetrics() const override {
+        return true;
     }
 
     virtual std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const {
@@ -178,7 +245,7 @@ public:
     }
 
     bool run(OperationContext* opCtx,
-             const string& dbname,
+             const std::string& dbname,
              const BSONObj& jsobj,
              BSONObjBuilder& result) {
         const NamespaceString nss(parseNs(dbname, jsobj));
@@ -200,8 +267,7 @@ public:
                 uassert(50847,
                         str::stream() << "The element that calls binDataClean() must be type of "
                                          "BinData, but type of "
-                                      << typeName(stateElem.type())
-                                      << " found.",
+                                      << typeName(stateElem.type()) << " found.",
                         (stateElem.type() == BSONType::BinData));
 
                 int len;
@@ -216,28 +282,28 @@ public:
         BSONObj sort = BSON("files_id" << 1 << "n" << 1);
 
         return writeConflictRetry(opCtx, "filemd5", dbname, [&] {
-            auto qr = stdx::make_unique<QueryRequest>(nss);
-            qr->setFilter(query);
-            qr->setSort(sort);
+            auto findCommand = std::make_unique<FindCommandRequest>(nss);
+            findCommand->setFilter(query.getOwned());
+            findCommand->setSort(sort.getOwned());
 
-            auto statusWithCQ = CanonicalQuery::canonicalize(opCtx, std::move(qr));
+            auto statusWithCQ = CanonicalQuery::canonicalize(opCtx, std::move(findCommand));
             if (!statusWithCQ.isOK()) {
                 uasserted(17240, "Can't canonicalize query " + query.toString());
                 return false;
             }
-            unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
+            std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
             // Check shard version at startup.
             // This will throw before we've done any work if shard version is outdated
             // We drop and re-acquire these locks every document because md5'ing is expensive
-            unique_ptr<AutoGetCollectionForReadCommand> ctx(
+            std::unique_ptr<AutoGetCollectionForReadCommand> ctx(
                 new AutoGetCollectionForReadCommand(opCtx, nss));
-            Collection* coll = ctx->getCollection();
+            const CollectionPtr& coll = ctx->getCollection();
 
             auto exec = uassertStatusOK(getExecutor(opCtx,
-                                                    coll,
+                                                    &coll,
                                                     std::move(cq),
-                                                    PlanExecutor::YIELD_MANUAL,
+                                                    PlanYieldPolicy::YieldPolicy::YIELD_MANUAL,
                                                     QueryPlannerParams::NO_TABLE_SCAN));
 
             // We need to hold a lock to clean up the PlanExecutor, so make sure we have one when we
@@ -263,63 +329,68 @@ public:
                 exec.reset();
             });
 
-            BSONObj obj;
-            PlanExecutor::ExecState state;
-            while (PlanExecutor::ADVANCED == (state = exec->getNext(&obj, NULL))) {
-                BSONElement ne = obj["n"];
-                verify(ne.isNumber());
-                int myn = ne.numberInt();
-                if (n != myn) {
-                    if (partialOk) {
-                        break;  // skipped chunk is probably on another shard
+            try {
+                BSONObj obj;
+                while (PlanExecutor::ADVANCED == exec->getNext(&obj, nullptr)) {
+                    BSONElement ne = obj["n"];
+                    verify(ne.isNumber());
+                    int myn = ne.numberInt();
+                    if (n != myn) {
+                        if (partialOk) {
+                            break;  // skipped chunk is probably on another shard
+                        }
+                        LOGV2(20452,
+                              "Should have chunk: {expected} have: {observed}",
+                              "Unexpected chunk",
+                              "expected"_attr = n,
+                              "observed"_attr = myn);
+                        dumpChunks(opCtx, nss.ns(), query, sort);
+                        uassert(10040, "chunks out of order", n == myn);
                     }
-                    log() << "should have chunk: " << n << " have:" << myn;
-                    dumpChunks(opCtx, nss.ns(), query, sort);
-                    uassert(10040, "chunks out of order", n == myn);
+
+                    // make a copy of obj since we access data in it while yielding locks
+                    BSONObj owned = obj.getOwned();
+                    uassert(50848,
+                            str::stream() << "The element that calls binDataClean() must be type "
+                                             "of BinData, but type of misisng found. Field name is "
+                                             "required",
+                            owned["data"]);
+                    uassert(50849,
+                            str::stream() << "The element that calls binDataClean() must be type "
+                                             "of BinData, but type of "
+                                          << owned["data"].type() << " found.",
+                            owned["data"].type() == BSONType::BinData);
+
+                    exec->saveState();
+                    // UNLOCKED
+                    ctx.reset();
+
+                    int len;
+                    const char* data = owned["data"].binDataClean(len);
+                    // This is potentially an expensive operation, so do it out of the lock
+                    md5_append(&st, (const md5_byte_t*)(data), len);
+                    n++;
+
+                    CurOpFailpointHelpers::waitWhileFailPointEnabled(
+                        &waitInFilemd5DuringManualYield, opCtx, "waitInFilemd5DuringManualYield");
+
+                    try {
+                        // RELOCKED
+                        ctx.reset(new AutoGetCollectionForReadCommand(opCtx, nss));
+                    } catch (const StaleConfigException&) {
+                        LOGV2_DEBUG(
+                            20453,
+                            1,
+                            "Chunk metadata changed during filemd5, will retarget and continue");
+                        break;
+                    }
+
+                    // Now that we have the lock again, we can restore the PlanExecutor.
+                    exec->restoreState(&ctx->getCollection());
                 }
-
-                // make a copy of obj since we access data in it while yielding locks
-                BSONObj owned = obj.getOwned();
-                uassert(50848,
-                        str::stream() << "The element that calls binDataClean() must be type "
-                                         "of BinData, but type of misisng found. Field name is "
-                                         "required",
-                        owned["data"]);
-                uassert(50849,
-                        str::stream() << "The element that calls binDataClean() must be type "
-                                         "of BinData, but type of "
-                                      << owned["data"].type()
-                                      << " found.",
-                        owned["data"].type() == BSONType::BinData);
-
-                exec->saveState();
-                // UNLOCKED
-                ctx.reset();
-
-                int len;
-                const char* data = owned["data"].binDataClean(len);
-                // This is potentially an expensive operation, so do it out of the lock
-                md5_append(&st, (const md5_byte_t*)(data), len);
-                n++;
-
-                CurOpFailpointHelpers::waitWhileFailPointEnabled(
-                    &waitInFilemd5DuringManualYield, opCtx, "waitInFilemd5DuringManualYield");
-
-                try {
-                    // RELOCKED
-                    ctx.reset(new AutoGetCollectionForReadCommand(opCtx, nss));
-                } catch (const StaleConfigException&) {
-                    LOG(1) << "chunk metadata changed during filemd5, will retarget and continue";
-                    break;
-                }
-
-                // Now that we have the lock again, we can restore the PlanExecutor.
-                exec->restoreState();
-            }
-
-            if (PlanExecutor::FAILURE == state) {
-                uassertStatusOK(WorkingSetCommon::getMemberObjectStatus(obj).withContext(
-                    "Executor error during filemd5 command"));
+            } catch (DBException& exception) {
+                exception.addContext("Executor error during filemd5 command");
+                throw;
             }
 
             if (partialOk)
@@ -336,15 +407,15 @@ public:
     }
 
     void dumpChunks(OperationContext* opCtx,
-                    const string& ns,
+                    const std::string& ns,
                     const BSONObj& query,
                     const BSONObj& sort) {
         DBDirectClient client(opCtx);
         Query q(query);
         q.sort(sort);
-        unique_ptr<DBClientCursor> c = client.query(NamespaceString(ns), q);
+        std::unique_ptr<DBClientCursor> c = client.query(NamespaceString(ns), q);
         while (c->more()) {
-            log() << c->nextSafe();
+            LOGV2(20454, "Chunk: {chunk}", "Dumping chunks", "chunk"_attr = c->nextSafe());
         }
     }
 
@@ -367,7 +438,7 @@ public:
     }
 
     virtual bool run(OperationContext* opCtx,
-                     const string& dbname,
+                     const std::string& dbname,
                      const BSONObj& cmdObj,
                      BSONObjBuilder& result) {
         result << "options" << QueryOption_AllSupported;

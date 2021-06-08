@@ -25,6 +25,7 @@
 # exception statement from all source files in the program, then also delete
 # it in the license file.
 #
+# pylint: disable=too-many-lines
 """
 Common error handling code for IDL compiler.
 
@@ -35,7 +36,7 @@ Common error handling code for IDL compiler.
 import inspect
 import os
 import sys
-from typing import List, Union, Any
+from typing import List, Union
 from yaml import nodes
 import yaml
 
@@ -53,7 +54,6 @@ ERROR_ID_DUPLICATE_NODE = "ID0005"
 ERROR_ID_UNKNOWN_TYPE = "ID0006"
 ERROR_ID_IS_NODE_VALID_BOOL = "ID0007"
 ERROR_ID_UNKNOWN_NODE = "ID0008"
-ERROR_ID_EMPTY_FIELDS = "ID0009"
 ERROR_ID_MISSING_REQUIRED_FIELD = "ID0010"
 ERROR_ID_ARRAY_NOT_VALID_TYPE = "ID0011"
 ERROR_ID_MISSING_AST_REQUIRED_FIELD = "ID0012"
@@ -109,6 +109,27 @@ ERROR_ID_IS_NODE_TYPE_SCALAR_OR_MAPPING = "ID0065"
 ERROR_ID_SERVER_PARAMETER_INVALID_ATTR = "ID0066"
 ERROR_ID_SERVER_PARAMETER_REQUIRED_ATTR = "ID0067"
 ERROR_ID_SERVER_PARAMETER_INVALID_METHOD_OVERRIDE = "ID0068"
+ERROR_ID_NON_CONST_GETTER_IN_IMMUTABLE_STRUCT = "ID0069"
+ERROR_ID_FEATURE_FLAG_DEFAULT_TRUE_MISSING_VERSION = "ID0070"
+ERROR_ID_FEATURE_FLAG_DEFAULT_FALSE_HAS_VERSION = "ID0071"
+ERROR_ID_INVALID_REPLY_TYPE = "ID0072"
+ERROR_ID_UNSTABLE_NO_API_VERSION = "ID0073"
+ERROR_ID_MISSING_REPLY_TYPE = "ID0074"
+ERROR_ID_USELESS_VARIANT = "ID0076"
+ERROR_ID_ILLEGAL_FIELD_ALWAYS_SERIALIZE_NOT_OPTIONAL = "ID0077"
+ERROR_ID_VARIANT_COMPARISON = "ID0078"
+ERROR_ID_VARIANT_NO_DEFAULT = "ID0079"
+ERROR_ID_VARIANT_DUPLICATE_TYPES = "ID0080"
+ERROR_ID_VARIANT_STRUCTS = "ID0081"
+ERROR_ID_NO_VARIANT_ENUM = "ID0082"
+ERROR_ID_COMMAND_DUPLICATES_NAME_AND_ALIAS = "ID0083"
+ERROR_ID_UNKOWN_ENUM_VALUE = "ID0084"
+ERROR_ID_EITHER_CHECK_OR_PRIVILEGE = "ID0085"
+ERROR_ID_DUPLICATE_ACTION_TYPE = "ID0086"
+ERROR_ID_DUPLICATE_ACCESS_CHECK = "ID0087"
+ERROR_ID_DUPLICATE_PRIVILEGE = "ID0088"
+ERROR_ID_EMPTY_ACCESS_CHECK = "ID0089"
+ERROR_ID_MISSING_ACCESS_CHECK = "ID0090"
 
 
 class IDLError(Exception):
@@ -288,6 +309,16 @@ class ParserContext(object):
             return True
         return False
 
+    def is_sequence_mapping(self, node, node_name):
+        # type: (Union[yaml.nodes.MappingNode, yaml.nodes.ScalarNode, yaml.nodes.SequenceNode], str) -> bool
+        """Return True if this YAML node is a Sequence of Mappings."""
+        if self._is_node_type(node, node_name, "sequence"):
+            for seq_node in node.value:
+                if not self.is_mapping_node(seq_node, node_name):
+                    return False
+            return True
+        return False
+
     def is_scalar_sequence_or_scalar_node(self, node, node_name):
         # type: (Union[yaml.nodes.MappingNode, yaml.nodes.ScalarNode, yaml.nodes.SequenceNode], str) -> bool
         # pylint: disable=invalid-name
@@ -354,13 +385,6 @@ class ParserContext(object):
         """Add an error about a duplicate node."""
         self._add_node_error(node, ERROR_ID_DUPLICATE_NODE,
                              "Duplicate node found for '%s'" % (node_name))
-
-    def add_empty_struct_error(self, node, name):
-        # type: (yaml.nodes.Node, str) -> None
-        """Add an error about a struct without fields."""
-        self._add_node_error(node, ERROR_ID_EMPTY_FIELDS,
-                             ("Struct '%s' must either have fields, chained_types, or " +
-                              "chained_structs specified but neither were found") % (name))
 
     def add_missing_required_field_error(self, node, node_parent, node_name):
         # type: (yaml.nodes.Node, str, str) -> None
@@ -502,7 +526,7 @@ class ParserContext(object):
     def add_bindata_no_default(self, location, ast_type, ast_parent):
         # type: (common.SourceLocation, str, str) -> None
         # pylint: disable=invalid-name
-        """Add an error about 'any' being used in a list of bson types."""
+        """Add an error about a bindata type with a default value."""
         self._add_error(location, ERROR_ID_BAD_BINDATA_DEFAULT,
                         ("Default values are not allowed for %s '%s'") % (ast_type, ast_parent))
 
@@ -664,6 +688,59 @@ class ParserContext(object):
         self._add_error(location, ERROR_ID_COMMAND_DUPLICATES_FIELD,
                         ("Command '%s' cannot have the same name as a field.") % (command_name))
 
+    def add_bad_field_non_const_getter_in_immutable_struct_error(self, location, struct_name,
+                                                                 field_name):
+        # type: (common.SourceLocation, str, str) -> None
+        """Add an error about marking a field with non_const_getter in an immutable struct."""
+        # pylint: disable=invalid-name
+        self._add_error(
+            location, ERROR_ID_NON_CONST_GETTER_IN_IMMUTABLE_STRUCT,
+            ("Cannot generate a non-const getter for field '%s' in struct '%s' since"
+             " struct '%s' is marked as immutable.") % (field_name, struct_name, struct_name))
+
+    def add_useless_variant_error(self, location):
+        # type: (common.SourceLocation) -> None
+        """Add an error about a variant with 0 or 1 variant types."""
+        self._add_error(location, ERROR_ID_USELESS_VARIANT,
+                        ("Cannot declare a variant with only 0 or 1 variant types"))
+
+    def add_variant_comparison_error(self, location):
+        # type: (common.SourceLocation) -> None
+        """Add an error about a struct with generate_comparison_operators and a variant field."""
+        self._add_error(location, ERROR_ID_VARIANT_COMPARISON,
+                        ("generate_comparison_operators is not supported with variant types"))
+
+    def add_variant_no_default_error(self, location, field_name):
+        # type: (common.SourceLocation, str) -> None
+        """Add an error about a variant having a default value."""
+        self._add_error(
+            location, ERROR_ID_VARIANT_NO_DEFAULT,
+            "Field '%s' is a variant, and default values for variants aren't implemented yet" %
+            (field_name))
+
+    def add_variant_duplicate_types_error(self, location, field_name, type_name):
+        # type: (common.SourceLocation, str, str) -> None
+        """Add an error about a variant having more than one alternative of the same BSON type."""
+        self._add_error(
+            location, ERROR_ID_VARIANT_DUPLICATE_TYPES,
+            ("Variant field '%s' has multiple alternatives with BSON type '%s', this is prohibited"
+             " to avoid ambiguity while parsing BSON.") % (field_name, type_name))
+
+    def add_variant_structs_error(self, location, field_name):
+        # type: (common.SourceLocation, str) -> None
+        """Add an error about a variant having more than one struct alternative."""
+        self._add_error(location, ERROR_ID_VARIANT_STRUCTS,
+                        ("Variant field '%s' has multiple struct alternatives, this is prohibited"
+                         " to avoid ambiguity while parsing BSON subdocuments.") % (field_name, ))
+
+    def add_variant_enum_error(self, location, field_name, type_name):
+        # type: (common.SourceLocation, str, str) -> None
+        """Add an error for a variant that can be an enum."""
+        self._add_error(
+            location, ERROR_ID_NO_VARIANT_ENUM,
+            "Field '%s' cannot be a variant with an enum alternative type '%s'" % (field_name,
+                                                                                   type_name))
+
     def is_scalar_non_negative_int_node(self, node, node_name):
         # type: (Union[yaml.nodes.MappingNode, yaml.nodes.ScalarNode, yaml.nodes.SequenceNode], str) -> bool
         """Return True if this YAML node is a Scalar and a valid non-negative int."""
@@ -793,6 +870,114 @@ class ParserContext(object):
         self._add_error(location, ERROR_ID_MISSING_SHORT_NAME_WITH_SINGLE_NAME,
                         ("Missing 'short_name' required with 'single_name' value '%s'") % (name))
 
+    def add_feature_flag_default_true_missing_version(self, location):
+        # type: (common.SourceLocation) -> None
+        """Add an error about a default flag with a default value of true but no version."""
+        # pylint: disable=invalid-name
+        self._add_error(location, ERROR_ID_FEATURE_FLAG_DEFAULT_TRUE_MISSING_VERSION,
+                        ("Missing 'version' required for feature flag that defaults to true"))
+
+    def add_feature_flag_default_false_has_version(self, location):
+        # type: (common.SourceLocation) -> None
+        """Add an error about a default flag with a default value of false but has a version."""
+        # pylint: disable=invalid-name
+        self._add_error(
+            location, ERROR_ID_FEATURE_FLAG_DEFAULT_FALSE_HAS_VERSION,
+            ("The 'version' attribute is not allowed for feature flag that defaults to false"))
+
+    def add_reply_type_invalid_type(self, location, command_name, reply_type_name):
+        # type: (common.SourceLocation, str, str) -> None
+        """Add an error about a command whose reply_type refers to an unknown type."""
+        # pylint: disable=invalid-name
+        self._add_error(
+            location, ERROR_ID_INVALID_REPLY_TYPE,
+            ("Command '%s' has invalid reply_type '%s'" % (command_name, reply_type_name)))
+
+    def add_unstable_no_api_version(self, location, command_name):
+        # type: (common.SourceLocation, str) -> None
+        """Add an error about a command with 'unstable' but no 'api_version'."""
+        # pylint: disable=invalid-name
+        self._add_error(
+            location, ERROR_ID_UNSTABLE_NO_API_VERSION,
+            ("Command '%s' specifies 'unstable' but has no 'api_version'" % (command_name, )))
+
+    def add_missing_reply_type(self, location, command_name):
+        # type: (common.SourceLocation, str) -> None
+        """Add an error about a command with 'api_version' but no 'reply_type'."""
+        # pylint: disable=invalid-name
+        self._add_error(
+            location, ERROR_ID_MISSING_REPLY_TYPE,
+            ("Command '%s' has an 'api_version' but no 'reply_type'" % (command_name, )))
+
+    def add_bad_field_always_serialize_not_optional(self, location, field_name):
+        # type: (common.SourceLocation, str) -> None
+        """Add an error about a field with 'always_serialize' but 'optional' isn't set to true."""
+        # pylint: disable=invalid-name
+        self._add_error(
+            location, ERROR_ID_ILLEGAL_FIELD_ALWAYS_SERIALIZE_NOT_OPTIONAL,
+            ("Field '%s' specifies 'always_serialize' but 'optional' isn't true.") % (field_name))
+
+    def add_duplicate_command_name_and_alias(self, node):
+        # type: (yaml.nodes.Node) -> None
+        """Add an error about a command name and command alias having the same name."""
+        # pylint: disable=invalid-name
+        self._add_node_error(node, ERROR_ID_COMMAND_DUPLICATES_NAME_AND_ALIAS,
+                             "Duplicate command_name and command_alias found.")
+
+    def add_unknown_enum_value(self, location, enum_name, enum_value):
+        # type: (common.SourceLocation, str, str) -> None
+        """Add an error about an unknown enum value."""
+        # pylint: disable=invalid-name
+        self._add_error(location, ERROR_ID_UNKOWN_ENUM_VALUE,
+                        "Cannot find enum value '%s' in enum '%s'." % (enum_value, enum_name))
+
+    def add_either_check_or_privilege(self, location):
+        # type: (common.SourceLocation) -> None
+        """Add an error about specifing both a check and a privilege or neither."""
+        # pylint: disable=invalid-name
+        self._add_error(
+            location, ERROR_ID_EITHER_CHECK_OR_PRIVILEGE,
+            "Must specify either a 'check' and a 'privilege' in an access_check, not both.")
+
+    def add_duplicate_action_types(self, location, name):
+        # type: (common.SourceLocation, str) -> None
+        """Add an error about specifying an action type twice in the same list."""
+        # pylint: disable=invalid-name
+        self._add_error(location, ERROR_ID_DUPLICATE_ACTION_TYPE,
+                        "Cannot specify an action_type '%s' more then once" % (name))
+
+    def add_duplicate_access_check(self, location, name):
+        # type: (common.SourceLocation, str) -> None
+        """Add an error about specifying an access check twice in the same list."""
+        # pylint: disable=invalid-name
+        self._add_error(location, ERROR_ID_DUPLICATE_ACCESS_CHECK,
+                        "Cannot specify an access_check '%s' more then once" % (name))
+
+    def add_duplicate_privilege(self, location, resource_pattern, action_type):
+        # type: (common.SourceLocation, str, str) -> None
+        """Add an error about specifying a privilege twice in the same list."""
+        # pylint: disable=invalid-name
+        self._add_error(
+            location, ERROR_ID_DUPLICATE_PRIVILEGE,
+            "Cannot specify the pair of resource_pattern '%s' and action_type '%s' more then once" %
+            (resource_pattern, action_type))
+
+    def add_empty_access_check(self, location):
+        # type: (common.SourceLocation) -> None
+        """Add an error about specifying one of ignore, none, simple or complex in an access check."""
+        # pylint: disable=invalid-name
+        self._add_error(
+            location, ERROR_ID_EMPTY_ACCESS_CHECK,
+            "Must one and only one of either a 'ignore', 'none', 'simple', or 'complex' in an access_check."
+        )
+
+    def add_missing_access_check(self, location, name):
+        # type: (common.SourceLocation, str) -> None
+        """Add an error about a missing access_check when api_version != ""."""
+        # pylint: disable=invalid-name
+        self._add_error(location, ERROR_ID_MISSING_ACCESS_CHECK,
+                        'Command "%s" has api_version != "" but is missing access_check.' % (name))
+
 
 def _assert_unique_error_messages():
     # type: () -> None
@@ -804,7 +989,7 @@ def _assert_unique_error_messages():
 
     error_ids_set = set(error_ids)
     if len(error_ids) != len(error_ids_set):
-        raise IDLError("IDL error codes prefixed with ERRROR_ID are not unique.")
+        raise IDLError("IDL error codes prefixed with ERROR_ID are not unique.")
 
 
 # On file import, check the error messages are unique

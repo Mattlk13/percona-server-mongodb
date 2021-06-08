@@ -41,8 +41,10 @@
 #include "mongo/db/session_killer.h"
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/stdx/unordered_set.h"
+#include "mongo/util/clock_source.h"
 #include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/duration.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 
@@ -83,7 +85,7 @@ public:
     static void set(ServiceContext* svcCtx, std::unique_ptr<CursorManager> newCursorManager);
 
 
-    CursorManager();
+    CursorManager(ClockSource* clockSource);
 
     /**
      * Destroys the cursor manager, deleting all managed cursors. Illegal to call if any managed
@@ -110,6 +112,13 @@ public:
      * Returns ErrorCodes::CursorNotFound if the cursor does not exist or
      * ErrorCodes::QueryPlanKilled if the cursor was killed in between uses.
      *
+     * If 'checkSessionAuth' is 'kCheckSession' or left unspecified, this function also checks if
+     * the current session in the specified 'opCtx' has privilege to access the cursor specified by
+     * 'id.' In this case, this function returns a 'mongo::Status' with information regarding the
+     * nature of the inaccessability when the cursor is not accessible. If 'kNoCheckSession' is
+     * passed for 'checkSessionAuth,' this function does not check if the current session is
+     * authorized to access the cursor with the given id.
+     *
      * Throws a AssertionException if the cursor is already pinned. Callers need not specially
      * handle this error, as it should only happen if a misbehaving client attempts to
      * simultaneously issue two operations against the same cursor id.
@@ -131,7 +140,7 @@ public:
      *
      * If 'shouldAudit' is true, will perform audit logging.
      */
-    Status killCursor(OperationContext* opCtx, CursorId id, bool shouldAudit);
+    Status killCursor(OperationContext* opCtx, CursorId id);
 
     /**
      * Returns an OK status if we're authorized to erase the cursor. Otherwise, returns
@@ -160,6 +169,11 @@ public:
      */
     stdx::unordered_set<CursorId> getCursorsForSession(LogicalSessionId lsid) const;
 
+    /*
+     * Returns a list of all open cursors for the given set of OperationKeys.
+     */
+    stdx::unordered_set<CursorId> getCursorsForOpKeys(std::vector<OperationKey>) const;
+
     /**
      * Returns the number of ClientCursors currently registered.
      */
@@ -171,6 +185,13 @@ public:
      */
     std::pair<Status, int> killCursorsWithMatchingSessions(OperationContext* opCtx,
                                                            const SessionKiller::Matcher& matcher);
+
+    /**
+     * Set the CursorManager's ClockSource*.
+     */
+    void setPreciseClockSource(ClockSource* preciseClockSource) {
+        _preciseClockSource = preciseClockSource;
+    }
 
 private:
     static constexpr int kNumPartitions = 16;
@@ -192,6 +213,17 @@ private:
 
     bool cursorShouldTimeout_inlock(const ClientCursor* cursor, Date_t now);
 
+    template <class T>
+    void removeCursorFromMap(T& map, ClientCursor* cursor) {
+        // Remove from the opKey map first since erasing from the map may free the pointer for
+        // 'cursor'.
+        if (auto opKey = cursor->getOperationKey()) {
+            stdx::lock_guard<Latch> lk(_opKeyMutex);
+            _opKeyMap.erase(*opKey);
+        }
+        map->erase(cursor->cursorid());
+    }
+
     // A CursorManager holds a pointer to all open ClientCursors. ClientCursors are owned by the
     // CursorManager, except when they are in use by a ClientCursorPin. When in use by a pin, an
     // unowned pointer remains to ensure they still receive kill notifications while in use.
@@ -211,5 +243,13 @@ private:
     std::unique_ptr<PseudoRandom> _random;
     std::unique_ptr<Partitioned<stdx::unordered_map<CursorId, ClientCursor*>, kNumPartitions>>
         _cursorMap;
+
+    // A mapping from client OperationKey to corresponding CursorID. Note that it's possible that
+    // cursors in the map above are not present in this map, since OperationKey is not required when
+    // registering a cursor.
+    mutable Mutex _opKeyMutex = MONGO_MAKE_LATCH("CursorManager::_opKeyMutex");
+    stdx::unordered_map<OperationKey, CursorId, UUID::Hash> _opKeyMap;
+
+    ClockSource* _preciseClockSource;
 };
 }  // namespace mongo

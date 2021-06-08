@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kTransaction
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTransaction
 
 #include "mongo/platform/basic.h"
 
@@ -37,18 +37,19 @@
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/client.h"
 #include "mongo/db/dbdirectclient.h"
-#include "mongo/db/dbdirectclient.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/ops/write_ops.h"
+#include "mongo/db/repl/repl_server_parameters_gen.h"
+#include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/session_txn_record_gen.h"
 #include "mongo/db/sessions_collection.h"
 #include "mongo/db/transaction_participant.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/write_ops/batched_command_response.h"
 #include "mongo/util/concurrency/thread_pool.h"
-#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
@@ -91,8 +92,8 @@ void killSessionTokens(OperationContext* opCtx,
         return;
 
     getThreadPool(opCtx)->schedule(
-        [ service = opCtx->getServiceContext(),
-          sessionKillTokens = std::move(sessionKillTokens) ](auto status) mutable {
+        [service = opCtx->getServiceContext(),
+         sessionKillTokens = std::move(sessionKillTokens)](auto status) mutable {
             invariant(status);
 
             ThreadClient tc("Kill-Sessions", service);
@@ -135,16 +136,15 @@ int removeSessionsTransactionRecords(OperationContext* opCtx,
         return 0;
 
     // From the passed-in sessions, find the ones which are actually expired/removed
-    auto expiredSessionIds =
-        uassertStatusOK(sessionsCollection.findRemovedSessions(opCtx, sessionIdsToRemove));
+    auto expiredSessionIds = sessionsCollection.findRemovedSessions(opCtx, sessionIdsToRemove);
 
     if (expiredSessionIds.empty())
         return 0;
 
     // Remove the session ids from the on-disk catalog
-    write_ops::Delete deleteOp(NamespaceString::kSessionTransactionsTableNamespace);
-    deleteOp.setWriteCommandBase([] {
-        write_ops::WriteCommandBase base;
+    write_ops::DeleteCommandRequest deleteOp(NamespaceString::kSessionTransactionsTableNamespace);
+    deleteOp.setWriteCommandRequestBase([] {
+        write_ops::WriteCommandRequestBase base;
         base.setOrdered(false);
         return base;
     }());
@@ -175,33 +175,36 @@ int removeSessionsTransactionRecords(OperationContext* opCtx,
 }
 
 void createTransactionTable(OperationContext* opCtx) {
-    const size_t initialExtentSize = 0;
-    const bool capped = false;
-    const bool maxSize = 0;
-    BSONObj result;
-
-    DBDirectClient client(opCtx);
-
-    if (client.createCollection(NamespaceString::kSessionTransactionsTableNamespace.ns(),
-                                initialExtentSize,
-                                capped,
-                                maxSize,
-                                &result)) {
+    auto serviceCtx = opCtx->getServiceContext();
+    CollectionOptions options;
+    auto status =
+        repl::StorageInterface::get(serviceCtx)
+            ->createCollection(opCtx, NamespaceString::kSessionTransactionsTableNamespace, options);
+    if (status == ErrorCodes::NamespaceExists) {
         return;
     }
 
-    const auto status = getStatusFromCommandResult(result);
+    uassertStatusOKWithContext(
+        status,
+        str::stream() << "Failed to create the "
+                      << NamespaceString::kSessionTransactionsTableNamespace.ns() << " collection");
+}
 
+void createRetryableFindAndModifyTable(OperationContext* opCtx) {
+    auto serviceCtx = opCtx->getServiceContext();
+    CollectionOptions options;
+    auto status = repl::StorageInterface::get(serviceCtx)
+                      ->createCollection(opCtx, NamespaceString::kConfigImagesNamespace, options);
     if (status == ErrorCodes::NamespaceExists) {
         return;
     }
 
     uassertStatusOKWithContext(status,
-                               str::stream()
-                                   << "Failed to create the "
-                                   << NamespaceString::kSessionTransactionsTableNamespace.ns()
-                                   << " collection");
+                               str::stream() << "Failed to create the "
+                                             << NamespaceString::kConfigImagesNamespace.ns()
+                                             << " collection");
 }
+
 
 void abortInProgressTransactions(OperationContext* opCtx) {
     DBDirectClient client(opCtx);
@@ -209,18 +212,24 @@ void abortInProgressTransactions(OperationContext* opCtx) {
                      << DurableTxnState_serializer(DurableTxnStateEnum::kInProgress)));
     auto cursor = client.query(NamespaceString::kSessionTransactionsTableNamespace, query);
     if (cursor->more()) {
-        LOG(3) << "Aborting in-progress transactions on stepup.";
+        LOGV2_DEBUG(21977, 3, "Aborting in-progress transactions on stepup.");
     }
     while (cursor->more()) {
         auto txnRecord = SessionTxnRecord::parse(
             IDLParserErrorContext("abort-in-progress-transactions"), cursor->next());
         opCtx->setLogicalSessionId(txnRecord.getSessionId());
         opCtx->setTxnNumber(txnRecord.getTxnNum());
+        opCtx->setInMultiDocumentTransaction();
         MongoDOperationContextSessionWithoutRefresh ocs(opCtx);
         auto txnParticipant = TransactionParticipant::get(opCtx);
-        LOG(3) << "Aborting transaction sessionId: " << txnRecord.getSessionId().toBSON()
-               << " txnNumber " << txnRecord.getTxnNum();
-        txnParticipant.abortTransactionForStepUp(opCtx);
+        LOGV2_DEBUG(21978,
+                    3,
+                    "Aborting transaction sessionId: {sessionId} txnNumber {txnNumber}",
+                    "Aborting transaction",
+                    "sessionId"_attr = txnRecord.getSessionId().toBSON(),
+                    "txnNumber"_attr = txnRecord.getTxnNum());
+        txnParticipant.abortTransaction(opCtx);
+        opCtx->resetMultiDocumentTransactionState();
     }
 }
 }  // namespace
@@ -242,7 +251,7 @@ void MongoDSessionCatalog::onStepUp(OperationContext* opCtx) {
         KillAllSessionsByPatternSet{makeKillAllSessionsByPattern(opCtx)});
     catalog->scanSessions(matcher, [&](const ObservableSession& session) {
         const auto txnParticipant = TransactionParticipant::get(session);
-        if (!txnParticipant.inMultiDocumentTransaction()) {
+        if (!txnParticipant.transactionIsOpen()) {
             sessionKillTokens.emplace_back(session.kill());
         }
 
@@ -261,8 +270,13 @@ void MongoDSessionCatalog::onStepUp(OperationContext* opCtx) {
             newOpCtx->setLogicalSessionId(sessionId);
             MongoDOperationContextSession ocs(newOpCtx.get());
             auto txnParticipant = TransactionParticipant::get(newOpCtx.get());
-            LOG(3) << "Restoring locks of prepared transaction. SessionId: " << sessionId.getId()
-                   << " TxnNumber: " << txnParticipant.getActiveTxnNumber();
+            LOGV2_DEBUG(21979,
+                        3,
+                        "Restoring locks of prepared transaction. SessionId: {sessionId} "
+                        "TxnNumber: {txnNumber}",
+                        "Restoring locks of prepared transaction",
+                        "sessionId"_attr = sessionId.getId(),
+                        "txnNumber"_attr = txnParticipant.getActiveTxnNumber());
             txnParticipant.refreshLocksForPreparedTransaction(newOpCtx.get(), false);
         }
     }
@@ -270,12 +284,14 @@ void MongoDSessionCatalog::onStepUp(OperationContext* opCtx) {
     abortInProgressTransactions(opCtx);
 
     createTransactionTable(opCtx);
+    if (repl::feature_flags::gFeatureFlagRetryableFindAndModify.isEnabledAndIgnoreFCV()) {
+        createRetryableFindAndModifyTable(opCtx);
+    }
 }
 
 boost::optional<UUID> MongoDSessionCatalog::getTransactionTableUUID(OperationContext* opCtx) {
-    AutoGetCollection autoColl(opCtx, NamespaceString::kSessionTransactionsTableNamespace, MODE_IS);
+    AutoGetCollection coll(opCtx, NamespaceString::kSessionTransactionsTableNamespace, MODE_IS);
 
-    const auto coll = autoColl.getCollection();
     if (!coll) {
         return boost::none;
     }
@@ -320,7 +336,8 @@ void MongoDSessionCatalog::observeDirectWriteToConfigTransactions(OperationConte
                               << " because it is in the prepared state",
                 !participant.transactionIsPrepared());
 
-        opCtx->recoveryUnit()->registerChange(new KillSessionTokenOnCommit(opCtx, session.kill()));
+        opCtx->recoveryUnit()->registerChange(
+            std::make_unique<KillSessionTokenOnCommit>(opCtx, session.kill()));
     });
 }
 
@@ -357,14 +374,13 @@ int MongoDSessionCatalog::reapSessionsOlderThan(OperationContext* opCtx,
                               });
 
         // From the passed-in sessions, find the ones which are actually expired/removed
-        auto expiredSessionIds =
-            uassertStatusOK(sessionsCollection.findRemovedSessions(opCtx, lsids));
+        auto expiredSessionIds = sessionsCollection.findRemovedSessions(opCtx, lsids);
 
         // Remove the session ids from the in-memory catalog
         for (const auto& lsid : expiredSessionIds) {
             catalog->scanSession(lsid, [](ObservableSession& session) {
                 const auto participant = TransactionParticipant::get(session);
-                if (!participant.inMultiDocumentTransaction()) {
+                if (!participant.transactionIsOpen()) {
                     session.markForReap();
                 }
             });
@@ -421,19 +437,13 @@ MongoDOperationContextSession::MongoDOperationContextSession(OperationContext* o
 MongoDOperationContextSession::~MongoDOperationContextSession() = default;
 
 void MongoDOperationContextSession::checkIn(OperationContext* opCtx) {
-    if (auto txnParticipant = TransactionParticipant::get(opCtx)) {
-        txnParticipant.stashTransactionResources(opCtx);
-    }
-
     OperationContextSession::checkIn(opCtx);
 }
 
-void MongoDOperationContextSession::checkOut(OperationContext* opCtx, const std::string& cmdName) {
+void MongoDOperationContextSession::checkOut(OperationContext* opCtx) {
     OperationContextSession::checkOut(opCtx);
-
-    if (auto txnParticipant = TransactionParticipant::get(opCtx)) {
-        txnParticipant.unstashTransactionResources(opCtx, cmdName);
-    }
+    auto txnParticipant = TransactionParticipant::get(opCtx);
+    txnParticipant.refreshFromStorageIfNeeded(opCtx);
 }
 
 MongoDOperationContextSessionWithoutRefresh::MongoDOperationContextSessionWithoutRefresh(
@@ -450,8 +460,19 @@ MongoDOperationContextSessionWithoutRefresh::~MongoDOperationContextSessionWitho
     const auto txnParticipant = TransactionParticipant::get(_opCtx);
     // A session on secondaries should never be checked back in with a TransactionParticipant that
     // isn't prepared, aborted, or committed.
-    invariant(!txnParticipant.inMultiDocumentTransaction() ||
-              txnParticipant.transactionIsPrepared());
+    invariant(!txnParticipant.transactionIsInProgress());
 }
+
+MongoDOperationContextSessionWithoutOplogRead::MongoDOperationContextSessionWithoutOplogRead(
+    OperationContext* opCtx)
+    : _operationContextSession(opCtx), _opCtx(opCtx) {
+    invariant(!opCtx->getClient()->isInDirectClient());
+
+    auto txnParticipant = TransactionParticipant::get(opCtx);
+    txnParticipant.refreshFromStorageIfNeededNoOplogEntryFetch(opCtx);
+}
+
+MongoDOperationContextSessionWithoutOplogRead::~MongoDOperationContextSessionWithoutOplogRead() =
+    default;
 
 }  // namespace mongo

@@ -33,92 +33,62 @@
 
 #include <boost/smart_ptr/intrusive_ptr.hpp>
 
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/document_source_replace_root_gen.h"
-#include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
-#include "mongo/db/pipeline/value.h"
 
 namespace mongo {
 
 using boost::intrusive_ptr;
 
-/**
- * This class implements the transformation logic for the $replaceRoot and $replaceWith stages.
- */
-class ReplaceRootTransformation final : public TransformerInterface {
+Document ReplaceRootTransformation::applyTransformation(const Document& input) {
+    // Extract subdocument in the form of a Value.
+    Value newRoot = _newRoot->evaluate(input, &_expCtx->variables);
 
-public:
-    ReplaceRootTransformation(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                              boost::intrusive_ptr<Expression> newRootExpression)
-        : _expCtx(expCtx), _newRoot(std::move(newRootExpression)) {}
+    // To ensure an accurate user-facing message, any user-facing syntax that uses this stage
+    // internally must provide an message opener that complies with its documentation.
+    StringData msgOpener = [&]() {
+        switch (_specifiedName) {
+            case UserSpecifiedName::kReplaceRoot:
+                return "'newRoot' expression "_sd;
+            case UserSpecifiedName::kReplaceWith:
+                return "'replacement document' "_sd;
+            default:
+                MONGO_UNREACHABLE;
+        }
+    }();
 
-    TransformerType getType() const final {
-        return TransformerType::kReplaceRoot;
-    }
+    // The newRoot expression, if it exists, must evaluate to an object.
+    uassert(40228,
+            str::stream() << msgOpener.toString()
+                          << "must evaluate to an object, but resulting value was: "
+                          << newRoot.toString() << ". Type of resulting value: '"
+                          << typeName(newRoot.getType())
+                          << "'. Input document: " << input.toString(),
+            newRoot.getType() == BSONType::Object);
 
-    Document applyTransformation(const Document& input) final {
-        // Extract subdocument in the form of a Value.
-        Value newRoot = _newRoot->evaluate(input);
-
-        // The newRoot expression, if it exists, must evaluate to an object.
-        uassert(40228,
-                str::stream()
-                    << "'newRoot' expression must evaluate to an object, but resulting value was: "
-                    << newRoot.toString()
-                    << ". Type of resulting value: '"
-                    << typeName(newRoot.getType())
-                    << "'. Input document: "
-                    << input.toString(),
-                newRoot.getType() == BSONType::Object);
-
-        // Turn the value into a document.
-        MutableDocument newDoc(newRoot.getDocument());
-        newDoc.copyMetaDataFrom(input);
-        return newDoc.freeze();
-    }
-
-    // Optimize the newRoot expression.
-    void optimize() final {
-        _newRoot->optimize();
-    }
-
-    Document serializeTransformation(
-        boost::optional<ExplainOptions::Verbosity> explain) const final {
-        return Document{{"newRoot", _newRoot->serialize(static_cast<bool>(explain))}};
-    }
-
-    DepsTracker::State addDependencies(DepsTracker* deps) const final {
-        _newRoot->addDependencies(deps);
-        // This stage will replace the entire document with a new document, so any existing fields
-        // will be replaced and cannot be required as dependencies.
-        return DepsTracker::State::EXHAUSTIVE_FIELDS;
-    }
-
-    DocumentSource::GetModPathsReturn getModifiedPaths() const final {
-        // Replaces the entire root, so all paths are modified.
-        return {DocumentSource::GetModPathsReturn::Type::kAllPaths, std::set<std::string>{}, {}};
-    }
-
-private:
-    const boost::intrusive_ptr<ExpressionContext> _expCtx;
-    boost::intrusive_ptr<Expression> _newRoot;
-};
+    // Turn the value into a document.
+    MutableDocument newDoc(newRoot.getDocument());
+    newDoc.copyMetaDataFrom(input);
+    return newDoc.freeze();
+}
 
 REGISTER_DOCUMENT_SOURCE(replaceRoot,
                          LiteParsedDocumentSourceDefault::parse,
-                         DocumentSourceReplaceRoot::createFromBson);
+                         DocumentSourceReplaceRoot::createFromBson,
+                         LiteParsedDocumentSource::AllowedWithApiStrict::kAlways);
 REGISTER_DOCUMENT_SOURCE(replaceWith,
                          LiteParsedDocumentSourceDefault::parse,
-                         DocumentSourceReplaceRoot::createFromBson);
+                         DocumentSourceReplaceRoot::createFromBson,
+                         LiteParsedDocumentSource::AllowedWithApiStrict::kAlways);
 
 intrusive_ptr<DocumentSource> DocumentSourceReplaceRoot::createFromBson(
     BSONElement elem, const intrusive_ptr<ExpressionContext>& expCtx) {
     const auto stageName = elem.fieldNameStringData();
     auto newRootExpression = [&]() {
         if (stageName == kAliasNameReplaceWith) {
-            return Expression::parseOperand(expCtx, elem, expCtx->variablesParseState);
+            return Expression::parseOperand(expCtx.get(), elem, expCtx->variablesParseState);
         }
 
         invariant(
@@ -127,8 +97,7 @@ intrusive_ptr<DocumentSource> DocumentSourceReplaceRoot::createFromBson(
                           << stageName);
         uassert(40229,
                 str::stream() << "expected an object as specification for " << kStageName
-                              << " stage, got "
-                              << typeName(elem.type()),
+                              << " stage, got " << typeName(elem.type()),
                 elem.type() == Object);
 
         auto spec =
@@ -139,7 +108,7 @@ intrusive_ptr<DocumentSource> DocumentSourceReplaceRoot::createFromBson(
         // to adapt the two.
         BSONObj parsingBson = BSON("newRoot" << spec.getNewRoot());
         return Expression::parseOperand(
-            expCtx, parsingBson.firstElement(), expCtx->variablesParseState);
+            expCtx.get(), parsingBson.firstElement(), expCtx->variablesParseState);
     }();
 
     // Whether this was specified as $replaceWith or $replaceRoot, always use the name $replaceRoot
@@ -147,8 +116,12 @@ intrusive_ptr<DocumentSource> DocumentSourceReplaceRoot::createFromBson(
     const bool isIndependentOfAnyCollection = false;
     return new DocumentSourceSingleDocumentTransformation(
         expCtx,
-        std::make_unique<ReplaceRootTransformation>(expCtx, newRootExpression),
-        kStageName.toString(),
+        std::make_unique<ReplaceRootTransformation>(
+            expCtx,
+            newRootExpression,
+            (stageName == kStageName) ? ReplaceRootTransformation::UserSpecifiedName::kReplaceRoot
+                                      : ReplaceRootTransformation::UserSpecifiedName::kReplaceWith),
+        kStageName.rawData(),
         isIndependentOfAnyCollection);
 }
 

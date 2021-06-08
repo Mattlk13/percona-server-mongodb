@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -42,17 +42,18 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/repl/repl_client_info.h"
-#include "mongo/db/s/config/sharding_catalog_manager.h"
+#include "mongo/db/s/dist_lock_manager.h"
 #include "mongo/db/server_options.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/catalog/type_database.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/move_primary_gen.h"
-#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
+// TODO (SERVER-54879): Remove this command entirely after 5.0 branches
 namespace mongo {
 namespace {
 
@@ -145,25 +146,25 @@ public:
         auto const catalogClient = Grid::get(opCtx)->catalogClient();
         auto const shardRegistry = Grid::get(opCtx)->shardRegistry();
 
-        auto dbDistLock = uassertStatusOK(catalogClient->getDistLockManager()->lock(
+        auto dbDistLock = uassertStatusOK(DistLockManager::get(opCtx)->lock(
             opCtx, dbname, "movePrimary", DistLockManager::kDefaultLockTimeout));
 
         auto dbType =
-            uassertStatusOK(catalogClient->getDatabase(
-                                opCtx, dbname, repl::ReadConcernArgs::get(opCtx).getLevel()))
-                .value;
-
+            catalogClient->getDatabase(opCtx, dbname, repl::ReadConcernArgs::get(opCtx).getLevel());
         const auto fromShard = uassertStatusOK(shardRegistry->getShard(opCtx, dbType.getPrimary()));
 
         const auto toShard = [&]() {
             auto toShardStatus = shardRegistry->getShard(opCtx, to);
             if (!toShardStatus.isOK()) {
-                log() << "Could not move database '" << dbname << "' to shard '" << to
-                      << causedBy(toShardStatus.getStatus());
-                uassertStatusOKWithContext(
-                    toShardStatus.getStatus(),
-                    str::stream() << "Could not move database '" << dbname << "' to shard '" << to
-                                  << "'");
+                LOGV2(21921,
+                      "Could not move database {db} to shard {shardId}: {error}",
+                      "Could not move database to shard",
+                      "db"_attr = dbname,
+                      "shardId"_attr = to,
+                      "error"_attr = toShardStatus.getStatus());
+                uassertStatusOKWithContext(toShardStatus.getStatus(),
+                                           str::stream() << "Could not move database '" << dbname
+                                                         << "' to shard '" << to << "'");
             }
 
             return toShardStatus.getValue();
@@ -181,7 +182,7 @@ public:
         }
 
         ShardMovePrimary shardMovePrimaryRequest;
-        shardMovePrimaryRequest.set_movePrimary(NamespaceString(dbname));
+        shardMovePrimaryRequest.set_shardsvrMovePrimary(NamespaceString(dbname));
         shardMovePrimaryRequest.setTo(toShard->getId().toString());
 
         auto cmdResponse = uassertStatusOK(fromShard->runCommandWithFixedRetryAttempts(
@@ -189,7 +190,7 @@ public:
             ReadPreferenceSetting(ReadPreference::PrimaryOnly),
             "admin",
             CommandHelpers::appendMajorityWriteConcern(
-                CommandHelpers::appendPassthroughFields(cmdObj, shardMovePrimaryRequest.toBSON())),
+                CommandHelpers::appendGenericCommandArgs(cmdObj, shardMovePrimaryRequest.toBSON())),
             Shard::RetryPolicy::kIdempotent));
 
         CommandHelpers::filterCommandReplyForPassthrough(cmdResponse.response, &result);

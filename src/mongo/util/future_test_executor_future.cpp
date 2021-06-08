@@ -37,42 +37,40 @@
 namespace mongo {
 namespace {
 TEST(Executor_Future, Success_getAsync) {
-    FUTURE_SUCCESS_TEST(
-        [] {},
-        [](/*Future<void>*/ auto&& fut) {
-            auto exec = InlineCountingExecutor::make();
-            auto pf = makePromiseFuture<void>();
-            ExecutorFuture<void>(exec).thenRunOn(exec).getAsync([outside = std::move(pf.promise)](
-                Status status) mutable {
-                ASSERT_OK(status);
-                outside.emplaceValue();
-            });
-            ASSERT_EQ(std::move(pf.future).getNoThrow(), Status::OK());
-            ASSERT_EQ(exec->tasksRun.load(), 1);
-        });
+    FUTURE_SUCCESS_TEST([] {},
+                        [](/*Future<void>*/ auto&& fut) {
+                            auto exec = InlineQueuedCountingExecutor::make();
+                            auto pf = makePromiseFuture<void>();
+                            ExecutorFuture<void>(exec).thenRunOn(exec).getAsync(
+                                [outside = std::move(pf.promise)](Status status) mutable {
+                                    ASSERT_OK(status);
+                                    outside.emplaceValue();
+                                });
+                            ASSERT_EQ(std::move(pf.future).getNoThrow(), Status::OK());
+                            ASSERT_EQ(exec->tasksRun.load(), 1);
+                        });
 }
 
 TEST(Executor_Future, Reject_getAsync) {
-    FUTURE_SUCCESS_TEST(
-        [] {},
-        [](/*Future<void>*/ auto&& fut) {
-            auto exec = RejectingExecutor::make();
-            auto pf = makePromiseFuture<void>();
-            std::move(fut).thenRunOn(exec).getAsync([promise = std::move(pf.promise)](
-                Status status) mutable {
-                promise.emplaceValue();  // shouldn't be run anyway.
-                FAIL("how did I run!?!?!");
-            });
+    FUTURE_SUCCESS_TEST([] {},
+                        [](/*Future<void>*/ auto&& fut) {
+                            auto exec = RejectingExecutor::make();
+                            auto pf = makePromiseFuture<void>();
+                            std::move(fut).thenRunOn(exec).getAsync(
+                                [promise = std::move(pf.promise)](Status status) mutable {
+                                    promise.emplaceValue();  // shouldn't be run anyway.
+                                    FAIL("how did I run!?!?!");
+                                });
 
-            // Promise is destroyed without calling the callback.
-            ASSERT_EQ(std::move(pf.future).getNoThrow(), ErrorCodes::BrokenPromise);
-        });
+                            // Promise is destroyed without calling the callback.
+                            ASSERT_EQ(std::move(pf.future).getNoThrow(), ErrorCodes::BrokenPromise);
+                        });
 }
 
 TEST(Executor_Future, Success_then) {
     FUTURE_SUCCESS_TEST([] {},
                         [](/*Future<void>*/ auto&& fut) {
-                            auto exec = InlineCountingExecutor::make();
+                            auto exec = InlineQueuedCountingExecutor::make();
                             ASSERT_EQ(std::move(fut).thenRunOn(exec).then([]() { return 3; }).get(),
                                       3);
                             ASSERT_EQ(exec->tasksRun.load(), 1);
@@ -95,7 +93,7 @@ TEST(Executor_Future, Reject_then) {
 
 TEST(Executor_Future, Fail_then) {
     FUTURE_FAIL_TEST<void>([](/*Future<void>*/ auto&& fut) {
-        auto exec = InlineCountingExecutor::make();
+        auto exec = InlineQueuedCountingExecutor::make();
         ASSERT_EQ(std::move(fut)
                       .thenRunOn(exec)
                       .then([]() {
@@ -111,7 +109,7 @@ TEST(Executor_Future, Fail_then) {
 TEST(Executor_Future, Success_onError) {
     FUTURE_SUCCESS_TEST([] { return 3; },
                         [](/*Future<int>*/ auto&& fut) {
-                            auto exec = InlineCountingExecutor::make();
+                            auto exec = InlineQueuedCountingExecutor::make();
                             ASSERT_EQ(std::move(fut)
                                           .thenRunOn(exec)
                                           .onError([](Status&&) {
@@ -126,7 +124,7 @@ TEST(Executor_Future, Success_onError) {
 
 TEST(Executor_Future, Fail_onErrorSimple) {
     FUTURE_FAIL_TEST<int>([](/*Future<int>*/ auto&& fut) {
-        auto exec = InlineCountingExecutor::make();
+        auto exec = InlineQueuedCountingExecutor::make();
         ASSERT_EQ(std::move(fut)
                       .thenRunOn(exec)
                       .onError([](Status s) {
@@ -141,7 +139,7 @@ TEST(Executor_Future, Fail_onErrorSimple) {
 
 TEST(Executor_Future, Fail_onErrorCode_OtherCode) {
     FUTURE_FAIL_TEST<void>([](/*Future<void>*/ auto&& fut) {
-        auto exec = InlineCountingExecutor::make();
+        auto exec = InlineQueuedCountingExecutor::make();
         ASSERT_EQ(
             std::move(fut)
                 .thenRunOn(exec)
@@ -155,7 +153,7 @@ TEST(Executor_Future, Fail_onErrorCode_OtherCode) {
 TEST(Executor_Future, Success_then_onError_onError_then) {
     FUTURE_SUCCESS_TEST([] {},
                         [](/*Future<void>*/ auto&& fut) {
-                            auto exec = InlineCountingExecutor::make();
+                            auto exec = InlineQueuedCountingExecutor::make();
                             ASSERT_EQ(
                                 std::move(fut)
                                     .thenRunOn(exec)
@@ -176,7 +174,7 @@ TEST(Executor_Future, Success_reject_recoverToFallback) {
     FUTURE_SUCCESS_TEST([] {},
                         [](/*Future<void>*/ auto&& fut) {
                             auto rejecter = RejectingExecutor::make();
-                            auto accepter = InlineCountingExecutor::make();
+                            auto accepter = InlineQueuedCountingExecutor::make();
 
                             auto res = std::move(fut)
                                            .thenRunOn(rejecter)

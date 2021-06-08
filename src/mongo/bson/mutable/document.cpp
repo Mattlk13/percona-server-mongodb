@@ -38,7 +38,6 @@
 #include <vector>
 
 #include "mongo/base/static_assert.h"
-#include "mongo/bson/inline_decls.h"
 #include "mongo/bson/mutable/damage_vector.h"
 #include "mongo/util/debug_util.h"
 
@@ -559,7 +558,7 @@ bool canAttach(const Element::RepIdx id, const ElementRep& rep) {
 
 // Returns a Status describing why 'canAttach' returned false. This function should not
 // be inlined since it just makes the callers larger for no real gain.
-NOINLINE_DECL Status getAttachmentError(const ElementRep& rep);
+MONGO_COMPILER_NOINLINE Status getAttachmentError(const ElementRep& rep);
 Status getAttachmentError(const ElementRep& rep) {
     if (rep.sibling.left != Element::kInvalidRepIdx)
         return Status(ErrorCodes::IllegalOperation, "dangling left sibling");
@@ -997,7 +996,7 @@ public:
         // inform upstream that we are not returning in-place result data.
         if (_inPlaceMode == Document::kInPlaceDisabled) {
             damages->clear();
-            *source = NULL;
+            *source = nullptr;
             if (size)
                 *size = 0;
             return false;
@@ -1077,7 +1076,7 @@ public:
     template <typename Builder>
     void writeElement(Element::RepIdx repIdx,
                       Builder* builder,
-                      const StringData* fieldName = NULL) const;
+                      const StringData* fieldName = nullptr) const;
 
     template <typename Builder>
     void writeChildren(Element::RepIdx repIdx, Builder* builder) const;
@@ -1698,6 +1697,14 @@ void Element::writeTo(BSONObjBuilder* const builder) const {
     }
 }
 
+void Element::writeChildrenTo(BSONObjBuilder* const builder) const {
+    invariant(ok());
+    const Document::Impl& impl = getDocument().getImpl();
+    const ElementRep& thisRep = impl.getElementRep(_repIdx);
+    invariant(impl.getType(thisRep) == mongo::Object);
+    impl.writeChildren(_repIdx, builder);
+}
+
 void Element::writeArrayTo(BSONArrayBuilder* const builder) const {
     invariant(ok());
     const Document::Impl& impl = getDocument().getImpl();
@@ -2270,14 +2277,14 @@ Document::Document(const BSONObj& value, InPlaceMode inPlaceMode)
 
 void Document::reset() {
     _impl->reset(Document::kInPlaceDisabled);
-    MONGO_COMPILER_VARIABLE_UNUSED const Element newRoot = makeRootElement();
+    [[maybe_unused]] const Element newRoot = makeRootElement();
     dassert(newRoot._repIdx == _root._repIdx);
     dassert(_root._repIdx == kRootRepIdx);
 }
 
 void Document::reset(const BSONObj& value, InPlaceMode inPlaceMode) {
     _impl->reset(inPlaceMode);
-    MONGO_COMPILER_VARIABLE_UNUSED const Element newRoot = makeRootElement(value);
+    [[maybe_unused]] const Element newRoot = makeRootElement(value);
     dassert(newRoot._repIdx == _root._repIdx);
     dassert(_root._repIdx == kRootRepIdx);
 }
@@ -2647,7 +2654,7 @@ Element Document::makeElementSafeNum(StringData fieldName, SafeNum value) {
 }
 
 Element Document::makeElement(ConstElement element) {
-    return makeElement(element, NULL);
+    return makeElement(element, nullptr);
 }
 
 Element Document::makeElementWithNewFieldName(StringData fieldName, ConstElement element) {

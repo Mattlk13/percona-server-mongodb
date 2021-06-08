@@ -42,8 +42,11 @@ namespace mongo {
  */
 class ShardId {
 public:
-    ShardId() = default;
+    static const ShardId kConfigServerId;
+
     ShardId(std::string shardId) : _shardId(std::move(shardId)) {}
+
+    ShardId() = default;
 
     operator StringData() const {
         return StringData(_shardId);
@@ -80,6 +83,14 @@ public:
     struct Hasher {
         std::size_t operator()(const ShardId&) const;
     };
+
+    /**
+     * Hash function compatible with absl::Hash for absl::unordered_{map,set}
+     */
+    template <typename H>
+    friend H AbslHashValue(H h, const ShardId& shardId) {
+        return H::combine(std::move(h), shardId.toString());
+    }
 
 private:
     std::string _shardId;

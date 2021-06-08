@@ -41,7 +41,7 @@ sys.path.append(os.getcwd())
 import packager  # pylint: disable=wrong-import-position
 
 # The MongoDB names for the architectures we support.
-ARCH_CHOICES = ["x86_64", "ppc64le", "s390x", "arm64"]
+ARCH_CHOICES = ["x86_64", "ppc64le", "s390x", "arm64", "aarch64"]
 
 # Made up names for the flavors of distribution we package for.
 DISTROS = ["suse", "debian", "redhat", "ubuntu", "amazon", "amazon2"]
@@ -52,7 +52,10 @@ class EnterpriseSpec(packager.Spec):
 
     def suffix(self):
         """Suffix."""
-        return "-enterprise" if int(self.ver.split(".")[1]) % 2 == 0 else "-enterprise-unstable"
+        if int(self.ver.split(".")[0]) >= 5:
+            return "-enterprise" if int(self.ver.split(".")[1]) == 0 else "-enterprise-unstable"
+        else:
+            return "-enterprise" if int(self.ver.split(".")[1]) % 2 == 0 else "-enterprise-unstable"
 
 
 class EnterpriseDistro(packager.Distro):
@@ -116,7 +119,7 @@ class EnterpriseDistro(packager.Distro):
     def build_os(self, arch):  # pylint: disable=too-many-branches
         """Return the build os label in the binary package to download.
 
-        The labels "rhel57", "rhel62", "rhel67" and "rhel70" are for redhat,
+        The labels "rhel57", "rhel62", "rhel67", "rhel70", "rhel80" are for redhat,
         the others are delegated to the super class.
         """
         # pylint: disable=too-many-return-statements
@@ -124,7 +127,7 @@ class EnterpriseDistro(packager.Distro):
             if self.dname == 'ubuntu':
                 return ["ubuntu1604", "ubuntu1804"]
             if self.dname == 'redhat':
-                return ["rhel71"]
+                return ["rhel71", "rhel81"]
             return []
         if arch == "s390x":
             if self.dname == 'redhat':
@@ -136,11 +139,16 @@ class EnterpriseDistro(packager.Distro):
             return []
         if arch == "arm64":
             if self.dname == 'ubuntu':
-                return ["ubuntu1604", "ubuntu1804"]
+                return ["ubuntu1804", "ubuntu2004"]
+        if arch == "aarch64":
+            if self.dname == 'redhat':
+                return ["rhel82"]
+            if self.dname == 'amazon2':
+                return ["amazon2"]
             return []
 
         if re.search("(redhat|fedora|centos)", self.dname):
-            return ["rhel70", "rhel62", "rhel57"]
+            return ["rhel80", "rhel70", "rhel62", "rhel57"]
         return super(EnterpriseDistro, self).build_os(arch)
         # pylint: enable=too-many-return-statements
 
@@ -220,7 +228,7 @@ def unpack_binaries_into(build_os, arch, spec, where):
     try:
         packager.sysassert(["tar", "xvzf", rootdir + "/" + tarfile(build_os, arch, spec)])
         release_dir = glob('mongodb-linux-*')[0]
-        for releasefile in "bin", "snmp", "LICENSE-Enterprise.txt", "README", "THIRD-PARTY-NOTICES", "THIRD-PARTY-NOTICES.gotools", "MPL-2":
+        for releasefile in "bin", "snmp", "LICENSE-Enterprise.txt", "README", "THIRD-PARTY-NOTICES", "MPL-2":
             os.rename("%s/%s" % (release_dir, releasefile), releasefile)
         os.rmdir(release_dir)
     except Exception:
@@ -253,10 +261,7 @@ def make_package(distro, build_os, arch, spec, srcdir):
     # packaging infrastructure will move the files to wherever they
     # need to go.
     unpack_binaries_into(build_os, arch, spec, sdir)
-    # Remove the mongoreplay binary due to libpcap dynamic
-    # linkage.
-    if os.path.exists(sdir + "bin/mongoreplay"):
-        os.unlink(sdir + "bin/mongoreplay")
+
     return distro.make_pkg(build_os, arch, spec, srcdir)
 
 

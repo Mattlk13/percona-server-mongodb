@@ -27,24 +27,24 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/scripting/mozjs/jsthread.h"
 
-#include "vm/PosixNSPR.h"
 #include <cstdio>
+#include <memory>
+#include <vm/PosixNSPR.h>
 
 #include "mongo/db/jsobj.h"
+#include "mongo/logv2/log.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/scripting/mozjs/implscope.h"
 #include "mongo/scripting/mozjs/valuereader.h"
 #include "mongo/scripting/mozjs/valuewriter.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
-#include "mongo/util/log.h"
 #include "mongo/util/stacktrace.h"
 
 namespace mongo {
@@ -106,24 +106,14 @@ public:
     void start() {
         uassert(ErrorCodes::JSInterpreterFailure, "Thread already started", !_started);
 
-        // Despite calling PR_CreateThread, we're actually using our own
-        // implementation of PosixNSPR.cpp in this directory. So these threads
-        // are actually hosted on top of stdx::threads and most of the flags
-        // don't matter.
-        _thread = PR_CreateThread(PR_USER_THREAD,
-                                  JSThread::run,
-                                  &_jsthread,
-                                  PR_PRIORITY_NORMAL,
-                                  PR_LOCAL_THREAD,
-                                  PR_JOINABLE_THREAD,
-                                  0);
+        _thread = stdx::thread(JSThread::run, &_jsthread);
         _started = true;
     }
 
     void join() {
         uassert(ErrorCodes::JSInterpreterFailure, "Thread not running", _started && !_done);
 
-        PR_JoinThread(_thread);
+        _thread.join();
         _done = true;
 
         uassertStatusOK(_sharedData->getErrorStatus());
@@ -160,12 +150,12 @@ private:
         SharedData() = default;
 
         void setErrorStatus(Status status) {
-            stdx::lock_guard<stdx::mutex> lck(_statusMutex);
+            stdx::lock_guard<Latch> lck(_statusMutex);
             _status = std::move(status);
         }
 
         Status getErrorStatus() {
-            stdx::lock_guard<stdx::mutex> lck(_statusMutex);
+            stdx::lock_guard<Latch> lck(_statusMutex);
             return _status;
         }
 
@@ -179,7 +169,7 @@ private:
         std::string _stack;
 
     private:
-        stdx::mutex _statusMutex;
+        Mutex _statusMutex = MONGO_MAKE_LATCH("SharedData::_statusMutex");
         Status _status = Status::OK();
     };
 
@@ -194,12 +184,16 @@ private:
             auto thisv = static_cast<JSThread*>(priv);
 
             try {
-                MozJSImplScope scope(static_cast<MozJSScriptEngine*>(getGlobalScriptEngine()));
+                MozJSImplScope scope(static_cast<MozJSScriptEngine*>(getGlobalScriptEngine()),
+                                     boost::none /* Don't override global jsHeapLimitMB */);
 
                 scope.setParentStack(thisv->_sharedData->_stack);
                 thisv->_sharedData->_returnData = scope.callThreadArgs(thisv->_sharedData->_args);
             } catch (...) {
                 auto status = exceptionToStatus();
+                LOGV2_WARNING(4988200,
+                              "JS Thread exiting after catching unhandled exception",
+                              "error"_attr = status);
                 thisv->_sharedData->setErrorStatus(status);
                 thisv->_sharedData->_returnData = BSON("ret" << BSONUndefined);
             }
@@ -211,7 +205,7 @@ private:
 
     bool _started;
     bool _done;
-    PRThread* _thread = nullptr;
+    stdx::thread _thread;
     std::shared_ptr<SharedData> _sharedData;
     JSThread _jsthread;
 };

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 #include "mongo/platform/basic.h"
 
@@ -38,8 +38,8 @@
 #include "mongo/client/read_preference.h"
 #include "mongo/client/replica_set_monitor.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/str.h"
 
@@ -52,23 +52,26 @@ RemoteCommandTargeterRS::RemoteCommandTargeterRS(const std::string& rsName,
     std::set<HostAndPort> seedServers(seedHosts.begin(), seedHosts.end());
     _rsMonitor = ReplicaSetMonitor::createIfNeeded(rsName, seedServers);
 
-    LOG(1) << "Started targeter for "
-           << ConnectionString::forReplicaSet(
-                  rsName, std::vector<HostAndPort>(seedServers.begin(), seedServers.end()));
+    LOGV2_DEBUG(20157,
+                1,
+                "Started targeter for {connectionString}",
+                "Started targeter",
+                "connectionString"_attr = ConnectionString::forReplicaSet(
+                    rsName, std::vector<HostAndPort>(seedServers.begin(), seedServers.end())));
 }
 
 ConnectionString RemoteCommandTargeterRS::connectionString() {
     return uassertStatusOK(ConnectionString::parse(_rsMonitor->getServerAddress()));
 }
 
-SemiFuture<HostAndPort> RemoteCommandTargeterRS::findHostWithMaxWait(
-    const ReadPreferenceSetting& readPref, Milliseconds maxWait) {
-    return _rsMonitor->getHostOrRefresh(readPref, maxWait);
+SemiFuture<HostAndPort> RemoteCommandTargeterRS::findHost(const ReadPreferenceSetting& readPref,
+                                                          const CancellationToken& cancelToken) {
+    return _rsMonitor->getHostOrRefresh(readPref, cancelToken);
 }
 
-SemiFuture<std::vector<HostAndPort>> RemoteCommandTargeterRS::findHostsWithMaxWait(
-    const ReadPreferenceSetting& readPref, Milliseconds maxWait) {
-    return _rsMonitor->getHostsOrRefresh(readPref, maxWait);
+SemiFuture<std::vector<HostAndPort>> RemoteCommandTargeterRS::findHosts(
+    const ReadPreferenceSetting& readPref, const CancellationToken& cancelToken) {
+    return _rsMonitor->getHostsOrRefresh(readPref, cancelToken);
 }
 
 StatusWith<HostAndPort> RemoteCommandTargeterRS::findHost(OperationContext* opCtx,
@@ -78,22 +81,31 @@ StatusWith<HostAndPort> RemoteCommandTargeterRS::findHost(OperationContext* opCt
         return interruptStatus;
     }
 
-    // Enforce a 20-second ceiling on the time spent looking for a host. This conforms with the
-    // behavior used throughout mongos prior to version 3.4, but is not fundamentally desirable.
-    // See comment in remote_command_targeter.h for details.
-    return _rsMonitor
-        ->getHostOrRefresh(readPref,
-                           std::min<Milliseconds>(opCtx->getRemainingMaxTimeMillis(), Seconds(20)))
-        .getNoThrow(opCtx);
+    bool maxTimeMsLesser =
+        (opCtx->getRemainingMaxTimeMillis() < ReplicaSetMonitorInterface::kDefaultFindHostTimeout);
+    auto swHostAndPort =
+        _rsMonitor->getHostOrRefresh(readPref, opCtx->getCancellationToken()).getNoThrow(opCtx);
+
+    if (maxTimeMsLesser && swHostAndPort.getStatus() == ErrorCodes::FailedToSatisfyReadPreference) {
+        return Status(ErrorCodes::MaxTimeMSExpired, "operation timed out");
+    }
+
+    return swHostAndPort;
 }
 
-void RemoteCommandTargeterRS::markHostNotMaster(const HostAndPort& host, const Status& status) {
+void RemoteCommandTargeterRS::markHostNotPrimary(const HostAndPort& host, const Status& status) {
     invariant(_rsMonitor);
 
     _rsMonitor->failedHost(host, status);
 }
 
 void RemoteCommandTargeterRS::markHostUnreachable(const HostAndPort& host, const Status& status) {
+    invariant(_rsMonitor);
+
+    _rsMonitor->failedHost(host, status);
+}
+
+void RemoteCommandTargeterRS::markHostShuttingDown(const HostAndPort& host, const Status& status) {
     invariant(_rsMonitor);
 
     _rsMonitor->failedHost(host, status);

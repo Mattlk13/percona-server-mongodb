@@ -4,13 +4,14 @@
  * @tags: [resource_intensive]
  */
 load('jstests/sharding/autosplit_include.js');
+load("jstests/sharding/libs/find_chunks_util.js");
 
 function shardSetup(shardConfig, dbName, collName) {
     var st = new ShardingTest(shardConfig);
     var db = st.getDB(dbName);
 
     // Set the balancer mode to only balance on autoSplit
-    assert.writeOK(st.s.getDB('config').settings.update(
+    assert.commandWorked(st.s.getDB('config').settings.update(
         {_id: 'balancer'},
         {'$unset': {stopped: ''}, '$set': {mode: 'autoSplitOnly'}},
         {writeConcern: {w: 'majority'}}));
@@ -20,11 +21,11 @@ function shardSetup(shardConfig, dbName, collName) {
 function getShardWithTopChunk(configDB, lowOrHigh, ns) {
     // lowOrHigh: 1 low "top chunk", -1 high "top chunk"
     print(ns);
-    print(configDB.chunks.count({"ns": ns}));
+    print(findChunksUtil.countChunksForNs(configDB, ns));
     print(configDB.chunks.count());
     print(JSON.stringify(configDB.chunks.findOne()));
     print(JSON.stringify(configDB.chunks.findOne({"ns": {$ne: "config.system.sessions"}})));
-    return configDB.chunks.find({"ns": ns}).sort({min: lowOrHigh}).limit(1).next().shard;
+    return findChunksUtil.findChunksByNs(configDB, ns).sort({min: lowOrHigh}).limit(1).next().shard;
 }
 
 function getNumberOfChunks(configDB) {
@@ -108,7 +109,7 @@ function runTest(test) {
         }
     }
 
-    assert.writeOK(configDB.tags.remove({ns: db + "." + collName}));
+    assert.commandWorked(configDB.tags.remove({ns: db + "." + collName}));
     // End of test cleanup
 }
 
@@ -157,119 +158,119 @@ var configDB = st.s.getDB('config');
 //            high - high shard key value
 var tests = [
     {
-      // Test auto-split on the "low" top chunk to another tagged shard
-      name: "low top chunk with tag move",
-      lowOrHigh: lowChunk,
-      movedToShard: st.rs2.name,
-      shards: [
-          {name: st.rs0.name, range: lowChunkRange, chunks: 20, tags: ["NYC"]},
-          {name: st.rs1.name, range: midChunkRange1, chunks: 20, tags: ["SF"]},
-          {name: st.rs2.name, range: highChunkRange, chunks: 5, tags: ["NYC"]},
-          {name: st.rs3.name, range: midChunkRange2, chunks: 1, tags: ["SF"]},
-      ],
-      tagRanges: [
-          {range: lowChunkTagRange, tag: "NYC"},
-          {range: highChunkTagRange, tag: "NYC"},
-          {range: midChunkRange1, tag: "SF"},
-          {range: midChunkRange2, tag: "SF"}
-      ],
-      inserts: lowChunkInserts
+        // Test auto-split on the "low" top chunk to another tagged shard
+        name: "low top chunk with tag move",
+        lowOrHigh: lowChunk,
+        movedToShard: st.rs2.name,
+        shards: [
+            {name: st.rs0.name, range: lowChunkRange, chunks: 20, tags: ["NYC"]},
+            {name: st.rs1.name, range: midChunkRange1, chunks: 20, tags: ["SF"]},
+            {name: st.rs2.name, range: highChunkRange, chunks: 5, tags: ["NYC"]},
+            {name: st.rs3.name, range: midChunkRange2, chunks: 1, tags: ["SF"]},
+        ],
+        tagRanges: [
+            {range: lowChunkTagRange, tag: "NYC"},
+            {range: highChunkTagRange, tag: "NYC"},
+            {range: midChunkRange1, tag: "SF"},
+            {range: midChunkRange2, tag: "SF"}
+        ],
+        inserts: lowChunkInserts
     },
     {
-      // Test auto-split on the "low" top chunk to same tagged shard
-      name: "low top chunk with tag no move",
-      lowOrHigh: lowChunk,
-      movedToShard: st.rs0.name,
-      shards: [
-          {name: st.rs0.name, range: lowChunkRange, chunks: 5, tags: ["NYC"]},
-          {name: st.rs1.name, range: midChunkRange1, chunks: 20, tags: ["SF"]},
-          {name: st.rs2.name, range: highChunkRange, chunks: 20, tags: ["NYC"]},
-          {name: st.rs3.name, range: midChunkRange2, chunks: 1, tags: ["SF"]},
-      ],
-      tagRanges: [
-          {range: lowChunkTagRange, tag: "NYC"},
-          {range: highChunkTagRange, tag: "NYC"},
-          {range: midChunkRange1, tag: "SF"},
-          {range: midChunkRange2, tag: "SF"}
-      ],
-      inserts: lowChunkInserts
+        // Test auto-split on the "low" top chunk to same tagged shard
+        name: "low top chunk with tag no move",
+        lowOrHigh: lowChunk,
+        movedToShard: st.rs0.name,
+        shards: [
+            {name: st.rs0.name, range: lowChunkRange, chunks: 5, tags: ["NYC"]},
+            {name: st.rs1.name, range: midChunkRange1, chunks: 20, tags: ["SF"]},
+            {name: st.rs2.name, range: highChunkRange, chunks: 20, tags: ["NYC"]},
+            {name: st.rs3.name, range: midChunkRange2, chunks: 1, tags: ["SF"]},
+        ],
+        tagRanges: [
+            {range: lowChunkTagRange, tag: "NYC"},
+            {range: highChunkTagRange, tag: "NYC"},
+            {range: midChunkRange1, tag: "SF"},
+            {range: midChunkRange2, tag: "SF"}
+        ],
+        inserts: lowChunkInserts
     },
     {
-      // Test auto-split on the "low" top chunk to another shard
-      name: "low top chunk no tag move",
-      lowOrHigh: lowChunk,
-      movedToShard: st.rs3.name,
-      shards: [
-          {name: st.rs0.name, range: lowChunkRange, chunks: 20},
-          {name: st.rs1.name, range: midChunkRange1, chunks: 20},
-          {name: st.rs2.name, range: highChunkRange, chunks: 5},
-          {name: st.rs3.name, range: midChunkRange2, chunks: 1}
-      ],
-      inserts: lowChunkInserts
+        // Test auto-split on the "low" top chunk to another shard
+        name: "low top chunk no tag move",
+        lowOrHigh: lowChunk,
+        movedToShard: st.rs3.name,
+        shards: [
+            {name: st.rs0.name, range: lowChunkRange, chunks: 20},
+            {name: st.rs1.name, range: midChunkRange1, chunks: 20},
+            {name: st.rs2.name, range: highChunkRange, chunks: 5},
+            {name: st.rs3.name, range: midChunkRange2, chunks: 1}
+        ],
+        inserts: lowChunkInserts
     },
     {
-      // Test auto-split on the "high" top chunk to another tagged shard
-      name: "high top chunk with tag move",
-      lowOrHigh: highChunk,
-      movedToShard: st.rs0.name,
-      shards: [
-          {name: st.rs0.name, range: lowChunkRange, chunks: 5, tags: ["NYC"]},
-          {name: st.rs1.name, range: midChunkRange1, chunks: 20, tags: ["SF"]},
-          {name: st.rs2.name, range: highChunkRange, chunks: 20, tags: ["NYC"]},
-          {name: st.rs3.name, range: midChunkRange2, chunks: 1, tags: ["SF"]}
-      ],
-      tagRanges: [
-          {range: lowChunkTagRange, tag: "NYC"},
-          {range: highChunkTagRange, tag: "NYC"},
-          {range: midChunkRange1, tag: "SF"},
-          {range: midChunkRange2, tag: "SF"}
-      ],
-      inserts: highChunkInserts
+        // Test auto-split on the "high" top chunk to another tagged shard
+        name: "high top chunk with tag move",
+        lowOrHigh: highChunk,
+        movedToShard: st.rs0.name,
+        shards: [
+            {name: st.rs0.name, range: lowChunkRange, chunks: 5, tags: ["NYC"]},
+            {name: st.rs1.name, range: midChunkRange1, chunks: 20, tags: ["SF"]},
+            {name: st.rs2.name, range: highChunkRange, chunks: 20, tags: ["NYC"]},
+            {name: st.rs3.name, range: midChunkRange2, chunks: 1, tags: ["SF"]}
+        ],
+        tagRanges: [
+            {range: lowChunkTagRange, tag: "NYC"},
+            {range: highChunkTagRange, tag: "NYC"},
+            {range: midChunkRange1, tag: "SF"},
+            {range: midChunkRange2, tag: "SF"}
+        ],
+        inserts: highChunkInserts
     },
     {
-      // Test auto-split on the "high" top chunk to another shard
-      name: "high top chunk no tag move",
-      lowOrHigh: highChunk,
-      movedToShard: st.rs3.name,
-      shards: [
-          {name: st.rs0.name, range: lowChunkRange, chunks: 5},
-          {name: st.rs1.name, range: midChunkRange1, chunks: 20},
-          {name: st.rs2.name, range: highChunkRange, chunks: 20},
-          {name: st.rs3.name, range: midChunkRange2, chunks: 1}
-      ],
-      inserts: highChunkInserts
+        // Test auto-split on the "high" top chunk to another shard
+        name: "high top chunk no tag move",
+        lowOrHigh: highChunk,
+        movedToShard: st.rs3.name,
+        shards: [
+            {name: st.rs0.name, range: lowChunkRange, chunks: 5},
+            {name: st.rs1.name, range: midChunkRange1, chunks: 20},
+            {name: st.rs2.name, range: highChunkRange, chunks: 20},
+            {name: st.rs3.name, range: midChunkRange2, chunks: 1}
+        ],
+        inserts: highChunkInserts
     },
     {
-      // Test auto-split on the "high" top chunk to same tagged shard
-      name: "high top chunk with tag no move",
-      lowOrHigh: highChunk,
-      movedToShard: st.rs2.name,
-      shards: [
-          {name: st.rs0.name, range: lowChunkRange, chunks: 20, tags: ["NYC"]},
-          {name: st.rs1.name, range: midChunkRange1, chunks: 20, tags: ["SF"]},
-          {name: st.rs2.name, range: highChunkRange, chunks: 5, tags: ["NYC"]},
-          {name: st.rs3.name, range: midChunkRange2, chunks: 1, tags: ["SF"]}
-      ],
-      tagRanges: [
-          {range: lowChunkTagRange, tag: "NYC"},
-          {range: highChunkTagRange, tag: "NYC"},
-          {range: midChunkRange1, tag: "SF"},
-          {range: midChunkRange2, tag: "SF"}
-      ],
-      inserts: highChunkInserts
+        // Test auto-split on the "high" top chunk to same tagged shard
+        name: "high top chunk with tag no move",
+        lowOrHigh: highChunk,
+        movedToShard: st.rs2.name,
+        shards: [
+            {name: st.rs0.name, range: lowChunkRange, chunks: 20, tags: ["NYC"]},
+            {name: st.rs1.name, range: midChunkRange1, chunks: 20, tags: ["SF"]},
+            {name: st.rs2.name, range: highChunkRange, chunks: 5, tags: ["NYC"]},
+            {name: st.rs3.name, range: midChunkRange2, chunks: 1, tags: ["SF"]}
+        ],
+        tagRanges: [
+            {range: lowChunkTagRange, tag: "NYC"},
+            {range: highChunkTagRange, tag: "NYC"},
+            {range: midChunkRange1, tag: "SF"},
+            {range: midChunkRange2, tag: "SF"}
+        ],
+        inserts: highChunkInserts
     },
     {
-      // Test auto-split on the "high" top chunk to same shard
-      name: "high top chunk no tag no move",
-      lowOrHigh: highChunk,
-      movedToShard: st.rs2.name,
-      shards: [
-          {name: st.rs0.name, range: lowChunkRange, chunks: 20},
-          {name: st.rs1.name, range: midChunkRange1, chunks: 20},
-          {name: st.rs2.name, range: highChunkRange, chunks: 1},
-          {name: st.rs3.name, range: midChunkRange2, chunks: 5}
-      ],
-      inserts: highChunkInserts
+        // Test auto-split on the "high" top chunk to same shard
+        name: "high top chunk no tag no move",
+        lowOrHigh: highChunk,
+        movedToShard: st.rs2.name,
+        shards: [
+            {name: st.rs0.name, range: lowChunkRange, chunks: 20},
+            {name: st.rs1.name, range: midChunkRange1, chunks: 20},
+            {name: st.rs2.name, range: highChunkRange, chunks: 1},
+            {name: st.rs3.name, range: midChunkRange2, chunks: 5}
+        ],
+        inserts: highChunkInserts
     },
 ];
 
@@ -296,20 +297,20 @@ st.ensurePrimaryShard(dbName, st.rs0.name);
 
 var singleNodeTests = [
     {
-      // Test auto-split on the "low" top chunk on single node shard
-      name: "single node shard - low top chunk",
-      lowOrHigh: lowChunk,
-      movedToShard: st.rs0.name,
-      shards: [{name: st.rs0.name, range: lowChunkRange, chunks: 2}],
-      inserts: lowChunkInserts
+        // Test auto-split on the "low" top chunk on single node shard
+        name: "single node shard - low top chunk",
+        lowOrHigh: lowChunk,
+        movedToShard: st.rs0.name,
+        shards: [{name: st.rs0.name, range: lowChunkRange, chunks: 2}],
+        inserts: lowChunkInserts
     },
     {
-      // Test auto-split on the "high" top chunk on single node shard
-      name: "single node shard - high top chunk",
-      lowOrHigh: highChunk,
-      movedToShard: st.rs0.name,
-      shards: [{name: st.rs0.name, range: highChunkRange, chunks: 2}],
-      inserts: highChunkInserts
+        // Test auto-split on the "high" top chunk on single node shard
+        name: "single node shard - high top chunk",
+        lowOrHigh: highChunk,
+        movedToShard: st.rs0.name,
+        shards: [{name: st.rs0.name, range: highChunkRange, chunks: 2}],
+        inserts: highChunkInserts
     },
 ];
 
@@ -336,26 +337,26 @@ configDB = st.s.getDB('config');
 
 var maxSizeTests = [
     {
-      // Test auto-split on the "low" top chunk with maxSize on destination shard
-      name: "maxSize - low top chunk",
-      lowOrHigh: lowChunk,
-      movedToShard: st.rs0.name,
-      shards: [
-          {name: st.rs0.name, range: lowChunkRange, chunks: 10},
-          {name: st.rs1.name, range: highChunkRange, chunks: 1}
-      ],
-      inserts: lowChunkInserts
+        // Test auto-split on the "low" top chunk with maxSize on destination shard
+        name: "maxSize - low top chunk",
+        lowOrHigh: lowChunk,
+        movedToShard: st.rs0.name,
+        shards: [
+            {name: st.rs0.name, range: lowChunkRange, chunks: 10},
+            {name: st.rs1.name, range: highChunkRange, chunks: 1}
+        ],
+        inserts: lowChunkInserts
     },
     {
-      // Test auto-split on the "high" top chunk with maxSize on destination shard
-      name: "maxSize - high top chunk",
-      lowOrHigh: highChunk,
-      movedToShard: st.rs0.name,
-      shards: [
-          {name: st.rs0.name, range: highChunkRange, chunks: 10},
-          {name: st.rs1.name, range: lowChunkRange, chunks: 1}
-      ],
-      inserts: highChunkInserts
+        // Test auto-split on the "high" top chunk with maxSize on destination shard
+        name: "maxSize - high top chunk",
+        lowOrHigh: highChunk,
+        movedToShard: st.rs0.name,
+        shards: [
+            {name: st.rs0.name, range: highChunkRange, chunks: 10},
+            {name: st.rs1.name, range: lowChunkRange, chunks: 1}
+        ],
+        inserts: highChunkInserts
     },
 ];
 

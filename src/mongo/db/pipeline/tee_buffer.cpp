@@ -33,7 +33,7 @@
 
 #include <algorithm>
 
-#include "mongo/db/pipeline/document.h"
+#include "mongo/db/exec/document_value/document.h"
 
 namespace mongo {
 
@@ -94,7 +94,7 @@ void TeeBuffer::loadNextBatch() {
     //   - TeeBuffer is the only place where a paused GetNextReturn will be returned.
     //   - The $facet stage is the only stage that uses TeeBuffer.
     //   - We currently disallow nested $facet stages.
-    invariant(!input.isPaused());
+    invariant(!input.isPaused());  // NOLINT(bugprone-use-after-move)
 
     // Populate the pending returns.
     for (size_t consumerId = 0; consumerId < _consumers.size(); ++consumerId) {

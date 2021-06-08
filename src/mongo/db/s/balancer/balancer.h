@@ -29,11 +29,12 @@
 
 #pragma once
 
+#include "mongo/db/repl/replica_set_aware_service.h"
 #include "mongo/db/s/balancer/balancer_chunk_selection_policy.h"
 #include "mongo/db/s/balancer/balancer_random.h"
 #include "mongo/db/s/balancer/migration_manager.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
 
 namespace mongo {
@@ -53,25 +54,19 @@ class Status;
  * there is an imbalance by checking the difference in chunks between the most and least
  * loaded shards. It would issue a request for a chunk migration per round, if it found so.
  */
-class Balancer {
+class Balancer : public ReplicaSetAwareServiceConfigSvr<Balancer> {
     Balancer(const Balancer&) = delete;
     Balancer& operator=(const Balancer&) = delete;
 
 public:
-    Balancer(ServiceContext* serviceContext);
-    ~Balancer();
-
     /**
-     * Instantiates an instance of the balancer and installs it on the specified service context.
-     * This method is not thread-safe and must be called only once when the service is starting.
-     */
-    static void create(ServiceContext* serviceContext);
-
-    /**
-     * Retrieves the per-service instance of the Balancer.
+     * Provide access to the Balancer decoration on ServiceContext.
      */
     static Balancer* get(ServiceContext* serviceContext);
     static Balancer* get(OperationContext* operationContext);
+
+    Balancer();
+    ~Balancer();
 
     /**
      * Invoked when the config server primary enters the 'PRIMARY' state and is invoked while the
@@ -136,7 +131,8 @@ public:
                            const ShardId& newShardId,
                            uint64_t maxChunkSizeBytes,
                            const MigrationSecondaryThrottleOptions& secondaryThrottle,
-                           bool waitForDelete);
+                           bool waitForDelete,
+                           bool forceJumbo);
 
     /**
      * Appends the runtime state of the balancer instance to the specified builder.
@@ -148,15 +144,35 @@ public:
      */
     void notifyPersistedBalancerSettingsChanged();
 
+    struct BalancerStatus {
+        bool balancerCompliant;
+        boost::optional<std::string> firstComplianceViolation;
+    };
+    /**
+     * Returns if a given collection is draining due to a removed shard, has chunks on an invalid
+     * zone or the number of chunks is imbalanced across the cluster
+     */
+    BalancerStatus getBalancerStatusForNs(OperationContext* opCtx, const NamespaceString& nss);
+
 private:
     /**
      * Possible runtime states of the balancer. The comments indicate the allowed next state.
      */
     enum State {
         kStopped,   // kRunning
-        kRunning,   // kStopping
+        kRunning,   // kStopping | kStopped
         kStopping,  // kStopped
     };
+
+    /**
+     * ReplicaSetAwareService entry points.
+     */
+    void onStartup(OperationContext* opCtx) final {}
+    void onShutdown() final {}
+    void onStepUpBegin(OperationContext* opCtx, long long term) final;
+    void onStepUpComplete(OperationContext* opCtx, long long term) final;
+    void onStepDown() final;
+    void onBecomeArbiter() final;
 
     /**
      * The main balancer loop, which runs in a separate thread.
@@ -172,13 +188,13 @@ private:
      * Signals the beginning and end of a balancing round.
      */
     void _beginRound(OperationContext* opCtx);
-    void _endRound(OperationContext* opCtx, Seconds waitTimeout);
+    void _endRound(OperationContext* opCtx, Milliseconds waitTimeout);
 
     /**
      * Blocks the caller for the specified timeout or until the balancer condition variable is
      * signaled, whichever comes first.
      */
-    void _sleepFor(OperationContext* opCtx, Seconds waitTimeout);
+    void _sleepFor(OperationContext* opCtx, Milliseconds waitTimeout);
 
     /**
      * Returns true if all the servers listed in configdb as being shards are reachable and are
@@ -187,10 +203,15 @@ private:
     bool _checkOIDs(OperationContext* opCtx);
 
     /**
-     * Iterates through all chunks in all collections and ensures that no chunks straddle tag
-     * boundary. If any do, they will be split.
+     * Iterates through all chunks in all collections. If the collection is the sessions collection,
+     * checks if the number of chunks is greater than or equal to the configured minimum number of
+     * chunks for the sessions collection (minNumChunksForSessionsCollection). If it isn't,
+     * calculates split points that evenly partition the key space into N ranges (where N is
+     * minNumChunksForSessionsCollection rounded up the next power of 2), and splits any chunks that
+     * straddle those split points. If the collection is any other collection, splits any chunks
+     * that straddle tag boundaries.
      */
-    Status _enforceTagRanges(OperationContext* opCtx);
+    Status _splitChunksIfNeeded(OperationContext* opCtx);
 
     /**
      * Schedules migrations for the specified set of chunks and returns how many chunks were
@@ -199,22 +220,15 @@ private:
     int _moveChunks(OperationContext* opCtx,
                     const BalancerChunkSelectionPolicy::MigrateInfoVector& candidateChunks);
 
-    /**
-     * Performs a split on the chunk with min value "minKey". If the split fails, it is marked as
-     * jumbo.
-     */
-    void _splitOrMarkJumbo(OperationContext* opCtx,
-                           const NamespaceString& nss,
-                           const BSONObj& minKey);
-
     // Protects the state below
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH("Balancer::_mutex");
 
     // Indicates the current state of the balancer
     State _state{kStopped};
 
     // The main balancer thread
     stdx::thread _thread;
+    stdx::condition_variable _joinCond;
 
     // The operation context of the main balancer thread. This value may only be available in the
     // kRunning state and is used to force interrupt of any blocking calls made by the balancer

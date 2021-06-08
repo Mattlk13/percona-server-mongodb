@@ -29,9 +29,11 @@
 
 #pragma once
 
+#include <boost/optional.hpp>
+#include <memory>
+
 #include "mongo/db/matcher/expression_array.h"
 #include "mongo/db/matcher/expression_with_placeholder.h"
-#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
@@ -43,7 +45,10 @@ public:
     static constexpr StringData kName = "$_internalSchemaMatchArrayIndex"_sd;
 
     InternalSchemaMatchArrayIndexMatchExpression(
-        StringData path, long long index, std::unique_ptr<ExpressionWithPlaceholder> expression);
+        StringData path,
+        long long index,
+        std::unique_ptr<ExpressionWithPlaceholder> expression,
+        clonable_ptr<ErrorAnnotation> annotation = nullptr);
 
     void debugString(StringBuilder& debug, int indentationLevel) const final;
 
@@ -72,7 +77,7 @@ public:
 
     std::unique_ptr<MatchExpression> shallowClone() const final;
 
-    std::vector<MatchExpression*>* getChildVector() final {
+    std::vector<std::unique_ptr<MatchExpression>>* getChildVector() final {
         return nullptr;
     }
 
@@ -83,6 +88,20 @@ public:
     MatchExpression* getChild(size_t i) const final {
         invariant(i == 0);
         return _expression->getFilter();
+    }
+
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    /**
+     * Returns an index of an array element this expression applies to.
+     */
+    long long arrayIndex() const {
+        return _index;
     }
 
 private:

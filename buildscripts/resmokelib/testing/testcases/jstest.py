@@ -1,15 +1,19 @@
 """The unittest.TestCase for JavaScript tests."""
 
+import copy
 import os
 import os.path
 import sys
+import shutil
 import threading
 
-from . import interface
-from ... import config
-from ... import core
-from ... import utils
-from ...utils import registry
+from buildscripts.resmokelib import config
+from buildscripts.resmokelib import core
+from buildscripts.resmokelib import logging
+from buildscripts.resmokelib import utils
+from buildscripts.resmokelib import errors
+from buildscripts.resmokelib.testing.testcases import interface
+from buildscripts.resmokelib.utils import registry
 
 
 class _SingleJSTestCase(interface.ProcessTestCase):
@@ -17,15 +21,15 @@ class _SingleJSTestCase(interface.ProcessTestCase):
 
     REGISTERED_NAME = registry.LEAVE_UNREGISTERED
 
-    def __init__(self, logger, js_filename, shell_executable=None, shell_options=None):
+    def __init__(self, logger, js_filename, test_id, shell_executable=None, shell_options=None):  # pylint: disable=too-many-arguments
         """Initialize the _SingleJSTestCase with the JS file to run."""
-
         interface.ProcessTestCase.__init__(self, logger, "JSTest", js_filename)
 
         # Command line options override the YAML configuration.
         self.shell_executable = utils.default_if_none(config.MONGO_EXECUTABLE, shell_executable)
 
         self.js_filename = js_filename
+        self.test_id = test_id
         self.shell_options = utils.default_if_none(shell_options, {}).copy()
 
     def configure(self, fixture, *args, **kwargs):
@@ -52,27 +56,17 @@ class _SingleJSTestCase(interface.ProcessTestCase):
         global_vars["MongoRunner.dataDir"] = data_dir
         global_vars["MongoRunner.dataPath"] = data_path
 
-        # Don't set the path to the mongod and mongos executables when the user didn't specify them
-        # via the command line. The functions in the mongo shell for spawning processes have their
-        # own logic for determining the default path to use.
-        if config.MONGOD_EXECUTABLE is not None:
-            global_vars["MongoRunner.mongodPath"] = config.MONGOD_EXECUTABLE
-        if config.MONGOS_EXECUTABLE is not None:
-            global_vars["MongoRunner.mongosPath"] = config.MONGOS_EXECUTABLE
-        # We provide an absolute path for mongo shell to ensure that programs starting their own
-        # mongo shell will use the same as specified from resmoke.py.
-        global_vars["MongoRunner.mongoShellPath"] = os.path.abspath(
-            utils.default_if_none(self.shell_executable, config.DEFAULT_MONGO_EXECUTABLE))
-
         test_data = global_vars.get("TestData", {}).copy()
         test_data["minPort"] = core.network.PortAllocator.min_test_port(self.fixture.job_num)
         test_data["maxPort"] = core.network.PortAllocator.max_test_port(self.fixture.job_num)
+        test_data["peerPids"] = self.fixture.pids()
+        test_data["alwaysUseLogFiles"] = config.ALWAYS_USE_LOG_FILES
         test_data["failIfUnterminatedProcesses"] = True
 
         global_vars["TestData"] = test_data
         self.shell_options["global_vars"] = global_vars
 
-        utils.rmtree(data_dir, ignore_errors=True)
+        shutil.rmtree(data_dir, ignore_errors=True)
 
         try:
             os.makedirs(data_dir)
@@ -80,7 +74,7 @@ class _SingleJSTestCase(interface.ProcessTestCase):
             # Directory already exists.
             pass
 
-        process_kwargs = self.shell_options.get("process_kwargs", {}).copy()
+        process_kwargs = copy.deepcopy(self.shell_options.get("process_kwargs", {}))
 
         if process_kwargs \
             and "env_vars" in process_kwargs \
@@ -109,7 +103,8 @@ class _SingleJSTestCase(interface.ProcessTestCase):
 
     def _make_process(self):
         return core.programs.mongo_shell_program(
-            self.logger, executable=self.shell_executable, filename=self.js_filename,
+            self.logger, self.fixture.job_num, test_id=self.test_id,
+            executable=self.shell_executable, filename=self.js_filename,
             connection_string=self.fixture.get_driver_connection_url(), **self.shell_options)
 
 
@@ -140,7 +135,7 @@ class JSTestCase(interface.ProcessTestCase):
 
         interface.ProcessTestCase.__init__(self, logger, "JSTest", js_filename)
         self.num_clients = JSTestCase.DEFAULT_CLIENT_NUM
-        self.test_case_template = _SingleJSTestCase(logger, js_filename, shell_executable,
+        self.test_case_template = _SingleJSTestCase(logger, js_filename, self._id, shell_executable,
                                                     shell_options)
 
     def configure(  # pylint: disable=arguments-differ,keyword-arg-before-vararg
@@ -180,7 +175,7 @@ class JSTestCase(interface.ProcessTestCase):
         """Create and configure a _SingleJSTestCase to be run in a separate thread."""
 
         shell_options = self._get_shell_options_for_thread(thread_id)
-        test_case = _SingleJSTestCase(logger, self.test_case_template.js_filename,
+        test_case = _SingleJSTestCase(logger, self.test_case_template.js_filename, self._id,
                                       self.test_case_template.shell_executable, shell_options)
 
         test_case.configure(self.fixture)
@@ -193,6 +188,7 @@ class JSTestCase(interface.ProcessTestCase):
             # If there was an exception, it will be logged in test_case's run_test function.
         finally:
             self.return_code = test_case.return_code
+            self._raise_if_unsafe_exit(self.return_code)
 
     def _run_multiple_copies(self):
         threads = []
@@ -200,7 +196,8 @@ class JSTestCase(interface.ProcessTestCase):
         try:
             # If there are multiple clients, make a new thread for each client.
             for thread_id in range(self.num_clients):
-                logger = self.logger.new_test_thread_logger(self.test_kind, str(thread_id))
+                logger = logging.loggers.new_test_thread_logger(self.logger, self.test_kind,
+                                                                str(thread_id))
                 test_case = self._create_test_case_for_thread(logger, thread_id)
                 test_cases.append(test_case)
 
@@ -215,12 +212,12 @@ class JSTestCase(interface.ProcessTestCase):
             for thread in threads:
                 thread.join()
 
-            # Go through each test's return code and store the first nonzero one if it exists.
+            # Go through each test's return codes, asserting safe exits and storing the last nonzero code.
             return_code = 0
             for test_case in test_cases:
                 if test_case.return_code != 0:
+                    self._raise_if_unsafe_exit(return_code)
                     return_code = test_case.return_code
-                    break
             self.return_code = return_code
 
             for (thread_id, thread) in enumerate(threads):
@@ -237,3 +234,13 @@ class JSTestCase(interface.ProcessTestCase):
             self._run_single_copy()
         else:
             self._run_multiple_copies()
+
+    def _raise_if_unsafe_exit(self, return_code):
+        """Determine if a return code represents and unsafe exit."""
+        # 252 and 253 may be returned in failed test executions.
+        # (i.e. -4 and -3 in mongo_main.cpp)
+        if self.return_code not in (252, 253, 0):
+            self.propagate_error = errors.UnsafeExitError(
+                f"Mongo shell exited with code {return_code} while running jstest {self.basename()}."
+                " Further test execution may be unsafe.")
+            raise self.propagate_error  # pylint: disable=raising-bad-type

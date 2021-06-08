@@ -27,23 +27,22 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/s/commands/cluster_command_test_fixture.h"
 
 #include "mongo/db/commands.h"
-#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/commands/txn_cmds_gen.h"
 #include "mongo/db/keys_collection_client_sharded.h"
 #include "mongo/db/keys_collection_manager.h"
-#include "mongo/db/logical_clock.h"
 #include "mongo/db/logical_session_cache_noop.h"
 #include "mongo/db/logical_time_validator.h"
+#include "mongo/db/vector_clock.h"
 #include "mongo/s/cluster_last_error_info.h"
-#include "mongo/util/fail_point_service.h"
-#include "mongo/util/log.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/options_parser/startup_option_init.h"
 #include "mongo/util/tick_source_mock.h"
 
 namespace mongo {
@@ -52,30 +51,28 @@ void ClusterCommandTestFixture::setUp() {
     CatalogCacheTestFixture::setUp();
     CatalogCacheTestFixture::setupNShards(numShards);
 
-    // Set up a logical clock with an initial time.
-    auto logicalClock = stdx::make_unique<LogicalClock>(getServiceContext());
-    logicalClock->setClusterTimeFromTrustedSource(kInMemoryLogicalTime);
-    LogicalClock::set(getServiceContext(), std::move(logicalClock));
+    // Set the initial clusterTime.
+    VectorClock::get(getServiceContext())->advanceClusterTime_forTest(kInMemoryLogicalTime);
 
-    auto keysCollectionClient = stdx::make_unique<KeysCollectionClientSharded>(
+    auto keysCollectionClient = std::make_unique<KeysCollectionClientSharded>(
         Grid::get(operationContext())->catalogClient());
 
     auto keyManager = std::make_shared<KeysCollectionManager>(
         "dummy", std::move(keysCollectionClient), Seconds(KeysRotationIntervalSec));
 
-    auto validator = stdx::make_unique<LogicalTimeValidator>(keyManager);
+    auto validator = std::make_unique<LogicalTimeValidator>(keyManager);
     LogicalTimeValidator::set(getServiceContext(), std::move(validator));
 
-    LogicalSessionCache::set(getServiceContext(), stdx::make_unique<LogicalSessionCacheNoop>());
+    LogicalSessionCache::set(getServiceContext(), std::make_unique<LogicalSessionCacheNoop>());
 
     // Set up a tick source for transaction metrics.
-    auto tickSource = stdx::make_unique<TickSourceMock<Microseconds>>();
+    auto tickSource = std::make_unique<TickSourceMock<Microseconds>>();
     tickSource->reset(1);
     getServiceContext()->setTickSource(std::move(tickSource));
 
     loadRoutingTableWithTwoChunksAndTwoShards(kNss);
 
-    _staleVersionAndSnapshotRetriesBlock = stdx::make_unique<FailPointEnableBlock>(
+    _staleVersionAndSnapshotRetriesBlock = std::make_unique<FailPointEnableBlock>(
         "enableStaleVersionAndSnapshotRetriesWithinTransactions");
 }
 
@@ -106,9 +103,22 @@ void ClusterCommandTestFixture::expectReturnsError(ErrorCodes::Error code) {
 }
 
 DbResponse ClusterCommandTestFixture::runCommand(BSONObj cmd) {
+    // TODO SERVER-48142 should remove the following fail-point usage.
+    // Skip appending required fields in unit-tests
+    FailPointEnableBlock skipAppendingReqFields("allowSkippingAppendRequiredFieldsToResponse");
+
     // Create a new client/operation context per command
     auto client = getServiceContext()->makeClient("ClusterCmdClient");
     auto opCtx = client->makeOperationContext();
+
+    {
+        // Have the new client use the dedicated threading model. This ensures the synchronous
+        // execution of the command by the client thread.
+        stdx::lock_guard lk(*client.get());
+        auto seCtx = transport::ServiceExecutorContext{};
+        seCtx.setThreadingModel(transport::ServiceExecutor::ThreadingModel::kDedicated);
+        transport::ServiceExecutorContext::set(client.get(), std::move(seCtx));
+    }
 
     const auto opMsgRequest = OpMsgRequest::fromDBAndBody(kNss.db(), cmd);
 
@@ -121,13 +131,15 @@ DbResponse ClusterCommandTestFixture::runCommand(BSONObj cmd) {
     auto clusterGLE = ClusterLastErrorInfo::get(client.get());
     clusterGLE->newRequest();
 
-    return Strategy::clientCommand(opCtx.get(), opMsgRequest.serialize());
+    AlternativeClientRegion acr(client);
+    auto rec = std::make_shared<RequestExecutionContext>(opCtx.get(), opMsgRequest.serialize());
+    return Strategy::clientCommand(std::move(rec)).get();
 }
 
-void ClusterCommandTestFixture::runCommandSuccessful(BSONObj cmd, bool isTargeted) {
+DbResponse ClusterCommandTestFixture::runCommandSuccessful(BSONObj cmd, bool isTargeted) {
     auto future = launchAsync([&] {
         // Shouldn't throw.
-        runCommand(cmd);
+        return runCommand(cmd);
     });
 
     size_t numMocks = isTargeted ? 1 : numShards;
@@ -135,7 +147,7 @@ void ClusterCommandTestFixture::runCommandSuccessful(BSONObj cmd, bool isTargete
         expectReturnsSuccess(i % numShards);
     }
 
-    future.default_timed_get();
+    return future.default_timed_get();
 }
 
 void ClusterCommandTestFixture::runTxnCommandOneError(BSONObj cmd,
@@ -304,5 +316,8 @@ void ClusterCommandTestFixture::appendTxnResponseMetadata(BSONObjBuilder& bob) {
     TxnResponseMetadata txnResponseMetadata(false);
     txnResponseMetadata.serialize(&bob);
 }
+
+// Satisfies dependency from StoreSASLOPtions.
+MONGO_STARTUP_OPTIONS_STORE(CoreOptions)(InitializerContext*) {}
 
 }  // namespace mongo

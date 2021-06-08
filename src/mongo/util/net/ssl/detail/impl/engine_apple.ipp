@@ -30,7 +30,7 @@
 
 #pragma once
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 #include "asio/detail/config.hpp"
 
@@ -38,7 +38,9 @@
 #include "asio/detail/throw_error.hpp"
 #include "asio/error.hpp"
 
-#include "mongo/util/log.h"
+#include <arpa/inet.h>
+
+#include "mongo/logv2/log.h"
 #include "mongo/util/net/ssl/apple.hpp"
 #include "mongo/util/net/ssl/detail/engine.hpp"
 #include "mongo/util/net/ssl/detail/stream_core.hpp"
@@ -63,16 +65,16 @@ public:
         const auto status = static_cast<::OSStatus>(value);
         apple::CFUniquePtr<::CFStringRef> errstr(::SecCopyErrorMessageString(status, nullptr));
         if (!errstr) {
-            return mongo::str::stream() << "Secure.Transport unknown error: "
-                                        << static_cast<int>(status);
+            return mongo::str::stream()
+                << "Secure.Transport unknown error: " << static_cast<int>(status);
         }
         const auto len = ::CFStringGetMaximumSizeForEncoding(::CFStringGetLength(errstr.get()),
                                                              ::kCFStringEncodingUTF8);
         std::string ret;
         ret.resize(len + 1);
         if (!::CFStringGetCString(errstr.get(), &ret[0], len, ::kCFStringEncodingUTF8)) {
-            return mongo::str::stream() << "Secure.Transport unknown error: "
-                                        << static_cast<int>(status);
+            return mongo::str::stream()
+                << "Secure.Transport unknown error: " << static_cast<int>(status);
         }
 
         ret.resize(strlen(ret.c_str()));
@@ -129,9 +131,6 @@ engine::engine(context::native_handle_type context, const std::string& remoteHos
         }
         _protoMin = context->protoMin;
         _protoMax = context->protoMax;
-        if (context->allowInvalidHostnames) {
-            _remoteHostName.clear();
-        }
     } else {
         apple::Context def;
         _protoMin = def.protoMin;
@@ -147,7 +146,7 @@ bool engine::_initSSL(stream_base::handshake_type type, asio::error_code& ec) {
     const auto side = (type == stream_base::client) ? ::kSSLClientSide : ::kSSLServerSide;
     _ssl.reset(::SSLCreateContext(nullptr, side, ::kSSLStreamType));
     if (!_ssl) {
-        mongo::error() << "Failed allocating SSLContext";
+        LOGV2_ERROR(24140, "Failed allocating SSLContext");
         ec = errorCode(::errSSLInternal);
         return false;
     }
@@ -243,7 +242,7 @@ engine::want engine::shutdown(asio::error_code& ec) {
             ec = errorCode(status);
         }
     } else {
-        mongo::error() << "SSL connection already shut down";
+        LOGV2_ERROR(24141, "SSL connection already shut down");
         ec = errorCode(::errSSLInternal);
     }
     return want::want_nothing;
@@ -311,6 +310,38 @@ asio::mutable_buffer engine::get_output(const asio::mutable_buffer& data) {
     *data_len = std::min<size_t>(requested, max_outbuf_size - this_->_outbuf.size());
     this_->_outbuf.insert(this_->_outbuf.end(), p, p + *data_len);
     return (requested == *data_len) ? ::errSecSuccess : ::errSSLWouldBlock;
+}
+
+boost::optional<std::string> engine::get_sni() {
+    if (_sni) {
+        return _sni;
+    }
+
+    size_t len = 0;
+    auto status = ::SSLCopyRequestedPeerNameLength(_ssl.get(), &len);
+    if (status != ::errSecSuccess) {
+        _sni = boost::none;
+        return _sni;
+    }
+
+    std::string sni;
+    sni.resize(len + 1);
+    status = ::SSLCopyRequestedPeerName(_ssl.get(), sni.data(), &len);
+    if (status != ::errSecSuccess) {
+        _sni = boost::none;
+        return _sni;
+    }
+
+    sni.resize(len);
+
+    // ::SSLCopyRequestedPeerName includes space for a null byte at the end of the string it writes.
+    // We do not want to include this null byte in the advertised SNI name
+    while (!sni.empty() && sni.back() == '\0') {
+        sni.pop_back();
+    }
+
+    _sni = sni;
+    return _sni;
 }
 
 engine::want engine::read(const asio::mutable_buffer& data,

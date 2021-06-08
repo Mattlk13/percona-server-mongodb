@@ -27,14 +27,15 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
-
 #include "mongo/platform/basic.h"
 
 #include "mongo/config.h"
 #include "mongo/db/commands/server_status.h"
 #include "mongo/transport/message_compressor_registry.h"
 #include "mongo/transport/service_entry_point.h"
+#include "mongo/transport/service_executor_fixed.h"
+#include "mongo/transport/service_executor_reserved.h"
+#include "mongo/transport/service_executor_synchronous.h"
 #include "mongo/util/net/hostname_canonicalization.h"
 #include "mongo/util/net/socket_utils.h"
 #include "mongo/util/net/ssl_manager.h"
@@ -84,10 +85,22 @@ public:
         BSONObjBuilder b;
         networkCounter.append(b);
         appendMessageCompressionStats(&b);
-        auto executor = opCtx->getServiceContext()->getServiceExecutor();
-        if (executor) {
-            BSONObjBuilder section(b.subobjStart("serviceExecutorTaskStats"));
-            executor->appendStats(&section);
+
+        {
+            BSONObjBuilder section = b.subobjStart("serviceExecutors");
+
+            auto svcCtx = opCtx->getServiceContext();
+            if (auto executor = transport::ServiceExecutorSynchronous::get(svcCtx)) {
+                executor->appendStats(&section);
+            }
+
+            if (auto executor = transport::ServiceExecutorReserved::get(svcCtx)) {
+                executor->appendStats(&section);
+            }
+
+            if (auto executor = transport::ServiceExecutorFixed::get(svcCtx)) {
+                executor->appendStats(&section);
+            }
         }
 
         return b.obj();
@@ -95,7 +108,6 @@ public:
 
 } network;
 
-#ifdef MONGO_CONFIG_SSL
 class Security : public ServerStatusSection {
 public:
     Security() : ServerStatusSection("security") {}
@@ -106,14 +118,53 @@ public:
 
     BSONObj generateSection(OperationContext* opCtx,
                             const BSONElement& configElement) const override {
-        BSONObj result;
-        if (getSSLManager()) {
-            result = getSSLManager()->getSSLConfiguration().getServerStatusBSON();
-        }
+        BSONObjBuilder result;
 
-        return result;
+        BSONObjBuilder auth;
+        authCounter.append(&auth);
+        result.append("authentication", auth.obj());
+
+#ifdef MONGO_CONFIG_SSL
+        if (SSLManagerCoordinator::get()) {
+            SSLManagerCoordinator::get()
+                ->getSSLManager()
+                ->getSSLConfiguration()
+                .getServerStatusBSON(&result);
+        }
+#endif
+
+        return result.obj();
     }
 } security;
+
+#ifdef MONGO_CONFIG_SSL
+/**
+ * Status section of which tls versions connected to MongoDB and completed an SSL handshake.
+ * Note: Clients are only not counted if they try to connect to the server with a unsupported TLS
+ * version. They are still counted if the server rejects them for certificate issues in
+ * parseAndValidatePeerCertificate.
+ */
+class TLSVersionStatus : public ServerStatusSection {
+public:
+    TLSVersionStatus() : ServerStatusSection("transportSecurity") {}
+
+    bool includeByDefault() const override {
+        return true;
+    }
+
+    BSONObj generateSection(OperationContext* opCtx,
+                            const BSONElement& configElement) const override {
+        auto& counts = TLSVersionCounts::get(opCtx->getServiceContext());
+
+        BSONObjBuilder builder;
+        builder.append("1.0", counts.tls10.load());
+        builder.append("1.1", counts.tls11.load());
+        builder.append("1.2", counts.tls12.load());
+        builder.append("1.3", counts.tls13.load());
+        builder.append("unknown", counts.tlsUnknown.load());
+        return builder.obj();
+    }
+} tlsVersionStatus;
 #endif
 
 class AdvisoryHostFQDNs final : public ServerStatusSection {

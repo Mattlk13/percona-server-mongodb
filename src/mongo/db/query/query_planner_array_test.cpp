@@ -1002,10 +1002,9 @@ TEST_F(QueryPlannerTest, CantIndexNegationBelowElemMatchValue) {
     // true means multikey
     addIndex(BSON("a" << 1), true);
 
-    runQuery(fromjson("{a: {$elemMatch: {$not: {$mod: [2, 0]}}}}"));
-
     // There are no indexed solutions, because negations of $mod are not indexable.
-    assertNumSolutions(0);
+    runInvalidQuery(fromjson("{a: {$elemMatch: {$not: {$mod: [2, 0]}}}}"));
+    assertNoSolutions();
 }
 
 /**
@@ -1138,7 +1137,7 @@ TEST_F(QueryPlannerTest, MultikeyElemMatchAllCompound3) {
 }
 
 TEST_F(QueryPlannerTest, CanIntersectBoundsWhenFirstFieldIsNotMultikey) {
-    MultikeyPaths multikeyPaths{std::set<size_t>{}, {0U}};
+    MultikeyPaths multikeyPaths{MultikeyComponents{}, {0U}};
     addIndex(BSON("a" << 1 << "b" << 1), multikeyPaths);
     runQuery(fromjson("{a: {$gte: 0, $lt: 10}}"));
 
@@ -1150,7 +1149,7 @@ TEST_F(QueryPlannerTest, CanIntersectBoundsWhenFirstFieldIsNotMultikey) {
 }
 
 TEST_F(QueryPlannerTest, CanIntersectBoundsOnFirstFieldWhenItAndSharedPrefixAreNotMultikey) {
-    MultikeyPaths multikeyPaths{std::set<size_t>{}, {1U}};
+    MultikeyPaths multikeyPaths{MultikeyComponents{}, {1U}};
     addIndex(BSON("a.b" << 1 << "a.c" << 1), multikeyPaths);
     runQuery(fromjson("{'a.b': {$gte: 0, $lt: 10}}"));
 
@@ -1162,7 +1161,7 @@ TEST_F(QueryPlannerTest, CanIntersectBoundsOnFirstFieldWhenItAndSharedPrefixAreN
 }
 
 TEST_F(QueryPlannerTest, CannotIntersectBoundsWhenFirstFieldIsMultikey) {
-    MultikeyPaths multikeyPaths{{0U}, std::set<size_t>{}};
+    MultikeyPaths multikeyPaths{{0U}, MultikeyComponents{}};
     addIndex(BSON("a" << 1 << "b" << 1), multikeyPaths);
     runQuery(fromjson("{a: {$gte: 0, $lt: 10}}"));
 
@@ -1177,7 +1176,7 @@ TEST_F(QueryPlannerTest, CannotIntersectBoundsWhenFirstFieldIsMultikey) {
 }
 
 TEST_F(QueryPlannerTest, CanIntersectBoundsWhenFirstFieldIsMultikeyButHasElemMatch) {
-    MultikeyPaths multikeyPaths{{0U}, std::set<size_t>{}};
+    MultikeyPaths multikeyPaths{{0U}, MultikeyComponents{}};
     addIndex(BSON("a" << 1 << "b" << 1), multikeyPaths);
     runQuery(fromjson("{a: {$elemMatch: {$gte: 0, $lt: 10}}}"));
 
@@ -1191,7 +1190,7 @@ TEST_F(QueryPlannerTest, CanIntersectBoundsWhenFirstFieldIsMultikeyButHasElemMat
 TEST_F(QueryPlannerTest, CanComplementBoundsOnFirstFieldWhenItIsMultikeyAndHasNotEqualExpr) {
     params.options = QueryPlannerParams::NO_TABLE_SCAN;
 
-    MultikeyPaths multikeyPaths{{0U}, std::set<size_t>{}};
+    MultikeyPaths multikeyPaths{{0U}, MultikeyComponents{}};
     addIndex(BSON("a" << 1 << "b" << 1), multikeyPaths);
     runQuery(fromjson("{a: {$ne: 3}, b: 2}"));
 
@@ -1205,7 +1204,7 @@ TEST_F(QueryPlannerTest, CanComplementBoundsOnFirstFieldWhenItIsMultikeyAndHasNo
 TEST_F(QueryPlannerTest, CanIntersectBoundsWhenFirstFieldIsMultikeyAndHasNotInsideElemMatch) {
     params.options = QueryPlannerParams::NO_TABLE_SCAN;
 
-    MultikeyPaths multikeyPaths{{0U}, std::set<size_t>{}};
+    MultikeyPaths multikeyPaths{{0U}, MultikeyComponents{}};
     addIndex(BSON("a" << 1 << "b" << 1), multikeyPaths);
     runQuery(fromjson("{a: {$elemMatch: {$not: {$gte: 10}, $gte: 0}}, b: 2}"));
 
@@ -1244,7 +1243,7 @@ TEST_F(QueryPlannerTest, CannotIntersectBoundsOnFirstFieldWhenItAndSharedPrefixA
 }
 
 TEST_F(QueryPlannerTest, CanIntersectBoundsWhenSecondFieldIsNotMultikey) {
-    MultikeyPaths multikeyPaths{{0U}, std::set<size_t>{}};
+    MultikeyPaths multikeyPaths{{0U}, MultikeyComponents{}};
     addIndex(BSON("a" << 1 << "b" << 1), multikeyPaths);
     runQuery(fromjson("{a: 2, b: {$gte: 0, $lt: 10}}"));
 
@@ -1256,7 +1255,7 @@ TEST_F(QueryPlannerTest, CanIntersectBoundsWhenSecondFieldIsNotMultikey) {
 }
 
 TEST_F(QueryPlannerTest, CanIntersectBoundsOnSecondFieldWhenItAndSharedPrefixAreNotMultikey) {
-    MultikeyPaths multikeyPaths{{1U}, std::set<size_t>{}};
+    MultikeyPaths multikeyPaths{{1U}, MultikeyComponents{}};
     addIndex(BSON("a.b" << 1 << "a.c" << 1), multikeyPaths);
     runQuery(fromjson("{'a.b': 2, 'a.c': {$gte: 0, $lt: 10}}"));
 
@@ -1268,7 +1267,7 @@ TEST_F(QueryPlannerTest, CanIntersectBoundsOnSecondFieldWhenItAndSharedPrefixAre
 }
 
 TEST_F(QueryPlannerTest, CannotIntersectBoundsWhenSecondFieldIsMultikey) {
-    MultikeyPaths multikeyPaths{std::set<size_t>{}, {0U}};
+    MultikeyPaths multikeyPaths{MultikeyComponents{}, {0U}};
     addIndex(BSON("a" << 1 << "b" << 1), multikeyPaths);
     runQuery(fromjson("{a: 2, b: {$gte: 0, $lt: 10}}"));
 
@@ -1280,7 +1279,7 @@ TEST_F(QueryPlannerTest, CannotIntersectBoundsWhenSecondFieldIsMultikey) {
 }
 
 TEST_F(QueryPlannerTest, CanIntersectBoundsWhenSecondFieldIsMultikeyButHasElemMatch) {
-    MultikeyPaths multikeyPaths{std::set<size_t>{}, {0U}};
+    MultikeyPaths multikeyPaths{MultikeyComponents{}, {0U}};
     addIndex(BSON("a" << 1 << "b" << 1), multikeyPaths);
     runQuery(fromjson("{a: 2, b: {$elemMatch: {$gte: 0, $lt: 10}}}"));
 
@@ -1294,7 +1293,7 @@ TEST_F(QueryPlannerTest, CanIntersectBoundsWhenSecondFieldIsMultikeyButHasElemMa
 TEST_F(QueryPlannerTest, CanComplementBoundsOnSecondFieldWhenItIsMultikeyAndHasNotEqualExpr) {
     params.options = QueryPlannerParams::NO_TABLE_SCAN;
 
-    MultikeyPaths multikeyPaths{std::set<size_t>{}, {0U}};
+    MultikeyPaths multikeyPaths{MultikeyComponents{}, {0U}};
     addIndex(BSON("a" << 1 << "b" << 1), multikeyPaths);
     runQuery(fromjson("{a: 2, b: {$ne: 3}}"));
 
@@ -1308,7 +1307,7 @@ TEST_F(QueryPlannerTest, CanComplementBoundsOnSecondFieldWhenItIsMultikeyAndHasN
 TEST_F(QueryPlannerTest, CanIntersectBoundsWhenSecondFieldIsMultikeyAndHasNotInsideElemMatch) {
     params.options = QueryPlannerParams::NO_TABLE_SCAN;
 
-    MultikeyPaths multikeyPaths{std::set<size_t>{}, {0U}};
+    MultikeyPaths multikeyPaths{MultikeyComponents{}, {0U}};
     addIndex(BSON("a" << 1 << "b" << 1), multikeyPaths);
     runQuery(fromjson("{a: 2, b: {$elemMatch: {$not: {$gte: 10}, $gte: 0}}}"));
 
@@ -2061,38 +2060,38 @@ TEST_F(QueryPlannerTest, CanHoistNegatedPredFromElemMatchIntoSiblingOr) {
         "{arr: {$elemMatch: {a: {$ne:1}, $or: [{b:2}, {b:3}]}}, $or: [{c:4, d:5}, {c:6, d:7}]}";
     runQuery(fromjson(queryStr));
 
-    assertNumSolutions(4U);
+    assertNumSolutions(3U);
 
     // Solution 1: {'arr.a': {$ne: 1}} is hoisted by $elemMatch and pushed into the top-level $or.
     assertSolutionExists(
-        "{fetch: {filter: {arr: {$elemMatch: {a: {$ne: 1}, $or: [{b: 2}, {b: 3}]}}}, node: {or: "
-        "{nodes: [{ixscan: {pattern: {'arr.a': 1, 'arr.b': 1, c: 1, d: 1}, bounds: {'arr.a': "
-        "[['MinKey', 1, true, false], [1, 'MaxKey', false, true]], 'arr.b' :[['MinKey', 'MaxKey', "
-        "true, true]], c: [[4, 4, true, true]], d: [[5, 5, true, true]]}}},{ixscan: {pattern: "
-        "{'arr.a': 1, 'arr.b': 1, c: 1, d: 1}, bounds: {'arr.a': [['MinKey', 1, true, false], [1, "
-        "'MaxKey', false, true]], 'arr.b' :[['MinKey', 'MaxKey', true, true]], c: [[6, 6, true, "
-        "true]], d: [[7, 7, true, true]]}}}]}}}}");
+        "{fetch: {filter: {arr: {$elemMatch: {a: {$ne: 1}, b: {$in: [2, 3]}}}}, "
+        "node: {or: {nodes: ["
+        "  {ixscan: "
+        "    {pattern: {'arr.a': 1, 'arr.b': 1, c: 1, d: 1}, "
+        "     bounds: {'arr.a': [['MinKey', 1, true, false], [1, 'MaxKey', false, true]], "
+        "              'arr.b':[[2, 2, true, true], [3, 3, true, true]], "
+        "              c: [[4, 4, true, true]],"
+        "              d: [[5, 5, true, true]]}}},"
+        "  {ixscan: "
+        "    {pattern: {'arr.a': 1, 'arr.b': 1, c: 1, d: 1}, "
+        "     bounds: {'arr.a': [['MinKey', 1, true, false], [1, 'MaxKey', false, true]], "
+        "              'arr.b':[[2, 2, true, true], [3, 3, true, true]], "
+        "              c: [[6, 6, true, true]], "
+        "              d: [[7, 7, true, true]]}}}]}}}}");
 
-    // Solution 2: {'arr.a': {$ne: 1}} is pushed down into its sibling $or within $elemMatch.
+    // Solution 2: no pushdowns; {'arr.a': {$ne: 1}} is indexed directly, without any other fields.
     assertSolutionExists(
-        "{fetch: {filter: {arr: {$elemMatch: {a: {$ne:1}, $or: [{a: {$ne:1}, b:2}, {a: {$ne:1}, "
-        "b:3}]}}, $or: [{c:4, d:5}, {c:6, d:7}]}, node: {or: {nodes: [{ixscan: {pattern: {'arr.a': "
-        "1, 'arr.b': 1, c: 1, d: 1}, bounds: {'arr.a': [['MinKey', 1, true, false], [1, 'MaxKey', "
-        "false, true]], 'arr.b' :[[2, 2, true, true]], c: [['MinKey', 'MaxKey', true, true]], d: "
-        "[['MinKey', 'MaxKey', true, true]]}}},{ixscan: {pattern: {'arr.a': 1, 'arr.b': 1, c: 1, "
-        "d: 1}, bounds: {'arr.a': [['MinKey', 1, true, false], [1, 'MaxKey', false, true]], "
-        "'arr.b' :[[3, 3, true, true]], c: [['MinKey', 'MaxKey', true, true]], d: [['MinKey', "
-        "'MaxKey', true, true]]}}}]}}}}");
+        "{fetch: {filter: "
+        "  {arr: {$elemMatch: {a: {$ne:1}, b: {$in: [2, 3]}}}, $or: [{c:4, d:5}, "
+        "  {c:6, d:7}]},"
+        "node: {ixscan: {pattern: {'arr.a': 1, 'arr.b': 1, c: 1, d: 1},"
+        "bounds: "
+        "{'arr.a': [['MinKey', 1, true, false], [1, 'MaxKey', false, true]],"
+        " 'arr.b': [[2, 2, true, true], [3, 3, true, true]],"
+        " c: [['MinKey', 'MaxKey', true, true]],"
+        " d: [['MinKey', 'MaxKey', true, true]]}}}}}");
 
-    // Solution 3: no pushdowns; {'arr.a': {$ne: 1}} is indexed directly, without any other fields.
-    assertSolutionExists(
-        "{fetch: {filter: {arr: {$elemMatch: {a: {$ne:1}, $or: [{b:2}, {b:3}]}}, $or: [{c:4, d:5}, "
-        "{c:6, d:7}]}, node: {ixscan: {pattern: {'arr.a': 1, 'arr.b': 1, c: 1, d: 1}, bounds: "
-        "{'arr.a': [['MinKey', 1, true, false], [1, 'MaxKey', false, true]], 'arr.b': [['MinKey', "
-        "'MaxKey', true, true]], c: [['MinKey', 'MaxKey', true, true]], d: [['MinKey', 'MaxKey', "
-        "true, true]]}}}}}");
-
-    // Solution 4: COLLSCAN.
+    // Solution 3: COLLSCAN.
     assertSolutionExists("{cscan: {dir: 1}}}}");
 }
 
@@ -2104,39 +2103,38 @@ TEST_F(QueryPlannerTest, CanHoistNegatedPredFromElemMatchIntoSiblingOrWithMultik
         "{arr: {$elemMatch: {a: {$ne:1}, $or: [{b:2}, {b:3}]}}, $or: [{c:4, d:5}, {c:6, d:7}]}";
     runQuery(fromjson(queryStr));
 
-    assertNumSolutions(4U);
+    assertNumSolutions(3U);
 
     // Solution 1: {'arr.a': {$ne: 1}} is hoisted by $elemMatch and pushed into the top-level $or.
     assertSolutionExists(
-        "{fetch: {filter: {arr: {$elemMatch: {a: {$ne: 1}, $or: [{b: 2}, {b: 3}]}}}, node: {or: "
-        "{nodes: [{fetch: {filter: {a: {$ne: 1}}, node: {ixscan: {pattern: {'arr.a': 1, 'arr.b': "
-        "1, c: 1, d: 1}, bounds: {'arr.a': [['MinKey', 1, true, false], [1, 'MaxKey', false, "
-        "true]], 'arr.b' :[['MinKey', 'MaxKey', true, true]], c: [[4, 4, true, true]], d: [[5, 5, "
-        "true, true]]}}}}}, {fetch: {filter: {a: {$ne: 1}}, node: {ixscan: {pattern: {'arr.a': 1, "
-        "'arr.b': 1, c: 1, d: 1}, bounds: {'arr.a': [['MinKey', 1, true, false], [1, 'MaxKey', "
-        "false, true]], 'arr.b' :[['MinKey', 'MaxKey', true, true]], c: [[6, 6, true, true]], d: "
-        "[[7, 7, true, true]]}}}}}]}}}}");
+        "{fetch: {filter: {arr: {$elemMatch: {a: {$ne: 1}, b: {$in: [2, 3]}}}},"
+        "node: {"
+        "  or: {nodes: ["
+        "    {fetch: {filter: {a: {$ne: 1}},"
+        "     node: {ixscan: {pattern: {'arr.a': 1, 'arr.b': 1, c: 1, d: 1},"
+        "     bounds: {'arr.a': [['MinKey', 1, true, false], [1, 'MaxKey', false, true]],"
+        "              'arr.b': [[2, 2, true, true], [3, 3, true, true]],"
+        "              c: [[4, 4, true, true]],"
+        "              d: [[5, 5, true, true]]}}}}},"
+        "    {fetch: {filter: {a: {$ne: 1}},"
+        "     node: {ixscan: {pattern: {'arr.a': 1, 'arr.b': 1, c: 1, d: 1},"
+        "     bounds: {'arr.a': [['MinKey', 1, true, false],[1, 'MaxKey', false, true]],"
+        "              'arr.b': [[2, 2, true, true], [3, 3, true, true]],"
+        "              c: [[6, 6, true, true]],"
+        "              d: [[7, 7, true, true]]}}}}}]}}}}");
 
-    // Solution 2: {'arr.a': {$ne: 1}} is pushed down into its sibling $or within $elemMatch.
+    // Solution 2: no pushdowns; {'arr.a': {$ne: 1}} is indexed directly, without any other fields.
     assertSolutionExists(
-        "{fetch: {filter: {arr: {$elemMatch: {a: {$ne:1}, $or: [{a: {$ne:1}, b:2}, {a: {$ne:1}, "
-        "b:3}]}}, $or: [{c:4, d:5}, {c:6, d:7}]}, node: {or: {nodes: [{ixscan: {pattern: {'arr.a': "
-        "1, 'arr.b': 1, c: 1, d: 1}, bounds: {'arr.a': [['MinKey', 1, true, false], [1, 'MaxKey', "
-        "false, true]], 'arr.b' :[[2, 2, true, true]], c: [['MinKey', 'MaxKey', true, true]], d: "
-        "[['MinKey', 'MaxKey', true, true]]}}},{ixscan: {pattern: {'arr.a': 1, 'arr.b': 1, c: 1, "
-        "d: 1}, bounds: {'arr.a': [['MinKey', 1, true, false], [1, 'MaxKey', false, true]], "
-        "'arr.b' :[[3, 3, true, true]], c: [['MinKey', 'MaxKey', true, true]], d: [['MinKey', "
-        "'MaxKey', true, true]]}}}]}}}}");
+        "{fetch: {filter:"
+        "  {arr: {$elemMatch: {a: {$ne:1}, b: {$in: [2, 3]}}}, $or: [{c:4, d:5}, {c:6, d:7}]},"
+        "  node: {ixscan: {pattern: {'arr.a': 1, 'arr.b': 1, c: 1, d: 1},"
+        "bounds: "
+        "  {'arr.a': [['MinKey', 1, true, false], [1, 'MaxKey', false, true]],"
+        "   'arr.b': [[2, 2, true, true], [3, 3, true, true]],"
+        "    c: [['MinKey', 'MaxKey', true, true]],"
+        "    d: [['MinKey', 'MaxKey', true, true]]}}}}}");
 
-    // Solution 3: no pushdowns; {'arr.a': {$ne: 1}} is indexed directly, without any other fields.
-    assertSolutionExists(
-        "{fetch: {filter: {arr: {$elemMatch: {a: {$ne:1}, $or: [{b:2}, {b:3}]}}, $or: [{c:4, d:5}, "
-        "{c:6, d:7}]}, node: {ixscan: {pattern: {'arr.a': 1, 'arr.b': 1, c: 1, d: 1}, bounds: "
-        "{'arr.a': [['MinKey', 1, true, false], [1, 'MaxKey', false, true]], 'arr.b': [['MinKey', "
-        "'MaxKey', true, true]], c: [['MinKey', 'MaxKey', true, true]], d: [['MinKey', 'MaxKey', "
-        "true, true]]}}}}}");
-
-    // Solution 4: COLLSCAN.
+    // Solution 3: COLLSCAN.
     assertSolutionExists("{cscan: {dir: 1}}}}");
 }
 
@@ -2148,77 +2146,26 @@ TEST_F(QueryPlannerTest, MultipleNegatedElemMatchPredOrPushdownsDoNotSelfInterse
     auto queryStr = "{arr: {$elemMatch: {a: {$ne:1}, $or: [{b:2}, {b:3}]}}, $or: [{c:4}, {c:6}]}";
     runQuery(fromjson(queryStr));
 
-    assertNumSolutions(9U);
+    assertNumSolutions(3U);
 
     // Solution 1: no pushdowns; {'arr.a': {$ne: 1}} is indexed directly by {arr.a: 1, arr.b: 1}.
     assertSolutionExists(
-        "{fetch: {node: {ixscan: {pattern: {'arr.a': 1, 'arr.b': 1}, bounds: {'arr.a': [['MinKey', "
-        "1, true, false], [1, 'MaxKey', false, true]], 'arr.b': [['MinKey', 'MaxKey', true, "
-        "true]]}}}}}");
+        "{fetch: {node: "
+        "{ixscan: {pattern: {'arr.a': 1, 'arr.b': 1}, "
+        "bounds: {"
+        "'arr.a': [['MinKey', 1, true, false], [1, 'MaxKey', false, true]], "
+        "'arr.b': [[2, 2, true, true], [3, 3, true, true]]}}}}}");
 
     // Solution 2: no pushdowns; {'arr.a': {$ne: 1}} is indexed directly by {arr.a: 1, c: 1}.
     assertSolutionExists(
-        "{fetch: {node: {ixscan: {pattern: {'arr.a': 1, c: 1}, bounds: {'arr.a': [['MinKey', 1, "
-        "true, false], [1, 'MaxKey', false, true]], c: [['MinKey', 'MaxKey', true, true]]}}}}}");
+        "{fetch: "
+        "  {node: "
+        "    {ixscan: {pattern: {'arr.a': 1, c: 1}, "
+        "             bounds: {'arr.a': [['MinKey', 1, true, false], [1, 'MaxKey', false, true]], "
+        "                      c: [[4, 4, true, true], [6, 6, true, true]]}}}}}");
 
-    // Solution 3: {'arr.a': {$ne: 1}} pushed into sibling $or and indexed by {arr.a: 1, arr.b: 1}.
-    assertSolutionExists(
-        "{fetch: {node: {or: {nodes: [{ixscan: {pattern: {'arr.a': 1, 'arr.b': 1}, bounds: "
-        "{'arr.a': [['MinKey', 1, true, false], [1, 'MaxKey', false, true]], 'arr.b' :[[2, 2, "
-        "true, true]]}}},{ixscan: {pattern: {'arr.a': 1, 'arr.b': 1}, bounds: {'arr.a': "
-        "[['MinKey', 1, true, false], [1, 'MaxKey', false, true]], 'arr.b' :[[3, 3, true, "
-        "true]]}}}]}}}}");
-
-    // Solution 4: {'arr.a': {$ne: 1}} pushed into top-level $or and indexed by {arr.a: 1, c: 1}.
-    assertSolutionExists(
-        "{fetch: {node: {or: {nodes: [{ixscan: {pattern: {'arr.a': 1, c: 1}, bounds: {'arr.a': "
-        "[['MinKey', 1, true, false], [1, 'MaxKey', false, true]], c: [[4, 4, true, "
-        "true]]}}},{ixscan: {pattern: {'arr.a': 1, c: 1}, bounds: {'arr.a': [['MinKey', 1, true, "
-        "false], [1, 'MaxKey', false, true]], c: [[6, 6, true, true]]}}}]}}}}");
-
-    // Solution 5: COLLSCAN.
+    // Solution 3: COLLSCAN.
     assertSolutionExists("{cscan: {dir: 1}}}}");
-
-    // Verify that we do not produce a plan which intersects BOTH $ors to which the $ne predicate
-    // has been pushed down. That is, we do not intersect the candidate plans outlined in solution 3
-    // and 4 above with one another, but only with non-pushdown plans 1 and 2.
-
-    // Solution 6: AND_HASH Solutions 1 and 3.
-    assertSolutionExists(
-        "{fetch: {node: {andHash: {nodes: [{or: {nodes: [{ixscan: {pattern: {'arr.a': 1, 'arr.b': "
-        "1}, bounds: {'arr.a': [['MinKey', 1, true, false], [1, 'MaxKey', false, true]], 'arr.b' "
-        ":[[2, 2, true, true]]}}}, {ixscan: {pattern: {'arr.a': 1, 'arr.b': 1}, bounds: {'arr.a': "
-        "[['MinKey', 1, true, false], [1, 'MaxKey', false, true]], 'arr.b' :[[3, 3, true, "
-        "true]]}}}]}}, {ixscan: {pattern: {'arr.a': 1, 'arr.b': 1}, bounds: {'arr.a': [['MinKey', "
-        "1, true, false], [1, 'MaxKey', false, true]], 'arr.b' :[['MinKey', 'MaxKey', true, "
-        "true]]}}}]}}}}");
-
-    // Solution 7: AND_HASH Solutions 1 and 4.
-    assertSolutionExists(
-        "{fetch: {node: {andHash: {nodes: [{or: {nodes: [{ixscan: {pattern: {'arr.a': 1, c: 1}, "
-        "bounds: {'arr.a': [['MinKey', 1, true, false], [1, 'MaxKey', false, true]], c :[[4, 4, "
-        "true, true]]}}}, {ixscan: {pattern: {'arr.a': 1, c: 1}, bounds: {'arr.a': [['MinKey', 1, "
-        "true, false], [1, 'MaxKey', false, true]], c :[[6, 6, true, true]]}}}]}}, {ixscan: "
-        "{pattern: {'arr.a': 1, 'arr.b': 1}, bounds: {'arr.a': [['MinKey', 1, true, false], [1, "
-        "'MaxKey', false, true]], 'arr.b' :[['MinKey', 'MaxKey', true, true]]}}}]}}}}");
-
-    // Solution 8: AND_HASH Solutions 2 and 3.
-    assertSolutionExists(
-        "{fetch: {node: {andHash: {nodes: [{or: {nodes: [{ixscan: {pattern: {'arr.a': 1, 'arr.b': "
-        "1}, bounds: {'arr.a': [['MinKey', 1, true, false], [1, 'MaxKey', false, true]], 'arr.b' "
-        ":[[2, 2, true, true]]}}}, {ixscan: {pattern: {'arr.a': 1, 'arr.b': 1}, bounds: {'arr.a': "
-        "[['MinKey', 1, true, false], [1, 'MaxKey', false, true]], 'arr.b' :[[3, 3, true, "
-        "true]]}}}]}}, {ixscan: {pattern: {'arr.a': 1, c: 1}, bounds: {'arr.a': [['MinKey', 1, "
-        "true, false], [1, 'MaxKey', false, true]], c: [['MinKey', 'MaxKey', true, true]]}}}]}}}}");
-
-    // Solution 9: AND_HASH Solutions 2 and 4.
-    assertSolutionExists(
-        "{fetch: {node: {andHash: {nodes: [{or: {nodes: [{ixscan: {pattern: {'arr.a': 1, c: 1}, "
-        "bounds: {'arr.a': [['MinKey', 1, true, false], [1, 'MaxKey', false, true]], c :[[4, 4, "
-        "true, true]]}}}, {ixscan: {pattern: {'arr.a': 1, c: 1}, bounds: {'arr.a': [['MinKey', 1, "
-        "true, false], [1, 'MaxKey', false, true]], c :[[6, 6, true, true]]}}}]}}, {ixscan: "
-        "{pattern: {'arr.a': 1, c: 1}, bounds: {'arr.a': [['MinKey', 1, true, false], [1, "
-        "'MaxKey', false, true]], c :[['MinKey', 'MaxKey', true, true]]}}}]}}}}");
 }
 
 TEST_F(QueryPlannerTest, ContainedOrCannotPushdownThroughElemMatchObj) {
@@ -2228,9 +2175,10 @@ TEST_F(QueryPlannerTest, ContainedOrCannotPushdownThroughElemMatchObj) {
 
     assertNumSolutions(2U);
     assertSolutionExists(
-        "{fetch: {filter: {b: {$elemMatch: {$or: [{c: 2}, {c: 3}]}}}, node: "
+        "{fetch: {filter: {b: {$elemMatch: {c: {$in: [2, 3]}}}},"
+        "node: "
         "{ixscan: {filter: null, pattern: {a: 1, 'b.c': 1}, "
-        "bounds: {a: [[1,1,true,true]], 'b.c': [['MinKey','MaxKey',true,true]]}}}}}");
+        "bounds: {a: [[1,1,true,true]], 'b.c': [[2,2,true,true],[3,3,true,true]]}}}}}");
     assertSolutionExists("{cscan: {dir: 1}}}}");
 }
 
@@ -2242,9 +2190,10 @@ TEST_F(QueryPlannerTest, ContainedOrCannotPushdownThroughElemMatchObjWithMultike
 
     assertNumSolutions(2U);
     assertSolutionExists(
-        "{fetch: {filter: {b: {$elemMatch: {$or: [{c: 2}, {c: 3}]}}}, node: "
+        "{fetch: {filter: {b: {$elemMatch: {c: {$in: [2, 3]}}}},"
+        "node: "
         "{ixscan: {filter: null, pattern: {a: 1, 'b.c': 1}, "
-        "bounds: {a: [[1,1,true,true]], 'b.c': [['MinKey','MaxKey',true,true]]}}}}}");
+        "bounds: {a: [[1,1,true,true]], 'b.c': [[2,2,true,true],[3,3,true,true]]}}}}}");
     assertSolutionExists("{cscan: {dir: 1}}}}");
 }
 
@@ -2253,9 +2202,10 @@ TEST_F(QueryPlannerTest, ContainedOrCannotPushdownThroughOrElemMatchObjOrPattern
 
     runQuery(fromjson("{a: 1, $or: [{a: 2}, {b: {$elemMatch: {$or: [{c: 3}, {c: 4}]}}}]}"));
 
-    assertNumSolutions(2U);
+    assertNumSolutions(3U);
     assertSolutionExists(
-        "{fetch: {filter: {$or: [{a: 2}, {b: {$elemMatch: {$or: [{c: 3}, {c: 4}]}}}]}, node: "
+        "{fetch: {filter: {$or: [{a: 2}, {b: {$elemMatch: {c: {$in: [3, 4]}}}}]},"
+        "node: "
         "{ixscan: {filter: null, pattern: {a: 1, 'b.c': 1}, "
         "bounds: {a: [[1,1,true,true]], 'b.c': [['MinKey','MaxKey',true,true]]}}}}}");
     assertSolutionExists("{cscan: {dir: 1}}}}");
@@ -2267,9 +2217,10 @@ TEST_F(QueryPlannerTest, ContainedOrCannotPushdownThroughOrElemMatchObjOrPattern
 
     runQuery(fromjson("{a: 1, $or: [{a: 2}, {b: {$elemMatch: {$or: [{c: 3}, {c: 4}]}}}]}"));
 
-    assertNumSolutions(2U);
+    assertNumSolutions(3U);
     assertSolutionExists(
-        "{fetch: {filter: {$or: [{a: 2}, {b: {$elemMatch: {$or: [{c: 3}, {c: 4}]}}}]}, node: "
+        "{fetch: {filter: {$or: [{a: 2}, {b: {$elemMatch: {c: {$in: [3, 4]}}}}]},"
+        "node: "
         "{ixscan: {filter: null, pattern: {a: 1, 'b.c': 1}, "
         "bounds: {a: [[1,1,true,true]], 'b.c': [['MinKey','MaxKey',true,true]]}}}}}");
     assertSolutionExists("{cscan: {dir: 1}}}}");
@@ -2385,28 +2336,28 @@ TEST_F(QueryPlannerTest, CantExplodeMultikeyIxscanForSort) {
 
     assertNumSolutions(1U);
     assertSolutionExists(
-        "{sort: {pattern: {b: 1}, limit: 0, node: {sortKeyGen: {node: "
+        "{sort: {pattern: {b: 1}, limit: 0, type: 'simple', node:"
         "{fetch: {filter: null, node: {ixscan: {pattern: {a: 1, b: 1}, filter: null, bounds: {a: "
-        "[[1,1,true,true], [2,2,true,true]], b: [['MinKey','MaxKey',true,true]]}}}}}}}}}");
+        "[[1,1,true,true], [2,2,true,true]], b: [['MinKey','MaxKey',true,true]]}}}}}}}");
 }
 
 TEST_F(QueryPlannerTest, CantExplodeMultikeyIxscanForSortWithPathLevelMultikeyMetadata) {
     params.options &= ~QueryPlannerParams::INCLUDE_COLLSCAN;
-    MultikeyPaths multikeyPaths{std::set<size_t>{}, {0U}};
+    MultikeyPaths multikeyPaths{MultikeyComponents{}, {0U}};
     addIndex(BSON("a" << 1 << "b.c" << 1), multikeyPaths);
 
     runQueryAsCommand(fromjson("{find: 'testns', filter: {a: {$in: [1, 2]}}, sort: {'b.c': 1}}"));
 
     assertNumSolutions(1U);
     assertSolutionExists(
-        "{sort: {pattern: {'b.c': 1}, limit: 0, node: {sortKeyGen: {node: "
+        "{sort: {pattern: {'b.c': 1}, limit: 0, type: 'simple', node: "
         "{fetch: {filter: null, node: {ixscan: {pattern: {a: 1, 'b.c': 1}, filter: null, bounds: "
-        "{a: [[1,1,true,true], [2,2,true,true]], 'b.c': [['MinKey','MaxKey',true,true]]}}}}}}}}}");
+        "{a: [[1,1,true,true], [2,2,true,true]], 'b.c': [['MinKey','MaxKey',true,true]]}}}}}}}");
 }
 
 TEST_F(QueryPlannerTest, CanExplodeMultikeyIndexScanForSortWhenSortFieldsAreNotMultikey) {
     params.options &= ~QueryPlannerParams::INCLUDE_COLLSCAN;
-    MultikeyPaths multikeyPaths{{0U}, std::set<size_t>{}};
+    MultikeyPaths multikeyPaths{{0U}, MultikeyComponents{}};
     addIndex(BSON("a" << 1 << "b.c" << 1), multikeyPaths);
 
     runQueryAsCommand(fromjson("{find: 'testns', filter: {a: {$in: [1, 2]}}, sort: {'b.c': 1}}"));
@@ -2418,6 +2369,71 @@ TEST_F(QueryPlannerTest, CanExplodeMultikeyIndexScanForSortWhenSortFieldsAreNotM
         "bounds: {a: [[1,1,true,true]], 'b.c': [['MinKey','MaxKey',true,true]]}}},"
         "{ixscan: {pattern: {a: 1, 'b.c': 1}, filter: null,"
         "bounds: {a: [[2,2,true,true]], 'b.c': [['MinKey','MaxKey',true,true]]}}}]}}}}");
+}
+
+TEST_F(QueryPlannerTest, MultikeyIndexScanWithMinKeyMaxKeyBoundsCanProvideSort) {
+    params.options &= ~QueryPlannerParams::INCLUDE_COLLSCAN;
+    MultikeyPaths multikeyPaths{{0U}};
+    addIndex(BSON("a" << 1), multikeyPaths);
+    runQueryAsCommand(fromjson("{find: 'testns', sort: {a: 1}}"));
+
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{fetch: {node: {ixscan: {pattern: {a: 1}, bounds: {a: "
+        "[['MinKey','MaxKey',true,true]]}}}}}");
+}
+
+TEST_F(QueryPlannerTest, MultikeyIndexScanWithBoundsOnIndexWithoutSharedPrefixCanProvideSort) {
+    params.options &= ~QueryPlannerParams::INCLUDE_COLLSCAN;
+    MultikeyPaths multikeyPaths{{0U}, {0U}};
+    addIndex(BSON("a" << 1 << "b" << 1), multikeyPaths);
+    runQueryAsCommand(fromjson("{find: 'testns', filter: {b : {$gte: 3}}, sort: {a: 1}}"));
+
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{fetch: {filter: {b: {$gte: 3}}, node: {ixscan: {pattern: {a: 1, b: 1}, bounds: {a: "
+        "[['MinKey','MaxKey',true,true]], b: [['MinKey','MaxKey',true,true]]}}}}}");
+}
+
+TEST_F(QueryPlannerTest,
+       MultikeyIndexScanWithBoundsOnIndexWithoutSharedPrefixCanProvideSortDifferentIndex) {
+    params.options &= ~QueryPlannerParams::INCLUDE_COLLSCAN;
+    MultikeyPaths multikeyPaths{{0U}, {0U}};
+    addIndex(BSON("a" << 1 << "b" << 1), multikeyPaths);
+    runQueryAsCommand(fromjson("{find: 'testns', filter: {a : {$eq: 3}}, sort: {b: 1}}"));
+
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{fetch: {node: {ixscan: {pattern: {a: 1, b: 1}, bounds: {a: "
+        "[[3,3,true,true]], b: [['MinKey','MaxKey',true,true]]}}}}}");
+}
+
+TEST_F(QueryPlannerTest,
+       MultikeyIndexScanWithFilterAndSortOnFieldsThatSharePrefixCannotProvideSort) {
+    params.options &= ~QueryPlannerParams::INCLUDE_COLLSCAN;
+    MultikeyPaths multikeyPaths{{0U}, {0U}};
+    addIndex(BSON("a" << 1 << "a.b" << 1), multikeyPaths);
+    runQueryAsCommand(fromjson("{find: 'testns', filter: {a : {$gte: 3}}, sort: {'a.b': 1}}"));
+
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{sort: {pattern: {'a.b': 1}, limit: 0, type: 'simple', node: "
+        "{fetch: {filter: null, node: {ixscan: {pattern: {a: 1, 'a.b': 1}, filter: null, bounds: "
+        "{a: [[3, Infinity, true,true]], 'a.b': [['MinKey','MaxKey',true,true]]}}}}}}}");
+}
+
+TEST_F(QueryPlannerTest,
+       MultikeyIndexScanWithFilterAndSortOnFieldsThatSharePrefixCannotProvideSortDifferentIndex) {
+    params.options &= ~QueryPlannerParams::INCLUDE_COLLSCAN;
+    MultikeyPaths multikeyPaths{{0U, 1U}, {0U}};
+    addIndex(BSON("a.b" << 1 << "a" << 1), multikeyPaths);
+    runQueryAsCommand(fromjson("{find: 'testns', filter: {'a.b' : {$gte: 3}}, sort: {a: 1}}"));
+
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{sort: {pattern: {a: 1}, limit: 0, type: 'simple', node: "
+        "{fetch: {filter: null, node: {ixscan: {pattern: {'a.b': 1, a: 1}, filter: null, bounds: "
+        "{'a.b': [[3, Infinity, true,true]], a: [['MinKey','MaxKey',true,true]]}}}}}}}");
 }
 
 TEST_F(QueryPlannerTest, ElemMatchValueNENull) {
@@ -2432,6 +2448,28 @@ TEST_F(QueryPlannerTest, ElemMatchValueNENull) {
         "  ixscan: {pattern: {a:1}, bounds: {"
         "    a: [['MinKey',undefined,true,false], [null,'MaxKey',false,true]]"
         "}}}}}");
+}
+
+TEST_F(QueryPlannerTest, ElemMatchValueNotGteOrNotLteNull) {
+    addIndex(BSON("a" << 1));
+    runQuery(fromjson("{a: {$elemMatch: {$not: {$gte: null}}}}"));
+
+    const auto collScanSol = "{cscan: {dir: 1}}";
+    const auto ixScanSol =
+        "{fetch: {node: {"
+        "  ixscan: {pattern: {a:1}, bounds: {"
+        "    a: [['MinKey',undefined,true,false], [null,'MaxKey',false,true]]"
+        "}}}}}";
+
+    assertNumSolutions(2U);
+    assertSolutionExists(collScanSol);
+    assertSolutionExists(ixScanSol);
+
+    runQuery(fromjson("{a: {$elemMatch: {$not: {$lte: null}}}}"));
+
+    assertNumSolutions(2U);
+    assertSolutionExists(collScanSol);
+    assertSolutionExists(ixScanSol);
 }
 
 TEST_F(QueryPlannerTest, ElemMatchObjectNENull) {
@@ -2632,53 +2670,47 @@ TEST_F(QueryPlannerTest, MustFetchBeforeDottedMultiKeyPathSort) {
 
     assertNumSolutions(3U);
     assertSolutionExists(
-        "{sort: {pattern: {'a.x': 1}, limit: 0, node: {sortKeyGen: {node: {cscan: {dir: 1}}}}}}");
+        "{sort: {pattern: {'a.x': 1}, limit: 0, type: 'simple', node: {cscan: {dir: 1}}}}");
     assertSolutionExists(
         "{sort: {"
         "  pattern: {'a.x': 1},"
         "  limit: 0,"
+        "  type: 'simple',"
         "  node: {"
-        "    sortKeyGen: {"
-        "      node: {"
-        "        fetch: {"
-        "          filter: {'a.x': 4},"
-        "          node: {"
-        "            ixscan: {"
-        "              filter: null, "
-        "              pattern: {'a.x': 1},"
-        "              bounds: {"
-        "                'a.x': [['MinKey', 'MaxKey', true, true]]"
-        "              },"
-        "              dir: 1"
-        "            }"
-        "          }"
-        "        }"
-        "      }"
-        "    }"
+        "   fetch: {"
+        "     filter: {'a.x': 4},"
+        "     node: {"
+        "       ixscan: {"
+        "         filter: null, "
+        "         pattern: {'a.x': 1},"
+        "         bounds: {"
+        "           'a.x': [['MinKey', 'MaxKey', true, true]]"
+        "         },"
+        "         dir: 1"
+        "       }"
+        "     }"
+        "   }"
         "  }"
         "}}");
     assertSolutionExists(
         "{sort: {"
         "  pattern: {'a.x': 1},"
         "  limit: 0,"
+        "  type: 'simple',"
         "  node: {"
-        "    sortKeyGen: {"
-        "      node: {"
-        "        fetch: {"
-        "          filter: null,"
-        "          node: {"
-        "            ixscan: {"
-        "              filter: null, "
-        "              pattern: {'a.x': 1},"
-        "              bounds: {"
-        "                'a.x': [[4, 4, true, true]]"
-        "              },"
-        "              dir: 1"
-        "            }"
-        "          }"
-        "        }"
-        "      }"
-        "    }"
+        "   fetch: {"
+        "     filter: null,"
+        "     node: {"
+        "       ixscan: {"
+        "         filter: null, "
+        "         pattern: {'a.x': 1},"
+        "         bounds: {"
+        "           'a.x': [[4, 4, true, true]]"
+        "         },"
+        "         dir: 1"
+        "       }"
+        "     }"
+        "   }"
         "  }"
         "}}");
 
@@ -2687,29 +2719,26 @@ TEST_F(QueryPlannerTest, MustFetchBeforeDottedMultiKeyPathSort) {
 
     assertNumSolutions(2U);
     assertSolutionExists(
-        "{sort: {pattern: {'a.x': 1}, limit: 0, node: {sortKeyGen: {node: {cscan: {dir: 1}}}}}}");
+        "{sort: {pattern: {'a.x': 1}, limit: 0, type: 'simple', node: {cscan: {dir: 1}}}}");
     assertSolutionExists(
         "{sort: {"
         "  pattern: {'a.x': 1},"
         "  limit: 0,"
+        "  type: 'simple',"
         "  node: {"
-        "    sortKeyGen: {"
-        "      node: {"
-        "        fetch: {"
-        "          filter: null,"
-        "          node: {"
-        "            ixscan: {"
-        "              filter: null, "
-        "              pattern: {'a.x': 1},"
-        "              bounds: {"
-        "                'a.x': [['MinKey', 'MaxKey', true, true]]"
-        "              },"
-        "              dir: 1"
-        "            }"
-        "          }"
-        "        }"
-        "      }"
-        "    }"
+        "   fetch: {"
+        "     filter: null,"
+        "     node: {"
+        "       ixscan: {"
+        "         filter: null, "
+        "         pattern: {'a.x': 1},"
+        "         bounds: {"
+        "           'a.x': [['MinKey', 'MaxKey', true, true]]"
+        "         },"
+        "         dir: 1"
+        "       }"
+        "     }"
+        "   }"
         "  }"
         "}}");
 }

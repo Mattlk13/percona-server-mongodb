@@ -31,6 +31,8 @@
 
 #include "mongo/db/logical_session_cache_impl.h"
 
+#include <memory>
+
 #include "mongo/bson/oid.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_session_for_test.h"
@@ -46,7 +48,6 @@
 #include "mongo/db/service_liaison_mock.h"
 #include "mongo/db/sessions_collection_mock.h"
 #include "mongo/stdx/future.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/ensure_fcv.h"
 #include "mongo/unittest/unittest.h"
 
@@ -69,16 +70,18 @@ public:
         : _service(std::make_shared<MockServiceLiaisonImpl>()),
           _sessions(std::make_shared<MockSessionsCollectionImpl>()) {
 
-        AuthorizationManager::set(getServiceContext(), AuthorizationManager::create());
+        AuthorizationManager::set(getServiceContext(),
+                                  AuthorizationManager::create(getServiceContext()));
 
         // Re-initialize the client after setting the AuthorizationManager to get an
         // AuthorizationSession.
         Client::releaseCurrent();
         Client::initThread(getThreadName());
         _opCtx = makeOperationContext();
-        auto mockService = stdx::make_unique<MockServiceLiaison>(_service);
-        auto mockSessions = stdx::make_unique<MockSessionsCollection>(_sessions);
-        _cache = stdx::make_unique<LogicalSessionCacheImpl>(
+
+        auto mockService = std::make_unique<MockServiceLiaison>(_service);
+        auto mockSessions = std::make_unique<MockSessionsCollection>(_sessions);
+        _cache = std::make_unique<LogicalSessionCacheImpl>(
             std::move(mockService),
             std::move(mockSessions),
             [](OperationContext*, SessionsCollection&, Date_t) {
@@ -102,14 +105,6 @@ public:
 
     std::shared_ptr<MockSessionsCollectionImpl> sessions() {
         return _sessions;
-    }
-
-    void setOpCtx() {
-        _opCtx = getClient()->makeOperationContext();
-    }
-
-    void clearOpCtx() {
-        _opCtx.reset();
     }
 
     OperationContext* opCtx() {
@@ -167,8 +162,7 @@ TEST_F(LogicalSessionCacheTest, StartSession) {
     ASSERT(!sessions()->has(lsid));
 
     // Do refresh, cached records should get flushed to collection.
-    clearOpCtx();
-    ASSERT(cache()->refreshNow(getClient()).isOK());
+    ASSERT(cache()->refreshNow(opCtx()).isOK());
     ASSERT(sessions()->has(lsid));
 
     // Try to start the same session again, should succeed.
@@ -199,7 +193,7 @@ TEST_F(LogicalSessionCacheTest, BasicSessionExpiration) {
     service()->fastForward(Milliseconds(kSessionTimeout.count() + 5));
 
     // Check that it is no longer in the cache
-    ASSERT_OK(cache()->refreshNow(getClient()));
+    ASSERT_OK(cache()->refreshNow(opCtx()));
     ASSERT_EQ(0UL, cache()->size());
 }
 
@@ -218,9 +212,8 @@ TEST_F(LogicalSessionCacheTest, ManySignedLsidsInCacheRefresh) {
     });
 
     // Force a refresh
-    clearOpCtx();
     service()->fastForward(kForceRefresh);
-    ASSERT(cache()->refreshNow(getClient()).isOK());
+    ASSERT_OK(cache()->refreshNow(opCtx()));
 }
 
 //
@@ -336,9 +329,8 @@ TEST_F(LogicalSessionCacheTest, RefreshMatrixSessionState) {
     }
 
     // Force a refresh
-    clearOpCtx();
     service()->fastForward(kForceRefresh);
-    ASSERT(cache()->refreshNow(getClient()).isOK());
+    ASSERT_OK(cache()->refreshNow(opCtx()));
 
     for (int i = 0; i < 32; i++) {
         std::stringstream failText;
@@ -349,8 +341,9 @@ TEST_F(LogicalSessionCacheTest, RefreshMatrixSessionState) {
         failText << " session case failed: ";
 
         ASSERT(sessions()->has(ids[i]) == testCases[i].inCollection)
-            << failText.str() << (testCases[i].inCollection ? "session wasn't in collection"
-                                                            : "session was in collection");
+            << failText.str()
+            << (testCases[i].inCollection ? "session wasn't in collection"
+                                          : "session was in collection");
         ASSERT((service()->matchKilled(ids[i]) != nullptr) == testCases[i].killed)
             << failText.str()
             << (testCases[i].killed ? "session wasn't killed" : "session was killed");

@@ -10,7 +10,7 @@ mongo.writeMode = function() {
 db = mongo.getDB(db.toString());
 
 var t = db.opcounters;
-var isMongos = ("isdbgrid" == db.runCommand("ismaster").msg);
+var isMongos = ("isdbgrid" == db.runCommand("hello").msg);
 var opCounters;
 
 //
@@ -128,7 +128,7 @@ assert.eq(opCounters.query + (isMongos ? 0 : 1), db.serverStatus().opcounters.qu
 //
 // 5. Getmore.
 //
-// - counted as 1 op per getmore issued, regardless of errors
+// - counted as 1 op per getmore issued
 //
 
 t.drop();
@@ -139,8 +139,6 @@ opCounters = db.serverStatus().opcounters;
 t.find().batchSize(2).toArray();  // 3 documents, batchSize=2 => 1 query + 1 getmore
 assert.eq(opCounters.query + 1, db.serverStatus().opcounters.query);
 assert.eq(opCounters.getmore + 1, db.serverStatus().opcounters.getmore);
-
-// Getmore, with error (TODO implement when SERVER-5813 is resolved).
 
 //
 // 6. Command.

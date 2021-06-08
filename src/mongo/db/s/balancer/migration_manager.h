@@ -37,23 +37,18 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/s/balancer/balancer_policy.h"
 #include "mongo/db/s/balancer/type_migration.h"
+#include "mongo/db/s/dist_lock_manager.h"
 #include "mongo/executor/task_executor.h"
-#include "mongo/s/catalog/dist_lock_manager.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/s/request_types/migration_secondary_throttle_options.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/util/concurrency/notification.h"
 #include "mongo/util/concurrency/with_lock.h"
 
 namespace mongo {
 
-class OperationContext;
 class ScopedMigrationRequest;
-class ServiceContext;
-class Status;
-template <typename T>
-class StatusWith;
 
 // Uniquely identifies a migration, regardless of shard and version.
 typedef std::string MigrationIdentifier;
@@ -174,7 +169,19 @@ private:
     // O(1) removal time.
     using MigrationsList = std::list<Migration>;
 
-    using CollectionMigrationsStateMap = stdx::unordered_map<NamespaceString, MigrationsList>;
+    // Tracks the execution of all of the active migrations within a collection. It holds a
+    // NamespaceSerializer lock for the corresponding nss, which will be released when all of the
+    // scheduled chunk migrations for this collection have completed.
+    struct MigrationsState {
+        MigrationsState(DistLockManager::ScopedLock lock);
+
+        MigrationsList migrationsList;
+        DistLockManager::ScopedLock lock;
+    };
+    using CollectionMigrationsStateMap = stdx::unordered_map<NamespaceString, MigrationsState>;
+
+    using ScopedMigrationRequestsMap =
+        std::map<MigrationIdentifier, StatusWith<ScopedMigrationRequest>>;
 
     /**
      * Optionally takes the collection distributed lock and schedules a chunk migration with the
@@ -187,7 +194,8 @@ private:
         const MigrateInfo& migrateInfo,
         uint64_t maxChunkSizeBytes,
         const MigrationSecondaryThrottleOptions& secondaryThrottle,
-        bool waitForDelete);
+        bool waitForDelete,
+        ScopedMigrationRequestsMap* scopedMigrationRequests);
 
     /**
      * Acquires the collection distributed lock for the specified namespace and if it succeeds,
@@ -195,11 +203,18 @@ private:
      *
      * The distributed lock is acquired before scheduling the first migration for the collection and
      * is only released when all active migrations on the collection have finished.
+     *
+     * Assumes that the migration document has already been written if no ScopedMigrationRequestsMap
+     * pointer is passed. Otherwise, writes the migration document under the collection distributed
+     * lock and adds it to the map.
      */
     void _schedule(WithLock,
                    OperationContext* opCtx,
                    const HostAndPort& targetHost,
-                   Migration migration);
+                   Migration migration,
+                   const MigrateInfo& migrateInfo,
+                   bool waitForDelete,
+                   ScopedMigrationRequestsMap* scopedMigrationRequests);
 
     /**
      * Used internally for migrations scheduled with the distributed lock acquired by the config
@@ -250,17 +265,12 @@ private:
     // The service context under which this migration manager runs.
     ServiceContext* const _serviceContext;
 
-    // Used as a constant session ID for all distributed locks that this MigrationManager holds.
-    // Currently required so that locks can be reacquired for the balancer in startRecovery and then
-    // overtaken in later operations.
-    const OID _lockSessionID{OID::gen()};
-
     // Carries migration information over from startRecovery to finishRecovery. Should only be set
     // in startRecovery and then accessed in finishRecovery.
     stdx::unordered_map<NamespaceString, std::list<MigrationType>> _migrationRecoveryMap;
 
     // Protects the class state below.
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH("MigrationManager::_mutex");
 
     // Always start the migration manager in a stopped state.
     State _state{State::kStopped};

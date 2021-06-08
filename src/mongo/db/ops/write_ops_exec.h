@@ -33,12 +33,19 @@
 #include <vector>
 
 #include "mongo/base/status_with.h"
+#include "mongo/db/catalog/collection_operation_source.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/ops/single_write_result_gen.h"
+#include "mongo/db/ops/update_result.h"
 #include "mongo/db/ops/write_ops.h"
 #include "mongo/s/stale_exception.h"
 
 namespace mongo {
+
+class OpDebug;
+class ParsedUpdate;
+
+namespace write_ops_exec {
 
 /**
  * The result of performing a single write, possibly within a batch.
@@ -49,7 +56,6 @@ struct WriteResult {
      */
     std::vector<StatusWith<SingleWriteResult>> results;
 };
-
 
 /**
  * Performs a batch of inserts, updates, or deletes.
@@ -62,12 +68,36 @@ struct WriteResult {
  * exception being thrown from these functions. Callers are responsible for managing LastError in
  * that case. This should generally be combined with LastError handling from parse failures.
  *
- * 'fromMigrate' indicates whether the operation was induced by a chunk migration
+ * 'type' indicates whether the operation was induced by a standard write, a chunk migration, or a
+ * time-series insert.
+ *
+ * Note: performInserts() gets called for both user and internal (like tenant collection cloner,
+ * and initial sync/tenant migration oplog buffer) inserts.
  */
 WriteResult performInserts(OperationContext* opCtx,
-                           const write_ops::Insert& op,
-                           bool fromMigrate = false);
-WriteResult performUpdates(OperationContext* opCtx, const write_ops::Update& op);
-WriteResult performDeletes(OperationContext* opCtx, const write_ops::Delete& op);
+                           const write_ops::InsertCommandRequest& op,
+                           const OperationSource& source = OperationSource::kStandard);
+WriteResult performUpdates(OperationContext* opCtx,
+                           const write_ops::UpdateCommandRequest& op,
+                           const OperationSource& source = OperationSource::kStandard);
+WriteResult performDeletes(OperationContext* opCtx, const write_ops::DeleteCommandRequest& op);
 
+Status performAtomicTimeseriesWrites(OperationContext* opCtx,
+                                     const std::vector<write_ops::InsertCommandRequest>& insertOps,
+                                     const std::vector<write_ops::UpdateCommandRequest>& updateOps);
+
+/**
+ * Populate 'opDebug' with stats describing the execution of an update operation. Illegal to call
+ * with a null OpDebug pointer.
+ */
+void recordUpdateResultInOpDebug(const UpdateResult& updateResult, OpDebug* opDebug);
+
+/**
+ * Returns true if an update failure due to a given DuplicateKey error is eligible for retry.
+ * Requires that parsedUpdate.hasParsedQuery() is true.
+ */
+bool shouldRetryDuplicateKeyException(const ParsedUpdate& parsedUpdate,
+                                      const DuplicateKeyErrorInfo& errorInfo);
+
+}  // namespace write_ops_exec
 }  // namespace mongo

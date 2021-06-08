@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 #include "mongo/platform/basic.h"
 
@@ -44,7 +44,8 @@
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/service_context.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
+#include "mongo/util/net/cidr.h"
 #include "mongo/util/net/socket_utils.h"
 #include "mongo/util/scopeguard.h"
 
@@ -77,11 +78,12 @@
 namespace mongo {
 namespace repl {
 
+MONGO_FAIL_POINT_DEFINE(failIsSelfCheck);
+
 OID instanceId;
 
 MONGO_INITIALIZER(GenerateInstanceId)(InitializerContext*) {
     instanceId = OID::gen();
-    return Status::OK();
 }
 
 namespace {
@@ -107,47 +109,53 @@ std::string stringifyError(int code) {
 std::vector<std::string> getAddrsForHost(const std::string& iporhost,
                                          const int port,
                                          const bool ipv6enabled) {
-    addrinfo* addrs = NULL;
+    addrinfo* addrs = nullptr;
     addrinfo hints = {0};
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_family = (ipv6enabled ? AF_UNSPEC : AF_INET);
 
-    const std::string portNum = BSONObjBuilder::numStr(port);
+    const std::string portNum = std::to_string(port);
 
     std::vector<std::string> out;
 
     int err = getaddrinfo(iporhost.c_str(), portNum.c_str(), &hints, &addrs);
 
     if (err) {
-        warning() << "getaddrinfo(\"" << iporhost << "\") failed: " << stringifyError(err)
-                  << std::endl;
+        LOGV2_WARNING(21207,
+                      "getaddrinfo(\"{host}\") failed: {error}",
+                      "getaddrinfo() failed",
+                      "host"_attr = iporhost,
+                      "error"_attr = stringifyError(err));
         return out;
     }
 
     ON_BLOCK_EXIT([&] { freeaddrinfo(addrs); });
 
-    for (addrinfo* addr = addrs; addr != NULL; addr = addr->ai_next) {
+    for (addrinfo* addr = addrs; addr != nullptr; addr = addr->ai_next) {
         int family = addr->ai_family;
         char host[NI_MAXHOST];
 
         if (family == AF_INET || family == AF_INET6) {
             err = getnameinfo(
-                addr->ai_addr, addr->ai_addrlen, host, NI_MAXHOST, NULL, 0, NI_NUMERICHOST);
+                addr->ai_addr, addr->ai_addrlen, host, NI_MAXHOST, nullptr, 0, NI_NUMERICHOST);
             if (err) {
-                warning() << "getnameinfo() failed: " << stringifyError(err) << std::endl;
+                LOGV2_WARNING(21208,
+                              "getnameinfo() failed: {error}",
+                              "getnameinfo() failed",
+                              "error"_attr = stringifyError(err));
                 continue;
             }
             out.push_back(host);
         }
     }
 
-    if (shouldLog(logger::LogSeverity::Debug(2))) {
-        StringBuilder builder;
-        builder << "getAddrsForHost(\"" << iporhost << ":" << port << "\"):";
-        for (std::vector<std::string>::const_iterator o = out.begin(); o != out.end(); ++o) {
-            builder << " [ " << *o << "]";
-        }
-        LOG(2) << builder.str();
+    if (shouldLog(MONGO_LOGV2_DEFAULT_COMPONENT, logv2::LogSeverity::Debug(2))) {
+        LOGV2_DEBUG(21205,
+                    2,
+                    "getAddrsForHost()",
+                    "host"_attr = iporhost,
+                    "port"_attr = port,
+                    "result"_attr = out);
     }
 
     return out;
@@ -156,6 +164,13 @@ std::vector<std::string> getAddrsForHost(const std::string& iporhost,
 }  // namespace
 
 bool isSelf(const HostAndPort& hostAndPort, ServiceContext* const ctx) {
+    if (MONGO_unlikely(failIsSelfCheck.shouldFail())) {
+        LOGV2(356490,
+              "failIsSelfCheck failpoint activated, returning false from isSelf",
+              "hostAndPort"_attr = hostAndPort);
+        return false;
+    }
+
     // Fastpath: check if the host&port in question is bound to one
     // of the interfaces on this machine.
     // No need for ip match if the ports do not match
@@ -164,11 +179,13 @@ bool isSelf(const HostAndPort& hostAndPort, ServiceContext* const ctx) {
 
         // If any of the bound addresses is the default route (0.0.0.0 on IPv4) it means we are
         // listening on all network interfaces and need to check against any of them.
+        auto defaultRoute = false;
         if (myAddrs.empty() ||
             std::any_of(myAddrs.cbegin(), myAddrs.cend(), [](std::string const& addrStr) {
                 return HostAndPort(addrStr, serverGlobalParams.port).isDefaultRoute();
             })) {
             myAddrs = getBoundAddrs(IPv6Enabled());
+            defaultRoute = true;
         }
 
         const std::vector<std::string> hostAddrs =
@@ -179,6 +196,26 @@ bool isSelf(const HostAndPort& hostAndPort, ServiceContext* const ctx) {
             for (std::vector<std::string>::const_iterator j = hostAddrs.begin();
                  j != hostAddrs.end();
                  ++j) {
+
+                // If we are listening on the default route and the host address is in the range of
+                // addresses that correspond to the loopback interface, then we consider the host as
+                // ourself.
+                //
+                // Note that this logic is included to account for the fact that Debian systems add
+                // the "127.0.1.1" address for the local host name (as opposed to "127.0.0.1").
+                // Debian does not do this for IPv6 so we don't need to check that here.
+                try {
+                    CIDR loopbackAddrs("127.0.0.1/8");
+                    if (defaultRoute && loopbackAddrs.contains(CIDR(*j))) {
+                        return true;
+                    }
+                } catch (const std::exception& e) {
+                    LOGV2_WARNING(4754500,
+                                  "Error checking host against loopback addresses",
+                                  "host"_attr = *j,
+                                  "error"_attr = e.what());
+                }
+
                 if (*i == *j) {
                     return true;
                 }
@@ -197,12 +234,25 @@ bool isSelf(const HostAndPort& hostAndPort, ServiceContext* const ctx) {
         // a replica set configuration document, but the 'isMaster' command requires a lock on the
         // replication coordinator to execute. As such we call we call 'connectSocketOnly', which
         // does not call 'isMaster'.
-        if (!conn.connectSocketOnly(hostAndPort).isOK()) {
+        auto connectSocketResult = conn.connectSocketOnly(hostAndPort, boost::none);
+        if (!connectSocketResult.isOK()) {
+            LOGV2(4834700,
+                  "isSelf could not connect via connectSocketOnly",
+                  "hostAndPort"_attr = hostAndPort,
+                  "error"_attr = connectSocketResult);
             return false;
         }
 
-        if (auth::isInternalAuthSet() && !conn.authenticateInternalUser().isOK()) {
-            return false;
+        if (auth::isInternalAuthSet()) {
+            auto authInternalUserResult =
+                conn.authenticateInternalUser(auth::StepDownBehavior::kKeepConnectionOpen);
+            if (!authInternalUserResult.isOK()) {
+                LOGV2(4834701,
+                      "isSelf could not authenticate internal user",
+                      "hostAndPort"_attr = hostAndPort,
+                      "error"_attr = authInternalUserResult);
+                return false;
+            }
         }
         BSONObj out;
         bool ok = conn.simpleCommand("admin", &out, "_isSelf");
@@ -210,7 +260,11 @@ bool isSelf(const HostAndPort& hostAndPort, ServiceContext* const ctx) {
 
         return me;
     } catch (const std::exception& e) {
-        warning() << "couldn't check isSelf (" << hostAndPort << ") " << e.what() << std::endl;
+        LOGV2_WARNING(21209,
+                      "couldn't check isSelf ({hostAndPort}) {error}",
+                      "Couldn't check isSelf",
+                      "hostAndPort"_attr = hostAndPort,
+                      "error"_attr = e.what());
     }
 
     return false;
@@ -229,14 +283,17 @@ std::vector<std::string> getBoundAddrs(const bool ipv6enabled) {
 
     int err = getifaddrs(&addrs);
     if (err) {
-        warning() << "getifaddrs failure: " << errnoWithDescription(err) << std::endl;
+        LOGV2_WARNING(21210,
+                      "getifaddrs failure: {error}",
+                      "getifaddrs() failed",
+                      "error"_attr = errnoWithDescription(err));
         return out;
     }
     ON_BLOCK_EXIT([&] { freeifaddrs(addrs); });
 
     // based on example code from linux getifaddrs manpage
-    for (ifaddrs* addr = addrs; addr != NULL; addr = addr->ifa_next) {
-        if (addr->ifa_addr == NULL)
+    for (ifaddrs* addr = addrs; addr != nullptr; addr = addr->ifa_next) {
+        if (addr->ifa_addr == nullptr)
             continue;
         int family = addr->ifa_addr->sa_family;
         char host[NI_MAXHOST];
@@ -247,11 +304,14 @@ std::vector<std::string> getBoundAddrs(const bool ipv6enabled) {
                 (family == AF_INET ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6)),
                 host,
                 NI_MAXHOST,
-                NULL,
+                nullptr,
                 0,
                 NI_NUMERICHOST);
             if (err) {
-                warning() << "getnameinfo() failed: " << gai_strerror(err) << std::endl;
+                LOGV2_WARNING(21211,
+                              "getnameinfo() failed: {error}",
+                              "getnameinfo() failed",
+                              "error"_attr = gai_strerror(err));
                 continue;
             }
             out.push_back(host);
@@ -273,9 +333,8 @@ std::vector<std::string> getBoundAddrs(const bool ipv6enabled) {
     for (int tries = 0; tries < 3; ++tries) {
         err = GetAdaptersAddresses(family,
                                    GAA_FLAG_SKIP_ANYCAST |  // only want unicast addrs
-                                       GAA_FLAG_SKIP_MULTICAST |
-                                       GAA_FLAG_SKIP_DNS_SERVER,
-                                   NULL,
+                                       GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER,
+                                   nullptr,
                                    adapters,
                                    &adaptersLen);
 
@@ -289,12 +348,15 @@ std::vector<std::string> getBoundAddrs(const bool ipv6enabled) {
     }
 
     if (err != NO_ERROR) {
-        warning() << "GetAdaptersAddresses() failed: " << errnoWithDescription(err) << std::endl;
+        LOGV2_WARNING(21212,
+                      "GetAdaptersAddresses() failed: {error}",
+                      "GetAdaptersAddresses() failed",
+                      "error"_attr = errnoWithDescription(err));
         return out;
     }
 
-    for (IP_ADAPTER_ADDRESSES* adapter = adapters; adapter != NULL; adapter = adapter->Next) {
-        for (IP_ADAPTER_UNICAST_ADDRESS* addr = adapter->FirstUnicastAddress; addr != NULL;
+    for (IP_ADAPTER_ADDRESSES* adapter = adapters; adapter != nullptr; adapter = adapter->Next) {
+        for (IP_ADAPTER_UNICAST_ADDRESS* addr = adapter->FirstUnicastAddress; addr != nullptr;
              addr = addr->Next) {
             short family = reinterpret_cast<SOCKADDR_STORAGE*>(addr->Address.lpSockaddr)->ss_family;
 
@@ -307,8 +369,10 @@ std::vector<std::string> getBoundAddrs(const bool ipv6enabled) {
                 boost::asio::detail::socket_ops::inet_ntop(
                     AF_INET, &(sock->sin_addr), addrstr, INET_ADDRSTRLEN, 0, ec);
                 if (ec) {
-                    warning() << "inet_ntop failed during IPv4 address conversion: " << ec.message()
-                              << std::endl;
+                    LOGV2_WARNING(21213,
+                                  "inet_ntop failed during IPv4 address conversion: {error}",
+                                  "inet_ntop failed during IPv4 address conversion",
+                                  "error"_attr = ec.message());
                     continue;
                 }
                 out.push_back(addrstr);
@@ -320,8 +384,10 @@ std::vector<std::string> getBoundAddrs(const bool ipv6enabled) {
                 boost::asio::detail::socket_ops::inet_ntop(
                     AF_INET6, &(sock->sin6_addr), addrstr, INET6_ADDRSTRLEN, 0, ec);
                 if (ec) {
-                    warning() << "inet_ntop failed during IPv6 address conversion: " << ec.message()
-                              << std::endl;
+                    LOGV2_WARNING(21214,
+                                  "inet_ntop failed during IPv6 address conversion: {error}",
+                                  "inet_ntop failed during IPv6 address conversion",
+                                  "error"_attr = ec.message());
                     continue;
                 }
                 out.push_back(addrstr);
@@ -331,13 +397,8 @@ std::vector<std::string> getBoundAddrs(const bool ipv6enabled) {
 
 #endif  // defined(_WIN32)
 
-    if (shouldLog(logger::LogSeverity::Debug(2))) {
-        StringBuilder builder;
-        builder << "getBoundAddrs():";
-        for (std::vector<std::string>::const_iterator o = out.begin(); o != out.end(); ++o) {
-            builder << " [ " << *o << "]";
-        }
-        LOG(2) << builder.str();
+    if (shouldLog(MONGO_LOGV2_DEFAULT_COMPONENT, logv2::LogSeverity::Debug(2))) {
+        LOGV2_DEBUG(21206, 2, "getBoundAddrs()", "result"_attr = out);
     }
     return out;
 }

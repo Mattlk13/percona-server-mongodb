@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -40,20 +40,21 @@
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/client/read_preference.h"
 #include "mongo/client/remote_command_targeter.h"
-#include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/logical_session_cache.h"
-#include "mongo/db/logical_session_id_helpers.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/aggregate_command_gen.h"
+#include "mongo/db/pipeline/document_source_match.h"
+#include "mongo/db/pipeline/document_source_union_with.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/executor/network_interface.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
 #include "mongo/s/catalog/config_server_version.h"
-#include "mongo/s/catalog/dist_lock_manager.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog/type_collection.h"
 #include "mongo/s/catalog/type_config_version.h"
@@ -61,7 +62,7 @@
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/catalog/type_tags.h"
 #include "mongo/s/client/shard.h"
-#include "mongo/s/database_version_helpers.h"
+#include "mongo/s/database_version.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/set_shard_version_request.h"
 #include "mongo/s/shard_key_pattern.h"
@@ -70,8 +71,7 @@
 #include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/s/write_ops/batched_command_response.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/fail_point_service.h"
-#include "mongo/util/log.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/str.h"
 #include "mongo/util/time_support.h"
@@ -90,38 +90,11 @@ using str::stream;
 
 namespace {
 
-class AlternativeSessionRegion {
-public:
-    AlternativeSessionRegion(OperationContext* opCtx)
-        : _alternateClient(opCtx->getServiceContext()->makeClient("alternative-session-region")),
-          _acr(_alternateClient),
-          _newOpCtx(cc().makeOperationContext()),
-          _lsid(makeLogicalSessionId(opCtx)) {
-        _newOpCtx->setLogicalSessionId(_lsid);
-    }
-
-    ~AlternativeSessionRegion() {
-        LogicalSessionCache::get(opCtx())->endSessions({_lsid});
-    }
-
-    OperationContext* opCtx() {
-        return &*_newOpCtx;
-    }
-
-private:
-    ServiceContext::UniqueClient _alternateClient;
-    AlternativeClientRegion _acr;
-    ServiceContext::UniqueOperationContext _newOpCtx;
-    LogicalSessionId _lsid;
-};
-
 const ReadPreferenceSetting kConfigReadSelector(ReadPreference::Nearest, TagSet{});
 const ReadPreferenceSetting kConfigPrimaryPreferredSelector(ReadPreference::PrimaryPreferred,
                                                             TagSet{});
 const int kMaxReadRetry = 3;
 const int kMaxWriteRetry = 3;
-
-const int kRetryableBatchWriteBSONSizeOverhead = kWriteCommandBSONArrayPerElementOverheadBytes * 2;
 
 const NamespaceString kSettingsNamespace("config", "settings");
 
@@ -138,7 +111,7 @@ void sendRetryableWriteBatchRequestToConfig(OperationContext* opCtx,
     auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
 
     BatchedCommandRequest request([&] {
-        write_ops::Insert insertOp(nss);
+        write_ops::InsertCommandRequest insertOp(nss);
         insertOp.setDocuments(docs);
         return insertOp;
     }());
@@ -162,118 +135,356 @@ void sendRetryableWriteBatchRequestToConfig(OperationContext* opCtx,
     uassertStatusOK(writeStatus);
 }
 
+AggregateCommandRequest makeCollectionAndChunksAggregation(OperationContext* opCtx,
+                                                           const NamespaceString& nss,
+                                                           const ChunkVersion& sinceVersion) {
+    auto expCtx = make_intrusive<ExpressionContext>(opCtx, nullptr, CollectionType::ConfigNS);
+    StringMap<ExpressionContext::ResolvedNamespace> resolvedNamespaces;
+    resolvedNamespaces[CollectionType::ConfigNS.coll()] = {CollectionType::ConfigNS,
+                                                           std::vector<BSONObj>()};
+    resolvedNamespaces[ChunkType::ConfigNS.coll()] = {ChunkType::ConfigNS, std::vector<BSONObj>()};
+    expCtx->setResolvedNamespaces(resolvedNamespaces);
+
+    using Doc = Document;
+    using Arr = std::vector<Value>;
+
+    Pipeline::SourceContainer stages;
+
+    // 1. Match config.collections entries with {_id: nss}. This stage will produce, at most, one
+    // config.collections document.
+    // {
+    //     $match: {
+    //         _id: <nss>
+    //     }
+    // }
+    stages.emplace_back(DocumentSourceMatch::create(
+        Doc{{CollectionType::kNssFieldName, nss.toString()}}.toBson(), expCtx));
+
+    // 2. Four $unionWith stages, each one of them guarded by a mutually exclusive condition on
+    // metadata format ('timestamp' exists) and whether the refresh is incremental ('lastmodEpoch'
+    // matches sinceVersion.epoch), so that only a single one of them will possibly execute their
+    // $lookup stage. This is necessary because the query optimizer is not able to use indexes when
+    // a $match inside a $lookup includes a $cond operator. Also note that depending on the metadata
+    // format (indicated by the presence of 'timestamp'), we have different guarantees about what
+    // indexes are present (ns_1_lastmod_1 or uuid_1_lastmod_1), so we must avoid possibly executing
+    // a $lookup that would need an inexistent index, even if it was to return empty results.
+    //
+    // The $lookup stages get the config.chunks documents according to the metadata format and the
+    // type of refresh (incremental or full), sorted by ascending 'lastmod'. The $lookup is
+    // immediately followed by $unwind to take advantage of the $lookup + $unwind coalescence
+    // optimization which avoids creating large intermediate documents.
+    //
+    // This $unionWith stage will produce one result document for each config.chunks document
+    // matching the refresh query.
+    // Note that we must not make any assumption on where the document produced by stage 1 will be
+    // placed in the response in relation with the documents produced by stage 2. The
+    // config.collections document produced in stage 1 could be interleaved between the
+    // config.chunks documents produced by stage 2.
+    //
+    // {
+    //     $unionWith: {
+    //         coll: "collections",
+    //         pipeline: [
+    //             { $match: { _id: <nss> } },
+    //             { $match: { timestamp: { $exists: 0 } } },
+    //             { $match: { lastmodEpoch: <sinceVersion.epoch> } },
+    //             {
+    //                 $lookup: {
+    //                     from: "chunks",
+    //                     as: "chunks",
+    //                     let: { local_ns: "$_id" },
+    //                     pipeline: [
+    //                         {
+    //                             $match: {
+    //                                 $expr: {
+    //                                     $eq: ["$ns", "$$local_ns"],
+    //                                 },
+    //                             }
+    //                         },
+    //                         { $match: { lastmod: { $gte: <sinceVersion> } } },
+    //                         {
+    //                             $sort: {
+    //                                 lastmod: 1
+    //                             }
+    //                         }
+    //                     ]
+    //                 }
+    //             },
+    //             {
+    //                 $unwind: {
+    //                     path: "$chunks"
+    //                 }
+    //             },
+    //             {
+    //                 $project: { _id: false, chunks: true }
+    //             }
+    //         ]
+    //     }
+    // },
+    // {
+    //     $unionWith: {
+    //         coll: "collections",
+    //         pipeline: [
+    //             { $match: { _id: <nss> } },
+    //             { $match: { timestamp: { $exists: 1 } } },
+    //             { $match: { lastmodEpoch: <sinceVersion.epoch> } },
+    //             {
+    //                 $lookup: {
+    //                     from: "chunks",
+    //                     as: "chunks",
+    //                     let: { local_uuid: "$uuid" },
+    //                     pipeline: [
+    //                         {
+    //                             $match: {
+    //                                 $expr: {
+    //                                     $eq: ["$uuid", "$$local_uuid"],
+    //                                 },
+    //                             }
+    //                         },
+    //                         { $match: { lastmod: { $gte: <sinceVersion> } } },
+    //                         {
+    //                             $sort: {
+    //                                 lastmod: 1
+    //                             }
+    //                         }
+    //                     ]
+    //                 }
+    //             },
+    //             {
+    //                 $unwind: {
+    //                     path: "$chunks"
+    //                 }
+    //             },
+    //             {
+    //                 $project: { _id: false, chunks: true }
+    //             },
+    //         ]
+    //     }
+    // },
+    // {
+    //     $unionWith: {
+    //         coll: "collections",
+    //         pipeline: [
+    //             { $match: { _id: <nss> } },
+    //             { $match: { timestamp: { $exists: 0 } } },
+    //             { $match: { lastmodEpoch: { $ne: <sinceVersion.epoch> } } },
+    //             {
+    //                 $lookup: {
+    //                     from: "chunks",
+    //                     as: "chunks",
+    //                     let: { local_ns: "$_id" },
+    //                     pipeline: [
+    //                         {
+    //                             $match: {
+    //                                 $expr: {
+    //                                     $eq: ["$ns", "$$local_ns"],
+    //                                 },
+    //                             }
+    //                         },
+    //                         {
+    //                             $sort: {
+    //                                 lastmod: 1
+    //                             }
+    //                         }
+    //                     ]
+    //                 }
+    //             },
+    //             {
+    //                 $unwind: {
+    //                     path: "$chunks"
+    //                 }
+    //             },
+    //             {
+    //                 $project: { _id: false, chunks: true }
+    //             },
+    //         ]
+    //     }
+    // },
+    // {
+    //     $unionWith: {
+    //         coll: "collections",
+    //         pipeline: [
+    //             { $match: { _id: <nss> } },
+    //             { $match: { timestamp: { $exists: 1 } } },
+    //             { $match: { lastmodEpoch: { $ne: <sinceVersion.epoch> } } },
+    //             {
+    //                 $lookup: {
+    //                     from: "chunks",
+    //                     as: "chunks",
+    //                     let: { local_uuid: "$uuid" },
+    //                     pipeline: [
+    //                         {
+    //                             $match: {
+    //                                 $expr: {
+    //                                     $eq: ["$uuid", "$$local_uuid"],
+    //                                 },
+    //                             }
+    //                         },
+    //                         {
+    //                             $sort: {
+    //                                 lastmod: 1
+    //                             }
+    //                         }
+    //                     ]
+    //                 }
+    //             },
+    //             {
+    //                 $unwind: {
+    //                     path: "$chunks"
+    //                 }
+    //             },
+    //             {
+    //                 $project: { _id: false, chunks: true }
+    //             },
+    //         ]
+    //     }
+    // }
+    const auto buildUnionWithFn = [&](bool withUUID, bool incremental) {
+        const auto lastmodEpochMatch = Doc{{incremental ? "$eq" : "$ne", sinceVersion.epoch()}};
+
+        const auto letExpr = withUUID ? Doc{{"local_uuid", "$" + CollectionType::kUuidFieldName}}
+                                      : Doc{{"local_ns", "$" + CollectionType::kNssFieldName}};
+
+        const auto eqNsOrUuidExpr = withUUID
+            ? Arr{Value{"$" + ChunkType::collectionUUID.name()}, Value{"$$local_uuid"_sd}}
+            : Arr{Value{"$" + ChunkType::ns.name()}, Value{"$$local_ns"_sd}};
+
+        constexpr auto chunksLookupOutputFieldName = "chunks"_sd;
+
+        const auto lookupPipeline = [&]() {
+            return Doc{
+                {"from", ChunkType::ConfigNS.coll()},
+                {"as", chunksLookupOutputFieldName},
+                {"let", letExpr},
+                {"pipeline",
+                 Arr{Value{Doc{{"$match", Doc{{"$expr", Doc{{"$eq", eqNsOrUuidExpr}}}}}}},
+                     incremental
+                         ? Value{Doc{{"$match",
+                                      Doc{{ChunkType::lastmod.name(),
+                                           Doc{{"$gte", Timestamp(sinceVersion.toLong())}}}}}}}
+                         : Value{/*noop*/},
+                     Value{Doc{{"$sort", Doc{{ChunkType::lastmod.name(), 1}}}}}}}};
+        }();
+
+        return Doc{
+            {"coll", CollectionType::ConfigNS.coll()},
+            {"pipeline",
+             Arr{Value{Doc{{"$match", Doc{{CollectionType::kNssFieldName, nss.toString()}}}}},
+                 Value{
+                     Doc{{"$match",
+                          Doc{{CollectionType::kTimestampFieldName, Doc{{"$exists", withUUID}}}}}}},
+                 Value{Doc{{"$match", Doc{{CollectionType::kEpochFieldName, lastmodEpochMatch}}}}},
+                 Value{Doc{{"$lookup", lookupPipeline}}},
+                 Value{Doc{{"$unwind", Doc{{"path", "$" + chunksLookupOutputFieldName}}}}},
+                 Value{Doc{
+                     {"$project", Doc{{"_id", false}, {chunksLookupOutputFieldName, true}}}}}}}};
+    };
+
+    // TODO SERVER-53283: Once 5.0 has branched out this stage is no longer necessary.
+    stages.emplace_back(DocumentSourceUnionWith::createFromBson(
+        Doc{{"$unionWith", buildUnionWithFn(false /* withUUID */, true /* incremental */)}}
+            .toBson()
+            .firstElement(),
+        expCtx));
+
+    stages.emplace_back(DocumentSourceUnionWith::createFromBson(
+        Doc{{"$unionWith", buildUnionWithFn(true /* withUUID */, true /* incremental */)}}
+            .toBson()
+            .firstElement(),
+        expCtx));
+
+    // TODO SERVER-53283: Once 5.0 has branched out this stage is no longer necessary.
+    stages.emplace_back(DocumentSourceUnionWith::createFromBson(
+        Doc{{"$unionWith", buildUnionWithFn(false /* withUUID */, false /* incremental */)}}
+            .toBson()
+            .firstElement(),
+        expCtx));
+
+    stages.emplace_back(DocumentSourceUnionWith::createFromBson(
+        Doc{{"$unionWith", buildUnionWithFn(true /* withUUID */, false /* incremental */)}}
+            .toBson()
+            .firstElement(),
+        expCtx));
+
+    auto pipeline = Pipeline::create(std::move(stages), expCtx);
+    auto serializedPipeline = pipeline->serializeToBson();
+    return AggregateCommandRequest(CollectionType::ConfigNS, std::move(serializedPipeline));
+}
+
 }  // namespace
 
-ShardingCatalogClientImpl::ShardingCatalogClientImpl(
-    std::unique_ptr<DistLockManager> distLockManager)
-    : _distLockManager(std::move(distLockManager)) {}
+ShardingCatalogClientImpl::ShardingCatalogClientImpl() = default;
 
 ShardingCatalogClientImpl::~ShardingCatalogClientImpl() = default;
-
-void ShardingCatalogClientImpl::startup() {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
-    if (_started) {
-        return;
-    }
-
-    _started = true;
-    _distLockManager->startUp();
-}
-
-void ShardingCatalogClientImpl::shutDown(OperationContext* opCtx) {
-    LOG(1) << "ShardingCatalogClientImpl::shutDown() called.";
-    {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
-        _inShutdown = true;
-    }
-
-    invariant(_distLockManager);
-    _distLockManager->shutDown(opCtx);
-}
 
 Status ShardingCatalogClientImpl::updateShardingCatalogEntryForCollection(
     OperationContext* opCtx,
     const NamespaceString& nss,
     const CollectionType& coll,
     const bool upsert) {
-    fassert(28634, coll.validate());
-
     auto status = _updateConfigDocument(opCtx,
                                         CollectionType::ConfigNS,
-                                        BSON(CollectionType::fullNs(nss.ns())),
+                                        BSON(CollectionType::kNssFieldName << nss.ns()),
                                         coll.toBSON(),
                                         upsert,
                                         ShardingCatalogClient::kMajorityWriteConcern);
     return status.getStatus().withContext(str::stream() << "Collection metadata write failed");
 }
 
-StatusWith<repl::OpTimeWith<DatabaseType>> ShardingCatalogClientImpl::getDatabase(
-    OperationContext* opCtx, const std::string& dbName, repl::ReadConcernLevel readConcernLevel) {
-    if (!NamespaceString::validDBName(dbName, NamespaceString::DollarInDbNameBehavior::Allow)) {
-        return {ErrorCodes::InvalidNamespace, stream() << dbName << " is not a valid db name"};
-    }
+DatabaseType ShardingCatalogClientImpl::getDatabase(OperationContext* opCtx,
+                                                    StringData dbName,
+                                                    repl::ReadConcernLevel readConcernLevel) {
+    uassert(ErrorCodes::InvalidNamespace,
+            stream() << dbName << " is not a valid db name",
+            NamespaceString::validDBName(dbName, NamespaceString::DollarInDbNameBehavior::Allow));
 
     // The admin database is always hosted on the config server.
-    if (dbName == NamespaceString::kAdminDb) {
-        DatabaseType dbt(
-            dbName, ShardRegistry::kConfigServerShardId, false, databaseVersion::makeFixed());
-        return repl::OpTimeWith<DatabaseType>(dbt);
-    }
+    if (dbName == NamespaceString::kAdminDb)
+        return DatabaseType(
+            dbName.toString(), ShardId::kConfigServerId, false, DatabaseVersion::makeFixed());
 
     // The config database's primary shard is always config, and it is always sharded.
-    if (dbName == NamespaceString::kConfigDb) {
-        DatabaseType dbt(
-            dbName, ShardRegistry::kConfigServerShardId, true, databaseVersion::makeFixed());
-        return repl::OpTimeWith<DatabaseType>(dbt);
-    }
+    if (dbName == NamespaceString::kConfigDb)
+        return DatabaseType(
+            dbName.toString(), ShardId::kConfigServerId, true, DatabaseVersion::makeFixed());
 
-    auto result = _fetchDatabaseMetadata(opCtx, dbName, kConfigReadSelector, readConcernLevel);
+    auto result =
+        _fetchDatabaseMetadata(opCtx, dbName.toString(), kConfigReadSelector, readConcernLevel);
     if (result == ErrorCodes::NamespaceNotFound) {
         // If we failed to find the database metadata on the 'nearest' config server, try again
         // against the primary, in case the database was recently created.
-        result = _fetchDatabaseMetadata(
-            opCtx, dbName, ReadPreferenceSetting{ReadPreference::PrimaryOnly}, readConcernLevel);
-        if (!result.isOK() && (result != ErrorCodes::NamespaceNotFound)) {
-            return result.getStatus().withContext(
-                str::stream() << "Could not confirm non-existence of database " << dbName);
-        }
+        return uassertStatusOK(
+                   _fetchDatabaseMetadata(opCtx,
+                                          dbName.toString(),
+                                          ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+                                          readConcernLevel))
+            .value;
     }
 
-    return result;
+    return uassertStatusOK(std::move(result)).value;
 }
 
-StatusWith<repl::OpTimeWith<std::vector<DatabaseType>>> ShardingCatalogClientImpl::getAllDBs(
-    OperationContext* opCtx, repl::ReadConcernLevel readConcern) {
+std::vector<DatabaseType> ShardingCatalogClientImpl::getAllDBs(OperationContext* opCtx,
+                                                               repl::ReadConcernLevel readConcern) {
     std::vector<DatabaseType> databases;
-    auto findStatus = _exhaustiveFindOnConfig(opCtx,
-                                              kConfigReadSelector,
-                                              readConcern,
-                                              DatabaseType::ConfigNS,
-                                              BSONObj(),     // no query filter
-                                              BSONObj(),     // no sort
-                                              boost::none);  // no limit
-    if (!findStatus.isOK()) {
-        return findStatus.getStatus();
+    auto dbs = uassertStatusOK(_exhaustiveFindOnConfig(opCtx,
+                                                       kConfigReadSelector,
+                                                       readConcern,
+                                                       DatabaseType::ConfigNS,
+                                                       BSONObj(),
+                                                       BSONObj(),
+                                                       boost::none))
+                   .value;
+    for (const BSONObj& doc : dbs) {
+        auto db = uassertStatusOKWithContext(
+            DatabaseType::fromBSON(doc), stream() << "Failed to parse database document " << doc);
+        uassertStatusOKWithContext(db.validate(),
+                                   stream() << "Failed to validate database document " << doc);
+
+        databases.emplace_back(std::move(db));
     }
 
-    for (const BSONObj& doc : findStatus.getValue().value) {
-        auto dbRes = DatabaseType::fromBSON(doc);
-        if (!dbRes.isOK()) {
-            return dbRes.getStatus().withContext(stream() << "Failed to parse database document "
-                                                          << doc);
-        }
-
-        Status validateStatus = dbRes.getValue().validate();
-        if (!validateStatus.isOK()) {
-            return validateStatus.withContext(stream() << "Failed to validate database document "
-                                                       << doc);
-        }
-
-        databases.push_back(dbRes.getValue());
-    }
-
-    return repl::OpTimeWith<std::vector<DatabaseType>>{std::move(databases),
-                                                       findStatus.getValue().opTime};
+    return databases;
 }
 
 StatusWith<repl::OpTimeWith<DatabaseType>> ShardingCatalogClientImpl::_fetchDatabaseMetadata(
@@ -309,102 +520,63 @@ StatusWith<repl::OpTimeWith<DatabaseType>> ShardingCatalogClientImpl::_fetchData
     return repl::OpTimeWith<DatabaseType>(parseStatus.getValue(), docsWithOpTime.opTime);
 }
 
-StatusWith<repl::OpTimeWith<CollectionType>> ShardingCatalogClientImpl::getCollection(
-    OperationContext* opCtx, const NamespaceString& nss, repl::ReadConcernLevel readConcernLevel) {
-    auto statusFind = _exhaustiveFindOnConfig(opCtx,
-                                              kConfigReadSelector,
-                                              readConcernLevel,
-                                              CollectionType::ConfigNS,
-                                              BSON(CollectionType::fullNs(nss.ns())),
-                                              BSONObj(),
-                                              1);
-    if (!statusFind.isOK()) {
-        return statusFind.getStatus();
-    }
+CollectionType ShardingCatalogClientImpl::getCollection(OperationContext* opCtx,
+                                                        const NamespaceString& nss,
+                                                        repl::ReadConcernLevel readConcernLevel) {
+    auto collDoc =
+        uassertStatusOK(_exhaustiveFindOnConfig(opCtx,
+                                                kConfigReadSelector,
+                                                readConcernLevel,
+                                                CollectionType::ConfigNS,
+                                                BSON(CollectionType::kNssFieldName << nss.ns()),
+                                                BSONObj(),
+                                                1))
+            .value;
+    uassert(ErrorCodes::NamespaceNotFound,
+            stream() << "collection " << nss.ns() << " not found",
+            !collDoc.empty());
 
-    const auto& retOpTimePair = statusFind.getValue();
-    const auto& retVal = retOpTimePair.value;
-    if (retVal.empty()) {
-        return Status(ErrorCodes::NamespaceNotFound,
-                      stream() << "collection " << nss.ns() << " not found");
-    }
-
-    invariant(retVal.size() == 1);
-
-    auto parseStatus = CollectionType::fromBSON(retVal.front());
-    if (!parseStatus.isOK()) {
-        return parseStatus.getStatus();
-    }
-
-    auto collType = parseStatus.getValue();
-    if (collType.getDropped()) {
-        return Status(ErrorCodes::NamespaceNotFound,
-                      stream() << "collection " << nss.ns() << " was dropped");
-    }
-
-    return repl::OpTimeWith<CollectionType>(collType, retOpTimePair.opTime);
+    CollectionType coll(collDoc[0]);
+    uassert(ErrorCodes::NamespaceNotFound,
+            stream() << "collection " << nss.ns() << " was dropped",
+            !coll.getDropped());
+    return coll;
 }
 
-StatusWith<std::vector<CollectionType>> ShardingCatalogClientImpl::getCollections(
-    OperationContext* opCtx,
-    const std::string* dbName,
-    OpTime* opTime,
-    repl::ReadConcernLevel readConcernLevel) {
+std::vector<CollectionType> ShardingCatalogClientImpl::getCollections(
+    OperationContext* opCtx, StringData dbName, repl::ReadConcernLevel readConcernLevel) {
     BSONObjBuilder b;
-    if (dbName) {
-        invariant(!dbName->empty());
-        b.appendRegex(CollectionType::fullNs(),
-                      string(str::stream() << "^" << pcrecpp::RE::QuoteMeta(*dbName) << "\\."));
-    }
+    if (!dbName.empty())
+        b.appendRegex(CollectionType::kNssFieldName,
+                      std::string(str::stream()
+                                  << "^" << pcrecpp::RE::QuoteMeta(dbName.toString()) << "\\."));
 
-    auto findStatus = _exhaustiveFindOnConfig(opCtx,
-                                              kConfigReadSelector,
-                                              readConcernLevel,
-                                              CollectionType::ConfigNS,
-                                              b.obj(),
-                                              BSONObj(),
-                                              boost::none);  // no limit
-    if (!findStatus.isOK()) {
-        return findStatus.getStatus();
-    }
-
-    const auto& docsOpTimePair = findStatus.getValue();
-
+    auto collDocs = uassertStatusOK(_exhaustiveFindOnConfig(opCtx,
+                                                            kConfigReadSelector,
+                                                            readConcernLevel,
+                                                            CollectionType::ConfigNS,
+                                                            b.obj(),
+                                                            BSONObj(),
+                                                            boost::none))
+                        .value;
     std::vector<CollectionType> collections;
-    for (const BSONObj& obj : docsOpTimePair.value) {
-        const auto collectionResult = CollectionType::fromBSON(obj);
-        if (!collectionResult.isOK()) {
-            return {ErrorCodes::FailedToParse,
-                    str::stream() << "error while parsing " << CollectionType::ConfigNS.ns()
-                                  << " document: "
-                                  << obj
-                                  << " : "
-                                  << collectionResult.getStatus().toString()};
-        }
-
-        collections.push_back(collectionResult.getValue());
-    }
-
-    if (opTime) {
-        *opTime = docsOpTimePair.opTime;
-    }
+    for (const BSONObj& obj : collDocs)
+        collections.emplace_back(obj);
 
     return collections;
 }
 
 std::vector<NamespaceString> ShardingCatalogClientImpl::getAllShardedCollectionsForDb(
     OperationContext* opCtx, StringData dbName, repl::ReadConcernLevel readConcern) {
-    const auto dbNameStr = dbName.toString();
-
-    const std::vector<CollectionType> collectionsOnConfig =
-        uassertStatusOK(getCollections(opCtx, &dbNameStr, nullptr, readConcern));
+    auto collectionsOnConfig = getCollections(opCtx, dbName, readConcern);
 
     std::vector<NamespaceString> collectionsToReturn;
     for (const auto& coll : collectionsOnConfig) {
-        if (coll.getDropped())
+        if (coll.getDropped()) {
             continue;
+        }
 
-        collectionsToReturn.push_back(coll.getNs());
+        collectionsToReturn.push_back(coll.getNss());
     }
 
     return collectionsToReturn;
@@ -511,14 +683,15 @@ StatusWith<std::vector<ChunkType>> ShardingCatalogClientImpl::getChunks(
     const BSONObj& sort,
     boost::optional<int> limit,
     OpTime* opTime,
-    repl::ReadConcernLevel readConcern) {
+    repl::ReadConcernLevel readConcern,
+    const boost::optional<BSONObj>& hint) {
     invariant(serverGlobalParams.clusterRole == ClusterRole::ConfigServer ||
               readConcern == repl::ReadConcernLevel::kMajorityReadConcern);
 
     // Convert boost::optional<int> to boost::optional<long long>.
     auto longLimit = limit ? boost::optional<long long>(*limit) : boost::none;
     auto findStatus = _exhaustiveFindOnConfig(
-        opCtx, kConfigReadSelector, readConcern, ChunkType::ConfigNS, query, sort, longLimit);
+        opCtx, kConfigReadSelector, readConcern, ChunkType::ConfigNS, query, sort, longLimit, hint);
     if (!findStatus.isOK()) {
         return findStatus.getStatus().withContext("Failed to load chunks");
     }
@@ -542,6 +715,77 @@ StatusWith<std::vector<ChunkType>> ShardingCatalogClientImpl::getChunks(
 
     return chunks;
 }
+
+std::pair<CollectionType, std::vector<ChunkType>> ShardingCatalogClientImpl::getCollectionAndChunks(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    const ChunkVersion& sinceVersion,
+    const repl::ReadConcernArgs& readConcern) {
+    auto aggRequest = makeCollectionAndChunksAggregation(opCtx, nss, sinceVersion);
+    aggRequest.setReadConcern(readConcern.toBSONInner());
+    aggRequest.setWriteConcern(WriteConcernOptions());
+
+    const auto readPref = (serverGlobalParams.clusterRole == ClusterRole::ConfigServer)
+        ? ReadPreferenceSetting()
+        : Grid::get(opCtx)->readPreferenceWithConfigTime(kConfigReadSelector);
+    aggRequest.setUnwrappedReadPref(readPref.toContainingBSON());
+
+    // Run the aggregation
+    std::vector<BSONObj> aggResult;
+    auto callback = [&aggResult](const std::vector<BSONObj>& batch) {
+        aggResult.insert(aggResult.end(),
+                         std::make_move_iterator(batch.begin()),
+                         std::make_move_iterator(batch.end()));
+        return true;
+    };
+
+    const auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
+    for (int retry = 1; retry <= kMaxWriteRetry; retry++) {
+        const Status status = configShard->runAggregation(opCtx, aggRequest, callback);
+        if (retry < kMaxWriteRetry &&
+            configShard->isRetriableError(status.code(), Shard::RetryPolicy::kIdempotent)) {
+            aggResult.clear();
+            continue;
+        }
+        uassertStatusOK(status);
+        break;
+    }
+
+    uassert(ErrorCodes::NamespaceNotFound,
+            stream() << "Collection " << nss.ns() << " not found",
+            !aggResult.empty());
+
+    boost::optional<CollectionType> coll;
+    std::vector<ChunkType> chunks;
+    chunks.reserve(aggResult.size() - 1);
+
+    // The aggregation may return the config.collections document anywhere between the
+    // config.chunks documents.
+    for (const auto& elem : aggResult) {
+        const auto chunkElem = elem.getField("chunks");
+        if (chunkElem) {
+            auto chunkRes = uassertStatusOK(ChunkType::fromConfigBSON(chunkElem.Obj()));
+            chunks.emplace_back(std::move(chunkRes));
+        } else {
+            uassert(5520100,
+                    "Found more than one 'collections' documents in aggregation response",
+                    !coll);
+            coll.emplace(elem);
+
+            uassert(ErrorCodes::NamespaceNotFound,
+                    str::stream() << "Collection " << nss.ns() << " is dropped.",
+                    !coll->getDropped());
+        }
+    }
+
+    uassert(5520101, "'collections' document not found in aggregation response", coll);
+
+    uassert(ErrorCodes::ConflictingOperationInProgress,
+            stream() << "No chunks were found for the collection " << nss,
+            !chunks.empty());
+
+    return {std::move(*coll), std::move(chunks)};
+};
 
 StatusWith<std::vector<TagsType>> ShardingCatalogClientImpl::getTagsForCollection(
     OperationContext* opCtx, const NamespaceString& nss) {
@@ -590,14 +834,14 @@ StatusWith<repl::OpTimeWith<std::vector<ShardType>>> ShardingCatalogClientImpl::
     for (const BSONObj& doc : findStatus.getValue().value) {
         auto shardRes = ShardType::fromBSON(doc);
         if (!shardRes.isOK()) {
-            return shardRes.getStatus().withContext(stream() << "Failed to parse shard document "
-                                                             << doc);
+            return shardRes.getStatus().withContext(stream()
+                                                    << "Failed to parse shard document " << doc);
         }
 
         Status validateStatus = shardRes.getValue().validate();
         if (!validateStatus.isOK()) {
-            return validateStatus.withContext(stream() << "Failed to validate shard document "
-                                                       << doc);
+            return validateStatus.withContext(stream()
+                                              << "Failed to validate shard document " << doc);
         }
 
         shards.push_back(shardRes.getValue());
@@ -607,34 +851,32 @@ StatusWith<repl::OpTimeWith<std::vector<ShardType>>> ShardingCatalogClientImpl::
                                                     findStatus.getValue().opTime};
 }
 
-bool ShardingCatalogClientImpl::runUserManagementWriteCommand(OperationContext* opCtx,
-                                                              const std::string& commandName,
-                                                              const std::string& dbname,
-                                                              const BSONObj& cmdObj,
-                                                              BSONObjBuilder* result) {
+Status ShardingCatalogClientImpl::runUserManagementWriteCommand(OperationContext* opCtx,
+                                                                StringData commandName,
+                                                                StringData dbname,
+                                                                const BSONObj& cmdObj,
+                                                                BSONObjBuilder* result) {
     BSONObj cmdToRun = cmdObj;
     {
         // Make sure that if the command has a write concern that it is w:1 or w:majority, and
         // convert w:1 or no write concern to w:majority before sending.
         WriteConcernOptions writeConcern;
-        writeConcern.reset();
 
         BSONElement writeConcernElement = cmdObj[WriteConcernOptions::kWriteConcernField];
         bool initialCmdHadWriteConcern = !writeConcernElement.eoo();
         if (initialCmdHadWriteConcern) {
-            Status status = writeConcern.parse(writeConcernElement.Obj());
-            if (!status.isOK()) {
-                return CommandHelpers::appendCommandStatusNoThrow(*result, status);
+            auto sw = WriteConcernOptions::parse(writeConcernElement.Obj());
+            if (!sw.isOK()) {
+                return sw.getStatus();
             }
+            writeConcern = sw.getValue();
 
-            if (!(writeConcern.wNumNodes == 1 ||
-                  writeConcern.wMode == WriteConcernOptions::kMajority)) {
-                return CommandHelpers::appendCommandStatusNoThrow(
-                    *result,
-                    {ErrorCodes::InvalidOptions,
-                     str::stream() << "Invalid replication write concern. User management write "
-                                      "commands may only use w:1 or w:'majority', got: "
-                                   << writeConcern.toBSON()});
+            if ((writeConcern.wNumNodes != 1) &&
+                (writeConcern.wMode != WriteConcernOptions::kMajority)) {
+                return {ErrorCodes::InvalidOptions,
+                        str::stream() << "Invalid replication write concern. User management write "
+                                         "commands may only use w:1 or w:'majority', got: "
+                                      << writeConcern.toBSON()};
             }
         }
 
@@ -658,29 +900,31 @@ bool ShardingCatalogClientImpl::runUserManagementWriteCommand(OperationContext* 
         cmdToRun = modifiedCmd.obj();
     }
 
-    auto response =
+    auto swResponse =
         Grid::get(opCtx)->shardRegistry()->getConfigShard()->runCommandWithFixedRetryAttempts(
             opCtx,
             ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-            dbname,
+            dbname.toString(),
             cmdToRun,
             Shard::kDefaultConfigCommandTimeout,
             Shard::RetryPolicy::kNotIdempotent);
 
-    if (!response.isOK()) {
-        return CommandHelpers::appendCommandStatusNoThrow(*result, response.getStatus());
-    }
-    if (!response.getValue().commandStatus.isOK()) {
-        return CommandHelpers::appendCommandStatusNoThrow(*result,
-                                                          response.getValue().commandStatus);
-    }
-    if (!response.getValue().writeConcernStatus.isOK()) {
-        return CommandHelpers::appendCommandStatusNoThrow(*result,
-                                                          response.getValue().writeConcernStatus);
+    if (!swResponse.isOK()) {
+        return swResponse.getStatus();
     }
 
-    CommandHelpers::filterCommandReplyForPassthrough(response.getValue().response, result);
-    return true;
+    auto response = std::move(swResponse.getValue());
+
+    if (!response.commandStatus.isOK()) {
+        return response.commandStatus;
+    }
+
+    if (!response.writeConcernStatus.isOK()) {
+        return response.writeConcernStatus;
+    }
+
+    CommandHelpers::filterCommandReplyForPassthrough(response.response, result);
+    return Status::OK();
 }
 
 bool ShardingCatalogClientImpl::runUserManagementReadCommand(OperationContext* opCtx,
@@ -713,9 +957,9 @@ Status ShardingCatalogClientImpl::applyChunkOpsDeprecated(OperationContext* opCt
     invariant(serverGlobalParams.clusterRole == ClusterRole::ConfigServer ||
               (readConcern == repl::ReadConcernLevel::kMajorityReadConcern &&
                writeConcern.wMode == WriteConcernOptions::kMajority));
-    BSONObj cmd = BSON("applyOps" << updateOps << "preCondition" << preCondition
-                                  << WriteConcernOptions::kWriteConcernField
-                                  << writeConcern.toBSON());
+    BSONObj cmd =
+        BSON("applyOps" << updateOps << "preCondition" << preCondition
+                        << WriteConcernOptions::kWriteConcernField << writeConcern.toBSON());
 
     auto response =
         Grid::get(opCtx)->shardRegistry()->getConfigShard()->runCommandWithFixedRetryAttempts(
@@ -736,7 +980,7 @@ Status ShardingCatalogClientImpl::applyChunkOpsDeprecated(OperationContext* opCt
     // TODO (Dianna) This fail point needs to be reexamined when CommitChunkMigration is in:
     // migrations will no longer be able to exercise it, so split or merge will need to do so.
     // SERVER-22659.
-    if (MONGO_FAIL_POINT(failApplyChunkOps)) {
+    if (MONGO_unlikely(failApplyChunkOps.shouldFail())) {
         status = Status(ErrorCodes::InternalError, "Failpoint 'failApplyChunkOps' generated error");
     }
 
@@ -749,8 +993,11 @@ Status ShardingCatalogClientImpl::applyChunkOpsDeprecated(OperationContext* opCt
         // document in the list of updates should be returned from a query to the chunks
         // collection. The last chunk can be identified by namespace and version number.
 
-        warning() << "chunk operation commit failed and metadata will be revalidated"
-                  << causedBy(redact(status));
+        LOGV2_WARNING(
+            22675,
+            "Error committing chunk operation, metadata will be revalidated. Caused by {error}",
+            "Error committing chunk operation, metadata will be revalidated",
+            "error"_attr = redact(status));
 
         // Look for the chunk in this shard whose version got bumped. We assume that if that
         // mod made it to the config server, then transaction was successful.
@@ -772,11 +1019,11 @@ Status ShardingCatalogClientImpl::applyChunkOpsDeprecated(OperationContext* opCt
         const auto& newestChunk = chunkWithStatus.getValue();
 
         if (newestChunk.empty()) {
-            errMsg = str::stream() << "chunk operation commit failed: version "
-                                   << lastChunkVersion.toString()
-                                   << " doesn't exist in namespace: " << nss.ns()
-                                   << ". Unable to save chunk ops. Command: " << cmd
-                                   << ". Result: " << response.getValue().response;
+            errMsg = str::stream()
+                << "chunk operation commit failed: version " << lastChunkVersion.toString()
+                << " doesn't exist in namespace: " << nss.ns()
+                << ". Unable to save chunk ops. Command: " << cmd
+                << ". Result: " << response.getValue().response;
             return status.withContext(errMsg);
         };
 
@@ -787,21 +1034,6 @@ Status ShardingCatalogClientImpl::applyChunkOpsDeprecated(OperationContext* opCt
     return Status::OK();
 }
 
-DistLockManager* ShardingCatalogClientImpl::getDistLockManager() {
-    invariant(_distLockManager);
-    return _distLockManager.get();
-}
-
-void ShardingCatalogClientImpl::writeConfigServerDirect(OperationContext* opCtx,
-                                                        const BatchedCommandRequest& batchRequest,
-                                                        BatchedCommandResponse* batchResponse) {
-    auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
-    *batchResponse = configShard->runBatchWriteCommand(opCtx,
-                                                       Shard::kDefaultConfigCommandTimeout,
-                                                       batchRequest,
-                                                       Shard::RetryPolicy::kNotIdempotent);
-}
-
 Status ShardingCatalogClientImpl::insertConfigDocument(OperationContext* opCtx,
                                                        const NamespaceString& nss,
                                                        const BSONObj& doc,
@@ -809,10 +1041,9 @@ Status ShardingCatalogClientImpl::insertConfigDocument(OperationContext* opCtx,
     invariant(nss.db() == NamespaceString::kAdminDb || nss.db() == NamespaceString::kConfigDb);
 
     const BSONElement idField = doc.getField("_id");
-    invariant(!idField.eoo());
 
     BatchedCommandRequest request([&] {
-        write_ops::Insert insertOp(nss);
+        write_ops::InsertCommandRequest insertOp(nss);
         insertOp.setDocuments({doc});
         return insertOp;
     }());
@@ -838,14 +1069,15 @@ Status ShardingCatalogClientImpl::insertConfigDocument(OperationContext* opCtx,
         // or it is because we failed to wait for write concern on the first attempt. In order to
         // differentiate, fetch the entry and check.
         if (retry > 1 && status == ErrorCodes::DuplicateKey) {
-            LOG(1) << "Insert retry failed because of duplicate key error, rechecking.";
+            LOGV2_DEBUG(
+                22674, 1, "Insert retry failed because of duplicate key error, rechecking.");
 
             auto fetchDuplicate =
                 _exhaustiveFindOnConfig(opCtx,
                                         ReadPreferenceSetting{ReadPreference::PrimaryOnly},
                                         repl::ReadConcernLevel::kMajorityReadConcern,
                                         nss,
-                                        idField.wrap(),
+                                        idField.eoo() ? doc : idField.wrap(),
                                         BSONObj(),
                                         boost::none);
             if (!fetchDuplicate.isOK()) {
@@ -887,30 +1119,29 @@ void ShardingCatalogClientImpl::insertConfigDocumentsAsRetryableWrite(
 
     std::vector<BSONObj> workingBatch;
     size_t workingBatchItemSize = 0;
-
-    int workingBatchDocSize = kRetryableBatchWriteBSONSizeOverhead;
+    int workingBatchDocSize = 0;
 
     while (!docs.empty()) {
         BSONObj toAdd = docs.back();
         docs.pop_back();
 
-        int docSize = toAdd.objsize();
-        bool batchAtSizeLimit = (workingBatchItemSize + 1 > write_ops::kMaxWriteBatchSize) ||
-            (workingBatchDocSize + docSize > BSONObjMaxUserSize);
-
-        if (batchAtSizeLimit) {
+        const int docSizePlusOverhead =
+            toAdd.objsize() + write_ops::kRetryableAndTxnBatchWriteBSONSizeOverhead;
+        // Check if pushing this object will exceed the batch size limit or the max object size
+        if ((workingBatchItemSize + 1 > write_ops::kMaxWriteBatchSize) ||
+            (workingBatchDocSize + docSizePlusOverhead > BSONObjMaxUserSize)) {
             sendRetryableWriteBatchRequestToConfig(
                 asr.opCtx(), nss, workingBatch, currentTxnNumber, writeConcern);
             ++currentTxnNumber;
 
             workingBatch.clear();
             workingBatchItemSize = 0;
-            workingBatchDocSize = kRetryableBatchWriteBSONSizeOverhead;
+            workingBatchDocSize = 0;
         }
 
         workingBatch.push_back(toAdd);
         ++workingBatchItemSize;
-        workingBatchDocSize += docSize;
+        workingBatchDocSize += docSizePlusOverhead;
     }
 
     if (!workingBatch.empty()) {
@@ -938,15 +1169,12 @@ StatusWith<bool> ShardingCatalogClientImpl::_updateConfigDocument(
     const WriteConcernOptions& writeConcern) {
     invariant(nss.db() == NamespaceString::kConfigDb);
 
-    const BSONElement idField = query.getField("_id");
-    invariant(!idField.eoo());
-
     BatchedCommandRequest request([&] {
-        write_ops::Update updateOp(nss);
+        write_ops::UpdateCommandRequest updateOp(nss);
         updateOp.setUpdates({[&] {
             write_ops::UpdateOpEntry entry;
             entry.setQ(query);
-            entry.setU(update);
+            entry.setU(write_ops::UpdateModification::parseFromClassicUpdate(update));
             entry.setUpsert(upsert);
             entry.setMulti(false);
             return entry;
@@ -976,7 +1204,7 @@ Status ShardingCatalogClientImpl::removeConfigDocuments(OperationContext* opCtx,
     invariant(nss.db() == NamespaceString::kConfigDb);
 
     BatchedCommandRequest request([&] {
-        write_ops::Delete deleteOp(nss);
+        write_ops::DeleteCommandRequest deleteOp(nss);
         deleteOp.setDeletes({[&] {
             write_ops::DeleteOpEntry entry;
             entry.setQ(query);
@@ -1000,9 +1228,10 @@ StatusWith<repl::OpTimeWith<vector<BSONObj>>> ShardingCatalogClientImpl::_exhaus
     const NamespaceString& nss,
     const BSONObj& query,
     const BSONObj& sort,
-    boost::optional<long long> limit) {
+    boost::optional<long long> limit,
+    const boost::optional<BSONObj>& hint) {
     auto response = Grid::get(opCtx)->shardRegistry()->getConfigShard()->exhaustiveFindOnConfig(
-        opCtx, readPref, readConcern, nss, query, sort, limit);
+        opCtx, readPref, readConcern, nss, query, sort, limit, hint);
     if (!response.isOK()) {
         return response.getStatus();
     }
@@ -1025,7 +1254,7 @@ StatusWith<std::vector<KeysCollectionDocument>> ShardingCatalogClientImpl::getNe
     auto findStatus = config->exhaustiveFindOnConfig(opCtx,
                                                      kConfigReadSelector,
                                                      readConcernLevel,
-                                                     KeysCollectionDocument::ConfigNS,
+                                                     NamespaceString::kKeysCollectionNamespace,
                                                      queryBuilder.obj(),
                                                      BSON("expiresAt" << 1),
                                                      boost::none);
@@ -1037,12 +1266,13 @@ StatusWith<std::vector<KeysCollectionDocument>> ShardingCatalogClientImpl::getNe
     const auto& keyDocs = findStatus.getValue().docs;
     std::vector<KeysCollectionDocument> keys;
     for (auto&& keyDoc : keyDocs) {
-        auto parseStatus = KeysCollectionDocument::fromBSON(keyDoc);
-        if (!parseStatus.isOK()) {
-            return parseStatus.getStatus();
+        KeysCollectionDocument key;
+        try {
+            key = KeysCollectionDocument::parse(IDLParserErrorContext("keyDoc"), keyDoc);
+        } catch (...) {
+            return exceptionToStatus();
         }
-
-        keys.push_back(std::move(parseStatus.getValue()));
+        keys.push_back(std::move(key));
     }
 
     return keys;

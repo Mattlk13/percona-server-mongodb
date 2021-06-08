@@ -27,10 +27,11 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
+#include <memory>
 #include <set>
 #include <string>
 #include <vector>
@@ -39,14 +40,12 @@
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/ops/write_ops.h"
+#include "mongo/db/query/query_request_helper.h"
 #include "mongo/db/storage/duplicate_key_error_info.h"
 #include "mongo/db/write_concern.h"
-#include "mongo/executor/network_interface_mock.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
-#include "mongo/s/catalog/dist_lock_manager_mock.h"
 #include "mongo/s/catalog/sharding_catalog_client_impl.h"
-#include "mongo/s/catalog/type_changelog.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog/type_collection.h"
 #include "mongo/s/catalog/type_database.h"
@@ -56,8 +55,6 @@
 #include "mongo/s/sharding_router_test_fixture.h"
 #include "mongo/s/write_ops/batched_command_response.h"
 #include "mongo/stdx/future.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
@@ -149,6 +146,13 @@ TEST_F(InsertRetryTest, RetryOnNetworkErrorFails) {
     future.default_timed_get();
 }
 
+void assertFindRequestHasFilter(const RemoteCommandRequest& request, BSONObj filter) {
+    // If there is no '$db', append it.
+    auto cmd = OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj).body;
+    auto query = query_request_helper::makeFromFindCommandForTests(cmd);
+    ASSERT_BSONOBJ_EQ(filter, query->getFilter());
+}
+
 TEST_F(InsertRetryTest, DuplicateKeyErrorAfterNetworkErrorMatch) {
     configTargeter()->setFindHostReturnValue({kTestHosts[0]});
 
@@ -177,9 +181,7 @@ TEST_F(InsertRetryTest, DuplicateKeyErrorAfterNetworkErrorMatch) {
 
     onFindCommand([&](const RemoteCommandRequest& request) {
         ASSERT_EQ(request.target, kTestHosts[1]);
-        auto query =
-            assertGet(QueryRequest::makeFromFindCommand(kTestNamespace, request.cmdObj, false));
-        ASSERT_BSONOBJ_EQ(BSON("_id" << 1), query->getFilter());
+        assertFindRequestHasFilter(request, BSON("_id" << 1));
 
         return vector<BSONObj>{objToInsert};
     });
@@ -215,10 +217,7 @@ TEST_F(InsertRetryTest, DuplicateKeyErrorAfterNetworkErrorNotFound) {
 
     onFindCommand([&](const RemoteCommandRequest& request) {
         ASSERT_EQ(request.target, kTestHosts[1]);
-        auto query =
-            assertGet(QueryRequest::makeFromFindCommand(kTestNamespace, request.cmdObj, false));
-        ASSERT_BSONOBJ_EQ(BSON("_id" << 1), query->getFilter());
-
+        assertFindRequestHasFilter(request, BSON("_id" << 1));
         return vector<BSONObj>();
     });
 
@@ -253,9 +252,7 @@ TEST_F(InsertRetryTest, DuplicateKeyErrorAfterNetworkErrorMismatch) {
 
     onFindCommand([&](const RemoteCommandRequest& request) {
         ASSERT_EQ(request.target, kTestHosts[1]);
-        auto query =
-            assertGet(QueryRequest::makeFromFindCommand(kTestNamespace, request.cmdObj, false));
-        ASSERT_BSONOBJ_EQ(BSON("_id" << 1), query->getFilter());
+        assertFindRequestHasFilter(request, BSON("_id" << 1));
 
         return vector<BSONObj>{BSON("_id" << 1 << "Value"
                                           << "TestValue has changed")};
@@ -288,7 +285,7 @@ TEST_F(InsertRetryTest, DuplicateKeyErrorAfterWriteConcernFailureMatch) {
         response.setStatus(Status::OK());
         response.setN(1);
 
-        auto wcError = stdx::make_unique<WriteConcernErrorDetail>();
+        auto wcError = std::make_unique<WriteConcernErrorDetail>();
 
         WriteConcernResult wcRes;
         wcRes.err = "timeout";
@@ -309,9 +306,7 @@ TEST_F(InsertRetryTest, DuplicateKeyErrorAfterWriteConcernFailureMatch) {
 
     onFindCommand([&](const RemoteCommandRequest& request) {
         ASSERT_EQ(request.target, kTestHosts[0]);
-        auto query =
-            assertGet(QueryRequest::makeFromFindCommand(kTestNamespace, request.cmdObj, false));
-        ASSERT_BSONOBJ_EQ(BSON("_id" << 1), query->getFilter());
+        assertFindRequestHasFilter(request, BSON("_id" << 1));
 
         return vector<BSONObj>{objToInsert};
     });
@@ -353,7 +348,7 @@ TEST_F(UpdateRetryTest, Success) {
     future.default_timed_get();
 }
 
-TEST_F(UpdateRetryTest, NotMasterErrorReturnedPersistently) {
+TEST_F(UpdateRetryTest, NotWritablePrimaryErrorReturnedPersistently) {
     configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
     BSONObj objToUpdate = BSON("_id" << 1 << "Value"
@@ -369,13 +364,14 @@ TEST_F(UpdateRetryTest, NotMasterErrorReturnedPersistently) {
                                                   updateExpr,
                                                   false,
                                                   ShardingCatalogClient::kMajorityWriteConcern);
-        ASSERT_EQUALS(ErrorCodes::NotMaster, status);
+        ASSERT_EQUALS(ErrorCodes::NotWritablePrimary, status);
     });
 
     for (int i = 0; i < 3; ++i) {
         onCommand([](const RemoteCommandRequest& request) {
             BSONObjBuilder bb;
-            CommandHelpers::appendCommandStatusNoThrow(bb, {ErrorCodes::NotMaster, "not master"});
+            CommandHelpers::appendCommandStatusNoThrow(
+                bb, {ErrorCodes::NotWritablePrimary, "not master"});
             return bb.obj();
         });
     }
@@ -383,8 +379,8 @@ TEST_F(UpdateRetryTest, NotMasterErrorReturnedPersistently) {
     future.default_timed_get();
 }
 
-TEST_F(UpdateRetryTest, NotMasterReturnedFromTargeter) {
-    configTargeter()->setFindHostReturnValue(Status(ErrorCodes::NotMaster, "not master"));
+TEST_F(UpdateRetryTest, NotWritablePrimaryReturnedFromTargeter) {
+    configTargeter()->setFindHostReturnValue(Status(ErrorCodes::NotWritablePrimary, "not master"));
 
     BSONObj objToUpdate = BSON("_id" << 1 << "Value"
                                      << "TestValue");
@@ -399,22 +395,19 @@ TEST_F(UpdateRetryTest, NotMasterReturnedFromTargeter) {
                                                   updateExpr,
                                                   false,
                                                   ShardingCatalogClient::kMajorityWriteConcern);
-        ASSERT_EQUALS(ErrorCodes::NotMaster, status);
+        ASSERT_EQUALS(ErrorCodes::NotWritablePrimary, status);
     });
 
     future.default_timed_get();
 }
 
-TEST_F(UpdateRetryTest, NotMasterOnceSuccessAfterRetry) {
+TEST_F(UpdateRetryTest, NotWritablePrimaryOnceSuccessAfterRetry) {
     HostAndPort host1("TestHost1");
     HostAndPort host2("TestHost2");
     configTargeter()->setFindHostReturnValue(host1);
 
-    CollectionType collection;
-    collection.setNs(NamespaceString("db.coll"));
-    collection.setUpdatedAt(network()->now());
-    collection.setUnique(true);
-    collection.setEpoch(OID::gen());
+    CollectionType collection(
+        NamespaceString("db.coll"), OID::gen(), network()->now(), UUID::gen());
     collection.setKeyPattern(KeyPattern(BSON("_id" << 1)));
 
     BSONObj objToUpdate = BSON("_id" << 1 << "Value"
@@ -436,11 +429,12 @@ TEST_F(UpdateRetryTest, NotMasterOnceSuccessAfterRetry) {
         ASSERT_EQUALS(host1, request.target);
 
         // Ensure that when the catalog manager tries to retarget after getting the
-        // NotMaster response, it will get back a new target.
+        // NotWritablePrimary response, it will get back a new target.
         configTargeter()->setFindHostReturnValue(host2);
 
         BSONObjBuilder bb;
-        CommandHelpers::appendCommandStatusNoThrow(bb, {ErrorCodes::NotMaster, "not master"});
+        CommandHelpers::appendCommandStatusNoThrow(bb,
+                                                   {ErrorCodes::NotWritablePrimary, "not master"});
         return bb.obj();
     });
 
@@ -486,7 +480,7 @@ TEST_F(UpdateRetryTest, OperationInterruptedDueToPrimaryStepDown) {
         BatchedCommandResponse response;
         response.setStatus(Status::OK());
 
-        auto writeErrDetail = stdx::make_unique<WriteErrorDetail>();
+        auto writeErrDetail = std::make_unique<WriteErrorDetail>();
         writeErrDetail->setIndex(0);
         writeErrDetail->setStatus(
             {ErrorCodes::InterruptedDueToReplStateChange, "Operation interrupted"});
@@ -538,7 +532,7 @@ TEST_F(UpdateRetryTest, WriteConcernFailure) {
         response.setStatus(Status::OK());
         response.setNModified(1);
 
-        auto wcError = stdx::make_unique<WriteConcernErrorDetail>();
+        auto wcError = std::make_unique<WriteConcernErrorDetail>();
 
         WriteConcernResult wcRes;
         wcRes.err = "timeout";

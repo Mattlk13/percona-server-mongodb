@@ -26,7 +26,7 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 #include <benchmark/benchmark.h>
@@ -34,7 +34,7 @@
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/lock_manager_test_help.h"
 #include "mongo/db/storage/recovery_unit_noop.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -52,10 +52,10 @@ public:
     void makeKClientsWithLockers(int k) {
         clients.reserve(k);
         for (int i = 0; i < k; ++i) {
-            auto client = getGlobalServiceContext()->makeClient(
-                str::stream() << "test client for thread " << i);
+            auto client = getGlobalServiceContext()->makeClient(str::stream()
+                                                                << "test client for thread " << i);
             auto opCtx = client->makeOperationContext();
-            opCtx->swapLockState(std::make_unique<LockerImpl>());
+            client->swapLockState(std::make_unique<LockerImpl>());
             clients.emplace_back(std::move(client), std::move(opCtx));
         }
     }
@@ -67,10 +67,10 @@ protected:
 };
 
 BENCHMARK_DEFINE_F(DConcurrencyTest, BM_StdMutex)(benchmark::State& state) {
-    static stdx::mutex mtx;
+    static auto mtx = MONGO_MAKE_LATCH();
 
     for (auto keepRunning : state) {
-        stdx::unique_lock<stdx::mutex> lk(mtx);
+        stdx::unique_lock<Latch> lk(mtx);
     }
 }
 
@@ -91,11 +91,8 @@ BENCHMARK_DEFINE_F(DConcurrencyTest, BM_ResourceMutexExclusive)(benchmark::State
 }
 
 BENCHMARK_DEFINE_F(DConcurrencyTest, BM_CollectionIntentSharedLock)(benchmark::State& state) {
-    std::unique_ptr<ForceSupportsDocLocking> supportDocLocking;
-
     if (state.thread_index == 0) {
         makeKClientsWithLockers(state.threads);
-        supportDocLocking = std::make_unique<ForceSupportsDocLocking>(true);
     }
 
     for (auto keepRunning : state) {
@@ -110,11 +107,8 @@ BENCHMARK_DEFINE_F(DConcurrencyTest, BM_CollectionIntentSharedLock)(benchmark::S
 }
 
 BENCHMARK_DEFINE_F(DConcurrencyTest, BM_CollectionIntentExclusiveLock)(benchmark::State& state) {
-    std::unique_ptr<ForceSupportsDocLocking> supportDocLocking;
-
     if (state.thread_index == 0) {
         makeKClientsWithLockers(state.threads);
-        supportDocLocking = std::make_unique<ForceSupportsDocLocking>(true);
     }
 
     for (auto keepRunning : state) {
@@ -128,12 +122,9 @@ BENCHMARK_DEFINE_F(DConcurrencyTest, BM_CollectionIntentExclusiveLock)(benchmark
     }
 }
 
-BENCHMARK_DEFINE_F(DConcurrencyTest, BM_MMAPv1CollectionSharedLock)(benchmark::State& state) {
-    std::unique_ptr<ForceSupportsDocLocking> supportDocLocking;
-
+BENCHMARK_DEFINE_F(DConcurrencyTest, BM_CollectionSharedLock)(benchmark::State& state) {
     if (state.thread_index == 0) {
         makeKClientsWithLockers(state.threads);
-        supportDocLocking = std::make_unique<ForceSupportsDocLocking>(false);
     }
 
     for (auto keepRunning : state) {
@@ -147,12 +138,9 @@ BENCHMARK_DEFINE_F(DConcurrencyTest, BM_MMAPv1CollectionSharedLock)(benchmark::S
     }
 }
 
-BENCHMARK_DEFINE_F(DConcurrencyTest, BM_MMAPv1CollectionExclusiveLock)(benchmark::State& state) {
-    std::unique_ptr<ForceSupportsDocLocking> supportDocLocking;
-
+BENCHMARK_DEFINE_F(DConcurrencyTest, BM_CollectionExclusiveLock)(benchmark::State& state) {
     if (state.thread_index == 0) {
         makeKClientsWithLockers(state.threads);
-        supportDocLocking = std::make_unique<ForceSupportsDocLocking>(false);
     }
 
     for (auto keepRunning : state) {
@@ -176,10 +164,8 @@ BENCHMARK_REGISTER_F(DConcurrencyTest, BM_CollectionIntentSharedLock)
 BENCHMARK_REGISTER_F(DConcurrencyTest, BM_CollectionIntentExclusiveLock)
     ->ThreadRange(1, kMaxPerfThreads);
 
-BENCHMARK_REGISTER_F(DConcurrencyTest, BM_MMAPv1CollectionSharedLock)
-    ->ThreadRange(1, kMaxPerfThreads);
-BENCHMARK_REGISTER_F(DConcurrencyTest, BM_MMAPv1CollectionExclusiveLock)
-    ->ThreadRange(1, kMaxPerfThreads);
+BENCHMARK_REGISTER_F(DConcurrencyTest, BM_CollectionSharedLock)->ThreadRange(1, kMaxPerfThreads);
+BENCHMARK_REGISTER_F(DConcurrencyTest, BM_CollectionExclusiveLock)->ThreadRange(1, kMaxPerfThreads);
 
 }  // namespace
 }  // namespace mongo

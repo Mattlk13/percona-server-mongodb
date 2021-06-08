@@ -8,13 +8,17 @@ env.Library(
     target='storage_devnull_core',
     source=[
         'devnull_kv_engine.cpp',
+        'ephemeral_catalog_record_store.cpp',
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/db/storage/ephemeral_for_test/ephemeral_for_test_record_store',
-        '$BUILD_DIR/mongo/db/storage/kv/kv_prefix',
+        '$BUILD_DIR/mongo/db/record_id_helpers',
+        '$BUILD_DIR/mongo/db/storage/recovery_unit_base',
     ],
     LIBDEPS_PRIVATE=[
-        '$BUILD_DIR/mongo/db/snapshot_window_options',
+        '$BUILD_DIR/mongo/db/catalog/collection_options',
+    ],
+    LIBDEPS_TYPEINFO=[
+        '$BUILD_DIR/mongo/db/service_context',
     ],
 )
 
@@ -24,11 +28,12 @@ env.Library(
         'devnull_init.cpp',
     ],
     LIBDEPS=[
+        '$BUILD_DIR/mongo/db/storage/durable_catalog_impl',
+        '$BUILD_DIR/mongo/db/storage/storage_engine_impl',
         'storage_devnull_core',
-        '$BUILD_DIR/mongo/db/storage/kv/kv_engine_core',
-        '$BUILD_DIR/mongo/db/storage/kv/kv_storage_engine',
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/storage/storage_engine_common',
+        '$BUILD_DIR/mongo/db/storage/storage_engine_lock_file',
     ],
 )

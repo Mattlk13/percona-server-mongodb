@@ -35,13 +35,12 @@
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/exec/document_value/document_value_test_util.h"
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
 #include "mongo/db/pipeline/document_source_mock.h"
 #include "mongo/db/pipeline/document_source_sample.h"
 #include "mongo/db/pipeline/document_source_sample_from_random_cursor.h"
-#include "mongo/db/pipeline/document_value_test_util.h"
 #include "mongo/db/pipeline/expression_context.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/clock_source_mock.h"
@@ -54,7 +53,7 @@ using boost::intrusive_ptr;
 
 class SampleBasics : public AggregationContextFixture {
 public:
-    SampleBasics() : _mock(DocumentSourceMock::createForTest()) {}
+    SampleBasics() : _mock(DocumentSourceMock::createForTest(getExpCtx())) {}
 
 protected:
     virtual void createSample(long long size) {
@@ -88,9 +87,9 @@ protected:
             auto nextResult = sample()->getNext();
             ASSERT_TRUE(nextResult.isAdvanced());
             auto thisDoc = nextResult.releaseDocument();
-            ASSERT_TRUE(thisDoc.hasRandMetaField());
+            ASSERT_TRUE(thisDoc.metadata().hasRandVal());
             if (prevDoc) {
-                ASSERT_LTE(thisDoc.getRandMetaField(), prevDoc->getRandMetaField());
+                ASSERT_LTE(thisDoc.metadata().getRandVal(), prevDoc->metadata().getRandVal());
             }
             prevDoc = std::move(thisDoc);
         }
@@ -166,7 +165,7 @@ TEST_F(SampleBasics, DocsUnmodified) {
     auto doc = next.releaseDocument();
     ASSERT_EQUALS(1, doc["a"].getInt());
     ASSERT_EQUALS(2, doc["b"]["c"].getInt());
-    ASSERT_TRUE(doc.hasRandMetaField());
+    ASSERT_TRUE(doc.metadata().hasRandVal());
     assertEOF();
 }
 
@@ -282,7 +281,7 @@ TEST_F(SampleFromRandomCursorBasics, DocsUnmodified) {
     auto doc = next.releaseDocument();
     ASSERT_EQUALS(1, doc["_id"].getInt());
     ASSERT_EQUALS(2, doc["b"]["c"].getInt());
-    ASSERT_TRUE(doc.hasRandMetaField());
+    ASSERT_TRUE(doc.metadata().hasRandVal());
     assertEOF();
 }
 
@@ -299,16 +298,16 @@ TEST_F(SampleFromRandomCursorBasics, IgnoreDuplicates) {
     ASSERT_TRUE(next.isAdvanced());
     auto doc = next.releaseDocument();
     ASSERT_EQUALS(1, doc["_id"].getInt());
-    ASSERT_TRUE(doc.hasRandMetaField());
-    double doc1Meta = doc.getRandMetaField();
+    ASSERT_TRUE(doc.metadata().hasRandVal());
+    double doc1Meta = doc.metadata().getRandVal();
 
     // Should ignore the duplicate {_id: 1}, and return {_id: 2}.
     next = sample()->getNext();
     ASSERT_TRUE(next.isAdvanced());
     doc = next.releaseDocument();
     ASSERT_EQUALS(2, doc["_id"].getInt());
-    ASSERT_TRUE(doc.hasRandMetaField());
-    double doc2Meta = doc.getRandMetaField();
+    ASSERT_TRUE(doc.metadata().hasRandVal());
+    double doc2Meta = doc.metadata().getRandVal();
     ASSERT_GTE(doc1Meta, doc2Meta);
 
     // Both stages should be exhausted.
@@ -372,13 +371,13 @@ TEST_F(SampleFromRandomCursorBasics, MimicNonOptimized) {
 
         auto doc = sample()->getNext();
         ASSERT_TRUE(doc.isAdvanced());
-        ASSERT_TRUE(doc.getDocument().hasRandMetaField());
-        firstTotal += doc.getDocument().getRandMetaField();
+        ASSERT_TRUE(doc.getDocument().metadata().hasRandVal());
+        firstTotal += doc.getDocument().metadata().getRandVal();
 
         doc = sample()->getNext();
         ASSERT_TRUE(doc.isAdvanced());
-        ASSERT_TRUE(doc.getDocument().hasRandMetaField());
-        secondTotal += doc.getDocument().getRandMetaField();
+        ASSERT_TRUE(doc.getDocument().metadata().hasRandVal());
+        secondTotal += doc.getDocument().metadata().getRandVal();
     }
     // The average random meta value of the first document should be about 0.75. We assume that
     // 10000 trials is sufficient for us to apply the Central Limit Theorem. Using an error
@@ -391,9 +390,9 @@ TEST_F(SampleFromRandomCursorBasics, MimicNonOptimized) {
     ASSERT_LTE(secondTotal / nTrials, 0.52);
 }
 
-DEATH_TEST_F(SampleFromRandomCursorBasics,
-             ShouldFailIfGivenPausedInput,
-             "Invariant failure Hit a MONGO_UNREACHABLE!") {
+DEATH_TEST_REGEX_F(SampleFromRandomCursorBasics,
+                   ShouldFailIfGivenPausedInput,
+                   "Invariant failure.*Hit a MONGO_UNREACHABLE!") {
     createSample(2);
     source()->push_back(Document{{"_id", 1}});
     source()->push_back(DocumentSource::GetNextResult::makePauseExecution());

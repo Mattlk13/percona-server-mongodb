@@ -34,7 +34,6 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/document_source.h"
-#include "mongo/db/pipeline/document_source_limit.h"
 #include "mongo/db/query/explain_options.h"
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/db/query/plan_summary_stats.h"
@@ -46,8 +45,29 @@ namespace mongo {
  */
 class DocumentSourceCursor : public DocumentSource {
 public:
-    // virtuals from DocumentSource
-    GetNextResult getNext() final;
+    static constexpr StringData kStageName = "$cursor"_sd;
+
+    /**
+     * Indicates whether or not this is a count-like operation. If the operation is count-like, then
+     * the cursor can produce empty documents since the subsequent stages need only the count of
+     * these documents (not the actual data).
+     */
+    enum class CursorType { kRegular, kEmptyDocuments };
+
+    /**
+     * Create a document source based on a passed-in PlanExecutor. 'exec' must be a yielding
+     * PlanExecutor, and must be registered with the associated collection's CursorManager.
+     *
+     * If 'cursorType' is 'kEmptyDocuments', then we inform the $cursor stage that this is a count
+     * scenario -- the dependency set is fully known and is empty. In this case, the newly created
+     * $cursor stage can return a sequence of empty documents for the caller to count.
+     */
+    static boost::intrusive_ptr<DocumentSourceCursor> create(
+        const CollectionPtr& collection,
+        std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec,
+        const boost::intrusive_ptr<ExpressionContext>& pExpCtx,
+        CursorType cursorType,
+        bool trackOplogTimestamp = false);
 
     const char* getSourceName() const override;
 
@@ -60,7 +80,8 @@ public:
                                      DiskUseRequirement::kNoDiskUse,
                                      FacetRequirement::kNotAllowed,
                                      TransactionRequirement::kAllowed,
-                                     LookupRequirement::kAllowed);
+                                     LookupRequirement::kAllowed,
+                                     UnionRequirement::kAllowed);
 
         constraints.requiresInputDocSource = false;
         return constraints;
@@ -74,89 +95,44 @@ public:
 
     void reattachToOperationContext(OperationContext* opCtx) final;
 
-    /**
-     * Create a document source based on a passed-in PlanExecutor. 'exec' must be a yielding
-     * PlanExecutor, and must be registered with the associated collection's CursorManager.
-     */
-    static boost::intrusive_ptr<DocumentSourceCursor> create(
-        Collection* collection,
-        std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec,
-        const boost::intrusive_ptr<ExpressionContext>& pExpCtx,
-        bool trackOplogTimestamp = false);
-
-    /*
-      Record the query that was specified for the cursor this wraps, if
-      any.
-
-      This should be captured after any optimizations are applied to
-      the pipeline so that it reflects what is really used.
-
-      This gets used for explain output.
-
-      @param pBsonObj the query to record
-     */
-    void setQuery(const BSONObj& query) {
-        _query = query;
-    }
-
-    /*
-      Record the sort that was specified for the cursor this wraps, if
-      any.
-
-      This should be captured after any optimizations are applied to
-      the pipeline so that it reflects what is really used.
-
-      This gets used for explain output.
-
-      @param pBsonObj the sort to record
-     */
-    void setSort(const BSONObj& sort) {
-        _sort = sort;
-    }
-
-    /**
-     * Informs this object of projection and dependency information.
-     *
-     * @param projection The projection that has been passed down to the query system.
-     * @param deps The output of DepsTracker::toParsedDeps.
-     */
-    void setProjection(const BSONObj& projection, const boost::optional<ParsedDeps>& deps) {
-        _projection = projection;
-        _dependencies = deps;
-    }
-
-    /**
-     * Returns the limit associated with this cursor, or -1 if there is no limit.
-     */
-    long long getLimit() const {
-        return _limit ? _limit->getLimit() : -1;
-    }
-
-    /**
-     * If subsequent sources need no information from the cursor, the cursor can simply output empty
-     * documents, avoiding the overhead of converting BSONObjs to Documents.
-     */
-    void shouldProduceEmptyDocs() {
-        _shouldProduceEmptyDocs = true;
-    }
-
     Timestamp getLatestOplogTimestamp() const {
         return _latestOplogTimestamp;
     }
+
+    /**
+     * Returns a postBatchResumeToken compatible with resharding oplog sync, if available.
+     * Otherwise, returns an empty object.
+     */
+    BSONObj getPostBatchResumeToken() const;
 
     const std::string& getPlanSummaryStr() const {
         return _planSummary;
     }
 
     const PlanSummaryStats& getPlanSummaryStats() const {
-        return _planSummaryStats;
+        return _stats.planSummaryStats;
+    }
+
+    bool usedDisk() final {
+        return _stats.planSummaryStats.usedDisk;
+    }
+
+    const SpecificStats* getSpecificStats() const final {
+        return &_stats;
+    }
+
+    const PlanExplainer::ExplainVersion& getExplainVersion() const {
+        return _exec->getPlanExplainer().getVersion();
     }
 
 protected:
-    DocumentSourceCursor(Collection* collection,
+    DocumentSourceCursor(const CollectionPtr& collection,
                          std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec,
                          const boost::intrusive_ptr<ExpressionContext>& pExpCtx,
+                         CursorType cursorType,
                          bool trackOplogTimestamp = false);
+
+    GetNextResult doGetNext() final;
 
     ~DocumentSourceCursor();
 
@@ -167,20 +143,73 @@ protected:
     void doDispose() final;
 
     /**
-     * Attempts to combine with any subsequent $limit stages by setting the internal '_limit' field.
-     */
-    Pipeline::SourceContainer::iterator doOptimizeAt(Pipeline::SourceContainer::iterator itr,
-                                                     Pipeline::SourceContainer* container) final;
-
-    /**
      * If '_shouldProduceEmptyDocs' is false, this function hook is called on each 'obj' returned by
      * '_exec' when loading a batch and returns a Document to be added to '_currentBatch'.
      *
-     * The default implementation is a dependency-aware BSONObj-to-Document transformation.
+     * The default implementation is the identity function.
      */
-    virtual Document transformBSONObjToDocument(const BSONObj& obj) const;
+    virtual Document transformDoc(Document&& doc) const {
+        return std::move(doc);
+    }
 
 private:
+    /**
+     * A $cursor stage loads documents from the underlying PlanExecutor in batches. An object of
+     * this class represents one such batch. Acts like a queue into which documents can be queued
+     * and dequeued in FIFO order.
+     */
+    class Batch {
+    public:
+        Batch(CursorType type) : _type(type) {}
+
+        /**
+         * Adds a new document to the batch.
+         */
+        void enqueue(Document&& doc);
+
+        /**
+         * Removes the first document from the batch.
+         */
+        Document dequeue();
+
+        void clear();
+
+        bool isEmpty() const;
+
+        /**
+         * Returns the approximate memory footprint of this batch, measured in bytes. Even after
+         * documents are dequeued from the batch, continues to indicate the batch's peak memory
+         * footprint. Resets to zero once the final document in the batch is dequeued.
+         */
+        size_t memUsageBytes() const {
+            return _memUsageBytes;
+        }
+
+        /**
+         * Illegal to call unless the CursorType is 'kRegular'.
+         */
+        const Document& peekFront() const {
+            invariant(_type == CursorType::kRegular);
+            return _batchOfDocs.front();
+        }
+
+    private:
+        // If 'kEmptyDocuments', then dependency analysis has indicated that all we need to execute
+        // the query is a count of the incoming documents.
+        const CursorType _type;
+
+        // Used only if '_type' is 'kRegular'. A deque of the documents comprising the batch.
+        std::deque<Document> _batchOfDocs;
+
+        // Used only if '_type' is 'kEmptyDocuments'. In this case, we don't need to keep the
+        // documents themselves, only a count of the number of documents in the batch.
+        size_t _count = 0;
+
+        // The approximate memory footprint of the batch in bytes. Always kept at zero when '_type'
+        // is 'kEmptyDocuments'.
+        size_t _memUsageBytes = 0;
+    };
+
     /**
      * Acquires the appropriate locks, then destroys and de-registers '_exec'. '_exec' must be
      * non-null.
@@ -202,16 +231,7 @@ private:
     void _updateOplogTimestamp();
 
     // Batches results returned from the underlying PlanExecutor.
-    std::deque<Document> _currentBatch;
-
-    // BSONObj members must outlive _projection and cursor.
-    BSONObj _query;
-    BSONObj _sort;
-    BSONObj _projection;
-    bool _shouldProduceEmptyDocs = false;
-    boost::optional<ParsedDeps> _dependencies;
-    boost::intrusive_ptr<DocumentSourceLimit> _limit;
-    long long _docsAddedToBatches;  // for _limit enforcement
+    Batch _currentBatch;
 
     // The underlying query plan which feeds this pipeline. Must be destroyed while holding the
     // collection lock.
@@ -223,19 +243,21 @@ private:
     Status _execStatus = Status::OK();
 
     std::string _planSummary;
-    PlanSummaryStats _planSummaryStats;
 
-    // Used only for explain() queries. Stores the stats of the winning plan when _exec's root
-    // stage is a MultiPlanStage. When the query is executed (with exec->executePlan()), it will
+    // Used only for explain() queries. Stores the stats of the winning plan when a plan was
+    // selected by the multi-planner. When the query is executed (with exec->executePlan()), it will
     // wipe out its own copy of the winning plan's statistics, so they need to be saved here.
-    std::unique_ptr<PlanStageStats> _winningPlanTrialStats;
+    boost::optional<PlanExplainer::PlanStatsDetails> _winningPlanTrialStats;
 
     // True if we are tracking the latest observed oplog timestamp, false otherwise.
     bool _trackOplogTS = false;
 
-    // If we are tailing the oplog and tracking the latest observed oplog time, this is the latest
-    // timestamp seen in the collection. Otherwise, this is a null timestamp.
+    // If we are tracking the latest observed oplog time, this is the latest timestamp seen in the
+    // oplog. Otherwise, this is a null timestamp.
     Timestamp _latestOplogTimestamp;
+
+    // Specific stats for $cursor stage.
+    DocumentSourceCursorStats _stats;
 };
 
 }  // namespace mongo

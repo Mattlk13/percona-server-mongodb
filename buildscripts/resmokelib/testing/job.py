@@ -2,15 +2,16 @@
 
 import sys
 import time
+from collections import namedtuple
+from collections import defaultdict
 
-from . import queue_element
-from . import testcases
-from .. import config
-from .. import errors
-from ..testing.fixtures import interface as _fixtures
-from ..testing.hooks import stepdown
-from ..testing.testcases import fixture as _fixture
-from ..utils import queue as _queue
+from buildscripts.resmokelib import config
+from buildscripts.resmokelib import errors
+from buildscripts.resmokelib.testing import testcases
+from buildscripts.resmokelib.testing.hooks import stepdown
+from buildscripts.resmokelib.testing.testcases import fixture as _fixture
+from buildscripts.resmokelib.testing.fixtures.interface import create_fixture_table
+from buildscripts.resmokelib.utils import queue as _queue
 
 
 class Job(object):  # pylint: disable=too-many-instance-attributes
@@ -21,14 +22,13 @@ class Job(object):  # pylint: disable=too-many-instance-attributes
             test_queue_logger):
         """Initialize the job with the specified fixture and hooks."""
 
-        self.job_num = job_num
         self.logger = logger
         self.fixture = fixture
         self.hooks = hooks
         self.report = report
         self.archival = archival
         self.suite_options = suite_options
-        self.test_queue_logger = test_queue_logger
+        self.manager = FixtureTestCaseManager(test_queue_logger, self.fixture, job_num, self.report)
 
         # Don't check fixture.is_running() when using the ContinuousStepdown hook, which kills
         # and restarts the primary. Even if the fixture is still running as expected, there is a
@@ -37,35 +37,10 @@ class Job(object):  # pylint: disable=too-many-instance-attributes
         self._check_if_fixture_running = not any(
             isinstance(hook, stepdown.ContinuousStepdown) for hook in self.hooks)
 
-    def setup_fixture(self):
-        """Run a test that sets up the job's fixture and waits for it to be ready.
-
-        Return True if the setup was successful, False otherwise.
-        """
-        if isinstance(self.fixture, _fixtures.NoOpFixture):
-            return True
-        test_case = _fixture.FixtureSetupTestCase(self.test_queue_logger, self.fixture,
-                                                  "job{}".format(self.job_num))
-        test_case(self.report)
-        if self.report.find_test_info(test_case).status != "pass":
-            self.logger.error("The setup of %s failed.", self.fixture)
-            return False
-        return True
-
-    def teardown_fixture(self):
-        """Run a test that tears down the job's fixture.
-
-        Return True if the teardown was successful, False otherwise.
-        """
-        if isinstance(self.fixture, _fixtures.NoOpFixture):
-            return True
-        test_case = _fixture.FixtureTeardownTestCase(self.test_queue_logger, self.fixture,
-                                                     "job{}".format(self.job_num))
-        test_case(self.report)
-        if self.report.find_test_info(test_case).status != "pass":
-            self.logger.error("The teardown of %s failed.", self.fixture)
-            return False
-        return True
+    @property
+    def job_num(self):
+        """Forward the job_num option from FixtureTestCaseManager."""
+        return self.manager.job_num
 
     @staticmethod
     def _interrupt_all_jobs(queue, interrupt_flag):
@@ -84,9 +59,10 @@ class Job(object):  # pylint: disable=too-many-instance-attributes
         will be run before this method returns. If an error occurs
         while destroying the fixture, then the 'teardown_flag' will be set.
         """
+        setup_succeeded = True
         if setup_flag is not None:
             try:
-                setup_succeeded = self.setup_fixture()
+                setup_succeeded = self.manager.setup_fixture(self.logger)
             except errors.StopExecution as err:
                 # Something went wrong when setting up the fixture. Perhaps we couldn't get a
                 # test_id from logkeeper for where to put the log output. We don't attempt to run
@@ -101,23 +77,24 @@ class Job(object):  # pylint: disable=too-many-instance-attributes
                 setup_succeeded = False
 
             if not setup_succeeded:
+                setup_flag.set()
                 self._interrupt_all_jobs(queue, interrupt_flag)
-                return
 
-        try:
-            self._run(queue, interrupt_flag)
-        except errors.StopExecution as err:
-            # Stop running tests immediately.
-            self.logger.error("Received a StopExecution exception: %s.", err)
-            self._interrupt_all_jobs(queue, interrupt_flag)
-        except:  # pylint: disable=bare-except
-            # Unknown error, stop execution.
-            self.logger.exception("Encountered an error during test execution.")
-            self._interrupt_all_jobs(queue, interrupt_flag)
+        if setup_succeeded:
+            try:
+                self._run(queue, interrupt_flag)
+            except errors.StopExecution as err:
+                # Stop running tests immediately.
+                self.logger.error("Received a StopExecution exception: %s.", err)
+                self._interrupt_all_jobs(queue, interrupt_flag)
+            except:  # pylint: disable=bare-except
+                # Unknown error, stop execution.
+                self.logger.exception("Encountered an error during test execution.")
+                self._interrupt_all_jobs(queue, interrupt_flag)
 
         if teardown_flag is not None:
             try:
-                teardown_succeeded = self.teardown_fixture()
+                teardown_succeeded = self.manager.teardown_fixture(self.logger)
             except errors.StopExecution as err:
                 # Something went wrong when tearing down the fixture. Perhaps we couldn't get a
                 # test_id from logkeeper for where to put the log output. We indicate back to the
@@ -194,9 +171,13 @@ class Job(object):  # pylint: disable=too-many-instance-attributes
 
         test.configure(self.fixture, config.NUM_CLIENTS_PER_FIXTURE)
         self._run_hooks_before_tests(test)
+        self.report.logging_prefix = create_fixture_table(self.fixture)
 
         test(self.report)
         try:
+            if test.propagate_error is not None:
+                raise test.propagate_error
+
             # We are intentionally only checking the individual 'test' status and not calling
             # report.wasSuccessful() here. It is possible that a thread running in the background as
             # part of a hook has added a failed test case to 'self.report'. Checking the individual
@@ -217,7 +198,8 @@ class Job(object):  # pylint: disable=too-many-instance-attributes
         finally:
             success = self.report.find_test_info(test).status == "pass"
             if self.archival:
-                self.archival.archive(self.logger, test, success)
+                result = TestResult(test=test, hook=None, success=success)
+                self.archival.archive(self.logger, result, self.manager)
 
         self._run_hooks_after_tests(test)
 
@@ -229,7 +211,8 @@ class Job(object):  # pylint: disable=too-many-instance-attributes
             success = True
         finally:
             if self.archival:
-                self.archival.archive(self.logger, test, success, hook=hook)
+                result = TestResult(test=test, hook=hook, success=success)
+                self.archival.archive(self.logger, result, self.manager)
 
     def _run_hooks_before_tests(self, test):
         """Run the before_test method on each of the hooks.
@@ -321,3 +304,62 @@ class Job(object):  # pylint: disable=too-many-instance-attributes
             # Multiple threads may be draining the queue simultaneously, so just ignore the
             # exception from the race between queue.empty() being false and failing to get an item.
             pass
+
+
+TestResult = namedtuple('TestResult', ['test', 'hook', 'success'])
+
+
+class FixtureTestCaseManager:
+    """Class that holds information needed to create new fixture setup/teardown test cases for a single job."""
+
+    def __init__(self, test_queue_logger, fixture, job_num, report):
+        """
+        Initialize the test case manager.
+
+        :param test_queue_logger: The logger associated with this job's test queue.
+        :param fixture: The fixture associated with this job.
+        :param job_num: This job's unique identifier.
+        :param report: Report object collecting test results.
+        """
+        self.test_queue_logger = test_queue_logger
+        self.fixture = fixture
+        self.job_num = job_num
+        self.report = report
+        self.times_set_up = 0  # Setups and kills may run multiple times.
+
+    def setup_fixture(self, logger):
+        """
+        Run a test that sets up the job's fixture and waits for it to be ready.
+
+        Return True if the setup was successful, False otherwise.
+        """
+        test_case = _fixture.FixtureSetupTestCase(self.test_queue_logger, self.fixture,
+                                                  "job{}".format(self.job_num), self.times_set_up)
+        test_case(self.report)
+        if self.report.find_test_info(test_case).status != "pass":
+            logger.error("The setup of %s failed.", self.fixture)
+            return False
+
+        return True
+
+    def teardown_fixture(self, logger, abort=False):
+        """
+        Run a test that tears down the job's fixture.
+
+        Return True if the teardown was successful, False otherwise.
+        """
+        if abort:
+            test_case = _fixture.FixtureAbortTestCase(self.test_queue_logger, self.fixture,
+                                                      "job{}".format(self.job_num),
+                                                      self.times_set_up)
+            self.times_set_up += 1
+        else:
+            test_case = _fixture.FixtureTeardownTestCase(self.test_queue_logger, self.fixture,
+                                                         "job{}".format(self.job_num))
+
+        test_case(self.report)
+        if self.report.find_test_info(test_case).status != "pass":
+            logger.error("The teardown of %s failed.", self.fixture)
+            return False
+
+        return True

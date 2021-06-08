@@ -31,6 +31,7 @@
 
 #include "mongo/base/status.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/db/catalog/collection_catalog.h"
 
 namespace mongo {
 class BSONObj;
@@ -48,15 +49,25 @@ Status createCollection(OperationContext* opCtx,
                         const BSONObj& idIndex = BSONObj());
 
 /**
+ * Creates a collection as parsed in 'cmd'.
+ */
+Status createCollection(OperationContext* opCtx,
+                        const NamespaceString& ns,
+                        const CreateCommand& cmd);
+
+/**
  * As above, but only used by replication to apply operations. This allows recreating collections
- * with specific UUIDs (if ui is given), and in that case will rename any existing collections with
- * the same name and a UUID to a temporary name. If ui is not given, an existing collection will
- * result in an error.
+ * with specific UUIDs (if ui is given). If ui is given and and a collection exists with the same
+ * name, the existing collection will be renamed to a temporary name if allowRenameOutOfTheWay is
+ * true. This function will invariant if there is an existing collection with the same name and
+ * allowRenameOutOfTheWay is false. If ui is not given, an existing collection will result in an
+ * error.
  */
 Status createCollectionForApplyOps(OperationContext* opCtx,
                                    const std::string& dbName,
-                                   const BSONElement& ui,
+                                   const OptionalCollectionUUID& ui,
                                    const BSONObj& cmdObj,
-                                   const BSONObj& idIndex = BSONObj());
+                                   const bool allowRenameOutOfTheWay,
+                                   boost::optional<BSONObj> idIndex = boost::none);
 
 }  // namespace mongo

@@ -29,12 +29,14 @@
 
 #pragma once
 
+#include "mongo/stdx/variant.h"
 #include <string>
 #include <vector>
 
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/service_context.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
+#include "mongo/util/uuid.h"
 
 /**
  * Caches the set of collections containing a TTL index.
@@ -45,13 +47,24 @@ namespace mongo {
 class TTLCollectionCache {
 public:
     static TTLCollectionCache& get(ServiceContext* ctx);
+
+    // Specifies that a collection is clustered by _id and is TTL.
+    class ClusteredId : public stdx::monostate {};
+    // Names an index that is TTL.
+    using IndexName = std::string;
+
+    // Specifies how a collection should expire data with TTL.
+    using Info = stdx::variant<ClusteredId, IndexName>;
+
     // Caller is responsible for ensuring no duplicates are registered.
-    void registerCollection(const NamespaceString& collectionNS);
-    void unregisterCollection(const NamespaceString& collectionNS);
-    std::vector<std::string> getCollections();
+    void registerTTLInfo(UUID uuid, const Info& info);
+    void deregisterTTLInfo(UUID uuid, const Info& info);
+
+    using InfoMap = stdx::unordered_map<UUID, std::vector<Info>, UUID::Hash>;
+    InfoMap getTTLInfos();
 
 private:
-    std::vector<std::string> _ttlCollections;
-    stdx::mutex _ttlCollectionsLock;
+    Mutex _ttlInfosLock = MONGO_MAKE_LATCH("TTLCollectionCache::_ttlInfosLock");
+    InfoMap _ttlInfos;
 };
 }  // namespace mongo

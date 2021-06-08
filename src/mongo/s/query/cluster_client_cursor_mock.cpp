@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -39,11 +39,11 @@ namespace mongo {
 
 ClusterClientCursorMock::ClusterClientCursorMock(boost::optional<LogicalSessionId> lsid,
                                                  boost::optional<TxnNumber> txnNumber,
-                                                 stdx::function<void(void)> killCallback)
+                                                 std::function<void(void)> killCallback)
     : _killCallback(std::move(killCallback)), _lsid(lsid), _txnNumber(txnNumber) {}
 
 ClusterClientCursorMock::~ClusterClientCursorMock() {
-    invariant((_exhausted && _remotesExhausted) || _killed);
+    invariant(_remotesExhausted || _killed);
 }
 
 StatusWith<ClusterQueryResult> ClusterClientCursorMock::next(
@@ -51,7 +51,7 @@ StatusWith<ClusterQueryResult> ClusterClientCursorMock::next(
     invariant(!_killed);
 
     if (_resultsQueue.empty()) {
-        _exhausted = true;
+        _remotesExhausted = true;
         return {ClusterQueryResult()};
     }
 
@@ -72,6 +72,10 @@ BSONObj ClusterClientCursorMock::getOriginatingCommand() const {
 
 const PrivilegeVector& ClusterClientCursorMock::getOriginatingPrivileges() const& {
     return _originatingPrivileges;
+}
+
+bool ClusterClientCursorMock::partialResultsReturned() const {
+    MONGO_UNREACHABLE;
 }
 
 std::size_t ClusterClientCursorMock::getNumRemotes() const {
@@ -129,10 +133,6 @@ bool ClusterClientCursorMock::remotesExhausted() {
     return _remotesExhausted;
 }
 
-void ClusterClientCursorMock::markRemotesNotExhausted() {
-    _remotesExhausted = false;
-}
-
 void ClusterClientCursorMock::queueError(Status status) {
     _resultsQueue.push({status});
 }
@@ -149,7 +149,19 @@ boost::optional<TxnNumber> ClusterClientCursorMock::getTxnNumber() const {
     return _txnNumber;
 }
 
+void ClusterClientCursorMock::setAPIParameters(APIParameters& apiParameters) {
+    _apiParameters = apiParameters;
+}
+
+APIParameters ClusterClientCursorMock::getAPIParameters() const {
+    return _apiParameters;
+}
+
 boost::optional<ReadPreferenceSetting> ClusterClientCursorMock::getReadPreference() const {
+    return boost::none;
+}
+
+boost::optional<ReadConcernArgs> ClusterClientCursorMock::getReadConcern() const {
     return boost::none;
 }
 

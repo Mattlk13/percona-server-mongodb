@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -38,13 +38,12 @@
 #include "mongo/client/replica_set_monitor.h"
 #include "mongo/config.h"
 #include "mongo/db/auth/authorization_manager.h"
-#include "mongo/db/command_generic_argument.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/parameters_gen.h"
+#include "mongo/db/commands/parse_log_component_settings.h"
 #include "mongo/db/storage/storage_options.h"
-#include "mongo/logger/logger.h"
-#include "mongo/logger/parse_log_component_settings.h"
-#include "mongo/util/log.h"
+#include "mongo/idl/command_generic_argument.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/str.h"
 
 using std::string;
@@ -53,11 +52,8 @@ using std::stringstream;
 namespace mongo {
 
 namespace {
-using logger::globalLogDomain;
-using logger::LogComponent;
-using logger::LogComponentSetting;
-using logger::LogSeverity;
-using logger::parseLogComponentSettings;
+using logv2::LogComponent;
+using logv2::LogSeverity;
 
 void appendParameterNames(std::string* help) {
     *help += "supported:\n";
@@ -101,8 +97,11 @@ void getLogComponentVerbosity(BSONObj* output) {
         LogComponent component = static_cast<LogComponent::Value>(i);
 
         int severity = -1;
-        if (globalLogDomain()->hasMinimumLogSeverity(component)) {
-            severity = globalLogDomain()->getMinimumLogSeverity(component).toInt();
+        if (logv2::LogManager::global().getGlobalSettings().hasMinimumLogSeverity(component)) {
+            severity = logv2::LogManager::global()
+                           .getGlobalSettings()
+                           .getMinimumLogSeverity(component)
+                           .toInt();
         }
 
         // Save LogComponent::kDefault LogSeverity at root
@@ -172,20 +171,22 @@ Status setLogComponentVerbosity(const BSONObj& bsonSettings) {
 
         // Negative value means to clear log level of component.
         if (newSetting.level < 0) {
-            globalLogDomain()->clearMinimumLoggedSeverity(newSetting.component);
+            logv2::LogManager::global().getGlobalSettings().clearMinimumLoggedSeverity(
+                newSetting.component);
             continue;
         }
         // Convert non-negative value to Log()/Debug(N).
         LogSeverity newSeverity =
             (newSetting.level > 0) ? LogSeverity::Debug(newSetting.level) : LogSeverity::Log();
-        globalLogDomain()->setMinimumLoggedSeverity(newSetting.component, newSeverity);
+        logv2::LogManager::global().getGlobalSettings().setMinimumLoggedSeverity(
+            newSetting.component, newSeverity);
     }
 
     return Status::OK();
 }
 
 // for automationServiceDescription
-stdx::mutex autoServiceDescriptorMutex;
+Mutex autoServiceDescriptorMutex;
 std::string autoServiceDescriptorValue;
 }  // namespace
 
@@ -306,8 +307,8 @@ public:
 
             // Make sure we are allowed to change this parameter
             if (!foundParameter->second->allowedToChangeAtRuntime()) {
-                errmsg = str::stream() << "not allowed to change [" << parameterName
-                                       << "] at runtime";
+                errmsg = str::stream()
+                    << "not allowed to change [" << parameterName << "] at runtime";
                 return false;
             }
 
@@ -342,6 +343,14 @@ public:
                 return false;
             }
 
+            if (parameterName == "requireApiVersion" && parameter.trueValue() &&
+                (serverGlobalParams.clusterRole == ClusterRole::ConfigServer ||
+                 serverGlobalParams.clusterRole == ClusterRole::ShardServer)) {
+                errmsg = str::stream()
+                    << "Cannot set parameter requireApiVersion=true on a shard or config server";
+                return false;
+            }
+
             auto oldValueObj = ([&] {
                 BSONObjBuilder bb;
                 if (numSet == 0) {
@@ -358,17 +367,30 @@ public:
             try {
                 uassertStatusOK(foundParameter->second->set(parameter));
             } catch (const DBException& ex) {
-                log() << "error setting parameter " << parameterName << " to "
-                      << redact(parameter.toString(false)) << " errMsg: " << redact(ex);
+                LOGV2(20496,
+                      "Error setting parameter {parameterName} to {newValue} errMsg: {error}",
+                      "Error setting parameter to new value",
+                      "parameterName"_attr = parameterName,
+                      "newValue"_attr = redact(parameter.toString(false)),
+                      "error"_attr = redact(ex));
                 throw;
             }
 
-            log() << "successfully set parameter " << parameterName << " to "
-                  << redact(parameter.toString(false))
-                  << (oldValue ? std::string(str::stream() << " (was "
-                                                           << redact(oldValue.toString(false))
-                                                           << ")")
-                               : "");
+            if (oldValue) {
+                LOGV2(23435,
+                      "Successfully set parameter {parameterName} to {newValue} (was "
+                      "{oldValue})",
+                      "Successfully set parameter to new value",
+                      "parameterName"_attr = parameterName,
+                      "newValue"_attr = redact(parameter.toString(false)),
+                      "oldValue"_attr = redact(oldValue.toString(false)));
+            } else {
+                LOGV2(23436,
+                      "Successfully set parameter {parameterName} to {newValue}",
+                      "Successfully set parameter to new value",
+                      "parameterName"_attr = parameterName,
+                      "newValue"_attr = redact(parameter.toString(false)));
+            }
 
             numSet++;
         }
@@ -385,7 +407,11 @@ public:
 void LogLevelServerParameter::append(OperationContext*,
                                      BSONObjBuilder& builder,
                                      const std::string& name) {
-    builder.append(name, globalLogDomain()->getMinimumLogSeverity().toInt());
+    builder.append(name,
+                   logv2::LogManager::global()
+                       .getGlobalSettings()
+                       .getMinimumLogSeverity(mongo::logv2::LogComponent::kDefault)
+                       .toInt());
 }
 
 Status LogLevelServerParameter::set(const BSONElement& newValueElement) {
@@ -394,20 +420,24 @@ Status LogLevelServerParameter::set(const BSONElement& newValueElement) {
         return Status(ErrorCodes::BadValue,
                       str::stream() << "Invalid value for logLevel: " << newValueElement);
     LogSeverity newSeverity = (newValue > 0) ? LogSeverity::Debug(newValue) : LogSeverity::Log();
-    globalLogDomain()->setMinimumLoggedSeverity(newSeverity);
+
+    logv2::LogManager::global().getGlobalSettings().setMinimumLoggedSeverity(
+        mongo::logv2::LogComponent::kDefault, newSeverity);
     return Status::OK();
 }
 
 Status LogLevelServerParameter::setFromString(const std::string& strLevel) {
     int newValue;
-    Status status = parseNumberFromString(strLevel, &newValue);
+    Status status = NumberParser{}(strLevel, &newValue);
     if (!status.isOK())
         return status;
     if (newValue < 0)
         return Status(ErrorCodes::BadValue,
                       str::stream() << "Invalid value for logLevel: " << newValue);
     LogSeverity newSeverity = (newValue > 0) ? LogSeverity::Debug(newValue) : LogSeverity::Log();
-    globalLogDomain()->setMinimumLoggedSeverity(newSeverity);
+
+    logv2::LogManager::global().getGlobalSettings().setMinimumLoggedSeverity(
+        mongo::logv2::LogComponent::kDefault, newSeverity);
     return Status::OK();
 }
 
@@ -422,8 +452,8 @@ void LogComponentVerbosityServerParameter::append(OperationContext*,
 Status LogComponentVerbosityServerParameter::set(const BSONElement& newValueElement) {
     if (!newValueElement.isABSONObj()) {
         return Status(ErrorCodes::TypeMismatch,
-                      str::stream() << "log component verbosity is not a BSON object: "
-                                    << newValueElement);
+                      str::stream()
+                          << "log component verbosity is not a BSON object: " << newValueElement);
     }
     return setLogComponentVerbosity(newValueElement.Obj());
 }
@@ -437,7 +467,7 @@ Status LogComponentVerbosityServerParameter::setFromString(const std::string& st
 void AutomationServiceDescriptorServerParameter::append(OperationContext*,
                                                         BSONObjBuilder& builder,
                                                         const std::string& name) {
-    const stdx::lock_guard<stdx::mutex> lock(autoServiceDescriptorMutex);
+    const stdx::lock_guard<Latch> lock(autoServiceDescriptorMutex);
     if (!autoServiceDescriptorValue.empty()) {
         builder.append(name, autoServiceDescriptorValue);
     }
@@ -456,12 +486,10 @@ Status AutomationServiceDescriptorServerParameter::setFromString(const std::stri
     if (str.size() > kMaxSize)
         return {ErrorCodes::Overflow,
                 str::stream() << "Value for parameter automationServiceDescriptor"
-                              << " must be no more than "
-                              << kMaxSize
-                              << " bytes"};
+                              << " must be no more than " << kMaxSize << " bytes"};
 
     {
-        const stdx::lock_guard<stdx::mutex> lock(autoServiceDescriptorMutex);
+        const stdx::lock_guard<Latch> lock(autoServiceDescriptorMutex);
         autoServiceDescriptorValue = str;
     }
 

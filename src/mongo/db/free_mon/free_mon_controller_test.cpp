@@ -27,22 +27,21 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 #include "mongo/platform/basic.h"
 
 #include <boost/filesystem.hpp>
 #include <future>
 #include <iostream>
+#include <memory>
 #include <snappy.h>
 
 #include "mongo/db/free_mon/free_mon_controller.h"
 #include "mongo/db/free_mon/free_mon_storage.h"
 
 #include "mongo/base/data_type_validated.h"
-#include "mongo/base/deinitializer_context.h"
 #include "mongo/bson/bson_validate.h"
-#include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/client.h"
@@ -62,18 +61,23 @@
 #include "mongo/db/service_context_d_test_fixture.h"
 #include "mongo/executor/network_interface_mock.h"
 #include "mongo/executor/thread_pool_task_executor_test_fixture.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/object_check.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/barrier.h"
 #include "mongo/unittest/temp_dir.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/clock_source.h"
-#include "mongo/util/log.h"
+#include "mongo/util/hex.h"
 
 
 namespace mongo {
 namespace {
 
+auto makeRandom() {
+    auto seed = SecureRandom().nextInt64();
+    LOGV2(24189, "PseudoRandom()", "seed"_attr = seed);
+    return PseudoRandom(seed);
+}
 
 class FreeMonMetricsCollectorMock : public FreeMonCollectorInterface {
 public:
@@ -87,7 +91,7 @@ public:
         builder.append("mock", "some data");
 
         {
-            stdx::lock_guard<stdx::mutex> lck(_mutex);
+            stdx::lock_guard<Latch> lck(_mutex);
 
             ++_counter;
 
@@ -106,12 +110,12 @@ public:
     }
 
     std::uint32_t count() {
-        stdx::lock_guard<stdx::mutex> lck(_mutex);
+        stdx::lock_guard<Latch> lck(_mutex);
         return _counter;
     }
 
     void wait() {
-        stdx::unique_lock<stdx::mutex> lck(_mutex);
+        stdx::unique_lock<Latch> lck(_mutex);
         while (_counter < _wait) {
             _condvar.wait(lck);
         }
@@ -119,8 +123,8 @@ public:
 
 private:
     /**
-    * Private enum to ensure caller uses class correctly.
-    */
+     * Private enum to ensure caller uses class correctly.
+     */
     enum class State {
         kNotStarted,
         kStarted,
@@ -131,7 +135,7 @@ private:
 
     std::uint32_t _counter{0};
 
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH("FreeMonMetricsCollectorMock::_mutex");
     stdx::condition_variable _condvar;
     std::uint32_t _wait{0};
 };
@@ -159,7 +163,7 @@ public:
      * Set the count of events to wait for.
      */
     void reset(uint32_t count) {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        stdx::lock_guard<Latch> lock(_mutex);
         ASSERT_EQ(_count, 0UL);
         ASSERT_GT(count, 0UL);
 
@@ -171,7 +175,7 @@ public:
      * Set the payload and signal waiter.
      */
     void set(T payload) {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        stdx::lock_guard<Latch> lock(_mutex);
 
         if (_count > 0) {
             --_count;
@@ -188,7 +192,7 @@ public:
      * Returns boost::none on timeout.
      */
     boost::optional<T> wait_for(Milliseconds duration) {
-        stdx::unique_lock<stdx::mutex> lock(_mutex);
+        stdx::unique_lock<Latch> lock(_mutex);
 
         if (!_condvar.wait_for(
                 lock, duration.toSystemDuration(), [this]() { return _count == 0; })) {
@@ -203,7 +207,7 @@ private:
     stdx::condition_variable _condvar;
 
     // Lock for condition variable and to protect state
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH("CountdownLatchResult::_mutex");
 
     // Count to wait fore
     uint32_t _count;
@@ -212,7 +216,7 @@ private:
     T _payload;
 };
 
-class FreeMonNetworkInterfaceMock : public FreeMonNetworkInterface {
+class FreeMonNetworkInterfaceMock final : public FreeMonNetworkInterface {
 public:
     struct Options {
         // If sync = true, then execute the callback immediately and the subsequent future chain
@@ -236,11 +240,10 @@ public:
     explicit FreeMonNetworkInterfaceMock(executor::ThreadPoolTaskExecutor* threadPool,
                                          Options options)
         : _threadPool(threadPool), _options(options), _countdownMetrics(0) {}
-    ~FreeMonNetworkInterfaceMock() final = default;
 
     Future<FreeMonRegistrationResponse> sendRegistrationAsync(
         const FreeMonRegistrationRequest& req) final {
-        log() << "Sending Registration ...";
+        LOGV2(20611, "Sending Registration ...");
 
         _registers.addAndFetch(1);
 
@@ -248,10 +251,9 @@ public:
         if (_options.doSync) {
             pf.promise.setFrom(doRegister(req));
         } else {
-            auto swSchedule =
-                _threadPool->scheduleWork([ sharedPromise = std::move(pf.promise), req, this ](
+            auto swSchedule = _threadPool->scheduleWork(
+                [sharedPromise = std::move(pf.promise), req, this](
                     const executor::TaskExecutor::CallbackArgs& cbArgs) mutable {
-
                     sharedPromise.setWith([&] { return doRegister(req); });
                 });
 
@@ -287,7 +289,7 @@ public:
 
 
     Future<FreeMonMetricsResponse> sendMetricsAsync(const FreeMonMetricsRequest& req) final {
-        log() << "Sending Metrics ...";
+        LOGV2(20612, "Sending Metrics ...");
 
         _metrics.addAndFetch(1);
 
@@ -295,10 +297,9 @@ public:
         if (_options.doSync) {
             pf.promise.setFrom(doMetrics(req));
         } else {
-            auto swSchedule =
-                _threadPool->scheduleWork([ sharedPromise = std::move(pf.promise), req, this ](
+            auto swSchedule = _threadPool->scheduleWork(
+                [sharedPromise = std::move(pf.promise), req, this](
                     const executor::TaskExecutor::CallbackArgs& cbArgs) mutable {
-
                     sharedPromise.setWith([&] { return doMetrics(req); });
                 });
 
@@ -312,7 +313,7 @@ public:
         auto cdr = req.getMetrics();
 
         {
-            stdx::lock_guard<stdx::mutex> lock(_metricsLock);
+            stdx::lock_guard<Latch> lock(_metricsLock);
             auto metrics = decompressMetrics(cdr);
             _lastMetrics = metrics;
             _countdownMetrics.set(metrics);
@@ -357,7 +358,7 @@ public:
     }
 
     BSONArray getLastMetrics() {
-        stdx::lock_guard<stdx::mutex> lock(_metricsLock);
+        stdx::lock_guard<Latch> lock(_metricsLock);
         return _lastMetrics;
     }
 
@@ -368,7 +369,7 @@ private:
 
     executor::ThreadPoolTaskExecutor* _threadPool;
 
-    stdx::mutex _metricsLock;
+    Mutex _metricsLock = MONGO_MAKE_LATCH("FreeMonNetworkInterfaceMock::_metricsLock");
     BSONArray _lastMetrics;
 
     Options _options;
@@ -420,11 +421,13 @@ void FreeMonControllerTest::setUp() {
 
     _opCtx = cc().makeOperationContext();
 
-    //_storage = stdx::make_unique<repl::StorageInterfaceImpl>();
+    //_storage = std::make_unique<repl::StorageInterfaceImpl>();
     repl::StorageInterface::set(service, std::make_unique<repl::StorageInterfaceImpl>());
 
     // Transition to PRIMARY so that the server can accept writes.
     ASSERT_OK(_getReplCoord()->setFollowerMode(repl::MemberState::RS_PRIMARY));
+
+    repl::createOplog(_opCtx.get());
 
     // Create collection with one document.
     CollectionOptions collectionOptions;
@@ -458,7 +461,7 @@ repl::ReplicationCoordinatorMock* FreeMonControllerTest::_getReplCoord() const {
 
 // Positive: Ensure deadlines sort properly
 TEST(FreeMonRetryTest, TestRegistration) {
-    PseudoRandom random(0);
+    auto random = makeRandom();
     RegistrationRetryCounter counter(random);
     counter.reset();
 
@@ -483,20 +486,47 @@ TEST(FreeMonRetryTest, TestRegistration) {
     }
 
     // Validate max timeout
-    for (int j = 0; j < 3; j++) {
-        // Fail requests
-        for (int i = 1; i <= 163; ++i) {
-            ASSERT_TRUE(counter.incrementError());
-        }
-        ASSERT_FALSE(counter.incrementError());
 
+    auto characterizeJitter = [](Seconds jitter1, Seconds jitter2) {
+        static constexpr size_t kStage1Retries = 10;
+        static constexpr auto kTMax = Days{2};
+        auto t = Seconds(0);
+        auto base = Seconds(1);
+        size_t i = 0;
+        for (; t < kTMax; ++i) {
+            if (i < kStage1Retries) {
+                base *= 2;
+                t += base + jitter1;
+            } else {
+                t += base + jitter2;
+            }
+        }
+        return i;
+    };
+    // If jitter is small as possible, we'd expect trueMax increments before false.
+    const auto trueMax = characterizeJitter(Seconds{2}, Seconds{60});
+    // If jitter is large as possible, we'd expect trueMin increments before false.
+    const auto trueMin = characterizeJitter(Seconds{9}, Seconds{119});
+
+    // LOGV2(20613, "trueMin:{trueMin}", "trueMin"_attr = trueMin);
+    // LOGV2(20614, "trueMax:{trueMax}", "trueMax"_attr = trueMax);
+
+    for (int j = 0; j < 30; j++) {
+        // std::cout << "j: " << j << "\n";
+        // Fail requests
+        size_t trueCount = 0;
+        while (counter.incrementError()) {
+            ++trueCount;
+        }
+        ASSERT_GTE(trueCount, trueMin);
+        ASSERT_LTE(trueCount, trueMax);
         counter.reset();
     }
 }
 
 // Positive: Ensure deadlines sort properly
 TEST(FreeMonRetryTest, TestMetrics) {
-    PseudoRandom random(0);
+    auto random = makeRandom();
     MetricsRetryCounter counter(random);
     counter.reset();
 
@@ -522,13 +552,28 @@ TEST(FreeMonRetryTest, TestMetrics) {
     }
 
     // Validate max timeout
-    for (int j = 0; j < 3; j++) {
-        // Fail requests
-        for (int i = 1; i < 9456; ++i) {
-            ASSERT_TRUE(counter.incrementError());
+    static size_t expectation = [] {
+        // There's technically a jitter in the MetricsRetryCounter but its default
+        // magnitude rounds to 0, so we make an exact expectation.
+        size_t iters = 0;
+        static constexpr auto kDurationMax = Days{7};
+        auto t = Seconds{0};
+        auto base = Seconds{1};
+        for (; t < kDurationMax; ++iters) {
+            if (iters < 6)
+                base *= 2;
+            t += base;
         }
-        ASSERT_FALSE(counter.incrementError());
+        return iters;
+    }();
 
+    for (int j = 0; j < 30; j++) {
+        // Fail requests
+        int iters = 0;
+        while (counter.incrementError()) {
+            ++iters;
+        }
+        ASSERT_EQ(iters, expectation);
         counter.reset();
     }
 }
@@ -543,8 +588,7 @@ TEST(FreeMonProcessorTest, TestRegistrationResponseValidation) {
                        << "http://www.example.com/123"
                        << "message"
                        << "msg456"
-                       << "reportingInterval"
-                       << 1LL))));
+                       << "reportingInterval" << 1LL))));
 
     // max reporting interval
     ASSERT_OK(FreeMonProcessor::validateRegistrationResponse(FreeMonRegistrationResponse::parse(
@@ -555,8 +599,7 @@ TEST(FreeMonProcessorTest, TestRegistrationResponseValidation) {
                        << "http://www.example.com/123"
                        << "message"
                        << "msg456"
-                       << "reportingInterval"
-                       << 30 * 60 * 60 * 24LL))));
+                       << "reportingInterval" << 30 * 60 * 60 * 24LL))));
 
     // Positive: version 2
     ASSERT_OK(FreeMonProcessor::validateRegistrationResponse(FreeMonRegistrationResponse::parse(
@@ -567,8 +610,7 @@ TEST(FreeMonProcessorTest, TestRegistrationResponseValidation) {
                        << "http://www.example.com/123"
                        << "message"
                        << "msg456"
-                       << "reportingInterval"
-                       << 1LL))));
+                       << "reportingInterval" << 1LL))));
 
     // Positive: empty registration id string
     ASSERT_OK(FreeMonProcessor::validateRegistrationResponse(FreeMonRegistrationResponse::parse(
@@ -579,8 +621,7 @@ TEST(FreeMonProcessorTest, TestRegistrationResponseValidation) {
                        << "http://www.example.com/123"
                        << "message"
                        << "msg456"
-                       << "reportingInterval"
-                       << 1LL))));
+                       << "reportingInterval" << 1LL))));
 
     // Negative: bad protocol version
     ASSERT_NOT_OK(FreeMonProcessor::validateRegistrationResponse(FreeMonRegistrationResponse::parse(
@@ -591,8 +632,7 @@ TEST(FreeMonProcessorTest, TestRegistrationResponseValidation) {
                        << "http://www.example.com/123"
                        << "message"
                        << "msg456"
-                       << "reportingInterval"
-                       << 1LL))));
+                       << "reportingInterval" << 1LL))));
 
     // Negative: halt uploading
     ASSERT_NOT_OK(FreeMonProcessor::validateRegistrationResponse(FreeMonRegistrationResponse::parse(
@@ -603,8 +643,7 @@ TEST(FreeMonProcessorTest, TestRegistrationResponseValidation) {
                        << "http://www.example.com/123"
                        << "message"
                        << "msg456"
-                       << "reportingInterval"
-                       << 1LL))));
+                       << "reportingInterval" << 1LL))));
 
     // Negative: large registartation id
     ASSERT_NOT_OK(FreeMonProcessor::validateRegistrationResponse(FreeMonRegistrationResponse::parse(
@@ -614,20 +653,16 @@ TEST(FreeMonProcessorTest, TestRegistrationResponseValidation) {
                        << "http://www.example.com/123"
                        << "message"
                        << "msg456"
-                       << "reportingInterval"
-                       << 1LL))));
+                       << "reportingInterval" << 1LL))));
 
     // Negative: large URL
     ASSERT_NOT_OK(FreeMonProcessor::validateRegistrationResponse(FreeMonRegistrationResponse::parse(
         IDLParserErrorContext("foo"),
         BSON("version" << 1LL << "haltMetricsUploading" << false << "id"
                        << "mock123"
-                       << "informationalURL"
-                       << std::string(5000, 'b')
-                       << "message"
+                       << "informationalURL" << std::string(5000, 'b') << "message"
                        << "msg456"
-                       << "reportingInterval"
-                       << 1LL))));
+                       << "reportingInterval" << 1LL))));
 
     // Negative: large message
     ASSERT_NOT_OK(FreeMonProcessor::validateRegistrationResponse(FreeMonRegistrationResponse::parse(
@@ -636,10 +671,7 @@ TEST(FreeMonProcessorTest, TestRegistrationResponseValidation) {
                        << "mock123"
                        << "informationalURL"
                        << "http://www.example.com/123"
-                       << "message"
-                       << std::string(5000, 'c')
-                       << "reportingInterval"
-                       << 1LL))));
+                       << "message" << std::string(5000, 'c') << "reportingInterval" << 1LL))));
 
     // Negative: too small a reporting interval
     ASSERT_NOT_OK(FreeMonProcessor::validateRegistrationResponse(FreeMonRegistrationResponse::parse(
@@ -650,8 +682,7 @@ TEST(FreeMonProcessorTest, TestRegistrationResponseValidation) {
                        << "http://www.example.com/123"
                        << "message"
                        << "msg456"
-                       << "reportingInterval"
-                       << 0LL))));
+                       << "reportingInterval" << 0LL))));
 
     // Negative: too large a reporting interval
     ASSERT_NOT_OK(FreeMonProcessor::validateRegistrationResponse(FreeMonRegistrationResponse::parse(
@@ -662,39 +693,36 @@ TEST(FreeMonProcessorTest, TestRegistrationResponseValidation) {
                        << "http://www.example.com/123"
                        << "message"
                        << "msg456"
-                       << "reportingInterval"
-                       << (60LL * 60 * 24 * 30 + 1LL)))));
+                       << "reportingInterval" << (60LL * 60 * 24 * 30 + 1LL)))));
 }
 
 
 // Positive: Ensure the response is validated correctly
 TEST(FreeMonProcessorTest, TestMetricsResponseValidation) {
-    ASSERT_OK(FreeMonProcessor::validateMetricsResponse(FreeMonMetricsResponse::parse(
-        IDLParserErrorContext("foo"),
+    ASSERT_OK(FreeMonProcessor::validateMetricsResponse(
+        FreeMonMetricsResponse::parse(IDLParserErrorContext("foo"),
 
-        BSON("version" << 1LL << "haltMetricsUploading" << false << "permanentlyDelete" << false
-                       << "id"
-                       << "mock123"
-                       << "informationalURL"
-                       << "http://www.example.com/123"
-                       << "message"
-                       << "msg456"
-                       << "reportingInterval"
-                       << 1LL))));
+                                      BSON("version" << 1LL << "haltMetricsUploading" << false
+                                                     << "permanentlyDelete" << false << "id"
+                                                     << "mock123"
+                                                     << "informationalURL"
+                                                     << "http://www.example.com/123"
+                                                     << "message"
+                                                     << "msg456"
+                                                     << "reportingInterval" << 1LL))));
 
     // Positive: Support version 2
-    ASSERT_OK(FreeMonProcessor::validateMetricsResponse(FreeMonMetricsResponse::parse(
-        IDLParserErrorContext("foo"),
+    ASSERT_OK(FreeMonProcessor::validateMetricsResponse(
+        FreeMonMetricsResponse::parse(IDLParserErrorContext("foo"),
 
-        BSON("version" << 2LL << "haltMetricsUploading" << false << "permanentlyDelete" << false
-                       << "id"
-                       << "mock123"
-                       << "informationalURL"
-                       << "http://www.example.com/123"
-                       << "message"
-                       << "msg456"
-                       << "reportingInterval"
-                       << 1LL))));
+                                      BSON("version" << 2LL << "haltMetricsUploading" << false
+                                                     << "permanentlyDelete" << false << "id"
+                                                     << "mock123"
+                                                     << "informationalURL"
+                                                     << "http://www.example.com/123"
+                                                     << "message"
+                                                     << "msg456"
+                                                     << "reportingInterval" << 1LL))));
 
     // Positive: Add resendRegistration
     ASSERT_OK(FreeMonProcessor::validateMetricsResponse(FreeMonMetricsResponse::parse(
@@ -707,10 +735,7 @@ TEST(FreeMonProcessorTest, TestMetricsResponseValidation) {
                        << "http://www.example.com/123"
                        << "message"
                        << "msg456"
-                       << "reportingInterval"
-                       << 1LL
-                       << "resendRegistration"
-                       << true))));
+                       << "reportingInterval" << 1LL << "resendRegistration" << true))));
 
 
     // Positive: max reporting interval
@@ -724,63 +749,52 @@ TEST(FreeMonProcessorTest, TestMetricsResponseValidation) {
                        << "http://www.example.com/123"
                        << "message"
                        << "msg456"
-                       << "reportingInterval"
-                       << 60 * 60 * 24 * 30LL))));
+                       << "reportingInterval" << 60 * 60 * 24 * 30LL))));
 
     // Negative: bad protocol version
-    ASSERT_NOT_OK(FreeMonProcessor::validateMetricsResponse(FreeMonMetricsResponse::parse(
-        IDLParserErrorContext("foo"),
-        BSON("version" << 42LL << "haltMetricsUploading" << false << "permanentlyDelete" << false
-                       << "id"
-                       << "mock123"
-                       << "informationalURL"
-                       << "http://www.example.com/123"
-                       << "message"
-                       << "msg456"
-                       << "reportingInterval"
-                       << 1LL))));
+    ASSERT_NOT_OK(FreeMonProcessor::validateMetricsResponse(
+        FreeMonMetricsResponse::parse(IDLParserErrorContext("foo"),
+                                      BSON("version" << 42LL << "haltMetricsUploading" << false
+                                                     << "permanentlyDelete" << false << "id"
+                                                     << "mock123"
+                                                     << "informationalURL"
+                                                     << "http://www.example.com/123"
+                                                     << "message"
+                                                     << "msg456"
+                                                     << "reportingInterval" << 1LL))));
 
     // Negative: halt uploading
-    ASSERT_NOT_OK(FreeMonProcessor::validateMetricsResponse(FreeMonMetricsResponse::parse(
-        IDLParserErrorContext("foo"),
-        BSON("version" << 1LL << "haltMetricsUploading" << true << "permanentlyDelete" << false
-                       << "id"
-                       << "mock123"
-                       << "informationalURL"
-                       << "http://www.example.com/123"
-                       << "message"
-                       << "msg456"
-                       << "reportingInterval"
-                       << 1LL))));
+    ASSERT_NOT_OK(FreeMonProcessor::validateMetricsResponse(
+        FreeMonMetricsResponse::parse(IDLParserErrorContext("foo"),
+                                      BSON("version" << 1LL << "haltMetricsUploading" << true
+                                                     << "permanentlyDelete" << false << "id"
+                                                     << "mock123"
+                                                     << "informationalURL"
+                                                     << "http://www.example.com/123"
+                                                     << "message"
+                                                     << "msg456"
+                                                     << "reportingInterval" << 1LL))));
 
     // Negative: large registartation id
     ASSERT_NOT_OK(FreeMonProcessor::validateMetricsResponse(FreeMonMetricsResponse::parse(
         IDLParserErrorContext("foo"),
         BSON("version" << 1LL << "haltMetricsUploading" << false << "permanentlyDelete" << false
-                       << "id"
-                       << std::string(5000, 'a')
-                       << "informationalURL"
+                       << "id" << std::string(5000, 'a') << "informationalURL"
                        << "http://www.example.com/123"
                        << "message"
                        << "msg456"
-                       << "reportingInterval"
-                       << 1LL))));
+                       << "reportingInterval" << 1LL))));
 
     // Negative: large URL
-    ASSERT_NOT_OK(FreeMonProcessor::validateMetricsResponse(
-        FreeMonMetricsResponse::parse(IDLParserErrorContext("foo"),
-                                      BSON("version" << 1LL << "haltMetricsUploading" << false
+    ASSERT_NOT_OK(FreeMonProcessor::validateMetricsResponse(FreeMonMetricsResponse::parse(
+        IDLParserErrorContext("foo"),
+        BSON("version" << 1LL << "haltMetricsUploading" << false
 
-                                                     << "permanentlyDelete"
-                                                     << false
-                                                     << "id"
-                                                     << "mock123"
-                                                     << "informationalURL"
-                                                     << std::string(5000, 'b')
-                                                     << "message"
-                                                     << "msg456"
-                                                     << "reportingInterval"
-                                                     << 1LL))));
+                       << "permanentlyDelete" << false << "id"
+                       << "mock123"
+                       << "informationalURL" << std::string(5000, 'b') << "message"
+                       << "msg456"
+                       << "reportingInterval" << 1LL))));
 
     // Negative: large message
     ASSERT_NOT_OK(FreeMonProcessor::validateMetricsResponse(FreeMonMetricsResponse::parse(
@@ -790,23 +804,19 @@ TEST(FreeMonProcessorTest, TestMetricsResponseValidation) {
                        << "mock123"
                        << "informationalURL"
                        << "http://www.example.com/123"
-                       << "message"
-                       << std::string(5000, 'c')
-                       << "reportingInterval"
-                       << 1LL))));
+                       << "message" << std::string(5000, 'c') << "reportingInterval" << 1LL))));
 
     // Negative: too small a reporting interval
-    ASSERT_NOT_OK(FreeMonProcessor::validateMetricsResponse(FreeMonMetricsResponse::parse(
-        IDLParserErrorContext("foo"),
-        BSON("version" << 1LL << "haltMetricsUploading" << false << "permanentlyDelete" << false
-                       << "id"
-                       << "mock123"
-                       << "informationalURL"
-                       << "http://www.example.com/123"
-                       << "message"
-                       << "msg456"
-                       << "reportingInterval"
-                       << 0LL))));
+    ASSERT_NOT_OK(FreeMonProcessor::validateMetricsResponse(
+        FreeMonMetricsResponse::parse(IDLParserErrorContext("foo"),
+                                      BSON("version" << 1LL << "haltMetricsUploading" << false
+                                                     << "permanentlyDelete" << false << "id"
+                                                     << "mock123"
+                                                     << "informationalURL"
+                                                     << "http://www.example.com/123"
+                                                     << "message"
+                                                     << "msg456"
+                                                     << "reportingInterval" << 0LL))));
 
     // Negative: too large a reporting interval
     ASSERT_NOT_OK(FreeMonProcessor::validateMetricsResponse(FreeMonMetricsResponse::parse(
@@ -818,8 +828,7 @@ TEST(FreeMonProcessorTest, TestMetricsResponseValidation) {
                        << "http://www.example.com/123"
                        << "message"
                        << "msg456"
-                       << "reportingInterval"
-                       << (60LL * 60 * 24 * 30 + 1LL)))));
+                       << "reportingInterval" << (60LL * 60 * 24 * 30 + 1LL)))));
 }
 
 /**
@@ -889,8 +898,8 @@ struct ControllerHolder {
     ControllerHolder(executor::ThreadPoolTaskExecutor* pool,
                      FreeMonNetworkInterfaceMock::Options opts,
                      bool useCrankForTest = true) {
-        auto registerCollectorUnique = stdx::make_unique<FreeMonMetricsCollectorMock>();
-        auto metricsCollectorUnique = stdx::make_unique<FreeMonMetricsCollectorMock>();
+        auto registerCollectorUnique = std::make_unique<FreeMonMetricsCollectorMock>();
+        auto metricsCollectorUnique = std::make_unique<FreeMonMetricsCollectorMock>();
 
         // If we want to manually turn the crank the queue, we must process the messages
         // synchronously
@@ -1350,7 +1359,7 @@ void FreeMonControllerRSTest::tearDown() {
 TEST_F(FreeMonControllerRSTest, TransitionToPrimary) {
     ControllerHolder controller(_mockThreadPool.get(), FreeMonNetworkInterfaceMock::Options());
 
-    // Now become a secondary, then primary, and try what happens when we become primary
+    // Now become a secondary, then primary, and see what happens when we become primary
     ASSERT_OK(_getReplCoord()->setFollowerMode(repl::MemberState::RS_SECONDARY));
     ASSERT_OK(_getReplCoord()->setFollowerMode(repl::MemberState::RS_PRIMARY));
 
@@ -1374,7 +1383,7 @@ TEST_F(FreeMonControllerRSTest, StartupOnSecondary) {
 
     FreeMonStorage::replace(_opCtx.get(), initStorage(StorageStateEnum::enabled));
 
-    // Now become a secondary, then primary, and try what happens when we become primary
+    // Now become a secondary, then primary, and see what happens when we become primary
     ASSERT_OK(_getReplCoord()->setFollowerMode(repl::MemberState::RS_SECONDARY));
 
     controller.start(RegistrationType::RegisterAfterOnTransitionToPrimary);
@@ -1544,6 +1553,54 @@ TEST_F(FreeMonControllerRSTest, SecondaryStopOnDocumentDrop) {
     ASSERT_EQ(controller.registerCollector->count(), 1UL);
     ASSERT_GTE(controller.metricsCollector->count(), 2UL);
 }
+
+
+// Positive: Test Metrics works on secondary after opObserver delete of document between metrics
+// send and metrics async complete
+TEST_F(FreeMonControllerRSTest, SecondaryStopOnDocumentDropDuringCollect) {
+    ControllerHolder controller(_mockThreadPool.get(), FreeMonNetworkInterfaceMock::Options());
+
+    FreeMonStorage::replace(_opCtx.get(), initStorage(StorageStateEnum::enabled));
+
+    // Now become a secondary
+    ASSERT_OK(_getReplCoord()->setFollowerMode(repl::MemberState::RS_SECONDARY));
+
+    controller.start(RegistrationType::RegisterAfterOnTransitionToPrimary);
+
+    controller->turnCrankForTest(Turner().registerServer().registerCommand().collect(1));
+
+    ASSERT_EQ(controller.metricsCollector->count(), 1UL);
+
+    // Crank the metrics send but not the complete
+    controller->turnCrankForTest(Turner().collect(1));
+
+    controller->notifyOnDelete();
+
+    // Move the notify delete above the async metrics complete
+    controller->deprioritizeFirstMessageForTest(FreeMonMessageType::AsyncMetricsComplete);
+
+    // There is a race condition where sometimes metrics send sneaks in
+    // Crank the notifyDelete and the async metrics complete.
+    controller->turnCrankForTest(Turner().notifyDelete().collect(1));
+
+    controller->turnCrankForTest(Turner().metricsSend().collect(2));
+
+    ASSERT_TRUE(FreeMonStorage::read(_opCtx.get()).is_initialized());
+
+    // Since there is no local write, it remains enabled
+    ASSERT_TRUE(FreeMonStorage::read(_opCtx.get()).get().getState() == StorageStateEnum::enabled);
+
+    BSONObjBuilder builder;
+    controller->getServerStatus(_opCtx.get(), &builder);
+    auto obj = builder.obj();
+    ASSERT_BSONOBJ_EQ(BSON("state"
+                           << "undecided"),
+                      obj);
+
+    ASSERT_EQ(controller.registerCollector->count(), 1UL);
+    ASSERT_EQ(controller.metricsCollector->count(), 5UL);
+}
+
 
 // Negative: Test nice shutdown on bad update
 TEST_F(FreeMonControllerRSTest, SecondaryStartOnBadUpdate) {

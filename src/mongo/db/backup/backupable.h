@@ -41,6 +41,19 @@ namespace mongo {
 
 namespace percona {
 
+struct S3BackupParameters {
+    std::string profile;  // empty value means default profile
+    std::string region;  // empty value means default region (US_EAST_1)
+    std::string endpoint;  // endpoint override, for example  "127.0.0.1:9000"
+    std::string scheme{"HTTPS"};  // HTTP/HTTPS, by default HTTPS
+    bool useVirtualAddressing{true};  // true by default
+    std::string bucket;  // S3 bucket name
+    std::string path;  // path inside bucket (may be empty)
+    std::string accessKeyId;  // access key id
+    std::string secretAccessKey;  // secret access key
+    int threadPoolSize{4};  //  thread pool size for multipart uploads
+};
+
 /**
  * The interface which provides the ability to perform hot
  * backups of the storage engine.
@@ -56,6 +69,26 @@ struct Backupable {
     virtual mongo::Status hotBackup(mongo::OperationContext* opCtx, const std::string& path) {
         return mongo::Status(mongo::ErrorCodes::IllegalOperation,
                              "This engine doesn't support hot backup.");
+    }
+
+    /**
+     * Perform hot backup into the file/stream in the tar archive format.
+     * @param path destination path to perform backup into.
+     * @return Status code of the operation.
+     */
+    virtual mongo::Status hotBackupTar(mongo::OperationContext* opCtx, const std::string& path) {
+        return mongo::Status(mongo::ErrorCodes::IllegalOperation,
+                             "This engine doesn't support hot backup to the tar format.");
+    }
+
+    /**
+     * Perform hot backup to S3-compatible storage.
+     * @param s3params parameters of server connection and backup location.
+     * @return Status code of the operation.
+     */
+    virtual mongo::Status hotBackup(mongo::OperationContext* opCtx, const S3BackupParameters& s3params) {
+        return mongo::Status(mongo::ErrorCodes::IllegalOperation,
+                             "This engine doesn't support hot backup to S3-compatible storage.");
     }
 };
 

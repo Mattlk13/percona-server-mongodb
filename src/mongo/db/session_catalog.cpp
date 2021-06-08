@@ -27,15 +27,16 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kWrite
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kWrite
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/session_catalog.h"
 
+#include <memory>
+
 #include "mongo/db/service_context.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 namespace {
@@ -48,7 +49,7 @@ const auto operationSessionDecoration =
 }  // namespace
 
 SessionCatalog::~SessionCatalog() {
-    stdx::lock_guard<stdx::mutex> lg(_mutex);
+    stdx::lock_guard<Latch> lg(_mutex);
     for (const auto& entry : _sessions) {
         ObservableSession session(lg, entry.second->session);
         invariant(!session.currentOperation());
@@ -57,7 +58,7 @@ SessionCatalog::~SessionCatalog() {
 }
 
 void SessionCatalog::reset_forTest() {
-    stdx::lock_guard<stdx::mutex> lg(_mutex);
+    stdx::lock_guard<Latch> lg(_mutex);
     _sessions.clear();
 }
 
@@ -78,7 +79,11 @@ SessionCatalog::ScopedCheckedOutSession SessionCatalog::_checkOutSession(Operati
     invariant(!opCtx->lockState()->inAWriteUnitOfWork());
     invariant(!opCtx->lockState()->isLocked());
 
-    stdx::unique_lock<stdx::mutex> ul(_mutex);
+    stdx::unique_lock<Latch> ul(_mutex);
+    uassert(ErrorCodes::InterruptedDueToReplStateChange,
+            "a stepdown process started, can't checkout sessions except for killing",
+            _checkoutAllowed);
+
     auto sri = _getOrCreateSessionRuntimeInfo(ul, opCtx, *opCtx->getLogicalSessionId());
 
     // Wait until the session is no longer checked out and until the previously scheduled kill has
@@ -105,7 +110,7 @@ SessionCatalog::SessionToKill SessionCatalog::checkOutSessionForKill(OperationCo
     invariant(!operationSessionDecoration(opCtx));
     invariant(!opCtx->getTxnNumber());
 
-    stdx::unique_lock<stdx::mutex> ul(_mutex);
+    stdx::unique_lock<Latch> ul(_mutex);
     auto sri = _getOrCreateSessionRuntimeInfo(ul, opCtx, killToken.lsidToKill);
     invariant(ObservableSession(ul, sri->session)._killed());
 
@@ -129,7 +134,7 @@ void SessionCatalog::scanSession(const LogicalSessionId& lsid,
     std::unique_ptr<SessionRuntimeInfo> sessionToReap;
 
     {
-        stdx::lock_guard<stdx::mutex> lg(_mutex);
+        stdx::lock_guard<Latch> lg(_mutex);
         auto it = _sessions.find(lsid);
         if (it != _sessions.end()) {
             auto& sri = it->second;
@@ -150,14 +155,19 @@ void SessionCatalog::scanSessions(const SessionKiller::Matcher& matcher,
     std::vector<std::unique_ptr<SessionRuntimeInfo>> sessionsToReap;
 
     {
-        stdx::lock_guard<stdx::mutex> lg(_mutex);
+        stdx::lock_guard<Latch> lg(_mutex);
 
-        LOG(2) << "Beginning scanSessions. Scanning " << _sessions.size() << " sessions.";
+        LOGV2_DEBUG(21976,
+                    2,
+                    "Scanning {sessionCount} sessions",
+                    "Scanning sessions",
+                    "sessionCount"_attr = _sessions.size());
 
         for (auto it = _sessions.begin(); it != _sessions.end(); ++it) {
             if (matcher.match(it->first)) {
                 auto& sri = it->second;
                 ObservableSession osession(lg, sri->session);
+
                 workerFn(osession);
 
                 if (osession._markedForReap && !osession._killed() &&
@@ -170,8 +180,18 @@ void SessionCatalog::scanSessions(const SessionKiller::Matcher& matcher,
     }
 }
 
+void SessionCatalog::_disallowCheckoutsExceptForKilling() {
+    stdx::unique_lock<Latch> ul(_mutex);
+    _checkoutAllowed = false;
+}
+
+void SessionCatalog::_allowCheckouts() {
+    stdx::lock_guard<Latch> lg(_mutex);
+    _checkoutAllowed = true;
+}
+
 SessionCatalog::KillToken SessionCatalog::killSession(const LogicalSessionId& lsid) {
-    stdx::lock_guard<stdx::mutex> lg(_mutex);
+    stdx::lock_guard<Latch> lg(_mutex);
     auto it = _sessions.find(lsid);
     uassert(ErrorCodes::NoSuchSession, "Session not found", it != _sessions.end());
 
@@ -180,7 +200,7 @@ SessionCatalog::KillToken SessionCatalog::killSession(const LogicalSessionId& ls
 }
 
 size_t SessionCatalog::size() const {
-    stdx::lock_guard<stdx::mutex> lg(_mutex);
+    stdx::lock_guard<Latch> lg(_mutex);
     return _sessions.size();
 }
 
@@ -196,7 +216,7 @@ SessionCatalog::SessionRuntimeInfo* SessionCatalog::_getOrCreateSessionRuntimeIn
 
 void SessionCatalog::_releaseSession(SessionRuntimeInfo* sri,
                                      boost::optional<KillToken> killToken) {
-    stdx::lock_guard<stdx::mutex> lg(_mutex);
+    stdx::lock_guard<Latch> lg(_mutex);
 
     // Make sure we have exactly the same session on the map and that it is still associated with an
     // operation context (meaning checked-out)
@@ -250,6 +270,23 @@ OperationContextSession::OperationContextSession(OperationContext* opCtx) : _opC
     checkOut(opCtx);
 }
 
+OperationContextSession::OperationContextSession(OperationContext* opCtx,
+                                                 SessionCatalog::KillToken killToken)
+    : _opCtx(opCtx) {
+    auto& checkedOutSession = operationSessionDecoration(opCtx);
+
+    invariant(!checkedOutSession);
+    invariant(!opCtx->getLogicalSessionId());  // lsid is specified by killToken argument.
+
+    const auto catalog = SessionCatalog::get(opCtx);
+    auto scopedSessionForKill = catalog->checkOutSessionForKill(opCtx, std::move(killToken));
+
+    // We acquire a Client lock here to guard the construction of this session so that references to
+    // this session are safe to use while the lock is held
+    stdx::lock_guard lk(*opCtx->getClient());
+    checkedOutSession.emplace(std::move(scopedSessionForKill._scos));
+}
+
 OperationContextSession::~OperationContextSession() {
     // Only release the checked out session at the end of the top-level request from the client, not
     // at the end of a nested DBDirectClient call
@@ -300,6 +337,14 @@ void OperationContextSession::checkOut(OperationContext* opCtx) {
     // this session are safe to use while the lock is held
     stdx::lock_guard<Client> lk(*opCtx->getClient());
     checkedOutSession.emplace(std::move(scopedCheckedOutSession));
+}
+
+ScopedBlockSessionCheckouts::ScopedBlockSessionCheckouts(OperationContext* opCtx) : _opCtx(opCtx) {
+    SessionCatalog::get(_opCtx)->_disallowCheckoutsExceptForKilling();
+}
+
+ScopedBlockSessionCheckouts::~ScopedBlockSessionCheckouts() {
+    SessionCatalog::get(_opCtx)->_allowCheckouts();
 }
 
 }  // namespace mongo

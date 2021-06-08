@@ -69,4 +69,4 @@ protected:
 #endif
     std::string _name;
 };
-}
+}  // namespace mongo

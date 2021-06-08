@@ -31,19 +31,23 @@
 
 #include "mongo/db/pipeline/accumulator.h"
 
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/accumulation_statement.h"
-#include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
-#include "mongo/db/pipeline/value.h"
+#include "mongo/db/pipeline/window_function/window_function_expression.h"
+#include "mongo/db/pipeline/window_function/window_function_stddev.h"
 
 namespace mongo {
 using boost::intrusive_ptr;
 
-REGISTER_ACCUMULATOR(stdDevPop, AccumulatorStdDevPop::create);
-REGISTER_ACCUMULATOR(stdDevSamp, AccumulatorStdDevSamp::create);
+REGISTER_ACCUMULATOR(stdDevPop, genericParseSingleExpressionAccumulator<AccumulatorStdDevPop>);
+REGISTER_ACCUMULATOR(stdDevSamp, genericParseSingleExpressionAccumulator<AccumulatorStdDevSamp>);
 REGISTER_EXPRESSION(stdDevPop, ExpressionFromAccumulator<AccumulatorStdDevPop>::parse);
 REGISTER_EXPRESSION(stdDevSamp, ExpressionFromAccumulator<AccumulatorStdDevSamp>::parse);
+REGISTER_REMOVABLE_WINDOW_FUNCTION(stdDevPop, AccumulatorStdDevPop, WindowFunctionStdDevPop);
+REGISTER_REMOVABLE_WINDOW_FUNCTION(stdDevSamp, AccumulatorStdDevSamp, WindowFunctionStdDevSamp);
 
 const char* AccumulatorStdDev::getOpName() const {
     return (_isSamp ? "$stdDevSamp" : "$stdDevPop");
@@ -58,11 +62,13 @@ void AccumulatorStdDev::processInternal(const Value& input, bool merging) {
         const double val = input.getDouble();
 
         // This is an implementation of the following algorithm:
-        // http://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Online_algorithm
+        // https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Welford's_online_algorithm
         _count += 1;
         const double delta = val - _mean;
-        _mean += delta / _count;
-        _m2 += delta * (val - _mean);
+        if (delta != 0.0) {
+            _mean += delta / _count;
+            _m2 += delta * (val - _mean);
+        }
     } else {
         // This is what getValue(true) produced below.
         verify(input.getType() == Object);
@@ -78,8 +84,13 @@ void AccumulatorStdDev::processInternal(const Value& input, bool merging) {
         const double delta = mean - _mean;
         const long long newCount = count + _count;
 
-        _mean = ((_count * _mean) + (count * mean)) / newCount;
-        _m2 += m2 + (delta * delta * (double(_count) * count / newCount));
+        if (delta != 0.0) {
+            // Avoid potential numerical stability issues.
+            _mean = ((_count * _mean) + (count * mean)) / newCount;
+            _m2 += delta * delta * (double(_count) * count / newCount);
+        }
+        _m2 += m2;
+
         _count = newCount;
     }
 }
@@ -96,20 +107,17 @@ Value AccumulatorStdDev::getValue(bool toBeMerged) {
     }
 }
 
-intrusive_ptr<Accumulator> AccumulatorStdDevSamp::create(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+intrusive_ptr<AccumulatorState> AccumulatorStdDevSamp::create(ExpressionContext* const expCtx) {
     return new AccumulatorStdDevSamp(expCtx);
 }
 
-intrusive_ptr<Accumulator> AccumulatorStdDevPop::create(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+intrusive_ptr<AccumulatorState> AccumulatorStdDevPop::create(ExpressionContext* const expCtx) {
     return new AccumulatorStdDevPop(expCtx);
 }
 
-AccumulatorStdDev::AccumulatorStdDev(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                     bool isSamp)
-    : Accumulator(expCtx), _isSamp(isSamp), _count(0), _mean(0), _m2(0) {
-    // This is a fixed size Accumulator so we never need to update this
+AccumulatorStdDev::AccumulatorStdDev(ExpressionContext* const expCtx, bool isSamp)
+    : AccumulatorState(expCtx), _isSamp(isSamp), _count(0), _mean(0), _m2(0) {
+    // This is a fixed size AccumulatorState so we never need to update this
     _memUsageBytes = sizeof(*this);
 }
 
@@ -118,4 +126,4 @@ void AccumulatorStdDev::reset() {
     _mean = 0;
     _m2 = 0;
 }
-}
+}  // namespace mongo

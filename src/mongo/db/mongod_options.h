@@ -32,7 +32,6 @@
 #include <boost/optional.hpp>
 
 #include "mongo/base/status.h"
-#include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/util/options_parser/environment.h"
@@ -75,13 +74,10 @@ Status validateMongodOptions(const moe::Environment& params);
  */
 Status canonicalizeMongodOptions(moe::Environment* params);
 
-// Must be called after "storeMongodOptions"
-StatusWith<repl::ReplSettings> parseMongodReplicationOptions(const moe::Environment& params);
-
 Status storeMongodOptions(const moe::Environment& params);
 
 /**
  * Help test user for storage.dbPath config option.
  */
 std::string storageDBPathDescription();
-}
+}  // namespace mongo

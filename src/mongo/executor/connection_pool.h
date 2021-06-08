@@ -29,19 +29,22 @@
 
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <queue>
 
+#include "mongo/config.h"
 #include "mongo/executor/egress_tag_closer.h"
 #include "mongo/executor/egress_tag_closer_manager.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/transport/session.h"
 #include "mongo/transport/transport_layer.h"
 #include "mongo/util/duration.h"
 #include "mongo/util/future.h"
+#include "mongo/util/hierarchical_acquisition.h"
 #include "mongo/util/net/hostandport.h"
+#include "mongo/util/net/ssl_options.h"
 #include "mongo/util/out_of_line_executor.h"
 #include "mongo/util/time_support.h"
 
@@ -63,26 +66,37 @@ struct ConnectionPoolStats;
  * HostAndPort. See comments on the various Options for how the pool operates.
  */
 class ConnectionPool : public EgressTagCloser, public std::enable_shared_from_this<ConnectionPool> {
-    class SpecificPool;
+    class LimitController;
 
 public:
+    class SpecificPool;
+
     class ConnectionInterface;
     class DependentTypeFactoryInterface;
     class TimerInterface;
+    class ControllerInterface;
 
-    using ConnectionHandleDeleter = stdx::function<void(ConnectionInterface* connection)>;
+    using ConnectionHandleDeleter = std::function<void(ConnectionInterface* connection)>;
     using ConnectionHandle = std::unique_ptr<ConnectionInterface, ConnectionHandleDeleter>;
 
     using GetConnectionCallback = unique_function<void(StatusWith<ConnectionHandle>)>;
 
-    static constexpr Milliseconds kDefaultHostTimeout = Minutes(5);
+    using PoolId = uint64_t;
+
     static constexpr size_t kDefaultMaxConns = std::numeric_limits<size_t>::max();
     static constexpr size_t kDefaultMinConns = 1;
     static constexpr size_t kDefaultMaxConnecting = 2;
+    static constexpr Milliseconds kDefaultHostTimeout = Minutes(5);
     static constexpr Milliseconds kDefaultRefreshRequirement = Minutes(1);
     static constexpr Milliseconds kDefaultRefreshTimeout = Seconds(20);
+    static constexpr Milliseconds kHostRetryTimeout = Seconds(1);
 
     static const Status kConnectionStateUnknown;
+
+    /**
+     * Make a vanilla LimitController as a decent default option
+     */
+    static std::shared_ptr<ControllerInterface> makeLimitController() noexcept;
 
     struct Options {
         Options() {}
@@ -137,6 +151,89 @@ public:
          * Connections created through this connection pool will not attempt to authenticate.
          */
         bool skipAuthentication = false;
+
+#ifdef MONGO_CONFIG_SSL
+        /**
+         * Provides SSL params if the egress cluster connection requires custom SSL certificates
+         * different from the global (default) certificates.
+         */
+        boost::optional<TransientSSLParams> transientSSLParams;
+#endif
+
+        std::function<std::shared_ptr<ControllerInterface>(void)> controllerFactory =
+            &ConnectionPool::makeLimitController;
+    };
+
+    /**
+     * A set of flags describing the health of a host pool
+     */
+    struct HostHealth {
+        /**
+         * The pool is expired and can be shutdown by updateController
+         *
+         * This flag is set to true when there have been no connection requests or in use
+         * connections for ControllerInterface::hostTimeout().
+         *
+         * This flag is set to false whenever a connection is requested.
+         */
+        bool isExpired = false;
+
+        /**
+         *  The pool has processed a failure and will not spawn new connections until requested
+         *
+         *  This flag is set to true by processFailure(), and thus also triggerShutdown().
+         *
+         *  This flag is set to false whenever a connection is requested.
+         *
+         *  As a further note, this prevents us from spamming a failed host with connection
+         *  attempts. If an external user believes a host should be available, they can request
+         *  again.
+         */
+        bool isFailed = false;
+
+        /**
+         * The pool is shutdown and will never be called by the ConnectionPool again.
+         *
+         * This flag is set to true by triggerShutdown() or updateController(). It is never unset.
+         */
+        bool isShutdown = false;
+    };
+
+    /**
+     * The state of connection pooling for a single host
+     *
+     * This should only be constructed by the SpecificPool.
+     */
+    struct HostState {
+        HostHealth health;
+        size_t requests = 0;
+        size_t pending = 0;
+        size_t ready = 0;
+        size_t active = 0;
+
+        std::string toString() const;
+    };
+
+    /**
+     * A simple set of controls to direct a single host
+     *
+     * This should only be constructed by a ControllerInterface
+     */
+    struct ConnectionControls {
+        size_t maxPendingConnections = kDefaultMaxConnecting;
+        size_t targetConnections = 0;
+
+        std::string toString() const;
+    };
+
+    /**
+     * A set of hosts and a flag canShutdown for if the group can shutdown
+     *
+     * This should only be constructed by a ControllerInterface
+     */
+    struct HostGroupState {
+        std::vector<HostAndPort> hosts;
+        bool canShutdown = false;
     };
 
     explicit ConnectionPool(std::shared_ptr<DependentTypeFactoryInterface> impl,
@@ -152,7 +249,7 @@ public:
     void dropConnections(transport::Session::TagMask tags) override;
 
     void mutateTags(const HostAndPort& hostAndPort,
-                    const stdx::function<transport::Session::TagMask(transport::Session::TagMask)>&
+                    const std::function<transport::Session::TagMask(transport::Session::TagMask)>&
                         mutateFunc) override;
 
     SemiFuture<ConnectionHandle> get(const HostAndPort& hostAndPort,
@@ -169,14 +266,15 @@ public:
 private:
     std::string _name;
 
-    // Options are set at startup and never changed at run time, so these are
-    // accessed outside the lock
+    const std::shared_ptr<DependentTypeFactoryInterface> _factory;
     const Options _options;
 
-    const std::shared_ptr<DependentTypeFactoryInterface> _factory;
+    std::shared_ptr<ControllerInterface> _controller;
 
     // The global mutex for specific pool access and the generation counter
-    mutable stdx::mutex _mutex;
+    mutable Mutex _mutex =
+        MONGO_MAKE_LATCH(HierarchicalAcquisitionLevel(1), "ExecutorConnectionPool::_mutex");
+    PoolId _nextPoolId = 0;
     stdx::unordered_map<HostAndPort, std::shared_ptr<SpecificPool>> _pools;
 
     EgressTagCloserManager* _manager;
@@ -194,7 +292,7 @@ class ConnectionPool::TimerInterface {
 public:
     TimerInterface() = default;
 
-    using TimeoutCallback = stdx::function<void()>;
+    using TimeoutCallback = std::function<void()>;
 
     virtual ~TimerInterface() = default;
 
@@ -270,6 +368,16 @@ public:
     virtual bool isHealthy() = 0;
 
     /**
+     * The implementation may choose to override this method to provide a quick check for
+     * connection health (e.g., by periodically caching the return value of the last invocation).
+     * Callers should be aware that a "true" return value does not always indicate a healthy
+     * connection.
+     */
+    virtual bool maybeHealthy() {
+        return isHealthy();
+    }
+
+    /**
      * Returns the last used time point for the connection
      */
     Date_t getLastUsed() const;
@@ -318,6 +426,76 @@ private:
     size_t _generation;
     Date_t _lastUsed;
     Status _status = ConnectionPool::kConnectionStateUnknown;
+};
+
+/**
+ * An implementation of ControllerInterface directs the behavior of a SpecificPool
+ *
+ * Generally speaking, a Controller will be given HostState via updateState and then return Controls
+ * via getControls. A Controller is expected to not directly mutate its SpecificPool, including via
+ * its ConnectionPool pointer. A Controller is expected to be given to only one ConnectionPool.
+ */
+class ConnectionPool::ControllerInterface {
+public:
+    using SpecificPool = typename ConnectionPool::SpecificPool;
+    using HostState = typename ConnectionPool::HostState;
+    using ConnectionControls = typename ConnectionPool::ConnectionControls;
+    using HostGroupState = typename ConnectionPool::HostGroupState;
+    using PoolId = typename ConnectionPool::PoolId;
+
+    virtual ~ControllerInterface() = default;
+
+    /**
+     * Initialize this ControllerInterface using the given ConnectionPool
+     *
+     * ConnectionPools provide access to Executors and other DTF-provided objects.
+     */
+    virtual void init(ConnectionPool* parent);
+
+    /**
+     * Inform this Controller that a pool should be tracked
+     */
+    virtual void addHost(PoolId id, const HostAndPort& host) = 0;
+
+    /**
+     * Inform this Controller of a new State for a pool
+     *
+     * This function returns the state of the group of hosts to which this host belongs.
+     */
+    virtual HostGroupState updateHost(PoolId id, const HostState& stats) = 0;
+
+    /**
+     * Inform this Controller that a pool is no longer tracked
+     */
+    virtual void removeHost(PoolId id) = 0;
+
+    /**
+     * Get controls for the given pool
+     */
+    virtual ConnectionControls getControls(PoolId id) = 0;
+
+    /**
+     * Get the various timeouts that this controller suggests
+     */
+    virtual Milliseconds hostTimeout() const = 0;
+    virtual Milliseconds pendingTimeout() const = 0;
+    virtual Milliseconds toRefreshTimeout() const = 0;
+
+    /**
+     * Get the name for this controller
+     *
+     * This function is intended to provide increased visibility into which controller is in use
+     */
+    virtual StringData name() const = 0;
+
+    const ConnectionPool* getPool() const {
+        return _pool;
+    }
+
+    virtual void updateConnectionPoolStats([[maybe_unused]] ConnectionPoolStats* cps) const = 0;
+
+protected:
+    ConnectionPool* _pool = nullptr;
 };
 
 /**

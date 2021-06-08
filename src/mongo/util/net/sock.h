@@ -51,9 +51,10 @@
 #include <vector>
 
 #include "mongo/config.h"
-#include "mongo/logger/log_severity.h"
+#include "mongo/logv2/log_severity.h"
 #include "mongo/platform/compiler.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/net/sockaddr.h"
 
 namespace mongo {
@@ -88,7 +89,7 @@ class Socket {
 public:
     static const int errorPollIntervalSecs;
 
-    Socket(int sock, const SockAddr& farEnd);
+    Socket(int sock, const SockAddr& remote);
 
     /** In some cases the timeout will actually be 2x this value - eg we do a partial send,
         then the timeout fires, then we try to send again, then the timeout fires again with
@@ -96,7 +97,7 @@ public:
 
         Generally you don't want a timeout, you should be very prepared for errors if you set one.
     */
-    Socket(double so_timeout = 0, logger::LogSeverity logLevel = logger::LogSeverity::Log());
+    Socket(double so_timeout = 0, logv2::LogSeverity logLevel = logv2::LogSeverity::Log());
 
     ~Socket();
 
@@ -108,7 +109,12 @@ public:
      *  an error, or due to a timeout on connection, or due to the system socket deciding the
      *  socket is invalid.
      */
-    bool connect(SockAddr& farEnd);
+    bool connect(SockAddr& remote, Milliseconds connectTimeoutMillis);
+
+    /**
+     * Connect using a default connect timeout of min(_timeout * 1000, kMaxConnectTimeoutMS)
+     */
+    bool connect(SockAddr& remote);
 
     void close();
     void send(const char* data, int len, const char* context);
@@ -118,10 +124,10 @@ public:
     void recv(char* data, int len);
     int unsafe_recv(char* buf, int max);
 
-    logger::LogSeverity getLogLevel() const {
+    logv2::LogSeverity getLogLevel() const {
         return _logLevel;
     }
-    void setLogLevel(logger::LogSeverity ll) {
+    void setLogLevel(logv2::LogSeverity ll) {
         _logLevel = ll;
     }
 
@@ -196,7 +202,7 @@ public:
      *
      * This function may throw SocketException.
      */
-    SSLPeerInfo doSSLHandshake(const char* firstBytes = NULL, int len = 0);
+    SSLPeerInfo doSSLHandshake(const char* firstBytes = nullptr, int len = 0);
 
     /**
      * @return the time when the socket was opened.
@@ -207,8 +213,6 @@ public:
 
     void handleRecvError(int ret, int len);
     void handleSendError(int ret, const char* context);
-
-    std::string getSNIServerName() const;
 
 private:
     void _init();
@@ -223,7 +227,7 @@ private:
     int _recv(char* buf, int max);
 
     SOCKET _fd;
-    uint64_t _fdCreationMicroSec;
+    uint64_t _fdCreationMicroSec = 0;
     SockAddr _local;
     SockAddr _remote;
     double _timeout;
@@ -236,7 +240,7 @@ private:
     std::unique_ptr<SSLConnectionInterface> _sslConnection;
     SSLManagerInterface* _sslManager;
 #endif
-    logger::LogSeverity _logLevel;  // passed to log() when logging errors
+    logv2::LogSeverity _logLevel;  // passed to log() when logging errors
 
     /** true until the first packet has been received or an outgoing connect has been made */
     bool _awaitingHandshake;

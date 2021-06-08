@@ -31,10 +31,11 @@
 
 #include "mongo/db/fts/fts_query_impl.h"
 
+#include <memory>
+
 #include "mongo/db/fts/fts_query_parser.h"
 #include "mongo/db/fts/fts_spec.h"
 #include "mongo/db/fts/fts_tokenizer.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -47,9 +48,11 @@ using std::stringstream;
 using std::vector;
 
 Status FTSQueryImpl::parse(TextIndexVersion textIndexVersion) {
-    StatusWithFTSLanguage ftsLanguage = FTSLanguage::make(getLanguage(), textIndexVersion);
-    if (!ftsLanguage.getStatus().isOK()) {
-        return ftsLanguage.getStatus();
+    const FTSLanguage* ftsLanguage;
+    try {
+        ftsLanguage = &FTSLanguage::make(getLanguage(), textIndexVersion);
+    } catch (const DBException& e) {
+        return e.toStatus();
     }
 
     bool isNgram = getLanguage()=="ngram";
@@ -129,7 +132,7 @@ Status FTSQueryImpl::parse(TextIndexVersion textIndexVersion) {
         }
     }
 
-    std::unique_ptr<FTSTokenizer> tokenizer(ftsLanguage.getValue()->createTokenizer());
+    std::unique_ptr<FTSTokenizer> tokenizer = ftsLanguage->createTokenizer();
 
     if(isNgram){
         _addTermsForNgram(tokenizer.get(), positiveTermSentence, false);
@@ -144,7 +147,7 @@ Status FTSQueryImpl::parse(TextIndexVersion textIndexVersion) {
 }
 
 std::unique_ptr<FTSQuery> FTSQueryImpl::clone() const {
-    auto clonedQuery = stdx::make_unique<FTSQueryImpl>();
+    auto clonedQuery = std::make_unique<FTSQueryImpl>();
     clonedQuery->setQuery(getQuery());
     clonedQuery->setLanguage(getLanguage());
     clonedQuery->setCaseSensitive(getCaseSensitive());
@@ -250,5 +253,5 @@ BSONObj FTSQueryImpl::toBSON() const {
     bob.append("negatedPhrases", getNegatedPhr());
     return bob.obj();
 }
-}
-}
+}  // namespace fts
+}  // namespace mongo

@@ -32,6 +32,14 @@
 #include "mongo/db/query/plan_cache.h"
 
 namespace mongo {
+
+/**
+ * Returns true if the query predicate involves a negation of an EQ, LTE, or GTE comparison to
+ * 'null'.
+ */
+bool isQueryNegatingEqualToNull(const mongo::MatchExpression* tree);
+
+
 namespace canonical_query_encoder {
 /**
  * Encode the given CanonicalQuery into a string representation which represents the shape of the
@@ -45,5 +53,5 @@ CanonicalQuery::QueryShapeString encode(const CanonicalQuery& cq);
  * Returns a hash of the given key (produced from either a QueryShapeString or a PlanCacheKey).
  */
 uint32_t computeHash(StringData key);
-}
-}
+}  // namespace canonical_query_encoder
+}  // namespace mongo

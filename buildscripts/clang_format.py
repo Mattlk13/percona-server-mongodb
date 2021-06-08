@@ -10,6 +10,7 @@
 
 import difflib
 import glob
+import logging
 import os
 import re
 import shutil
@@ -23,16 +24,17 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from distutils import spawn  # pylint: disable=no-name-in-module
 from optparse import OptionParser
-from multiprocessing import cpu_count
+import structlog
 
 # Get relative imports to work when the package is not installed on the PYTHONPATH.
 if __name__ == "__main__" and __package__ is None:
     sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(os.path.realpath(__file__)))))
 
-from buildscripts.linter import git  # pylint: disable=wrong-import-position
-from buildscripts.linter import parallel  # pylint: disable=wrong-import-position
+# pylint: disable=wrong-import-position
+from buildscripts.linter.filediff import gather_changed_files_for_lint
+from buildscripts.linter import git, parallel
+# pylint: enable=wrong-import-position
 
 ##############################################################################
 #
@@ -41,17 +43,20 @@ from buildscripts.linter import parallel  # pylint: disable=wrong-import-positio
 #
 
 # Expected version of clang-format
-CLANG_FORMAT_VERSION = "3.8.0"
-CLANG_FORMAT_SHORT_VERSION = "3.8"
+CLANG_FORMAT_VERSION = "7.0.1"
+CLANG_FORMAT_SHORT_VERSION = "7.0"
+CLANG_FORMAT_SHORTER_VERSION = "70"
 
 # Name of clang-format as a binary
 CLANG_FORMAT_PROGNAME = "clang-format"
 
 # URL location of the "cached" copy of clang-format to download
 # for users which do not have clang-format installed
-CLANG_FORMAT_HTTP_LINUX_CACHE = "https://s3.amazonaws.com/boxes.10gen.com/build/clang-format-3.8-rhel55.tar.gz"
+CLANG_FORMAT_HTTP_LINUX_CACHE = "https://s3.amazonaws.com/boxes.10gen.com/build/clang-format-7.0.1-rhel70.tar.gz"
 
-CLANG_FORMAT_HTTP_DARWIN_CACHE = "https://s3.amazonaws.com/boxes.10gen.com/build/clang%2Bllvm-3.8.0-x86_64-apple-darwin.tar.xz"
+CLANG_FORMAT_HTTP_DARWIN_CACHE = "https://s3.amazonaws.com/boxes.10gen.com/build/clang-format-7.0.1-x86_64-apple-darwin.tar.gz"
+
+CLANG_FORMAT_TOOLCHAIN_PATH = "/opt/mongodbtoolchain/v3/bin/clang-format"
 
 # Path in the tarball to the clang-format binary
 CLANG_FORMAT_SOURCE_TAR_BASE = string.Template("clang+llvm-$version-$tar_path/bin/" +
@@ -59,13 +64,14 @@ CLANG_FORMAT_SOURCE_TAR_BASE = string.Template("clang+llvm-$version-$tar_path/bi
 
 
 ##############################################################################
-def callo(args):
+def callo(args, **kwargs):
     """Call a program, and capture its output."""
-    return subprocess.check_output(args).decode('utf-8')
+    return subprocess.check_output(args, **kwargs).decode('utf-8')
 
 
 def get_tar_path(version, tar_path):
     """Return the path to clang-format in the llvm tarball."""
+    # pylint: disable=too-many-function-args
     return CLANG_FORMAT_SOURCE_TAR_BASE.substitute(version=version, tar_path=tar_path)
 
 
@@ -129,70 +135,75 @@ def get_clang_format_from_linux_cache(dest_file):
 class ClangFormat(object):
     """ClangFormat class."""
 
-    def __init__(self, path, cache_dir):  # pylint: disable=too-many-branches
+    def __init__(self, path, cache_dir):
+        # pylint: disable=too-many-branches,too-many-statements
         """Initialize ClangFormat."""
         self.path = None
-        clang_format_progname_ext = ""
-
-        if sys.platform == "win32":
-            clang_format_progname_ext += ".exe"
 
         # Check the clang-format the user specified
         if path is not None:
-            if os.path.isfile(path):
-                self.path = path
-            else:
-                print("WARNING: Could not find clang-format %s" % (path))
+            self.path = path
+            if not self._validate_version():
+                print("WARNING: Could not find clang-format in the user specified path %s" %
+                      (self.path))
+                self.path = None
 
         # Check the environment variable
-        if "MONGO_CLANG_FORMAT" in os.environ:
-            self.path = os.environ["MONGO_CLANG_FORMAT"]
+        if self.path is None:
+            if "MONGO_CLANG_FORMAT" in os.environ:
+                self.path = os.environ["MONGO_CLANG_FORMAT"]
+                if not self._validate_version():
+                    self.path = None
 
-            if self.path and not self._validate_version():
-                self.path = None
+        # Check for the binary in the expected toolchain directory on non-windows systems
+        if self.path is None:
+            if sys.platform != "win32":
+                if os.path.exists(CLANG_FORMAT_TOOLCHAIN_PATH):
+                    self.path = CLANG_FORMAT_TOOLCHAIN_PATH
+                    if not self._validate_version():
+                        self.path = None
 
         # Check the users' PATH environment variable now
         if self.path is None:
             # Check for various versions staring with binaries with version specific suffixes in the
             # user's path
-            programs = [
-                CLANG_FORMAT_PROGNAME + "-" + CLANG_FORMAT_VERSION,
-                CLANG_FORMAT_PROGNAME + "-" + CLANG_FORMAT_SHORT_VERSION,
-                CLANG_FORMAT_PROGNAME,
-            ]
+            programs = list(
+                map(lambda program: program + ".exe" if sys.platform == "win32" else program, [
+                    CLANG_FORMAT_PROGNAME + "-" + CLANG_FORMAT_VERSION,
+                    CLANG_FORMAT_PROGNAME + "-" + CLANG_FORMAT_SHORT_VERSION,
+                    CLANG_FORMAT_PROGNAME + CLANG_FORMAT_SHORTER_VERSION,
+                    CLANG_FORMAT_PROGNAME,
+                ]))
 
+            directories_to_check = os.environ["PATH"].split(os.pathsep)
+
+            # If Windows, try to grab it from Program Files
+            # Check both native Program Files and WOW64 version
             if sys.platform == "win32":
-                for i, _ in enumerate(programs):
-                    programs[i] += '.exe'
+                programfiles = [
+                    os.environ["ProgramFiles"],
+                    os.environ["ProgramFiles(x86)"],
+                ]
 
-            for program in programs:
-                self.path = spawn.find_executable(program)
+                directories_to_check += [os.path.join(p, "LLVM\\bin\\") for p in programfiles]
 
-                if self.path:
-                    if not self._validate_version():
-                        self.path = None
-                    else:
+            for ospath in directories_to_check:
+                for program in programs:
+                    self.path = os.path.join(ospath, program)
+                    if os.path.exists(self.path) and self._validate_version():
                         break
-
-        # If Windows, try to grab it from Program Files
-        # Check both native Program Files and WOW64 version
-        if sys.platform == "win32":
-            programfiles = [
-                os.environ["ProgramFiles"],
-                os.environ["ProgramFiles(x86)"],
-            ]
-
-            for programfile in programfiles:
-                win32bin = os.path.join(programfile, "LLVM\\bin\\clang-format.exe")
-                if os.path.exists(win32bin):
-                    self.path = win32bin
-                    break
+                    self.path = None
+                    continue
+                else:
+                    continue
+                break
 
         # Have not found it yet, download it from the web
         if self.path is None:
             if not os.path.isdir(cache_dir):
                 os.makedirs(cache_dir)
 
+            clang_format_progname_ext = ".exe" if sys.platform == "win32" else ""
             self.path = os.path.join(
                 cache_dir,
                 CLANG_FORMAT_PROGNAME + "-" + CLANG_FORMAT_VERSION + clang_format_progname_ext)
@@ -204,8 +215,8 @@ class ClangFormat(object):
                 elif sys.platform == "darwin":
                     get_clang_format_from_darwin_cache(self.path)
                 else:
-                    print("ERROR: clang-format.py does not support downloading clang-format " +
-                          " on this platform, please install clang-format " + CLANG_FORMAT_VERSION)
+                    print("ERROR: clang_format.py does not support downloading clang-format " +
+                          "on this platform, please install clang-format " + CLANG_FORMAT_VERSION)
 
         # Validate we have the correct version
         # We only can fail here if the user specified a clang-format binary and it is the wrong
@@ -223,8 +234,8 @@ class ClangFormat(object):
         if CLANG_FORMAT_VERSION in cf_version:
             return True
 
-        print("WARNING: clang-format found in path, but incorrect version found at " + self.path +
-              " with version: " + cf_version)
+        print("WARNING: clang-format with incorrect version found at " + self.path + " version: " +
+              cf_version)
 
         return False
 
@@ -233,8 +244,13 @@ class ClangFormat(object):
         with open(file_name, 'rb') as original_text:
             original_file = original_text.read().decode('utf-8')
 
-        # Get formatted file as clang-format would format the file
-        formatted_file = callo([self.path, "--style=file", file_name])
+            original_text.seek(0)
+
+            # Get formatted file as clang-format would format the file
+            formatted_file = callo([
+                self.path, "--assume-filename=" +
+                (file_name if not file_name.endswith(".h") else file_name + "pp"), "--style=file"
+            ], stdin=original_text)
 
         if original_file != formatted_file:
             if print_diff:
@@ -245,8 +261,7 @@ class ClangFormat(object):
                 # Take a lock to ensure diffs do not get mixed when printed to the screen
                 with self.print_lock:
                     print("ERROR: Found diff for " + file_name)
-                    print("To fix formatting errors, run %s --style=file -i %s" % (self.path,
-                                                                                   file_name))
+                    print("To fix formatting errors, run `buildscripts/clang_format.py format`")
                     for line in result:
                         print(line.rstrip())
 
@@ -264,7 +279,25 @@ class ClangFormat(object):
             return True
 
         # Update the file with clang-format
-        formatted = not subprocess.call([self.path, "--style=file", "-i", file_name])
+        # We have to tell `clang-format` to format on standard input due to its file type
+        # determiner.  `--assume-filename` doesn't work directly on files, but only on standard
+        # input.  Thus we have to open the file as the subprocess's standard input. Then we record
+        # that formatted standard output back into the file.  We can't use the `-i` option, due to
+        # the fact that `clang-format` believes that many of our C++ headers are Objective-C code.
+        formatted = True
+        with open(file_name, 'rb') as source_stream:
+            try:
+                reformatted_text = subprocess.check_output([
+                    self.path, "--assume-filename=" +
+                    (file_name if not file_name.endswith(".h") else file_name + "pp"),
+                    "--style=file"
+                ], stdin=source_stream)
+            except subprocess.CalledProcessError:
+                formatted = False
+
+        if formatted:
+            with open(file_name, "wb") as output_stream:
+                output_stream.write(reformatted_text)
 
         # Version 3.8 generates files like foo.cpp~RF83372177.TMP when it formats foo.cpp
         # on Windows, we must clean these up
@@ -281,8 +314,8 @@ FILES_RE = re.compile('\\.(h|hpp|ipp|cpp|js)$')
 
 def is_interesting_file(file_name):
     """Return true if this file should be checked."""
-    return ((file_name.startswith("jstests") or file_name.startswith("src"))
-            and not file_name.startswith("src/third_party/")
+    return (file_name.startswith("jstests")
+            or file_name.startswith("src") and not file_name.startswith("src/third_party/")
             and not file_name.startswith("src/mongo/gotools/")) and FILES_RE.search(file_name)
 
 
@@ -303,7 +336,7 @@ def _lint_files(clang_format, files):
     lint_clean = parallel.parallel_process([os.path.abspath(f) for f in files], clang_format.lint)
 
     if not lint_clean:
-        print("ERROR: Code Style does not match coding style")
+        print("ERROR: Source code does not match required source formatting style")
         sys.exit(1)
 
 
@@ -312,6 +345,18 @@ def lint_patch(clang_format, infile):
     files = git.get_files_to_check_from_patch(infile, is_interesting_file)
 
     # Patch may have files that we do not want to check which is fine
+    if files:
+        _lint_files(clang_format, files)
+
+
+def lint_git_diff(clang_format):
+    """
+    Lint the files that have changes since the last git commit.
+
+    :param clang_format: Path to clang_format command.
+    """
+    files = gather_changed_files_for_lint(is_interesting_file)
+
     if files:
         _lint_files(clang_format, files)
 
@@ -356,6 +401,7 @@ def format_func(clang_format):
 def format_my_func(clang_format, origin_branch):
     """My Format files command entry point."""
     files = git.get_my_files_to_check(is_interesting_file, origin_branch)
+    files = [f for f in files if os.path.exists(f)]
 
     _format_files(clang_format, files)
 
@@ -421,22 +467,22 @@ def reformat_branch(  # pylint: disable=too-many-branches,too-many-locals,too-ma
             % (new_branch, new_branch))
 
     commits = get_list_from_lines(
-        repo.log(["--reverse", "--pretty=format:%H",
-                  "%s..HEAD" % commit_prior_to_reformat]))
+        repo.git_log([
+            "--reverse", "--no-show-signature", "--pretty=format:%H",
+            "%s..HEAD" % commit_prior_to_reformat
+        ]))
 
     previous_commit_base = commit_after_reformat
-
-    files_match = re.compile('\\.(h|cpp|js)$')
 
     # Go through all the commits the user made on the local branch and migrate to a new branch
     # that is based on post_reformat commits instead
     for commit_hash in commits:
-        repo.checkout(["--quiet", commit_hash])
+        repo.git_checkout(["--quiet", commit_hash])
 
         deleted_files = []
 
         # Format each of the files by checking out just a single commit from the user's branch
-        commit_files = get_list_from_lines(repo.diff(["HEAD~", "--name-only"]))
+        commit_files = get_list_from_lines(repo.git_diff(["HEAD~", "--name-only"]))
 
         for commit_file in commit_files:
 
@@ -447,7 +493,7 @@ def reformat_branch(  # pylint: disable=too-many-branches,too-many-locals,too-ma
                 deleted_files.append(commit_file)
                 continue
 
-            if files_match.search(commit_file):
+            if is_interesting_file(commit_file):
                 clang_format.format(commit_file)
             else:
                 print("Skipping file '%s' since it is not a file clang_format should format" %
@@ -457,44 +503,44 @@ def reformat_branch(  # pylint: disable=too-many-branches,too-many-locals,too-ma
         if not repo.is_working_tree_dirty():
             print("Commit %s needed no reformatting" % commit_hash)
         else:
-            repo.commit(["--all", "--amend", "--no-edit"])
+            repo.git_commit(["--all", "--amend", "--no-edit"])
 
         # Rebase our new commit on top the post-reformat commit
-        previous_commit = repo.rev_parse(["HEAD"])
+        previous_commit = repo.git_rev_parse(["HEAD"])
 
         # Checkout the new branch with the reformatted commits
         # Note: we will not name as a branch until we are done with all commits on the local branch
-        repo.checkout(["--quiet", previous_commit_base])
+        repo.git_checkout(["--quiet", previous_commit_base])
 
         # Copy each file from the reformatted commit on top of the post reformat
         diff_files = get_list_from_lines(
-            repo.diff(["%s~..%s" % (previous_commit, previous_commit), "--name-only"]))
+            repo.git_diff(["%s~..%s" % (previous_commit, previous_commit), "--name-only"]))
 
         for diff_file in diff_files:
             # If the file was deleted in the commit we are reformatting, we need to delete it again
             if diff_file in deleted_files:
-                repo.rm([diff_file])
+                repo.git_rm(["--ignore-unmatch", diff_file])
                 continue
 
             # The file has been added or modified, continue as normal
-            file_contents = repo.show(["%s:%s" % (previous_commit, diff_file)])
+            file_contents = repo.git_show(["%s:%s" % (previous_commit, diff_file)])
 
             root_dir = os.path.dirname(diff_file)
             if root_dir and not os.path.exists(root_dir):
                 os.makedirs(root_dir)
 
-            with open(diff_file, "w+") as new_file:
+            with open(diff_file, "w+", encoding="utf-8") as new_file:
                 new_file.write(file_contents)
 
-            repo.add([diff_file])
+            repo.git_add([diff_file])
 
         # Create a new commit onto clang-formatted branch
-        repo.commit(["--reuse-message=%s" % previous_commit])
+        repo.git_commit(["--reuse-message=%s" % previous_commit, "--no-gpg-sign", "--allow-empty"])
 
-        previous_commit_base = repo.rev_parse(["HEAD"])
+        previous_commit_base = repo.git_rev_parse(["HEAD"])
 
     # Create a new branch to mark the hashes we have been using
-    repo.checkout(["-b", new_branch])
+    repo.git_checkout(["-b", new_branch])
 
     print("reformat-branch is done running.\n")
     print("A copy of your branch has been made named '%s', and formatted with clang-format.\n" %
@@ -506,7 +552,7 @@ def reformat_branch(  # pylint: disable=too-many-branches,too-many-locals,too-ma
 def usage():
     """Print usage."""
     print(
-        "clang-format.py supports 6 commands [ lint, lint-all, lint-patch, format, format-my, reformat-branch]."
+        "clang_format.py supports 6 commands (lint, lint-all, lint-patch, format, format-my, reformat-branch)."
     )
     print("\nformat-my <origin branch>")
     print("   <origin branch>  - upstream branch to compare against")
@@ -514,6 +560,9 @@ def usage():
 
 def main():
     """Execute Main entry point."""
+    logging.basicConfig(stream=sys.stdout, level=logging.INFO)
+    structlog.configure(logger_factory=structlog.stdlib.LoggerFactory())
+
     parser = OptionParser()
     parser.add_option("-c", "--clang-format", type="string", dest="clang_format")
 
@@ -528,10 +577,11 @@ def main():
             lint_all(options.clang_format)
         elif command == "lint-patch":
             lint_patch(options.clang_format, args[2:])
+        elif command == "lint-git-diff":
+            lint_git_diff(options.clang_format)
         elif command == "format":
             format_func(options.clang_format)
         elif command == "format-my":
-
             format_my_func(options.clang_format, args[2] if len(args) > 2 else "origin/master")
         elif command == "reformat-branch":
 

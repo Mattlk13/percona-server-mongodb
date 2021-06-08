@@ -27,13 +27,14 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/s/config/sharding_catalog_manager.h"
 
 #include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/client/read_preference.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/s/balancer/balancer_policy.h"
@@ -46,7 +47,6 @@
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/shard_key_pattern.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
@@ -59,7 +59,7 @@ const WriteConcernOptions kNoWaitWriteConcern(1, WriteConcernOptions::SyncMode::
  * Note: range should have the full shard key.
  * Returns ErrorCodes::RangeOverlapConflict is an overlap is detected.
  */
-Status checkForOveralappedZonedKeyRange(OperationContext* opCtx,
+Status checkForOverlappingZonedKeyRange(OperationContext* opCtx,
                                         Shard* configServer,
                                         const NamespaceString& nss,
                                         const ChunkRange& range,
@@ -113,62 +113,74 @@ Status checkForOveralappedZonedKeyRange(OperationContext* opCtx,
  * - ErrorCodes::ShardKeyNotFound if range is not compatible (for example, not a prefix of shard
  * key) with the shard key of nss.
  */
-StatusWith<ChunkRange> includeFullShardKey(OperationContext* opCtx,
-                                           Shard* configServer,
-                                           const NamespaceString& nss,
-                                           const ChunkRange& range,
-                                           KeyPattern* shardKeyPatternOut) {
-    auto findCollStatus =
-        configServer->exhaustiveFindOnConfig(opCtx,
-                                             kConfigPrimarySelector,
-                                             repl::ReadConcernLevel::kLocalReadConcern,
-                                             CollectionType::ConfigNS,
-                                             BSON(CollectionType::fullNs(nss.ns())),
-                                             BSONObj(),
-                                             1);
+ChunkRange includeFullShardKey(OperationContext* opCtx,
+                               Shard* configServer,
+                               const NamespaceString& nss,
+                               const ChunkRange& range,
+                               KeyPattern* shardKeyPatternOut) {
+    auto findCollResult = uassertStatusOK(configServer->exhaustiveFindOnConfig(
+                                              opCtx,
+                                              kConfigPrimarySelector,
+                                              repl::ReadConcernLevel::kLocalReadConcern,
+                                              CollectionType::ConfigNS,
+                                              BSON(CollectionType::kNssFieldName << nss.ns()),
+                                              BSONObj(),
+                                              1))
+                              .docs;
+    uassert(ErrorCodes::NamespaceNotSharded,
+            str::stream() << nss.ns() << " is not sharded",
+            !findCollResult.empty());
 
-    if (!findCollStatus.isOK()) {
-        return findCollStatus.getStatus();
-    }
+    CollectionType coll(findCollResult.front());
+    uassert(ErrorCodes::NamespaceNotSharded,
+            str::stream() << nss.ns() << " is not sharded",
+            !coll.getDropped());
 
-    const auto& findCollResult = findCollStatus.getValue().docs;
-
-    if (findCollResult.size() < 1) {
-        return {ErrorCodes::NamespaceNotSharded, str::stream() << nss.ns() << " is not sharded"};
-    }
-
-    auto parseStatus = CollectionType::fromBSON(findCollResult.front());
-    if (!parseStatus.isOK()) {
-        return parseStatus.getStatus();
-    }
-
-    auto collDoc = parseStatus.getValue();
-    if (collDoc.getDropped()) {
-        return {ErrorCodes::NamespaceNotSharded, str::stream() << nss.ns() << " is not sharded"};
-    }
-
-    const auto& shardKeyPattern = collDoc.getKeyPattern();
+    const auto& shardKeyPattern = coll.getKeyPattern();
     const auto& shardKeyBSON = shardKeyPattern.toBSON();
     *shardKeyPatternOut = shardKeyPattern;
 
-    if (!range.getMin().isFieldNamePrefixOf(shardKeyBSON)) {
-        return {ErrorCodes::ShardKeyNotFound,
-                str::stream() << "min: " << range.getMin() << " is not a prefix of the shard key "
-                              << shardKeyBSON
-                              << " of ns: "
-                              << nss.ns()};
-    }
-
-    if (!range.getMax().isFieldNamePrefixOf(shardKeyBSON)) {
-        return {ErrorCodes::ShardKeyNotFound,
-                str::stream() << "max: " << range.getMax() << " is not a prefix of the shard key "
-                              << shardKeyBSON
-                              << " of ns: "
-                              << nss.ns()};
-    }
+    uassert(ErrorCodes::ShardKeyNotFound,
+            str::stream() << "min: " << range.getMin() << " is not a prefix of the shard key "
+                          << shardKeyBSON << " of ns: " << nss.ns(),
+            range.getMin().isFieldNamePrefixOf(shardKeyBSON));
+    uassert(ErrorCodes::ShardKeyNotFound,
+            str::stream() << "max: " << range.getMax() << " is not a prefix of the shard key "
+                          << shardKeyBSON << " of ns: " << nss.ns(),
+            range.getMax().isFieldNamePrefixOf(shardKeyBSON));
 
     return ChunkRange(shardKeyPattern.extendRangeBound(range.getMin(), false),
                       shardKeyPattern.extendRangeBound(range.getMax(), false));
+}
+
+/**
+ * Checks whether every hashed field in the given shard key pattern corresponds to a field of type
+ * NumberLong, MinKey, or MaxKey in the provided chunk range. Returns ErrorCodes::InvalidOptions if
+ * there exists a field violating this constraint.
+ */
+Status checkHashedShardKeyRange(const ChunkRange& range, const KeyPattern& shardKeyPattern) {
+    BSONObjIterator rangeMin(range.getMin());
+    BSONObjIterator rangeMax(range.getMax());
+    BSONObjIterator shardKey(shardKeyPattern.toBSON());
+
+    while (shardKey.more()) {
+        auto shardKeyField = shardKey.next();
+        auto rangeMinField = rangeMin.next();
+        auto rangeMaxField = rangeMax.next();
+
+        if (ShardKeyPattern::isHashedPatternEl(shardKeyField) &&
+            (!ShardKeyPattern::isValidHashedValue(rangeMinField) ||
+             !ShardKeyPattern::isValidHashedValue(rangeMaxField))) {
+            return {ErrorCodes::InvalidOptions,
+                    str::stream() << "there exists a field in the range " << range.getMin()
+                                  << " -->> " << range.getMax()
+                                  << " not of type NumberLong, MinKey, or MaxKey which corresponds "
+                                     "to a hashed field in the shard key pattern "
+                                  << shardKeyPattern};
+        }
+    }
+
+    return Status::OK();
 }
 
 }  // namespace
@@ -229,59 +241,19 @@ Status ShardingCatalogManager::removeShardFromZone(OperationContext* opCtx,
     }
 
     //
-    // Check how many shards belongs to this zone.
+    // Ensure the shard is not only shard that the zone belongs to. Otherwise, the zone must
+    // not have any chunk ranges associated with it.
     //
+    auto isRequiredByZone =
+        _isShardRequiredByZoneStillInUse(opCtx, kConfigPrimarySelector, shardName, zoneName);
 
-    auto findShardStatus =
-        configShard->exhaustiveFindOnConfig(opCtx,
-                                            kConfigPrimarySelector,
-                                            repl::ReadConcernLevel::kLocalReadConcern,
-                                            shardNS,
-                                            BSON(ShardType::tags() << zoneName),
-                                            BSONObj(),
-                                            2);
-
-    if (!findShardStatus.isOK()) {
-        return findShardStatus.getStatus();
+    if (!isRequiredByZone.isOK()) {
+        return isRequiredByZone.getStatus();
     }
 
-    const auto shardDocs = findShardStatus.getValue().docs;
-
-    if (shardDocs.size() == 0) {
-        // The zone doesn't exists, this could be a retry.
-        return Status::OK();
-    }
-
-    if (shardDocs.size() == 1) {
-        auto shardDocStatus = ShardType::fromBSON(shardDocs.front());
-        if (!shardDocStatus.isOK()) {
-            return shardDocStatus.getStatus();
-        }
-
-        auto shardDoc = shardDocStatus.getValue();
-        if (shardDoc.getName() != shardName) {
-            // The last shard that belongs to this zone is a different shard.
-            // This could be a retry, so return OK.
-            return Status::OK();
-        }
-
-        auto findChunkRangeStatus =
-            configShard->exhaustiveFindOnConfig(opCtx,
-                                                kConfigPrimarySelector,
-                                                repl::ReadConcernLevel::kLocalReadConcern,
-                                                TagsType::ConfigNS,
-                                                BSON(TagsType::tag() << zoneName),
-                                                BSONObj(),
-                                                1);
-
-        if (!findChunkRangeStatus.isOK()) {
-            return findChunkRangeStatus.getStatus();
-        }
-
-        if (findChunkRangeStatus.getValue().docs.size() > 0) {
-            return {ErrorCodes::ZoneStillInUse,
-                    "cannot remove a shard from zone if a chunk range is associated with it"};
-        }
+    if (isRequiredByZone.getValue()) {
+        return {ErrorCodes::ZoneStillInUse,
+                "cannot remove a shard from zone if a chunk range is associated with it"};
     }
 
     //
@@ -310,112 +282,81 @@ Status ShardingCatalogManager::removeShardFromZone(OperationContext* opCtx,
 }
 
 
-Status ShardingCatalogManager::assignKeyRangeToZone(OperationContext* opCtx,
-                                                    const NamespaceString& nss,
-                                                    const ChunkRange& givenRange,
-                                                    const std::string& zoneName) {
-    auto zoneBoundsStorageStatus =
-        ShardKeyPattern::checkShardKeyIsValidForMetadataStorage(givenRange.getMin());
-    if (zoneBoundsStorageStatus.isOK()) {
-        zoneBoundsStorageStatus =
-            ShardKeyPattern::checkShardKeyIsValidForMetadataStorage(givenRange.getMax());
-    }
-
-    if (!zoneBoundsStorageStatus.isOK()) {
-        return zoneBoundsStorageStatus;
-    }
-
-    Lock::ExclusiveLock lk(opCtx->lockState(), _kZoneOpLock);
+void ShardingCatalogManager::assignKeyRangeToZone(OperationContext* opCtx,
+                                                  const NamespaceString& nss,
+                                                  const ChunkRange& givenRange,
+                                                  const std::string& zoneName) {
+    uassertStatusOK(ShardKeyPattern::checkShardKeyIsValidForMetadataStorage(givenRange.getMin()));
+    uassertStatusOK(ShardKeyPattern::checkShardKeyIsValidForMetadataStorage(givenRange.getMax()));
 
     auto configServer = Grid::get(opCtx)->shardRegistry()->getConfigShard();
 
-    KeyPattern shardKeyPattern{BSONObj()};
-    auto fullShardKeyStatus =
-        includeFullShardKey(opCtx, configServer.get(), nss, givenRange, &shardKeyPattern);
-    const bool namespaceNotSharded =
-        (fullShardKeyStatus.getStatus() == ErrorCodes::NamespaceNotSharded);
+    Lock::ExclusiveLock lk(opCtx->lockState(), _kZoneOpLock);
 
-    if (!fullShardKeyStatus.isOK() && !namespaceNotSharded) {
-        return fullShardKeyStatus.getStatus();
+    auto zoneDoc = uassertStatusOK(configServer->exhaustiveFindOnConfig(
+                                       opCtx,
+                                       kConfigPrimarySelector,
+                                       repl::ReadConcernLevel::kLocalReadConcern,
+                                       ShardType::ConfigNS,
+                                       BSON(ShardType::tags() << zoneName),
+                                       BSONObj(),
+                                       1))
+                       .docs;
+    uassert(ErrorCodes::ZoneNotFound,
+            str::stream() << "zone " << zoneName << " does not exist",
+            !zoneDoc.empty());
+
+    ChunkRange actualRange = givenRange;
+    KeyPattern keyPattern;
+    try {
+        actualRange = includeFullShardKey(opCtx, configServer.get(), nss, givenRange, &keyPattern);
+    } catch (const ExceptionFor<ErrorCodes::NamespaceNotSharded>&) {
+        // range remains the same as 'givenRange'
+        uassertStatusOK(givenRange.extractKeyPattern(&keyPattern));
     }
 
-    const auto& fullShardKeyRange =
-        namespaceNotSharded ? givenRange : fullShardKeyStatus.getValue();
-    if (namespaceNotSharded) {
-        Status shardKeyStatus = fullShardKeyRange.extractKeyPattern(&shardKeyPattern);
-        if (!shardKeyStatus.isOK()) {
-            return shardKeyStatus;
-        }
-    }
-
-    auto zoneExistStatus =
-        configServer->exhaustiveFindOnConfig(opCtx,
-                                             kConfigPrimarySelector,
-                                             repl::ReadConcernLevel::kLocalReadConcern,
-                                             ShardType::ConfigNS,
-                                             BSON(ShardType::tags() << zoneName),
-                                             BSONObj(),
-                                             1);
-
-    if (!zoneExistStatus.isOK()) {
-        return zoneExistStatus.getStatus();
-    }
-
-    auto zoneExist = zoneExistStatus.getValue().docs.size() > 0;
-    if (!zoneExist) {
-        return {ErrorCodes::ZoneNotFound,
-                str::stream() << "zone " << zoneName << " does not exist"};
-    }
-
-    auto overlapStatus = checkForOveralappedZonedKeyRange(
-        opCtx, configServer.get(), nss, fullShardKeyRange, zoneName, shardKeyPattern);
-    if (!overlapStatus.isOK()) {
-        return overlapStatus;
-    }
-
-    BSONObj updateQuery(
-        BSON("_id" << BSON(TagsType::ns(nss.ns()) << TagsType::min(fullShardKeyRange.getMin()))));
+    uassertStatusOK(checkHashedShardKeyRange(actualRange, keyPattern));
+    uassertStatusOK(checkForOverlappingZonedKeyRange(
+        opCtx, configServer.get(), nss, actualRange, zoneName, keyPattern));
 
     BSONObjBuilder updateBuilder;
-    updateBuilder.append("_id",
-                         BSON(TagsType::ns(nss.ns()) << TagsType::min(fullShardKeyRange.getMin())));
     updateBuilder.append(TagsType::ns(), nss.ns());
-    updateBuilder.append(TagsType::min(), fullShardKeyRange.getMin());
-    updateBuilder.append(TagsType::max(), fullShardKeyRange.getMax());
+    updateBuilder.append(TagsType::min(), actualRange.getMin());
+    updateBuilder.append(TagsType::max(), actualRange.getMax());
     updateBuilder.append(TagsType::tag(), zoneName);
 
-    auto updateStatus = Grid::get(opCtx)->catalogClient()->updateConfigDocument(
-        opCtx, TagsType::ConfigNS, updateQuery, updateBuilder.obj(), true, kNoWaitWriteConcern);
-
-    if (!updateStatus.isOK()) {
-        return updateStatus.getStatus();
-    }
-
-    return Status::OK();
+    uassertStatusOK(Grid::get(opCtx)->catalogClient()->updateConfigDocument(
+        opCtx,
+        TagsType::ConfigNS,
+        BSON(TagsType::ns(nss.ns()) << TagsType::min(actualRange.getMin())),
+        updateBuilder.obj(),
+        true,
+        kNoWaitWriteConcern));
 }
 
-Status ShardingCatalogManager::removeKeyRangeFromZone(OperationContext* opCtx,
-                                                      const NamespaceString& nss,
-                                                      const ChunkRange& range) {
-    Lock::ExclusiveLock lk(opCtx->lockState(), _kZoneOpLock);
-
+void ShardingCatalogManager::removeKeyRangeFromZone(OperationContext* opCtx,
+                                                    const NamespaceString& nss,
+                                                    const ChunkRange& givenRange) {
     auto configServer = Grid::get(opCtx)->shardRegistry()->getConfigShard();
 
-    KeyPattern shardKeyPattern{BSONObj()};
-    auto fullShardKeyStatus =
-        includeFullShardKey(opCtx, configServer.get(), nss, range, &shardKeyPattern);
-    const bool namespaceNotSharded =
-        (fullShardKeyStatus.getStatus() == ErrorCodes::NamespaceNotSharded);
-    if (!fullShardKeyStatus.isOK() && !namespaceNotSharded) {
-        return fullShardKeyStatus.getStatus();
+    Lock::ExclusiveLock lk(opCtx->lockState(), _kZoneOpLock);
+
+    ChunkRange actualRange = givenRange;
+    KeyPattern keyPattern;
+    try {
+        actualRange = includeFullShardKey(opCtx, configServer.get(), nss, givenRange, &keyPattern);
+    } catch (const ExceptionFor<ErrorCodes::NamespaceNotSharded>&) {
+        // range remains the same as 'givenRange'
+        uassertStatusOK(givenRange.extractKeyPattern(&keyPattern));
     }
 
     BSONObjBuilder removeBuilder;
-    removeBuilder.append("_id", BSON(TagsType::ns(nss.ns()) << TagsType::min(range.getMin())));
-    removeBuilder.append(TagsType::max(), range.getMax());
+    removeBuilder.append(TagsType::ns(), nss.ns());
+    removeBuilder.append(TagsType::min(), actualRange.getMin());
+    removeBuilder.append(TagsType::max(), actualRange.getMax());
 
-    return Grid::get(opCtx)->catalogClient()->removeConfigDocuments(
-        opCtx, TagsType::ConfigNS, removeBuilder.obj(), kNoWaitWriteConcern);
+    uassertStatusOK(Grid::get(opCtx)->catalogClient()->removeConfigDocuments(
+        opCtx, TagsType::ConfigNS, removeBuilder.obj(), kNoWaitWriteConcern));
 }
 
 }  // namespace mongo

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 #include "mongo/platform/basic.h"
 
@@ -45,7 +45,6 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/bsontypes.h"
-#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/free_mon/free_mon_controller.h"
 #include "mongo/db/free_mon/free_mon_message.h"
@@ -65,8 +64,8 @@
 #include "mongo/util/assert_util.h"
 #include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/future.h"
-#include "mongo/util/log.h"
 #include "mongo/util/net/http_client.h"
+#include "mongo/util/testing_proctor.h"
 
 namespace mongo {
 
@@ -81,22 +80,21 @@ auto makeTaskExecutor(ServiceContext* /*serviceContext*/) {
     tpOptions.onCreateThread = [](const std::string& threadName) {
         Client::initThread(threadName.c_str());
     };
-    return stdx::make_unique<executor::ThreadPoolTaskExecutor>(
+    return std::make_unique<executor::ThreadPoolTaskExecutor>(
         std::make_unique<ThreadPool>(tpOptions), executor::makeNetworkInterface("FreeMonNet"));
 }
 
-class FreeMonNetworkHttp : public FreeMonNetworkInterface {
+class FreeMonNetworkHttp final : public FreeMonNetworkInterface {
 public:
     explicit FreeMonNetworkHttp(ServiceContext* serviceContext) {
         _executor = makeTaskExecutor(serviceContext);
         _executor->startup();
         _client = HttpClient::create();
-        _client->allowInsecureHTTP(getTestCommandsEnabled());
+        _client->allowInsecureHTTP(TestingProctor::instance().isEnabled());
         _client->setHeaders({"Content-Type: application/octet-stream",
                              "Accept: application/octet-stream",
                              "Expect:"});
     }
-    ~FreeMonNetworkHttp() final = default;
 
     Future<FreeMonRegistrationResponse> sendRegistrationAsync(
         const FreeMonRegistrationRequest& req) override {
@@ -105,7 +103,6 @@ public:
             reqObj.objdata(), reqObj.objdata() + reqObj.objsize());
 
         return post("/register", data).then([](DataBuilder&& blob) {
-
             if (!blob.size()) {
                 uasserted(ErrorCodes::FreeMonHttpTemporaryFailure, "Empty response received");
             }
@@ -128,7 +125,6 @@ public:
             reqObj.objdata(), reqObj.objdata() + reqObj.objsize());
 
         return post("/metrics", data).then([](DataBuilder&& blob) {
-
             if (!blob.size()) {
                 uasserted(ErrorCodes::FreeMonHttpTemporaryFailure, "Empty response received");
             }
@@ -152,7 +148,7 @@ private:
         std::string url(FreeMonEndpointURL + path.toString());
 
         auto status = _executor->scheduleWork(
-            [ promise = std::move(pf.promise), url = std::move(url), data = std::move(data), this ](
+            [promise = std::move(pf.promise), url = std::move(url), data = std::move(data), this](
                 const executor::TaskExecutor::CallbackArgs& cbArgs) mutable {
                 ConstDataRange cdr(data->data(), data->size());
                 try {
@@ -202,28 +198,11 @@ public:
               // Try to filter server status to make it cheaper to collect. Harmless if we gather
               // extra
               BSON("serverStatus" << 1 << "storageEngine" << true << "extra_info" << false
-                                  << "opLatencies"
-                                  << false
-                                  << "opcountersRepl"
-                                  << false
-                                  << "opcounters"
-                                  << false
-                                  << "transactions"
-                                  << false
-                                  << "connections"
-                                  << false
-                                  << "network"
-                                  << false
-                                  << "tcMalloc"
-                                  << false
-                                  << "network"
-                                  << false
-                                  << "wiredTiger"
-                                  << false
-                                  << "sharding"
-                                  << false
-                                  << "metrics"
-                                  << false)) {}
+                                  << "opLatencies" << false << "opcountersRepl" << false
+                                  << "opcounters" << false << "transactions" << false
+                                  << "connections" << false << "network" << false << "tcMalloc"
+                                  << false << "network" << false << "wiredTiger" << false
+                                  << "sharding" << false << "metrics" << false)) {}
 
     std::string name() const final {
         return "storageEngine";
@@ -253,14 +232,11 @@ public:
     }
 
     void collect(OperationContext* opCtx, BSONObjBuilder& builder) {
-        for (auto nss : _namespaces) {
-            AutoGetCollectionForRead coll(opCtx, nss);
-            auto* collection = coll.getCollection();
-            if (collection) {
-                auto optUUID = collection->uuid();
-                if (optUUID) {
-                    builder << nss.toString() << optUUID.get();
-                }
+        auto catalog = CollectionCatalog::get(opCtx);
+        for (auto& nss : _namespaces) {
+            auto optUUID = catalog->lookupUUIDByNSS(opCtx, nss);
+            if (optUUID) {
+                builder << nss.toString() << optUUID.get();
             }
         }
     }
@@ -285,23 +261,23 @@ void registerCollectors(FreeMonController* controller) {
     // These are collected only at registration
     //
     // CmdBuildInfo
-    controller->addRegistrationCollector(stdx::make_unique<FTDCSimpleInternalCommandCollector>(
+    controller->addRegistrationCollector(std::make_unique<FTDCSimpleInternalCommandCollector>(
         "buildInfo", "buildInfo", "", BSON("buildInfo" << 1)));
 
     // HostInfoCmd
-    controller->addRegistrationCollector(stdx::make_unique<FTDCSimpleInternalCommandCollector>(
+    controller->addRegistrationCollector(std::make_unique<FTDCSimpleInternalCommandCollector>(
         "hostInfo", "hostInfo", "", BSON("hostInfo" << 1)));
 
     // Add storageEngine section from serverStatus
     controller->addRegistrationCollector(
-        stdx::make_unique<FreeMonLocalStorageEngineStatusCollector>());
+        std::make_unique<FreeMonLocalStorageEngineStatusCollector>());
 
     // Gather one document from local.clustermanager
-    controller->addRegistrationCollector(stdx::make_unique<FreeMonLocalClusterManagerCollector>());
+    controller->addRegistrationCollector(std::make_unique<FreeMonLocalClusterManagerCollector>());
 
     // These are periodically for metrics upload
     //
-    controller->addMetricsCollector(stdx::make_unique<FTDCSimpleInternalCommandCollector>(
+    controller->addMetricsCollector(std::make_unique<FTDCSimpleInternalCommandCollector>(
         "getDiagnosticData", "diagnosticData", "", BSON("getDiagnosticData" << 1)));
 
     // These are collected at registration and as metrics periodically
@@ -309,10 +285,10 @@ void registerCollectors(FreeMonController* controller) {
     if (repl::ReplicationCoordinator::get(getGlobalServiceContext())->getReplicationMode() !=
         repl::ReplicationCoordinator::modeNone) {
         // CmdReplSetGetConfig
-        controller->addRegistrationCollector(stdx::make_unique<FTDCSimpleInternalCommandCollector>(
+        controller->addRegistrationCollector(std::make_unique<FTDCSimpleInternalCommandCollector>(
             "replSetGetConfig", "replSetGetConfig", "", BSON("replSetGetConfig" << 1)));
 
-        controller->addMetricsCollector(stdx::make_unique<FTDCSimpleInternalCommandCollector>(
+        controller->addMetricsCollector(std::make_unique<FTDCSimpleInternalCommandCollector>(
             "replSetGetConfig", "replSetGetConfig", "", BSON("replSetGetConfig" << 1)));
 
         // Collect UUID for certain collections.
@@ -323,10 +299,10 @@ void registerCollectors(FreeMonController* controller) {
             std::make_unique<FreeMonNamespaceUUIDCollector>(namespaces));
     }
 
-    controller->addRegistrationCollector(stdx::make_unique<FTDCSimpleInternalCommandCollector>(
+    controller->addRegistrationCollector(std::make_unique<FTDCSimpleInternalCommandCollector>(
         "isMaster", "isMaster", "", BSON("isMaster" << 1)));
 
-    controller->addMetricsCollector(stdx::make_unique<FTDCSimpleInternalCommandCollector>(
+    controller->addMetricsCollector(std::make_unique<FTDCSimpleInternalCommandCollector>(
         "isMaster", "isMaster", "", BSON("isMaster" << 1)));
 }
 
@@ -335,8 +311,7 @@ void startFreeMonitoring(ServiceContext* serviceContext) {
         return;
     }
 
-    // Check for http, not https here because testEnabled may not be set yet
-    if (!getTestCommandsEnabled()) {
+    if (!TestingProctor::instance().isEnabled()) {
         uassert(50774,
                 "ExportedFreeMonEndpointURL only supports https:// URLs",
                 FreeMonEndpointURL.compare(0, 5, "https") == 0);
@@ -344,14 +319,14 @@ void startFreeMonitoring(ServiceContext* serviceContext) {
 
     auto network = std::unique_ptr<FreeMonNetworkInterface>(new FreeMonNetworkHttp(serviceContext));
 
-    auto controller = stdx::make_unique<FreeMonController>(std::move(network));
+    auto controller = std::make_unique<FreeMonController>(std::move(network));
 
     auto controllerPtr = controller.get();
 
     registerCollectors(controller.get());
 
     // Install the new controller
-    FreeMonController::set(getGlobalServiceContext(), std::move(controller));
+    FreeMonController::init(getGlobalServiceContext(), std::move(controller));
 
     RegistrationType registrationType = RegistrationType::DoNotRegister;
     if (globalFreeMonParams.freeMonitoringState == EnableCloudStateEnum::kOn) {
@@ -392,7 +367,7 @@ void notifyFreeMonitoringOnTransitionToPrimary() {
 }
 
 void setupFreeMonitoringOpObserver(OpObserverRegistry* registry) {
-    registry->addObserver(stdx::make_unique<FreeMonOpObserver>());
+    registry->addObserver(std::make_unique<FreeMonOpObserver>());
 }
 
 }  // namespace mongo

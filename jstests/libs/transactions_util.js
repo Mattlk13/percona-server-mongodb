@@ -2,6 +2,12 @@
  * Utilities for testing transactions.
  */
 var TransactionsUtil = (function() {
+    load("jstests/libs/override_methods/override_helpers.js");
+
+    // Although createCollection and createIndexes are supported inside multi-document
+    // transactions, we intentionally exclude them from this list since they are non-
+    // idempotent and, for createIndexes, are not supported inside multi-document
+    // transactions for all cases.
     const kCmdsSupportingTransactions = new Set([
         'aggregate',
         'delete',
@@ -21,12 +27,21 @@ var TransactionsUtil = (function() {
         'delete',
     ]);
 
+    // Indicates an aggregation command with a pipeline that cannot run in a transaction but can
+    // still execute concurrently with other transactions. Pipelines with $changeStream or $out
+    // cannot run within a transaction.
+    function commandIsNonTxnAggregation(cmdName, cmdObj) {
+        return OverrideHelpers.isAggregationWithOutOrMergeStage(cmdName, cmdObj) ||
+            OverrideHelpers.isAggregationWithChangeStreamStage(cmdName, cmdObj);
+    }
+
     function commandSupportsTxn(dbName, cmdName, cmdObj) {
         if (cmdName === 'commitTransaction' || cmdName === 'abortTransaction') {
             return true;
         }
 
-        if (!kCmdsSupportingTransactions.has(cmdName)) {
+        if (!kCmdsSupportingTransactions.has(cmdName) ||
+            commandIsNonTxnAggregation(cmdName, cmdObj)) {
             return false;
         }
 
@@ -65,10 +80,14 @@ var TransactionsUtil = (function() {
     function deepCopyObject(dst, src) {
         for (var k in src) {
             var v = src[k];
-            if (typeof(v) == "object" && v !== null) {
+            if (typeof (v) == "object" && v !== null) {
                 if (v.constructor === ObjectId) {  // convert ObjectId properly
                     eval("v = " + tojson(v));
                 } else if (v instanceof NumberLong) {  // convert NumberLong properly
+                    eval("v = " + tojson(v));
+                } else if (v instanceof Date) {  // convert Date properly
+                    eval("v = " + tojson(v));
+                } else if (v instanceof Timestamp) {  // convert Timestamp properly
                     eval("v = " + tojson(v));
                 } else if (Object.getPrototypeOf(v) === Object.prototype) {
                     v = deepCopyObject({}, v);
@@ -89,6 +108,10 @@ var TransactionsUtil = (function() {
     }
 
     return {
-        commandSupportsTxn, commandTypeCanSupportTxn, deepCopyObject, isTransientTransactionError,
+        commandIsNonTxnAggregation,
+        commandSupportsTxn,
+        commandTypeCanSupportTxn,
+        deepCopyObject,
+        isTransientTransactionError,
     };
 })();

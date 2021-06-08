@@ -5,9 +5,8 @@
  */
 
 var ElectionHandoffTest = (function() {
-
-    load("jstests/libs/check_log.js");
     load("jstests/replsets/rslib.js");
+    load("jstests/libs/logv2_helpers.js");
 
     const kStepDownPeriodSecs = 30;
     const kSIGTERM = 15;
@@ -21,6 +20,9 @@ var ElectionHandoffTest = (function() {
      * are:
      *   stepDownBySignal - When this option is set, the primary will be stepped down by stopping
      *                      and restarting with sigterm, rather than with a replSetStepDown command
+     *   stepDownPeriodSecs - The number of seconds to step down the primary.
+     *   secondaryCatchUpPeriodSecs - The number of seconds that the mongod will wait for an
+     *                                electable secondary to catch up to the primary.
      */
     function testElectionHandoff(rst, initialPrimaryId, expectedCandidateId, options = {}) {
         const config = rst.getReplSetConfigFromNode();
@@ -51,7 +53,7 @@ var ElectionHandoffTest = (function() {
         // Make sure all secondaries are ready before stepping down. We must additionally
         // make sure that the primary is aware that the secondaries are ready and caught up
         // to the primary's lastApplied, so we issue a dummy write and wait on its optime.
-        assert.writeOK(primary.getDB("test").secondariesMustBeCaughtUpToHere.insert(
+        assert.commandWorked(primary.getDB("test").secondariesMustBeCaughtUpToHere.insert(
             {"a": 1}, {writeConcern: {w: rst.nodes.length}}));
         rst.awaitNodesAgreeOnAppliedOpTime();
 
@@ -61,8 +63,9 @@ var ElectionHandoffTest = (function() {
             rst.start(initialPrimaryId, {}, true);
         } else {
             assert.commandWorked(primary.adminCommand({
-                replSetStepDown: kStepDownPeriodSecs,
-                secondaryCatchUpPeriodSecs: kStepDownPeriodSecs / 2
+                replSetStepDown: options.stepDownPeriodSecs || kStepDownPeriodSecs,
+                secondaryCatchUpPeriodSecs:
+                    options.secondaryCatchUpPeriodSecs || kStepDownPeriodSecs / 2
             }));
         }
 
@@ -73,13 +76,26 @@ var ElectionHandoffTest = (function() {
         // The checkLog() function blocks until the log line appears.
         checkLog.contains(expectedCandidate, "Starting an election due to step up request");
 
-        // If there are only two nodes in the set, verify that the old primary voted "yes".
-        if (numNodes === 2) {
-            checkLog.contains(expectedCandidate,
-                              `skipping dry run and running for election in term ${term+1}`);
-            checkLog.contains(
-                expectedCandidate,
-                `VoteRequester(term ${term+1}) received a yes vote from ${primary.host}`);
+        if (isJsonLog(expectedCandidate)) {
+            // If there are only two nodes in the set, verify that the old primary voted "yes".
+            if (numNodes === 2) {
+                checkLog.contains(
+                    expectedCandidate,
+                    `Skipping dry run and running for election","attr":{"newTerm":${term + 1}}}`);
+                checkLog.checkContainsOnceJson(
+                    expectedCandidate,
+                    51799,
+                    {"term": term + 1, vote: "yes", "from": primary.host});
+            }
+        } else {
+            // If there are only two nodes in the set, verify that the old primary voted "yes".
+            if (numNodes === 2) {
+                checkLog.contains(expectedCandidate,
+                                  `skipping dry run and running for election in term ${term + 1}`);
+                checkLog.contains(
+                    expectedCandidate,
+                    `VoteRequester(term ${term + 1}) received a yes vote from ${primary.host}`);
+            }
         }
 
         rst.awaitNodesAgreeOnPrimary();
@@ -87,5 +103,4 @@ var ElectionHandoffTest = (function() {
     }
 
     return {testElectionHandoff: testElectionHandoff, stepDownPeriodSecs: kStepDownPeriodSecs};
-
 })();

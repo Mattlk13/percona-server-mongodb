@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -40,7 +40,6 @@
 #include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/update_zone_key_range_request_type.h"
-#include "mongo/util/log.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -106,17 +105,14 @@ public:
         auto parsedRequest =
             uassertStatusOK(UpdateZoneKeyRangeRequest::parseFromConfigCommand(cmdObj));
 
-        std::string zoneName;
-        if (!parsedRequest.isRemove()) {
-            zoneName = parsedRequest.getZoneName();
-        }
-
         if (parsedRequest.isRemove()) {
-            uassertStatusOK(ShardingCatalogManager::get(opCtx)->removeKeyRangeFromZone(
-                opCtx, parsedRequest.getNS(), parsedRequest.getRange()));
+            ShardingCatalogManager::get(opCtx)->removeKeyRangeFromZone(
+                opCtx, parsedRequest.getNS(), parsedRequest.getRange());
         } else {
-            uassertStatusOK(ShardingCatalogManager::get(opCtx)->assignKeyRangeToZone(
-                opCtx, parsedRequest.getNS(), parsedRequest.getRange(), zoneName));
+            ShardingCatalogManager::get(opCtx)->assignKeyRangeToZone(opCtx,
+                                                                     parsedRequest.getNS(),
+                                                                     parsedRequest.getRange(),
+                                                                     parsedRequest.getZoneName());
         }
 
         return true;

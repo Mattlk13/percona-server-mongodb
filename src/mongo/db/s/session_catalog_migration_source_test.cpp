@@ -59,12 +59,12 @@ repl::OplogEntry makeOplogEntry(repl::OpTime opTime,
                                 NamespaceString nss,
                                 BSONObj object,
                                 boost::optional<BSONObj> object2,
-                                boost::optional<Date_t> wallClockTime,
-                                StmtId stmtId,
+                                Date_t wallClockTime,
+                                const std::vector<StmtId>& stmtIds,
                                 repl::OpTime prevWriteOpTimeInTransaction,
                                 boost::optional<repl::OpTime> preImageOpTime,
                                 boost::optional<repl::OpTime> postImageOpTime) {
-    return repl::OplogEntry(
+    return {repl::DurableOplogEntry(
         opTime,                           // optime
         0,                                // hash
         opType,                           // opType
@@ -77,18 +77,20 @@ repl::OplogEntry makeOplogEntry(repl::OpTime opTime,
         {},                               // sessionInfo
         boost::none,                      // upsert
         wallClockTime,                    // wall clock time
-        stmtId,                           // statement id
+        stmtIds,                          // statement ids
         prevWriteOpTimeInTransaction,     // optime of previous write within same transaction
         preImageOpTime,                   // pre-image optime
-        postImageOpTime);                 // post-image optime
+        postImageOpTime,                  // post-image optime
+        boost::none,                      // ShardId of resharding recipient
+        boost::none)};                    // _id
 }
 
 repl::OplogEntry makeOplogEntry(repl::OpTime opTime,
                                 repl::OpTypeEnum opType,
                                 BSONObj object,
                                 boost::optional<BSONObj> object2,
-                                boost::optional<Date_t> wallClockTime,
-                                StmtId stmtId,
+                                Date_t wallClockTime,
+                                const std::vector<StmtId>& stmtIds,
                                 repl::OpTime prevWriteOpTimeInTransaction,
                                 boost::optional<repl::OpTime> preImageOpTime = boost::none,
                                 boost::optional<repl::OpTime> postImageOpTime = boost::none) {
@@ -98,7 +100,7 @@ repl::OplogEntry makeOplogEntry(repl::OpTime opTime,
                           object,
                           object2,
                           wallClockTime,
-                          stmtId,
+                          stmtIds,
                           prevWriteOpTimeInTransaction,
                           preImageOpTime,
                           postImageOpTime);
@@ -117,7 +119,7 @@ TEST_F(SessionCatalogMigrationSourceTest, OneSessionWithTwoWrites) {
         BSON("x" << 30),                      // o
         boost::none,                          // o2
         Date_t::now(),                        // wall clock time
-        0,                                    // statement id
+        {0},                                  // statement ids
         repl::OpTime(Timestamp(0, 0), 0));    // optime of previous write within same transaction
     insertOplogEntry(entry1);
 
@@ -127,7 +129,7 @@ TEST_F(SessionCatalogMigrationSourceTest, OneSessionWithTwoWrites) {
                        BSON("x" << 50),                        // o
                        boost::none,                            // o2
                        Date_t::now(),                          // wall clock time
-                       1,                                      // statement id
+                       {1},                                    // statement ids
                        entry1.getOpTime());  // optime of previous write within same transaction
     insertOplogEntry(entry2);
 
@@ -135,7 +137,7 @@ TEST_F(SessionCatalogMigrationSourceTest, OneSessionWithTwoWrites) {
     sessionRecord.setSessionId(makeLogicalSessionIdForTest());
     sessionRecord.setTxnNum(1);
     sessionRecord.setLastWriteOpTime(entry2.getOpTime());
-    sessionRecord.setLastWriteDate(*entry2.getWallClockTime());
+    sessionRecord.setLastWriteDate(entry2.getWallClockTime());
 
     DBDirectClient client(opCtx());
     client.insert(NamespaceString::kSessionTransactionsTableNamespace.ns(), sessionRecord.toBSON());
@@ -148,7 +150,7 @@ TEST_F(SessionCatalogMigrationSourceTest, OneSessionWithTwoWrites) {
         auto nextOplogResult = migrationSource.getLastFetchedOplog();
         ASSERT_FALSE(nextOplogResult.shouldWaitForMajority);
         // Cannot compare directly because of SERVER-31356
-        ASSERT_BSONOBJ_EQ(entry2.toBSON(), nextOplogResult.oplog->toBSON());
+        ASSERT_BSONOBJ_EQ(entry2.getEntry().toBSON(), nextOplogResult.oplog->getEntry().toBSON());
         ASSERT_TRUE(migrationSource.fetchNextOplog(opCtx()));
     }
 
@@ -157,7 +159,61 @@ TEST_F(SessionCatalogMigrationSourceTest, OneSessionWithTwoWrites) {
         auto nextOplogResult = migrationSource.getLastFetchedOplog();
         ASSERT_FALSE(nextOplogResult.shouldWaitForMajority);
         // Cannot compare directly because of SERVER-31356
-        ASSERT_BSONOBJ_EQ(entry1.toBSON(), nextOplogResult.oplog->toBSON());
+        ASSERT_BSONOBJ_EQ(entry1.getEntry().toBSON(), nextOplogResult.oplog->getEntry().toBSON());
+    }
+
+    ASSERT_FALSE(migrationSource.fetchNextOplog(opCtx()));
+    ASSERT_FALSE(migrationSource.hasMoreOplog());
+}
+
+TEST_F(SessionCatalogMigrationSourceTest, OneSessionWithTwoWritesMultiStmtIds) {
+    auto entry1 = makeOplogEntry(
+        repl::OpTime(Timestamp(52, 345), 2),  // optime
+        repl::OpTypeEnum::kInsert,            // op type
+        BSON("x" << 30),                      // o
+        boost::none,                          // o2
+        Date_t::now(),                        // wall clock time
+        {0, 1},                               // statement ids
+        repl::OpTime(Timestamp(0, 0), 0));    // optime of previous write within same transaction
+    insertOplogEntry(entry1);
+
+    auto entry2 =
+        makeOplogEntry(repl::OpTime(Timestamp(67, 54801), 2),  // optime
+                       repl::OpTypeEnum::kInsert,              // op type
+                       BSON("x" << 50),                        // o
+                       boost::none,                            // o2
+                       Date_t::now(),                          // wall clock time
+                       {2, 3},                                 // statement ids
+                       entry1.getOpTime());  // optime of previous write within same transaction
+    insertOplogEntry(entry2);
+
+    SessionTxnRecord sessionRecord;
+    sessionRecord.setSessionId(makeLogicalSessionIdForTest());
+    sessionRecord.setTxnNum(1);
+    sessionRecord.setLastWriteOpTime(entry2.getOpTime());
+    sessionRecord.setLastWriteDate(entry2.getWallClockTime());
+
+    DBDirectClient client(opCtx());
+    client.insert(NamespaceString::kSessionTransactionsTableNamespace.ns(), sessionRecord.toBSON());
+
+    SessionCatalogMigrationSource migrationSource(opCtx(), kNs, kChunkRange, kShardKey);
+    ASSERT_TRUE(migrationSource.fetchNextOplog(opCtx()));
+
+    {
+        ASSERT_TRUE(migrationSource.hasMoreOplog());
+        auto nextOplogResult = migrationSource.getLastFetchedOplog();
+        ASSERT_FALSE(nextOplogResult.shouldWaitForMajority);
+        // Cannot compare directly because of SERVER-31356
+        ASSERT_BSONOBJ_EQ(entry2.getEntry().toBSON(), nextOplogResult.oplog->getEntry().toBSON());
+        ASSERT_TRUE(migrationSource.fetchNextOplog(opCtx()));
+    }
+
+    {
+        ASSERT_TRUE(migrationSource.hasMoreOplog());
+        auto nextOplogResult = migrationSource.getLastFetchedOplog();
+        ASSERT_FALSE(nextOplogResult.shouldWaitForMajority);
+        // Cannot compare directly because of SERVER-31356
+        ASSERT_BSONOBJ_EQ(entry1.getEntry().toBSON(), nextOplogResult.oplog->getEntry().toBSON());
     }
 
     ASSERT_FALSE(migrationSource.fetchNextOplog(opCtx()));
@@ -171,7 +227,7 @@ TEST_F(SessionCatalogMigrationSourceTest, TwoSessionWithTwoWrites) {
         BSON("x" << 30),                      // o
         boost::none,                          // o2
         Date_t::now(),                        // wall clock time
-        0,                                    // statement id
+        {0},                                  // statement ids
         repl::OpTime(Timestamp(0, 0), 0));    // optime of previous write within same transaction
 
     auto entry1b =
@@ -180,14 +236,14 @@ TEST_F(SessionCatalogMigrationSourceTest, TwoSessionWithTwoWrites) {
                        BSON("x" << 50),                        // o
                        boost::none,                            // o2
                        Date_t::now(),                          // wall clock time
-                       1,                                      // statement id
+                       {1},                                    // statement ids
                        entry1a.getOpTime());  // optime of previous write within same transaction
 
     SessionTxnRecord sessionRecord1;
     sessionRecord1.setSessionId(makeLogicalSessionIdForTest());
     sessionRecord1.setTxnNum(1);
     sessionRecord1.setLastWriteOpTime(entry1b.getOpTime());
-    sessionRecord1.setLastWriteDate(*entry1b.getWallClockTime());
+    sessionRecord1.setLastWriteDate(entry1b.getWallClockTime());
 
     DBDirectClient client(opCtx());
     client.insert(NamespaceString::kSessionTransactionsTableNamespace.ns(),
@@ -199,7 +255,7 @@ TEST_F(SessionCatalogMigrationSourceTest, TwoSessionWithTwoWrites) {
         BSON("x" << 30),                     // o
         boost::none,                         // o2
         Date_t::now(),                       // wall clock time
-        3,                                   // statement id
+        {3},                                 // statement ids
         repl::OpTime(Timestamp(0, 0), 0));   // optime of previous write within same transaction
 
     auto entry2b =
@@ -208,14 +264,14 @@ TEST_F(SessionCatalogMigrationSourceTest, TwoSessionWithTwoWrites) {
                        BSON("x" << 50),                      // o
                        boost::none,                          // o2
                        Date_t::now(),                        // wall clock time
-                       4,                                    // statement id
+                       {4},                                  // statement ids
                        entry2a.getOpTime());  // optime of previous write within same transaction
 
     SessionTxnRecord sessionRecord2;
     sessionRecord2.setSessionId(makeLogicalSessionIdForTest());
     sessionRecord2.setTxnNum(1);
     sessionRecord2.setLastWriteOpTime(entry2b.getOpTime());
-    sessionRecord2.setLastWriteDate(*entry2b.getWallClockTime());
+    sessionRecord2.setLastWriteDate(entry2b.getWallClockTime());
 
     client.insert(NamespaceString::kSessionTransactionsTableNamespace.ns(),
                   sessionRecord2.toBSON());
@@ -235,7 +291,8 @@ TEST_F(SessionCatalogMigrationSourceTest, TwoSessionWithTwoWrites) {
             auto nextOplogResult = migrationSource.getLastFetchedOplog();
             ASSERT_FALSE(nextOplogResult.shouldWaitForMajority);
             // Cannot compare directly because of SERVER-31356
-            ASSERT_BSONOBJ_EQ(firstExpectedOplog.toBSON(), nextOplogResult.oplog->toBSON());
+            ASSERT_BSONOBJ_EQ(firstExpectedOplog.getEntry().toBSON(),
+                              nextOplogResult.oplog->getEntry().toBSON());
             ASSERT_TRUE(migrationSource.fetchNextOplog(opCtx()));
         }
 
@@ -243,7 +300,8 @@ TEST_F(SessionCatalogMigrationSourceTest, TwoSessionWithTwoWrites) {
             ASSERT_TRUE(migrationSource.hasMoreOplog());
             auto nextOplogResult = migrationSource.getLastFetchedOplog();
             ASSERT_FALSE(nextOplogResult.shouldWaitForMajority);
-            ASSERT_BSONOBJ_EQ(secondExpectedOplog.toBSON(), nextOplogResult.oplog->toBSON());
+            ASSERT_BSONOBJ_EQ(secondExpectedOplog.getEntry().toBSON(),
+                              nextOplogResult.oplog->getEntry().toBSON());
         }
     };
 
@@ -275,7 +333,7 @@ TEST_F(SessionCatalogMigrationSourceTest, OneSessionWithFindAndModifyPreImageAnd
         BSON("x" << 30),                      // o
         boost::none,                          // o2
         Date_t::now(),                        // wall clock time
-        0,                                    // statement id
+        {0},                                  // statement ids
         repl::OpTime(Timestamp(0, 0), 0));    // optime of previous write within same transaction
     insertOplogEntry(entry1);
 
@@ -285,7 +343,7 @@ TEST_F(SessionCatalogMigrationSourceTest, OneSessionWithFindAndModifyPreImageAnd
         BSON("x" << 50),                      // o
         boost::none,                          // o2
         Date_t::now(),                        // wall clock time
-        1,                                    // statement id
+        {1},                                  // statement ids
         repl::OpTime(Timestamp(0, 0), 0),     // optime of previous write within same transaction
         entry1.getOpTime());                  // pre-image optime
     insertOplogEntry(entry2);
@@ -296,7 +354,7 @@ TEST_F(SessionCatalogMigrationSourceTest, OneSessionWithFindAndModifyPreImageAnd
         BSON("x" << 20),                    // o
         boost::none,                        // o2
         Date_t::now(),                      // wall clock time
-        2,                                  // statement id
+        {2},                                // statement ids
         repl::OpTime(Timestamp(0, 0), 0));  // optime of previous write within same transaction
     insertOplogEntry(entry3);
 
@@ -306,7 +364,7 @@ TEST_F(SessionCatalogMigrationSourceTest, OneSessionWithFindAndModifyPreImageAnd
                        BSON("$inc" << BSON("x" << 1)),     // o
                        BSON("x" << 19),                    // o2
                        Date_t::now(),                      // wall clock time
-                       3,                                  // statement id
+                       {3},                                // statement ids
                        entry2.getOpTime(),   // optime of previous write within same transaction
                        boost::none,          // pre-image optime
                        entry3.getOpTime());  // post-image optime
@@ -316,7 +374,7 @@ TEST_F(SessionCatalogMigrationSourceTest, OneSessionWithFindAndModifyPreImageAnd
     sessionRecord.setSessionId(makeLogicalSessionIdForTest());
     sessionRecord.setTxnNum(1);
     sessionRecord.setLastWriteOpTime(entry4.getOpTime());
-    sessionRecord.setLastWriteDate(*entry4.getWallClockTime());
+    sessionRecord.setLastWriteDate(entry4.getWallClockTime());
 
     DBDirectClient client(opCtx());
     client.insert(NamespaceString::kSessionTransactionsTableNamespace.ns(), sessionRecord.toBSON());
@@ -324,14 +382,85 @@ TEST_F(SessionCatalogMigrationSourceTest, OneSessionWithFindAndModifyPreImageAnd
     SessionCatalogMigrationSource migrationSource(opCtx(), kNs, kChunkRange, kShardKey);
     ASSERT_TRUE(migrationSource.fetchNextOplog(opCtx()));
 
-    auto expectedSequece = {entry3, entry4, entry1, entry2};
+    auto expectedSequence = {entry3, entry4, entry1, entry2};
 
-    for (auto oplog : expectedSequece) {
+    for (auto oplog : expectedSequence) {
         ASSERT_TRUE(migrationSource.hasMoreOplog());
         auto nextOplogResult = migrationSource.getLastFetchedOplog();
         ASSERT_FALSE(nextOplogResult.shouldWaitForMajority);
         // Cannot compare directly because of SERVER-31356
-        ASSERT_BSONOBJ_EQ(oplog.toBSON(), nextOplogResult.oplog->toBSON());
+        ASSERT_BSONOBJ_EQ(oplog.getEntry().toBSON(), nextOplogResult.oplog->getEntry().toBSON());
+        migrationSource.fetchNextOplog(opCtx());
+    }
+
+    ASSERT_FALSE(migrationSource.hasMoreOplog());
+}
+
+TEST_F(SessionCatalogMigrationSourceTest,
+       OneSessionWithFindAndModifyPreImageAndPostImageMultiStmtIds) {
+    auto entry1 = makeOplogEntry(
+        repl::OpTime(Timestamp(52, 345), 2),  // optime
+        repl::OpTypeEnum::kNoop,              // op type
+        BSON("x" << 30),                      // o
+        boost::none,                          // o2
+        Date_t::now(),                        // wall clock time
+        {0, 1},                               // statement ids
+        repl::OpTime(Timestamp(0, 0), 0));    // optime of previous write within same transaction
+    insertOplogEntry(entry1);
+
+    auto entry2 = makeOplogEntry(
+        repl::OpTime(Timestamp(52, 346), 2),  // optime
+        repl::OpTypeEnum::kDelete,            // op type
+        BSON("x" << 50),                      // o
+        boost::none,                          // o2
+        Date_t::now(),                        // wall clock time
+        {2, 3},                               // statement ids
+        repl::OpTime(Timestamp(0, 0), 0),     // optime of previous write within same transaction
+        entry1.getOpTime());                  // pre-image optime
+    insertOplogEntry(entry2);
+
+    auto entry3 = makeOplogEntry(
+        repl::OpTime(Timestamp(73, 5), 2),  // optime
+        repl::OpTypeEnum::kNoop,            // op type
+        BSON("x" << 20),                    // o
+        boost::none,                        // o2
+        Date_t::now(),                      // wall clock time
+        {4, 5},                             // statement ids
+        repl::OpTime(Timestamp(0, 0), 0));  // optime of previous write within same transaction
+    insertOplogEntry(entry3);
+
+    auto entry4 =
+        makeOplogEntry(repl::OpTime(Timestamp(73, 6), 2),  // optime
+                       repl::OpTypeEnum::kUpdate,          // op type
+                       BSON("$inc" << BSON("x" << 1)),     // o
+                       BSON("x" << 19),                    // o2
+                       Date_t::now(),                      // wall clock time
+                       {6, 7},                             // statement ids
+                       entry2.getOpTime(),   // optime of previous write within same transaction
+                       boost::none,          // pre-image optime
+                       entry3.getOpTime());  // post-image optime
+    insertOplogEntry(entry4);
+
+    SessionTxnRecord sessionRecord;
+    sessionRecord.setSessionId(makeLogicalSessionIdForTest());
+    sessionRecord.setTxnNum(1);
+    sessionRecord.setLastWriteOpTime(entry4.getOpTime());
+    sessionRecord.setLastWriteDate(entry4.getWallClockTime());
+
+    DBDirectClient client(opCtx());
+    client.insert(NamespaceString::kSessionTransactionsTableNamespace.ns(), sessionRecord.toBSON());
+
+    SessionCatalogMigrationSource migrationSource(opCtx(), kNs, kChunkRange, kShardKey);
+    ASSERT_TRUE(migrationSource.fetchNextOplog(opCtx()));
+
+    auto expectedSequence = {entry3, entry4, entry1, entry2};
+
+    for (auto oplog : expectedSequence) {
+        ASSERT_TRUE(migrationSource.hasMoreOplog());
+        auto nextOplogResult = migrationSource.getLastFetchedOplog();
+        ASSERT_FALSE(nextOplogResult.shouldWaitForMajority);
+        // Cannot compare directly because of SERVER-31356
+        ASSERT_BSONOBJ_EQ(oplog.getEntry().toBSON(), nextOplogResult.oplog->getEntry().toBSON());
         migrationSource.fetchNextOplog(opCtx());
     }
 
@@ -345,7 +474,7 @@ TEST_F(SessionCatalogMigrationSourceTest, OplogWithOtherNsShouldBeIgnored) {
         BSON("x" << 30),                      // o
         boost::none,                          // o2
         Date_t::now(),                        // wall clock time
-        0,                                    // statement id
+        {0},                                  // statement ids
         repl::OpTime(Timestamp(0, 0), 0));    // optime of previous write within same transaction
     insertOplogEntry(entry1);
 
@@ -353,7 +482,7 @@ TEST_F(SessionCatalogMigrationSourceTest, OplogWithOtherNsShouldBeIgnored) {
     sessionRecord1.setSessionId(makeLogicalSessionIdForTest());
     sessionRecord1.setTxnNum(1);
     sessionRecord1.setLastWriteOpTime(entry1.getOpTime());
-    sessionRecord1.setLastWriteDate(*entry1.getWallClockTime());
+    sessionRecord1.setLastWriteDate(entry1.getWallClockTime());
 
     DBDirectClient client(opCtx());
     client.insert(NamespaceString::kSessionTransactionsTableNamespace.ns(),
@@ -367,7 +496,7 @@ TEST_F(SessionCatalogMigrationSourceTest, OplogWithOtherNsShouldBeIgnored) {
         BSON("x" << 30),                     // o
         boost::none,                         // o2
         Date_t::now(),                       // wall clock time
-        1,                                   // statement id
+        {1},                                 // statement ids
         repl::OpTime(Timestamp(0, 0), 0),    // optime of previous write within same transaction
         boost::none,                         // pre-image optime
         boost::none);                        // post-image optime
@@ -377,7 +506,7 @@ TEST_F(SessionCatalogMigrationSourceTest, OplogWithOtherNsShouldBeIgnored) {
     sessionRecord2.setSessionId(makeLogicalSessionIdForTest());
     sessionRecord2.setTxnNum(1);
     sessionRecord2.setLastWriteOpTime(entry2.getOpTime());
-    sessionRecord2.setLastWriteDate(*entry2.getWallClockTime());
+    sessionRecord2.setLastWriteDate(entry2.getWallClockTime());
 
     client.insert(NamespaceString::kSessionTransactionsTableNamespace.ns(),
                   sessionRecord2.toBSON());
@@ -389,7 +518,7 @@ TEST_F(SessionCatalogMigrationSourceTest, OplogWithOtherNsShouldBeIgnored) {
     auto nextOplogResult = migrationSource.getLastFetchedOplog();
     ASSERT_FALSE(nextOplogResult.shouldWaitForMajority);
     // Cannot compare directly because of SERVER-31356
-    ASSERT_BSONOBJ_EQ(entry1.toBSON(), nextOplogResult.oplog->toBSON());
+    ASSERT_BSONOBJ_EQ(entry1.getEntry().toBSON(), nextOplogResult.oplog->getEntry().toBSON());
 
     ASSERT_FALSE(migrationSource.fetchNextOplog(opCtx()));
     ASSERT_FALSE(migrationSource.hasMoreOplog());
@@ -402,7 +531,7 @@ TEST_F(SessionCatalogMigrationSourceTest, SessionDumpWithMultipleNewWrites) {
         BSON("x" << 30),                      // o
         boost::none,                          // o2
         Date_t::now(),                        // wall clock time
-        0,                                    // statement id
+        {0},                                  // statement ids
         repl::OpTime(Timestamp(0, 0), 0));    // optime of previous write within same transaction
 
     insertOplogEntry(entry1);
@@ -411,7 +540,7 @@ TEST_F(SessionCatalogMigrationSourceTest, SessionDumpWithMultipleNewWrites) {
     sessionRecord1.setSessionId(makeLogicalSessionIdForTest());
     sessionRecord1.setTxnNum(1);
     sessionRecord1.setLastWriteOpTime(entry1.getOpTime());
-    sessionRecord1.setLastWriteDate(*entry1.getWallClockTime());
+    sessionRecord1.setLastWriteDate(entry1.getWallClockTime());
 
     DBDirectClient client(opCtx());
     client.insert(NamespaceString::kSessionTransactionsTableNamespace.ns(),
@@ -423,7 +552,7 @@ TEST_F(SessionCatalogMigrationSourceTest, SessionDumpWithMultipleNewWrites) {
         BSON("x" << 30),                     // o
         boost::none,                         // o2
         Date_t::now(),                       // wall clock time
-        1,                                   // statement id
+        {1},                                 // statement ids
         repl::OpTime(Timestamp(0, 0), 0));   // optime of previous write within same transaction
     insertOplogEntry(entry2);
 
@@ -433,7 +562,7 @@ TEST_F(SessionCatalogMigrationSourceTest, SessionDumpWithMultipleNewWrites) {
         BSON("x" << 40),                     // o
         boost::none,                         // o2
         Date_t::now(),                       // wall clock time
-        2,                                   // statement id
+        {2},                                 // statement ids
         repl::OpTime(Timestamp(0, 0), 0));   // optime of previous write within same transaction
     insertOplogEntry(entry3);
 
@@ -450,7 +579,7 @@ TEST_F(SessionCatalogMigrationSourceTest, SessionDumpWithMultipleNewWrites) {
         auto nextOplogResult = migrationSource.getLastFetchedOplog();
         ASSERT_FALSE(nextOplogResult.shouldWaitForMajority);
         // Cannot compare directly because of SERVER-31356
-        ASSERT_BSONOBJ_EQ(entry1.toBSON(), nextOplogResult.oplog->toBSON());
+        ASSERT_BSONOBJ_EQ(entry1.getEntry().toBSON(), nextOplogResult.oplog->getEntry().toBSON());
         ASSERT_TRUE(migrationSource.fetchNextOplog(opCtx()));
     }
 
@@ -458,7 +587,7 @@ TEST_F(SessionCatalogMigrationSourceTest, SessionDumpWithMultipleNewWrites) {
         ASSERT_TRUE(migrationSource.hasMoreOplog());
         auto nextOplogResult = migrationSource.getLastFetchedOplog();
         ASSERT_TRUE(nextOplogResult.shouldWaitForMajority);
-        ASSERT_BSONOBJ_EQ(entry2.toBSON(), nextOplogResult.oplog->toBSON());
+        ASSERT_BSONOBJ_EQ(entry2.getEntry().toBSON(), nextOplogResult.oplog->getEntry().toBSON());
         ASSERT_TRUE(migrationSource.fetchNextOplog(opCtx()));
     }
 
@@ -466,7 +595,7 @@ TEST_F(SessionCatalogMigrationSourceTest, SessionDumpWithMultipleNewWrites) {
         ASSERT_TRUE(migrationSource.hasMoreOplog());
         auto nextOplogResult = migrationSource.getLastFetchedOplog();
         ASSERT_TRUE(nextOplogResult.shouldWaitForMajority);
-        ASSERT_BSONOBJ_EQ(entry3.toBSON(), nextOplogResult.oplog->toBSON());
+        ASSERT_BSONOBJ_EQ(entry3.getEntry().toBSON(), nextOplogResult.oplog->getEntry().toBSON());
     }
 
     ASSERT_FALSE(migrationSource.fetchNextOplog(opCtx()));
@@ -495,7 +624,7 @@ TEST_F(SessionCatalogMigrationSourceTest, ShouldBeAbleInsertNewWritesAfterBuffer
             BSON("x" << 30),                      // o
             boost::none,                          // o2
             Date_t::now(),                        // wall clock time
-            0,                                    // statement id
+            {0},                                  // statement ids
             repl::OpTime(Timestamp(0, 0), 0));  // optime of previous write within same transaction
         insertOplogEntry(entry);
 
@@ -507,7 +636,7 @@ TEST_F(SessionCatalogMigrationSourceTest, ShouldBeAbleInsertNewWritesAfterBuffer
         auto nextOplogResult = migrationSource.getLastFetchedOplog();
         ASSERT_TRUE(nextOplogResult.shouldWaitForMajority);
         // Cannot compare directly because of SERVER-31356
-        ASSERT_BSONOBJ_EQ(entry.toBSON(), nextOplogResult.oplog->toBSON());
+        ASSERT_BSONOBJ_EQ(entry.getEntry().toBSON(), nextOplogResult.oplog->getEntry().toBSON());
 
         ASSERT_FALSE(migrationSource.fetchNextOplog(opCtx()));
         ASSERT_FALSE(migrationSource.hasMoreOplog());
@@ -520,7 +649,7 @@ TEST_F(SessionCatalogMigrationSourceTest, ShouldBeAbleInsertNewWritesAfterBuffer
             BSON("x" << 30),                     // o
             boost::none,                         // o2
             Date_t::now(),                       // wall clock time
-            1,                                   // statement id
+            {1},                                 // statement ids
             repl::OpTime(Timestamp(0, 0), 0));   // optime of previous write within same transaction
         insertOplogEntry(entry);
 
@@ -531,7 +660,7 @@ TEST_F(SessionCatalogMigrationSourceTest, ShouldBeAbleInsertNewWritesAfterBuffer
         ASSERT_TRUE(migrationSource.fetchNextOplog(opCtx()));
         auto nextOplogResult = migrationSource.getLastFetchedOplog();
         ASSERT_TRUE(nextOplogResult.shouldWaitForMajority);
-        ASSERT_BSONOBJ_EQ(entry.toBSON(), nextOplogResult.oplog->toBSON());
+        ASSERT_BSONOBJ_EQ(entry.getEntry().toBSON(), nextOplogResult.oplog->getEntry().toBSON());
 
         ASSERT_FALSE(migrationSource.fetchNextOplog(opCtx()));
         ASSERT_FALSE(migrationSource.hasMoreOplog());
@@ -544,7 +673,7 @@ TEST_F(SessionCatalogMigrationSourceTest, ShouldBeAbleInsertNewWritesAfterBuffer
             BSON("x" << 40),                     // o
             boost::none,                         // o2
             Date_t::now(),                       // wall clock time
-            2,                                   // statement id
+            {2},                                 // statement ids
             repl::OpTime(Timestamp(0, 0), 0));   // optime of previous write within same transaction
         insertOplogEntry(entry);
 
@@ -555,7 +684,7 @@ TEST_F(SessionCatalogMigrationSourceTest, ShouldBeAbleInsertNewWritesAfterBuffer
         ASSERT_TRUE(migrationSource.fetchNextOplog(opCtx()));
         auto nextOplogResult = migrationSource.getLastFetchedOplog();
         ASSERT_TRUE(nextOplogResult.shouldWaitForMajority);
-        ASSERT_BSONOBJ_EQ(entry.toBSON(), nextOplogResult.oplog->toBSON());
+        ASSERT_BSONOBJ_EQ(entry.getEntry().toBSON(), nextOplogResult.oplog->getEntry().toBSON());
 
         ASSERT_FALSE(migrationSource.fetchNextOplog(opCtx()));
         ASSERT_FALSE(migrationSource.hasMoreOplog());
@@ -569,7 +698,7 @@ TEST_F(SessionCatalogMigrationSourceTest, ReturnsDeadEndSentinelForIncompleteHis
         BSON("x" << 30),                      // o
         boost::none,                          // o2
         Date_t::now(),                        // wall clock time
-        0,                                    // statement id
+        {0},                                  // statement ids
         repl::OpTime(Timestamp(40, 1), 2));   // optime of previous write within same transaction
     insertOplogEntry(entry);
 
@@ -579,7 +708,7 @@ TEST_F(SessionCatalogMigrationSourceTest, ReturnsDeadEndSentinelForIncompleteHis
     sessionRecord.setSessionId(sessionId);
     sessionRecord.setTxnNum(31);
     sessionRecord.setLastWriteOpTime(entry.getOpTime());
-    sessionRecord.setLastWriteDate(*entry.getWallClockTime());
+    sessionRecord.setLastWriteDate(entry.getWallClockTime());
 
     DBDirectClient client(opCtx());
     client.insert(NamespaceString::kSessionTransactionsTableNamespace.ns(), sessionRecord.toBSON());
@@ -592,7 +721,7 @@ TEST_F(SessionCatalogMigrationSourceTest, ReturnsDeadEndSentinelForIncompleteHis
         auto nextOplogResult = migrationSource.getLastFetchedOplog();
         ASSERT_FALSE(nextOplogResult.shouldWaitForMajority);
         // Cannot compare directly because of SERVER-31356
-        ASSERT_BSONOBJ_EQ(entry.toBSON(), nextOplogResult.oplog->toBSON());
+        ASSERT_BSONOBJ_EQ(entry.getEntry().toBSON(), nextOplogResult.oplog->getEntry().toBSON());
         ASSERT_TRUE(migrationSource.fetchNextOplog(opCtx()));
     }
 
@@ -604,10 +733,9 @@ TEST_F(SessionCatalogMigrationSourceTest, ReturnsDeadEndSentinelForIncompleteHis
         auto oplog = *nextOplogResult.oplog;
         ASSERT_TRUE(oplog.getObject2());
         ASSERT_BSONOBJ_EQ(TransactionParticipant::kDeadEndSentinel, *oplog.getObject2());
-        ASSERT_TRUE(oplog.getStatementId());
-        ASSERT_EQ(kIncompleteHistoryStmtId, *oplog.getStatementId());
-        ASSERT_TRUE(oplog.getWallClockTime());
-        ASSERT_NE(Date_t{}, *oplog.getWallClockTime());
+        ASSERT_EQ(1, oplog.getStatementIds().size());
+        ASSERT_EQ(kIncompleteHistoryStmtId, oplog.getStatementIds().front());
+        ASSERT_NE(Date_t{}, oplog.getWallClockTime());
 
         auto sessionInfo = oplog.getOperationSessionInfo();
         ASSERT_TRUE(sessionInfo.getSessionId());
@@ -627,7 +755,7 @@ TEST_F(SessionCatalogMigrationSourceTest, ShouldAssertWhenRollbackDetected) {
         BSON("x" << 30),                      // o
         boost::none,                          // o2
         Date_t::now(),                        // wall clock time
-        0,                                    // statement id
+        {0},                                  // statement ids
         repl::OpTime(Timestamp(40, 1), 2));   // optime of previous write within same transaction
     insertOplogEntry(entry);
 
@@ -637,7 +765,7 @@ TEST_F(SessionCatalogMigrationSourceTest, ShouldAssertWhenRollbackDetected) {
     sessionRecord.setSessionId(sessionId);
     sessionRecord.setTxnNum(31);
     sessionRecord.setLastWriteOpTime(entry.getOpTime());
-    sessionRecord.setLastWriteDate(*entry.getWallClockTime());
+    sessionRecord.setLastWriteDate(entry.getWallClockTime());
 
     DBDirectClient client(opCtx());
     client.insert(NamespaceString::kSessionTransactionsTableNamespace.ns(), sessionRecord.toBSON());
@@ -650,7 +778,7 @@ TEST_F(SessionCatalogMigrationSourceTest, ShouldAssertWhenRollbackDetected) {
         auto nextOplogResult = migrationSource.getLastFetchedOplog();
         ASSERT_FALSE(nextOplogResult.shouldWaitForMajority);
         // Cannot compare directly because of SERVER-31356
-        ASSERT_BSONOBJ_EQ(entry.toBSON(), nextOplogResult.oplog->toBSON());
+        ASSERT_BSONOBJ_EQ(entry.getEntry().toBSON(), nextOplogResult.oplog->getEntry().toBSON());
     }
 
     ASSERT_OK(repl::ReplicationProcess::get(opCtx())->incrementRollbackID(opCtx()));
@@ -754,7 +882,7 @@ TEST_F(SessionCatalogMigrationSourceTest,
         BSON("x" << 30),                      // o
         boost::none,                          // o2
         Date_t::now(),                        // wall clock time
-        0,                                    // statement id
+        {0},                                  // statement ids
         repl::OpTime(Timestamp(0, 0), 0));    // optime of previous write within same transaction
 
     // Create a config.transaction entry pointing to the insert oplog entry.
@@ -762,7 +890,7 @@ TEST_F(SessionCatalogMigrationSourceTest,
     retryableWriteRecord.setSessionId(makeLogicalSessionIdForTest());
     retryableWriteRecord.setTxnNum(1);
     retryableWriteRecord.setLastWriteOpTime(insertOplog.getOpTime());
-    retryableWriteRecord.setLastWriteDate(*insertOplog.getWallClockTime());
+    retryableWriteRecord.setLastWriteDate(insertOplog.getWallClockTime());
 
     // Create a config.transaction entry pointing to an imaginary commitTransaction entry.
     SessionTxnRecord txnRecord;
@@ -791,7 +919,8 @@ TEST_F(SessionCatalogMigrationSourceTest,
         auto nextOplogResult = migrationSource.getLastFetchedOplog();
         ASSERT_FALSE(nextOplogResult.shouldWaitForMajority);
         // Cannot compare directly because of SERVER-31356
-        ASSERT_BSONOBJ_EQ(insertOplog.toBSON(), nextOplogResult.oplog->toBSON());
+        ASSERT_BSONOBJ_EQ(insertOplog.getEntry().toBSON(),
+                          nextOplogResult.oplog->getEntry().toBSON());
     };
 
     // Function to verify the oplog entry corresponding to the transaction.
@@ -828,7 +957,7 @@ TEST_F(SessionCatalogMigrationSourceTest, FindAndModifyDeleteNotTouchingChunkIsI
         BSON("x" << -50),                     // o
         boost::none,                          // o2
         Date_t::now(),                        // wall clock time
-        0,                                    // statement id
+        {0},                                  // statement ids
         repl::OpTime(Timestamp(0, 0), 0));    // optime of previous write within same transaction
     insertOplogEntry(entry1);
 
@@ -838,7 +967,7 @@ TEST_F(SessionCatalogMigrationSourceTest, FindAndModifyDeleteNotTouchingChunkIsI
         BSON("x" << -50),                     // o
         boost::none,                          // o2
         Date_t::now(),                        // wall clock time
-        1,                                    // statement id
+        {1},                                  // statement ids
         repl::OpTime(Timestamp(0, 0), 0),     // optime of previous write within same transaction
         entry1.getOpTime());                  // pre-image optime
     insertOplogEntry(entry2);
@@ -847,7 +976,7 @@ TEST_F(SessionCatalogMigrationSourceTest, FindAndModifyDeleteNotTouchingChunkIsI
     sessionRecord.setSessionId(makeLogicalSessionIdForTest());
     sessionRecord.setTxnNum(1);
     sessionRecord.setLastWriteOpTime(entry2.getOpTime());
-    sessionRecord.setLastWriteDate(*entry2.getWallClockTime());
+    sessionRecord.setLastWriteDate(entry2.getWallClockTime());
 
     DBDirectClient client(opCtx());
     client.insert(NamespaceString::kSessionTransactionsTableNamespace.ns(), sessionRecord.toBSON());
@@ -863,7 +992,7 @@ TEST_F(SessionCatalogMigrationSourceTest, FindAndModifyUpdatePrePostNotTouchingC
         BSON("x" << -5),                      // o
         boost::none,                          // o2
         Date_t::now(),                        // wall clock time
-        0,                                    // statement id
+        {0},                                  // statement ids
         repl::OpTime(Timestamp(0, 0), 0));    // optime of previous write within same transaction
     insertOplogEntry(entry1);
 
@@ -873,7 +1002,7 @@ TEST_F(SessionCatalogMigrationSourceTest, FindAndModifyUpdatePrePostNotTouchingC
         BSON("$set" << BSON("y" << 1)),       // o
         BSON("x" << -5),                      // o2
         Date_t::now(),                        // wall clock time
-        1,                                    // statement id
+        {1},                                  // statement ids
         repl::OpTime(Timestamp(0, 0), 0),     // optime of previous write within same transaction
         entry1.getOpTime());                  // pre-image optime
     insertOplogEntry(entry2);
@@ -882,7 +1011,7 @@ TEST_F(SessionCatalogMigrationSourceTest, FindAndModifyUpdatePrePostNotTouchingC
     sessionRecord.setSessionId(makeLogicalSessionIdForTest());
     sessionRecord.setTxnNum(1);
     sessionRecord.setLastWriteOpTime(entry2.getOpTime());
-    sessionRecord.setLastWriteDate(*entry2.getWallClockTime());
+    sessionRecord.setLastWriteDate(entry2.getWallClockTime());
 
     DBDirectClient client(opCtx());
     client.insert(NamespaceString::kSessionTransactionsTableNamespace.ns(), sessionRecord.toBSON());
@@ -899,7 +1028,7 @@ TEST_F(SessionCatalogMigrationSourceTest,
         BSON("x" << -50),                     // o
         boost::none,                          // o2
         Date_t::now(),                        // wall clock time
-        0,                                    // statement id
+        {0},                                  // statement ids
         repl::OpTime(Timestamp(0, 0), 0));    // optime of previous write within same transaction
     insertOplogEntry(entry1);
 
@@ -909,7 +1038,7 @@ TEST_F(SessionCatalogMigrationSourceTest,
         BSON("$set" << BSON("x" << -50)),     // o
         BSON("x" << 10),                      // o2
         Date_t::now(),                        // wall clock time
-        1,                                    // statement id
+        {1},                                  // statement ids
         repl::OpTime(Timestamp(0, 0), 0),     // optime of previous write within same transaction
         boost::none,                          // pre-image optime
         entry1.getOpTime());                  // post-image optime
@@ -919,7 +1048,7 @@ TEST_F(SessionCatalogMigrationSourceTest,
     sessionRecord.setSessionId(makeLogicalSessionIdForTest());
     sessionRecord.setTxnNum(1);
     sessionRecord.setLastWriteOpTime(entry2.getOpTime());
-    sessionRecord.setLastWriteDate(*entry2.getWallClockTime());
+    sessionRecord.setLastWriteDate(entry2.getWallClockTime());
 
     DBDirectClient client(opCtx());
     client.insert(NamespaceString::kSessionTransactionsTableNamespace.ns(), sessionRecord.toBSON());
@@ -927,14 +1056,14 @@ TEST_F(SessionCatalogMigrationSourceTest,
     SessionCatalogMigrationSource migrationSource(opCtx(), kNs, kChunkRange, kShardKey);
     ASSERT_TRUE(migrationSource.fetchNextOplog(opCtx()));
 
-    auto expectedSequece = {entry1, entry2};
+    auto expectedSequence = {entry1, entry2};
 
-    for (auto oplog : expectedSequece) {
+    for (auto oplog : expectedSequence) {
         ASSERT_TRUE(migrationSource.hasMoreOplog());
         auto nextOplogResult = migrationSource.getLastFetchedOplog();
         ASSERT_FALSE(nextOplogResult.shouldWaitForMajority);
         // Cannot compare directly because of SERVER-31356
-        ASSERT_BSONOBJ_EQ(oplog.toBSON(), nextOplogResult.oplog->toBSON());
+        ASSERT_BSONOBJ_EQ(oplog.getEntry().toBSON(), nextOplogResult.oplog->getEntry().toBSON());
         migrationSource.fetchNextOplog(opCtx());
     }
 
@@ -949,7 +1078,7 @@ TEST_F(SessionCatalogMigrationSourceTest,
         BSON("x" << 50),                      // o
         boost::none,                          // o2
         Date_t::now(),                        // wall clock time
-        0,                                    // statement id
+        {0},                                  // statement ids
         repl::OpTime(Timestamp(0, 0), 0));    // optime of previous write within same transaction
     insertOplogEntry(entry1);
 
@@ -959,7 +1088,7 @@ TEST_F(SessionCatalogMigrationSourceTest,
         BSON("$set" << BSON("x" << 50)),      // o
         BSON("x" << -10),                     // o2
         Date_t::now(),                        // wall clock time
-        1,                                    // statement id
+        {1},                                  // statement ids
         repl::OpTime(Timestamp(0, 0), 0),     // optime of previous write within same transaction
         boost::none,                          // pre-image optime
         entry1.getOpTime());                  // post-image optime
@@ -969,7 +1098,7 @@ TEST_F(SessionCatalogMigrationSourceTest,
     sessionRecord.setSessionId(makeLogicalSessionIdForTest());
     sessionRecord.setTxnNum(1);
     sessionRecord.setLastWriteOpTime(entry2.getOpTime());
-    sessionRecord.setLastWriteDate(*entry2.getWallClockTime());
+    sessionRecord.setLastWriteDate(entry2.getWallClockTime());
 
     DBDirectClient client(opCtx());
     client.insert(NamespaceString::kSessionTransactionsTableNamespace.ns(), sessionRecord.toBSON());
@@ -985,7 +1114,7 @@ TEST_F(SessionCatalogMigrationSourceTest, FindAndModifyUpdateNotTouchingChunkSho
         BSON("x" << -10 << "y" << 50),        // o
         boost::none,                          // o2
         Date_t::now(),                        // wall clock time
-        0,                                    // statement id
+        {0},                                  // statement ids
         repl::OpTime(Timestamp(0, 0), 0));    // optime of previous write within same transaction
     insertOplogEntry(entry1);
 
@@ -995,7 +1124,7 @@ TEST_F(SessionCatalogMigrationSourceTest, FindAndModifyUpdateNotTouchingChunkSho
         BSON("$set" << BSON("y" << 50)),      // o
         BSON("x" << -10),                     // o2
         Date_t::now(),                        // wall clock time
-        1,                                    // statement id
+        {1},                                  // statement ids
         repl::OpTime(Timestamp(0, 0), 0),     // optime of previous write within same transaction
         boost::none,                          // pre-image optime
         entry1.getOpTime());                  // post-image optime
@@ -1005,7 +1134,7 @@ TEST_F(SessionCatalogMigrationSourceTest, FindAndModifyUpdateNotTouchingChunkSho
     sessionRecord.setSessionId(makeLogicalSessionIdForTest());
     sessionRecord.setTxnNum(1);
     sessionRecord.setLastWriteOpTime(entry2.getOpTime());
-    sessionRecord.setLastWriteDate(*entry2.getWallClockTime());
+    sessionRecord.setLastWriteDate(entry2.getWallClockTime());
 
     DBDirectClient client(opCtx());
     client.insert(NamespaceString::kSessionTransactionsTableNamespace.ns(), sessionRecord.toBSON());
@@ -1028,7 +1157,7 @@ TEST_F(SessionCatalogMigrationSourceTest, TwoSessionWithTwoWritesContainingWrite
         BSON("x" << 30),                      // o
         boost::none,                          // o2
         Date_t::now(),                        // wall clock time
-        0,                                    // statement id
+        {0},                                  // statement ids
         repl::OpTime(Timestamp(0, 0), 0));    // optime of previous write within same transaction
 
     auto entry1b =
@@ -1037,14 +1166,14 @@ TEST_F(SessionCatalogMigrationSourceTest, TwoSessionWithTwoWritesContainingWrite
                        BSON("x" << -50),                       // o
                        boost::none,                            // o2
                        Date_t::now(),                          // wall clock time
-                       1,                                      // statement id
+                       {1},                                    // statement ids
                        entry1a.getOpTime());  // optime of previous write within same transaction
 
     SessionTxnRecord sessionRecord1;
     sessionRecord1.setSessionId(higherSessionId);
     sessionRecord1.setTxnNum(1);
     sessionRecord1.setLastWriteOpTime(entry1b.getOpTime());
-    sessionRecord1.setLastWriteDate(*entry1b.getWallClockTime());
+    sessionRecord1.setLastWriteDate(entry1b.getWallClockTime());
 
     DBDirectClient client(opCtx());
     client.insert(NamespaceString::kSessionTransactionsTableNamespace.ns(),
@@ -1056,7 +1185,7 @@ TEST_F(SessionCatalogMigrationSourceTest, TwoSessionWithTwoWritesContainingWrite
         BSON("x" << 30),                     // o
         boost::none,                         // o2
         Date_t::now(),                       // wall clock time
-        3,                                   // statement id
+        {3},                                 // statement ids
         repl::OpTime(Timestamp(0, 0), 0));   // optime of previous write within same transaction
 
     auto entry2b =
@@ -1065,14 +1194,14 @@ TEST_F(SessionCatalogMigrationSourceTest, TwoSessionWithTwoWritesContainingWrite
                        BSON("x" << 50),                      // o
                        boost::none,                          // o2
                        Date_t::now(),                        // wall clock time
-                       4,                                    // statement id
+                       {4},                                  // statement ids
                        entry2a.getOpTime());  // optime of previous write within same transaction
 
     SessionTxnRecord sessionRecord2;
     sessionRecord2.setSessionId(lowerSessionId);
     sessionRecord2.setTxnNum(1);
     sessionRecord2.setLastWriteOpTime(entry2b.getOpTime());
-    sessionRecord2.setLastWriteDate(*entry2b.getWallClockTime());
+    sessionRecord2.setLastWriteDate(entry2b.getWallClockTime());
 
     client.insert(NamespaceString::kSessionTransactionsTableNamespace.ns(),
                   sessionRecord2.toBSON());
@@ -1085,14 +1214,14 @@ TEST_F(SessionCatalogMigrationSourceTest, TwoSessionWithTwoWritesContainingWrite
     SessionCatalogMigrationSource migrationSource(opCtx(), kNs, kChunkRange, kShardKey);
     ASSERT_TRUE(migrationSource.fetchNextOplog(opCtx()));
 
-    auto expectedSequece = {entry1a, entry2b, entry2a};
+    auto expectedSequence = {entry1a, entry2b, entry2a};
 
-    for (auto oplog : expectedSequece) {
+    for (auto oplog : expectedSequence) {
         ASSERT_TRUE(migrationSource.hasMoreOplog());
         auto nextOplogResult = migrationSource.getLastFetchedOplog();
         ASSERT_FALSE(nextOplogResult.shouldWaitForMajority);
         // Cannot compare directly because of SERVER-31356
-        ASSERT_BSONOBJ_EQ(oplog.toBSON(), nextOplogResult.oplog->toBSON());
+        ASSERT_BSONOBJ_EQ(oplog.getEntry().toBSON(), nextOplogResult.oplog->getEntry().toBSON());
         migrationSource.fetchNextOplog(opCtx());
     }
 

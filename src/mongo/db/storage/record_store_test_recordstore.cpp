@@ -38,8 +38,8 @@
 namespace mongo {
 namespace {
 
-using std::unique_ptr;
 using std::string;
+using std::unique_ptr;
 
 // Verify that the name of the record store is not NULL and nonempty.
 TEST(RecordStoreTestHarness, RecordStoreName) {
@@ -48,7 +48,7 @@ TEST(RecordStoreTestHarness, RecordStoreName) {
 
     {
         const char* name = rs->name();
-        ASSERT(name != NULL && name[0] != '\0');
+        ASSERT(name != nullptr && name[0] != '\0');
     }
 }
 
@@ -61,13 +61,6 @@ TEST(RecordStoreTestHarness, Namespace) {
         string ns = rs->ns();
         ASSERT(ns[0] != '\0');
     }
-}
-
-// Call isCapped() on a non-capped collection and verify the result is false.
-TEST(RecordStoreTestHarness, IsNotCapped) {
-    const auto harnessHelper(newRecordStoreHarnessHelper());
-    unique_ptr<RecordStore> rs(harnessHelper->newNonCappedRecordStore());
-    ASSERT(!rs->isCapped());
 }
 
 }  // namespace

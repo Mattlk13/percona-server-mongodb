@@ -27,18 +27,19 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/s/query/cluster_client_cursor_impl.h"
 #include "mongo/s/query/cluster_cursor_manager.h"
 
 #include <set>
 
 #include "mongo/db/kill_sessions_common.h"
 #include "mongo/db/logical_session_cache.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/clock_source.h"
-#include "mongo/util/log.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -57,9 +58,8 @@ Status cursorNotFoundStatus(const NamespaceString& nss, CursorId cursorId) {
 
 Status cursorInUseStatus(const NamespaceString& nss, CursorId cursorId) {
     return {ErrorCodes::CursorInUse,
-            str::stream() << "Cursor already in use (namespace: '" << nss.ns() << "', id: "
-                          << cursorId
-                          << ")."};
+            str::stream() << "Cursor already in use (namespace: '" << nss.ns()
+                          << "', id: " << cursorId << ")."};
 }
 
 //
@@ -78,12 +78,11 @@ uint32_t extractPrefixFromCursorId(CursorId cursorId) {
 }  // namespace
 
 ClusterCursorManager::PinnedCursor::PinnedCursor(ClusterCursorManager* manager,
-                                                 std::unique_ptr<ClusterClientCursor> cursor,
+                                                 ClusterClientCursorGuard&& cursorGuard,
                                                  const NamespaceString& nss,
                                                  CursorId cursorId)
-    : _manager(manager), _cursor(std::move(cursor)), _nss(nss), _cursorId(cursorId) {
+    : _manager(manager), _cursor(cursorGuard.releaseCursor()), _nss(nss), _cursorId(cursorId) {
     invariant(_manager);
-    invariant(_cursor);
     invariant(_cursorId);  // Zero is not a valid cursor id.
 }
 
@@ -113,28 +112,6 @@ ClusterCursorManager::PinnedCursor& ClusterCursorManager::PinnedCursor::operator
     return *this;
 }
 
-StatusWith<ClusterQueryResult> ClusterCursorManager::PinnedCursor::next(
-    RouterExecStage::ExecContext execContext) {
-    invariant(_cursor);
-    return _cursor->next(execContext);
-}
-
-bool ClusterCursorManager::PinnedCursor::isTailable() const {
-    invariant(_cursor);
-    return _cursor->isTailable();
-}
-
-bool ClusterCursorManager::PinnedCursor::isTailableAndAwaitData() const {
-    invariant(_cursor);
-    return _cursor->isTailableAndAwaitData();
-}
-
-boost::optional<ReadPreferenceSetting> ClusterCursorManager::PinnedCursor::getReadPreference()
-    const {
-    invariant(_cursor);
-    return _cursor->getReadPreference();
-}
-
 void ClusterCursorManager::PinnedCursor::returnCursor(CursorState cursorState) {
     invariant(_cursor);
     // Note that unpinning a cursor transfers ownership of the underlying ClusterClientCursor object
@@ -143,86 +120,24 @@ void ClusterCursorManager::PinnedCursor::returnCursor(CursorState cursorState) {
     *this = PinnedCursor();
 }
 
-BSONObj ClusterCursorManager::PinnedCursor::getOriginatingCommand() const {
-    invariant(_cursor);
-    return _cursor->getOriginatingCommand();
-}
-
-const PrivilegeVector& ClusterCursorManager::PinnedCursor::getOriginatingPrivileges() const& {
-    invariant(_cursor);
-    return _cursor->getOriginatingPrivileges();
-}
-
-std::size_t ClusterCursorManager::PinnedCursor::getNumRemotes() const {
-    invariant(_cursor);
-    return _cursor->getNumRemotes();
-}
-
-BSONObj ClusterCursorManager::PinnedCursor::getPostBatchResumeToken() const {
-    invariant(_cursor);
-    return _cursor->getPostBatchResumeToken();
-}
-
 CursorId ClusterCursorManager::PinnedCursor::getCursorId() const {
     return _cursorId;
 }
 
-long long ClusterCursorManager::PinnedCursor::getNumReturnedSoFar() const {
-    invariant(_cursor);
-    return _cursor->getNumReturnedSoFar();
-}
-
-Date_t ClusterCursorManager::PinnedCursor::getLastUseDate() const {
-    invariant(_cursor);
-    return _cursor->getLastUseDate();
-}
-
-void ClusterCursorManager::PinnedCursor::setLastUseDate(Date_t now) {
-    invariant(_cursor);
-    _cursor->setLastUseDate(now);
-}
-Date_t ClusterCursorManager::PinnedCursor::getCreatedDate() const {
-    invariant(_cursor);
-    return _cursor->getCreatedDate();
-}
-void ClusterCursorManager::PinnedCursor::incNBatches() {
-    invariant(_cursor);
-    return _cursor->incNBatches();
-}
-
-long long ClusterCursorManager::PinnedCursor::getNBatches() const {
-    invariant(_cursor);
-    return _cursor->getNBatches();
-}
-
-void ClusterCursorManager::PinnedCursor::queueResult(const ClusterQueryResult& result) {
-    invariant(_cursor);
-    _cursor->queueResult(result);
-}
-
-bool ClusterCursorManager::PinnedCursor::remotesExhausted() {
-    invariant(_cursor);
-    return _cursor->remotesExhausted();
-}
-
 GenericCursor ClusterCursorManager::PinnedCursor::toGenericCursor() const {
+    invariant(_cursor);
     GenericCursor gc;
     gc.setCursorId(getCursorId());
     gc.setNs(_nss);
-    gc.setLsid(getLsid());
-    gc.setNDocsReturned(getNumReturnedSoFar());
-    gc.setTailable(isTailable());
-    gc.setAwaitData(isTailableAndAwaitData());
-    gc.setOriginatingCommand(getOriginatingCommand());
-    gc.setLastAccessDate(getLastUseDate());
-    gc.setCreatedDate(getCreatedDate());
-    gc.setNBatchesReturned(getNBatches());
+    gc.setLsid(_cursor->getLsid());
+    gc.setNDocsReturned(_cursor->getNumReturnedSoFar());
+    gc.setTailable(_cursor->isTailable());
+    gc.setAwaitData(_cursor->isTailableAndAwaitData());
+    gc.setOriginatingCommand(_cursor->getOriginatingCommand());
+    gc.setLastAccessDate(_cursor->getLastUseDate());
+    gc.setCreatedDate(_cursor->getCreatedDate());
+    gc.setNBatchesReturned(_cursor->getNBatches());
     return gc;
-}
-
-Status ClusterCursorManager::PinnedCursor::setAwaitDataTimeout(Milliseconds awaitDataTimeout) {
-    invariant(_cursor);
-    return _cursor->setAwaitDataTimeout(awaitDataTimeout);
 }
 
 void ClusterCursorManager::PinnedCursor::returnAndKillCursor() {
@@ -232,19 +147,10 @@ void ClusterCursorManager::PinnedCursor::returnAndKillCursor() {
     returnCursor(CursorState::Exhausted);
 }
 
-boost::optional<LogicalSessionId> ClusterCursorManager::PinnedCursor::getLsid() const {
-    invariant(_cursor);
-    return _cursor->getLsid();
-}
-
-boost::optional<TxnNumber> ClusterCursorManager::PinnedCursor::getTxnNumber() const {
-    invariant(_cursor);
-    return _cursor->getTxnNumber();
-}
-
 ClusterCursorManager::ClusterCursorManager(ClockSource* clockSource)
     : _clockSource(clockSource),
-      _pseudoRandom(std::unique_ptr<SecureRandom>(SecureRandom::create())->nextInt64()) {
+      _randomSeed(SecureRandom().nextInt64()),
+      _pseudoRandom(_randomSeed) {
     invariant(_clockSource);
 }
 
@@ -255,7 +161,7 @@ ClusterCursorManager::~ClusterCursorManager() {
 
 void ClusterCursorManager::shutdown(OperationContext* opCtx) {
     {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        stdx::lock_guard<Latch> lk(_mutex);
         _inShutdown = true;
     }
     killAllCursors(opCtx);
@@ -271,7 +177,8 @@ StatusWith<CursorId> ClusterCursorManager::registerCursor(
     // Read the clock out of the lock.
     const auto now = _clockSource->now();
 
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    stdx::unique_lock<Latch> lk(_mutex);
+    _log.push({LogEvent::Type::kRegisterAttempt, boost::none, now, nss});
 
     if (_inShutdown) {
         lk.unlock();
@@ -320,10 +227,15 @@ StatusWith<CursorId> ClusterCursorManager::registerCursor(
     } while (cursorId == 0 || entryMap.count(cursorId) > 0);
 
     // Create a new CursorEntry and register it in the CursorEntryContainer's map.
-    auto emplaceResult = entryMap.emplace(
-        cursorId,
-        CursorEntry(std::move(cursor), cursorType, cursorLifetime, now, authenticatedUsers));
+    auto emplaceResult = entryMap.emplace(cursorId,
+                                          CursorEntry(std::move(cursor),
+                                                      cursorType,
+                                                      cursorLifetime,
+                                                      now,
+                                                      authenticatedUsers,
+                                                      opCtx->getOperationKey()));
     invariant(emplaceResult.second);
+    _log.push({LogEvent::Type::kRegisterComplete, cursorId, now, nss});
 
     return cursorId;
 }
@@ -334,7 +246,10 @@ StatusWith<ClusterCursorManager::PinnedCursor> ClusterCursorManager::checkOutCur
     OperationContext* opCtx,
     AuthzCheckFn authChecker,
     AuthCheck checkSessionAuth) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    const auto now = _clockSource->now();
+
+    stdx::lock_guard<Latch> lk(_mutex);
+    _log.push({LogEvent::Type::kCheckoutAttempt, cursorId, now, nss});
 
     if (_inShutdown) {
         return Status(ErrorCodes::ShutdownInProgress,
@@ -349,9 +264,9 @@ StatusWith<ClusterCursorManager::PinnedCursor> ClusterCursorManager::checkOutCur
     // Check if the user is coauthorized to access this cursor.
     auto authCheckStatus = authChecker(entry->getAuthenticatedUsers());
     if (!authCheckStatus.isOK()) {
-        return authCheckStatus.withContext(
-            str::stream() << "cursor id " << cursorId
-                          << " was not created by the authenticated user");
+        return authCheckStatus.withContext(str::stream()
+                                           << "cursor id " << cursorId
+                                           << " was not created by the authenticated user");
     }
 
     if (checkSessionAuth == kCheckSession) {
@@ -365,22 +280,21 @@ StatusWith<ClusterCursorManager::PinnedCursor> ClusterCursorManager::checkOutCur
         return cursorInUseStatus(nss, cursorId);
     }
 
-    // Note: due to SERVER-31138, despite putting this in a unique_ptr, it's actually not safe to
-    // return before the end of this function. Be careful to avoid any early returns/throws after
-    // this point.
-    auto cursor = entry->releaseCursor(opCtx);
+    auto cursorGuard = entry->releaseCursor(opCtx);
 
     // We use pinning of a cursor as a proxy for active, user-initiated use of a cursor.  Therefore,
     // we pass down to the logical session cache and vivify the record (updating last use).
-    if (cursor->getLsid()) {
+    if (cursorGuard->getLsid()) {
         auto vivifyCursorStatus =
-            LogicalSessionCache::get(opCtx)->vivify(opCtx, cursor->getLsid().get());
+            LogicalSessionCache::get(opCtx)->vivify(opCtx, cursorGuard->getLsid().get());
         if (!vivifyCursorStatus.isOK()) {
             return vivifyCursorStatus;
         }
     }
-    cursor->reattachToOperationContext(opCtx);
-    return PinnedCursor(this, std::move(cursor), nss, cursorId);
+    cursorGuard->reattachToOperationContext(opCtx);
+
+    _log.push({LogEvent::Type::kCheckoutComplete, cursorId, now, nss});
+    return PinnedCursor(this, std::move(cursorGuard), nss, cursorId);
 }
 
 void ClusterCursorManager::checkInCursor(std::unique_ptr<ClusterClientCursor> cursor,
@@ -397,7 +311,8 @@ void ClusterCursorManager::checkInCursor(std::unique_ptr<ClusterClientCursor> cu
     cursor->detachFromOperationContext();
     cursor->setLastUseDate(now);
 
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    stdx::unique_lock<Latch> lk(_mutex);
+    _log.push({LogEvent::Type::kCheckInAttempt, cursorId, now, nss});
 
     CursorEntry* entry = _getEntry(lk, nss, cursorId);
     invariant(entry);
@@ -409,6 +324,7 @@ void ClusterCursorManager::checkInCursor(std::unique_ptr<ClusterClientCursor> cu
     entry->returnCursor(std::move(cursor));
 
     if (cursorState == CursorState::NotExhausted && !killPending) {
+        _log.push({LogEvent::Type::kCheckInCompleteCursorSaved, cursorId, now, nss});
         // The caller may need the cursor again.
         return;
     }
@@ -422,7 +338,7 @@ Status ClusterCursorManager::checkAuthForKillCursors(OperationContext* opCtx,
                                                      const NamespaceString& nss,
                                                      CursorId cursorId,
                                                      AuthzCheckFn authChecker) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     auto entry = _getEntry(lk, nss, cursorId);
 
     if (!entry) {
@@ -450,7 +366,10 @@ Status ClusterCursorManager::killCursor(OperationContext* opCtx,
                                         CursorId cursorId) {
     invariant(opCtx);
 
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    const auto now = _clockSource->now();
+    stdx::unique_lock<Latch> lk(_mutex);
+
+    _log.push({LogEvent::Type::kKillCursorAttempt, cursorId, now, nss});
 
     CursorEntry* entry = _getEntry(lk, nss, cursorId);
     if (!entry) {
@@ -474,54 +393,61 @@ Status ClusterCursorManager::killCursor(OperationContext* opCtx,
     return Status::OK();
 }
 
-void ClusterCursorManager::detachAndKillCursor(stdx::unique_lock<stdx::mutex> lk,
+void ClusterCursorManager::detachAndKillCursor(stdx::unique_lock<Latch> lk,
                                                OperationContext* opCtx,
                                                const NamespaceString& nss,
                                                CursorId cursorId) {
-    auto detachedCursor = _detachCursor(lk, nss, cursorId);
-    invariant(detachedCursor.getStatus());
+    auto detachedCursorGuard = _detachCursor(lk, opCtx, nss, cursorId);
+    invariant(detachedCursorGuard.getStatus());
 
     // Deletion of the cursor can happen out of the lock.
     lk.unlock();
-    detachedCursor.getValue()->kill(opCtx);
-    detachedCursor.getValue().reset();
+    detachedCursorGuard.getValue()->kill(opCtx);
 }
 
 std::size_t ClusterCursorManager::killMortalCursorsInactiveSince(OperationContext* opCtx,
                                                                  Date_t cutoff) {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    const auto now = _clockSource->now();
+    stdx::unique_lock<Latch> lk(_mutex);
 
     auto pred = [cutoff](CursorId cursorId, const CursorEntry& entry) -> bool {
-        bool res = entry.getLifetimeType() == CursorLifetime::Mortal &&
+        bool res = entry.getLifetimeType() == CursorLifetime::Mortal && !entry.getLsid() &&
             !entry.getOperationUsingCursor() && entry.getLastActive() <= cutoff;
 
         if (res) {
-            log() << "Cursor id " << cursorId << " timed out, idle since "
-                  << entry.getLastActive().toString();
+            LOGV2(22837,
+                  "Cursor timed out",
+                  "cursorId"_attr = cursorId,
+                  "idleSince"_attr = entry.getLastActive().toString());
         }
 
         return res;
     };
 
-    return killCursorsSatisfying(std::move(lk), opCtx, std::move(pred));
+    return killCursorsSatisfying(std::move(lk), opCtx, std::move(pred), now);
 }
 
 void ClusterCursorManager::killAllCursors(OperationContext* opCtx) {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    const auto now = _clockSource->now();
+    stdx::unique_lock<Latch> lk(_mutex);
     auto pred = [](CursorId, const CursorEntry&) -> bool { return true; };
 
-    killCursorsSatisfying(std::move(lk), opCtx, std::move(pred));
+    killCursorsSatisfying(std::move(lk), opCtx, std::move(pred), now);
 }
 
 std::size_t ClusterCursorManager::killCursorsSatisfying(
-    stdx::unique_lock<stdx::mutex> lk,
+    stdx::unique_lock<Latch> lk,
     OperationContext* opCtx,
-    std::function<bool(CursorId, const CursorEntry&)> pred) {
+    std::function<bool(CursorId, const CursorEntry&)> pred,
+    Date_t now) {
     invariant(opCtx);
     invariant(lk.owns_lock());
     std::size_t nKilled = 0;
 
-    std::vector<std::unique_ptr<ClusterClientCursor>> cursorsToDestroy;
+    _log.push(
+        {LogEvent::Type::kRemoveCursorsSatisfyingPredicateAttempt, boost::none, now, boost::none});
+
+    std::vector<ClusterClientCursorGuard> cursorsToDestroy;
     auto nsContainerIt = _namespaceToContainerMap.begin();
     while (nsContainerIt != _namespaceToContainerMap.end()) {
         auto&& entryMap = nsContainerIt->second.entryMap;
@@ -544,7 +470,15 @@ std::size_t ClusterCursorManager::killCursorsSatisfying(
                 continue;
             }
 
-            cursorsToDestroy.push_back(entry.releaseCursor(nullptr));
+            _log.push({LogEvent::Type::kCursorMarkedForDeletionBySatisfyingPredicate,
+                       cursorId,
+                       // While we collected 'now' above, we ran caller-provided predicates which
+                       // may have been expensive. To avoid re-reading from the clock while the
+                       // lock is held, we do not provide a value for 'now' in this log entry.
+                       boost::none,
+                       nsContainerIt->first});
+
+            cursorsToDestroy.push_back(entry.releaseCursor(opCtx));
 
             // Destroy the entry and set the iterator to the next element.
             entryMap.erase(cursorIdEntryIt++);
@@ -557,19 +491,28 @@ std::size_t ClusterCursorManager::killCursorsSatisfying(
         }
     }
 
-    // Call kill() outside of the lock, as it may require waiting for callbacks to finish.
+    _log.push({LogEvent::Type::kRemoveCursorsSatisfyingPredicateComplete,
+               boost::none,
+               // While we collected 'now' above, we ran caller-provided predicates which may have
+               // been expensive. To avoid re-reading from the clock while the lock is held, we do
+               // not provide a value for 'now' in this log entry.
+               boost::none,
+               boost::none});
+
+    // Ensure cursors are killed outside the lock, as killing may require waiting for callbacks to
+    // finish.
     lk.unlock();
 
-    for (auto&& cursor : cursorsToDestroy) {
-        invariant(cursor.get());
-        cursor->kill(opCtx);
+    for (auto&& cursorGuard : cursorsToDestroy) {
+        invariant(cursorGuard);
+        cursorGuard->kill(opCtx);
     }
 
     return nKilled;
 }
 
 ClusterCursorManager::Stats ClusterCursorManager::stats() const {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
 
     Stats stats;
 
@@ -602,7 +545,7 @@ ClusterCursorManager::Stats ClusterCursorManager::stats() const {
 }
 
 void ClusterCursorManager::appendActiveSessions(LogicalSessionIdSet* lsids) const {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
 
     for (const auto& nsContainerPair : _namespaceToContainerMap) {
         for (const auto& cursorIdEntryPair : nsContainerPair.second.entryMap) {
@@ -643,7 +586,7 @@ std::vector<GenericCursor> ClusterCursorManager::getIdleCursors(
     const OperationContext* opCtx, MongoProcessInterface::CurrentOpUserMode userMode) const {
     std::vector<GenericCursor> cursors;
 
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
 
     AuthorizationSession* ctxAuth = AuthorizationSession::get(opCtx->getClient());
 
@@ -681,6 +624,7 @@ std::pair<Status, int> ClusterCursorManager::killCursorsWithMatchingSessions(
             return;
         }
         uassertStatusOK(mgr.killCursor(opCtx, *cursorNss, id));
+        LOGV2(22838, "Killing cursor as part of killing session(s)", "cursorId"_attr = id);
     };
 
     auto bySessionCursorKiller = makeKillCursorsBySessionAdaptor(opCtx, matcher, std::move(eraser));
@@ -691,14 +635,12 @@ std::pair<Status, int> ClusterCursorManager::killCursorsWithMatchingSessions(
 
 stdx::unordered_set<CursorId> ClusterCursorManager::getCursorsForSession(
     LogicalSessionId lsid) const {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
 
     stdx::unordered_set<CursorId> cursorIds;
 
     for (auto&& nsContainerPair : _namespaceToContainerMap) {
-        for (auto&& cursorIdEntryPair : nsContainerPair.second.entryMap) {
-            const CursorEntry& entry = cursorIdEntryPair.second;
-
+        for (auto&& [cursorId, entry] : nsContainerPair.second.entryMap) {
             if (entry.isKillPending()) {
                 // Don't include sessions for killed cursors.
                 continue;
@@ -706,7 +648,34 @@ stdx::unordered_set<CursorId> ClusterCursorManager::getCursorsForSession(
 
             auto cursorLsid = entry.getLsid();
             if (lsid == cursorLsid) {
-                cursorIds.insert(cursorIdEntryPair.first);
+                cursorIds.insert(cursorId);
+            }
+        }
+    }
+
+    return cursorIds;
+}
+
+stdx::unordered_set<CursorId> ClusterCursorManager::getCursorsForOpKeys(
+    std::vector<OperationKey> opKeys) const {
+    stdx::lock_guard<Latch> lk(_mutex);
+
+    stdx::unordered_set<CursorId> cursorIds;
+
+    // While we could maintain a cached mapping of OperationKey to CursorID to increase performance,
+    // this approach was chosen given that 1) mongos will not have as many open cursors as a shard
+    // and 2) mongos performance has historically not been a bottleneck.
+    for (auto&& opKey : opKeys) {
+        for (auto&& nsContainerPair : _namespaceToContainerMap) {
+            for (auto&& [cursorId, entry] : nsContainerPair.second.entryMap) {
+                if (entry.isKillPending()) {
+                    // Don't include any killed cursors.
+                    continue;
+                }
+
+                if (opKey == entry.getOperationKey()) {
+                    cursorIds.insert(cursorId);
+                }
             }
         }
     }
@@ -716,7 +685,7 @@ stdx::unordered_set<CursorId> ClusterCursorManager::getCursorsForSession(
 
 boost::optional<NamespaceString> ClusterCursorManager::getNamespaceForCursorId(
     CursorId cursorId) const {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
 
     const auto it = _cursorIdPrefixToNamespaceMap.find(extractPrefixFromCursorId(cursorId));
     if (it == _cursorIdPrefixToNamespaceMap.end()) {
@@ -750,15 +719,36 @@ auto ClusterCursorManager::eraseContainer(NssToCursorContainerMap::iterator it)
     // This was the last cursor remaining in the given namespace.  Erase all state associated
     // with this namespace.
     size_t numDeleted = _cursorIdPrefixToNamespaceMap.erase(container.containerPrefix);
-    invariant(numDeleted == 1);
+    if (numDeleted != 1) {
+        LOGV2_ERROR(
+            4786901,
+            "Error attempting to erase CursorEntryContainer for nss {nss} and containerPrefix"
+            "{prefix}. Could not find containerPrefix in map from cursor ID prefix to nss. "
+            "Expected 'numDeleted' to be 1, but got {actualNumDeleted}",
+            "Error attempting to erase CursorEntryContainer. Could not find containerPrefix in map "
+            "from cursor id prefix to namespace string.",
+            "nss"_attr = it->first,
+            "prefix"_attr = container.containerPrefix,
+            "actualNumDeleted"_attr = numDeleted);
+        logCursorManagerInfo();
+        MONGO_UNREACHABLE;
+    }
+    const auto nssRemoved = it->first;
     _namespaceToContainerMap.erase(it++);
+    _log.push({LogEvent::Type::kNamespaceEntryMapErased,
+               boost::none,
+               boost::none,
+               std::move(nssRemoved)});
+
     invariant(_namespaceToContainerMap.size() == _cursorIdPrefixToNamespaceMap.size());
     return it;
 }
 
-StatusWith<std::unique_ptr<ClusterClientCursor>> ClusterCursorManager::_detachCursor(
-    WithLock lk, NamespaceString const& nss, CursorId cursorId) {
-
+StatusWith<ClusterClientCursorGuard> ClusterCursorManager::_detachCursor(WithLock lk,
+                                                                         OperationContext* opCtx,
+                                                                         const NamespaceString& nss,
+                                                                         CursorId cursorId) {
+    _log.push({LogEvent::Type::kDetachAttempt, cursorId, boost::none, nss});
     CursorEntry* entry = _getEntry(lk, nss, cursorId);
     if (!entry) {
         return cursorNotFoundStatus(nss, cursorId);
@@ -769,7 +759,7 @@ StatusWith<std::unique_ptr<ClusterClientCursor>> ClusterCursorManager::_detachCu
     }
 
     // Transfer ownership away from the entry.
-    std::unique_ptr<ClusterClientCursor> cursor = entry->releaseCursor(nullptr);
+    ClusterClientCursorGuard cursor = entry->releaseCursor(opCtx);
 
     // Destroy the entry.
     auto nsToContainerIt = _namespaceToContainerMap.find(nss);
@@ -781,7 +771,107 @@ StatusWith<std::unique_ptr<ClusterClientCursor>> ClusterCursorManager::_detachCu
         eraseContainer(nsToContainerIt);
     }
 
+    _log.push({LogEvent::Type::kDetachComplete, cursorId, boost::none, nss});
+
     return std::move(cursor);
 }
 
+void ClusterCursorManager::logCursorManagerInfo() const {
+    LOGV2_ERROR_OPTIONS(4786900,
+                        logv2::LogTruncation::Disabled,
+                        "Dumping cursor manager contents. "
+                        "NSS -> Container map: {nssToContainer} "
+                        "Cursor ID Prefix -> NSS map: {cursorIdToNss} "
+                        "Internal log: {internalLog}",
+                        "Dumping cursor manager contents.",
+                        "{nssToContainer}"_attr = dumpNssToContainerMap(),
+                        "{cursorIdToNss}"_attr = dumpCursorIdToNssMap(),
+                        "{internalLog}"_attr = dumpInternalLog());
+}
+
+std::string ClusterCursorManager::LogEvent::typeToString(ClusterCursorManager::LogEvent::Type t) {
+    const static stdx::unordered_map<LogEvent::Type, std::string> kMap = {
+        {Type::kRegisterAttempt, "registerAttempt"},
+        {Type::kRegisterComplete, "registerComplete"},
+        {Type::kCheckoutAttempt, "checkoutAttempt"},
+        {Type::kCheckoutComplete, "checkoutComplete"},
+        {Type::kCheckInAttempt, "checkInAttempt"},
+        {Type::kCheckInCompleteCursorSaved, "checkInCompleteCursorSaved"},
+        {Type::kDetachAttempt, "detachAttempt"},
+        {Type::kDetachComplete, "detachComplete"},
+        {Type::kNamespaceEntryMapErased, "namespaceEntryMapErased"},
+        {Type::kRemoveCursorsSatisfyingPredicateAttempt, "killCursorsSatisfyingPredicateAttempt"},
+        {Type::kRemoveCursorsSatisfyingPredicateComplete, "killCursorsSatisfyingPredicateComplete"},
+        {Type::kKillCursorAttempt, "killCursorAttempt"},
+    };
+
+    if (auto it = kMap.find(t); it != kMap.end()) {
+        return it->second;
+    }
+    return "unknown " + std::to_string(static_cast<int>(t));
+}
+
+BSONObj ClusterCursorManager::dumpNssToContainerMap() const {
+    BSONObjBuilder bob;
+    // Record an object for the NSS -> Container map.
+    {
+        BSONObjBuilder nssToContainer(bob.subobjStart("nssToContainer"));
+        for (auto&& [nss, cursorContainer] : _namespaceToContainerMap) {
+            BSONObjBuilder nssBob(nssToContainer.subobjStart(nss.toString()));
+            nssBob.appendNumber("containerPrefix",
+                                static_cast<long long>(cursorContainer.containerPrefix));
+            BSONArrayBuilder cursors(nssBob.subarrayStart("cursors"));
+            for (auto&& [cursorId, cursorEntry] : cursorContainer.entryMap) {
+                BSONObjBuilder cursorBob(cursors.subobjStart());
+                cursorBob.appendNumber("id", cursorId);
+                cursorBob.append("lastActive", cursorEntry.getLastActive());
+            }
+        }
+    }
+    return bob.obj();
+}
+
+BSONObj ClusterCursorManager::dumpCursorIdToNssMap() const {
+    BSONObjBuilder bob;
+
+    // Record an array for the Cursor ID Prefix -> NSS map.
+    {
+        BSONArrayBuilder cursorIdPrefixToNss(bob.subarrayStart("cursorIdPrefixToNss"));
+        for (auto&& [cursorIdPrefix, nss] : _cursorIdPrefixToNamespaceMap) {
+            BSONObjBuilder bob(cursorIdPrefixToNss.subobjStart());
+            bob.appendNumber("cursorIdPrefix", static_cast<long long>(cursorIdPrefix));
+            bob.append("nss", nss.toString());
+        }
+    }
+
+    return bob.obj();
+}
+
+BSONObj ClusterCursorManager::dumpInternalLog() const {
+    BSONObjBuilder bob;
+    // Dump the internal log maintained by the ClusterCursorManager.
+    {
+        BSONArrayBuilder logBuilder(bob.subarrayStart("log"));
+        size_t i = _log.start;
+        while (i != _log.end) {
+            BSONObjBuilder bob(logBuilder.subobjStart());
+            const auto& logEntry = _log.events[i];
+            if (logEntry.cursorId) {
+                bob.appendNumber("cursorId", *logEntry.cursorId);
+            }
+            bob.append("type", LogEvent::typeToString(logEntry.type));
+
+            if (logEntry.time) {
+                bob.append("approxTime", *logEntry.time);
+            }
+
+            if (logEntry.nss) {
+                bob.append("nss", logEntry.nss->toString());
+            }
+
+            i = (i + 1) % _log.events.size();
+        }
+    }
+    return bob.obj();
+}
 }  // namespace mongo

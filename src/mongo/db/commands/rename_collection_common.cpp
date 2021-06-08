@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#include "mongo/db/commands/rename_collection.h"
+#include "mongo/db/commands/rename_collection_common.h"
 
 #include <string>
 #include <vector>
@@ -60,7 +60,8 @@ Status checkAuthForRenameCollectionCommand(Client* client,
     const NamespaceString targetNS(targetNsElt.valueStringData());
     bool dropTarget = cmdObj["dropTarget"].trueValue();
 
-    if (sourceNS.db() == targetNS.db() && !sourceNS.isSystem() && !targetNS.isSystem()) {
+    if (sourceNS.db() == targetNS.db() && sourceNS.isNormalCollection() &&
+        targetNS.isNormalCollection()) {
         bool canRename = AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
             ResourcePattern::forDatabaseName(sourceNS.db()), ActionType::renameCollectionSameDB);
 

@@ -32,11 +32,12 @@
 #include "mongo/db/update/object_replace_executor.h"
 
 #include "mongo/base/data_view.h"
+#include "mongo/bson/mutable/document.h"
 #include "mongo/db/bson/dotted_path_support.h"
-#include "mongo/db/logical_clock.h"
-#include "mongo/db/logical_time.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/update/storage_validation.h"
+#include "mongo/db/update/update_oplog_entry_serialization.h"
+#include "mongo/db/vector_clock_mutable.h"
 
 namespace mongo {
 
@@ -63,7 +64,7 @@ ObjectReplaceExecutor::ObjectReplaceExecutor(BSONObj replacement)
             unsigned long long timestamp = timestampView.read<unsigned long long>();
             if (timestamp == 0) {
                 ServiceContext* service = getGlobalServiceContext();
-                auto ts = LogicalClock::get(service)->reserveTicks(1).asTimestamp();
+                auto ts = VectorClockMutable::get(service)->tickClusterTime(1).asTimestamp();
                 timestampView.write(tagLittleEndian(ts.asULL()));
             }
         }
@@ -71,7 +72,10 @@ ObjectReplaceExecutor::ObjectReplaceExecutor(BSONObj replacement)
 }
 
 UpdateExecutor::ApplyResult ObjectReplaceExecutor::applyReplacementUpdate(
-    ApplyParams applyParams, const BSONObj& replacementDoc, bool replacementDocContainsIdField) {
+    ApplyParams applyParams,
+    const BSONObj& replacementDoc,
+    bool replacementDocContainsIdField,
+    bool allowTopLevelDollarPrefixedFields) {
     auto originalDoc = applyParams.element.getDocument().getObject();
 
     // Check for noop.
@@ -99,10 +103,13 @@ UpdateExecutor::ApplyResult ObjectReplaceExecutor::applyReplacementUpdate(
         invariant(applyParams.element.appendElement(elem));
     }
 
-    // Validate for storage.
-    if (applyParams.validateForStorage) {
-        storage_validation::storageValid(applyParams.element.getDocument());
-    }
+    ApplyResult ret;
+
+    // Validate for storage and check if the document contains any '.'/'$' field name.
+    storage_validation::storageValid(applyParams.element.getDocument(),
+                                     allowTopLevelDollarPrefixedFields,
+                                     applyParams.validateForStorage,
+                                     &ret.containsDotsAndDollarsField);
 
     // Check immutable paths.
     for (auto path = applyParams.immutablePaths.begin(); path != applyParams.immutablePaths.end();
@@ -136,26 +143,21 @@ UpdateExecutor::ApplyResult ObjectReplaceExecutor::applyReplacementUpdate(
             uassert(ErrorCodes::ImmutableField,
                     str::stream() << "After applying the update, the (immutable) field '"
                                   << (*path)->dottedField()
-                                  << "' was found to have been altered to "
-                                  << newElem.toString(),
+                                  << "' was found to have been altered to " << newElem.toString(),
                     newElem.compareWithBSONElement(oldElem, nullptr, false) == 0);
         }
     }
 
-    if (applyParams.logBuilder) {
-        auto replacementObject = applyParams.logBuilder->getDocument().end();
-        invariant(applyParams.logBuilder->getReplacementObject(&replacementObject));
-        for (auto current = applyParams.element.leftChild(); current.ok();
-             current = current.rightSibling()) {
-            invariant(replacementObject.appendElement(current.getValue()));
-        }
-    }
-
-    return ApplyResult();
+    return ret;
 }
 
 UpdateExecutor::ApplyResult ObjectReplaceExecutor::applyUpdate(ApplyParams applyParams) const {
-    return applyReplacementUpdate(applyParams, _replacementDoc, _containsId);
-}
+    auto ret = applyReplacementUpdate(applyParams, _replacementDoc, _containsId);
 
+    if (!ret.noop && applyParams.logMode != ApplyParams::LogMode::kDoNotGenerateOplogEntry) {
+        ret.oplogEntry = update_oplog_entry::makeReplacementOplogEntry(
+            applyParams.element.getDocument().getObject());
+    }
+    return ret;
+}
 }  // namespace mongo

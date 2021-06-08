@@ -86,11 +86,19 @@ public:
     Status writePid();
 
     /**
+     * Writes the string to file.
+     * Fails if lock file has not been opened.
+     */
+    Status writeString(StringData str);
+
+    /**
      * Truncates file contents and releases file locks.
      */
     void clearPidAndUnlock();
 
 private:
+    std::string _getNonExistentPathMessage() const;
+
     std::string _dbpath;
     std::string _filespec;
     bool _uncleanShutdown;

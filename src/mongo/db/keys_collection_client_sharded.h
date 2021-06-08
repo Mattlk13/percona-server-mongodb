@@ -40,14 +40,25 @@ public:
     KeysCollectionClientSharded(ShardingCatalogClient*);
 
     /**
-     * Returns keys for the given purpose and with an expiresAt value greater than newerThanThis.
+     * Returns keys in the config server's admin.system.keys that match the given purpose and have
+     * an expiresAt value greater than newerThanThis. Uses readConcern level majority if possible.
      */
-    StatusWith<std::vector<KeysCollectionDocument>> getNewKeys(
-        OperationContext* opCtx, StringData purpose, const LogicalTime& newerThanThis) override;
+    StatusWith<std::vector<KeysCollectionDocument>> getNewInternalKeys(
+        OperationContext* opCtx,
+        StringData purpose,
+        const LogicalTime& newerThanThis,
+        bool useMajority) override;
 
     /**
-    * Directly inserts a key document to the storage
-    */
+     * Returns validation-only keys copied from other clusters that match the given purpose.
+     * Currently, a sharded cluster never copies cluster time keys from other clusters.
+     */
+    StatusWith<std::vector<ExternalKeysCollectionDocument>> getAllExternalKeys(
+        OperationContext* opCtx, StringData purpose) override;
+
+    /**
+     * Directly inserts a key document to the storage
+     */
     Status insertNewKey(OperationContext* opCtx, const BSONObj& doc) override;
 
     bool supportsMajorityReads() const final {

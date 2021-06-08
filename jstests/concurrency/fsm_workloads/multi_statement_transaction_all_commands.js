@@ -7,7 +7,6 @@
  */
 load('jstests/concurrency/fsm_workload_helpers/cleanup_txns.js');
 var $config = (function() {
-
     function quietly(func) {
         const printOriginal = print;
         try {
@@ -114,7 +113,8 @@ var $config = (function() {
             do {
                 try {
                     shouldJoin = false;
-                    quietly(() => this.session.commitTransaction());
+                    quietly(() =>
+                                assert.commandWorked(this.session.commitTransaction_forTesting()));
                 } catch (e) {
                     if (e.code === ErrorCodes.TransactionTooOld ||
                         e.code === ErrorCodes.TransactionCommitted ||
@@ -215,5 +215,4 @@ var $config = (function() {
         setup: setup,
         teardown: teardown
     };
-
 })();

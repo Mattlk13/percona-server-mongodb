@@ -35,12 +35,14 @@
 
 #include "mongo/db/index/multikey_paths.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/storage/key_string.h"
 
 namespace mongo {
 
 struct MultikeyPathInfo {
     NamespaceString nss;
     std::string indexName;
+    KeyStringSet multikeyMetadataKeys;
     MultikeyPaths multikeyPaths;
 };
 
@@ -56,7 +58,17 @@ class MultikeyPathTracker {
 public:
     static const OperationContext::Decoration<MultikeyPathTracker> get;
 
+    /**
+     * Returns a string representation of MultikeyPaths for logging.
+     */
+    static std::string dumpMultikeyPaths(const MultikeyPaths& multikeyPaths);
+
     static void mergeMultikeyPaths(MultikeyPaths* toMergeInto, const MultikeyPaths& newPaths);
+
+    /**
+     * Return true iff the child's paths are a subset of the parent.
+     */
+    static bool covers(const MultikeyPaths& parent, const MultikeyPaths& child);
 
     // Decoration requires a default constructor.
     MultikeyPathTracker() = default;

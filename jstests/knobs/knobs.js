@@ -6,12 +6,6 @@ var adminDB = db.getSiblingDB('admin');
     assert.commandWorked(c);
     assert.eq(c.cursorTimeoutMillis, 9)
 }
-// test failIndexKeyTooLong
-{
-    var c = adminDB.runCommand({ getParameter: 1, failIndexKeyTooLong: 1});
-    assert.commandWorked(c);
-    assert.eq(c.failIndexKeyTooLong, false)
-}
 // test internalQueryPlannerEnableIndexIntersection
 {
     var c = adminDB.runCommand({ getParameter: 1, internalQueryPlannerEnableIndexIntersection: 1});

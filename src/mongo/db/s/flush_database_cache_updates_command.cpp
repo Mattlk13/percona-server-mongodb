@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -50,15 +50,14 @@
 #include "mongo/s/request_types/flush_database_cache_updates_gen.h"
 
 
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 namespace {
 
-class FlushDatabaseCacheUpdatesCmd final : public TypedCommand<FlushDatabaseCacheUpdatesCmd> {
+template <typename Derived>
+class FlushDatabaseCacheUpdatesCmdBase : public TypedCommand<Derived> {
 public:
-    using Request = _flushDatabaseCacheUpdates;
-
     std::string help() const override {
         return "Internal command which waits for any pending routing table cache updates for a "
                "particular database to be written locally. The operationTime returned in the "
@@ -72,13 +71,14 @@ public:
         return true;
     }
 
-    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
-        return AllowedOnSecondary::kNever;
+    Command::AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return Command::AllowedOnSecondary::kNever;
     }
 
-    class Invocation final : public InvocationBase {
+    class Invocation final : public TypedCommand<Derived>::InvocationBase {
     public:
-        using InvocationBase::InvocationBase;
+        using Base = typename TypedCommand<Derived>::InvocationBase;
+        using Base::Base;
 
         /**
          * ns() is the database to flush, with no collection.
@@ -88,7 +88,7 @@ public:
         }
 
         bool supportsWriteConcern() const override {
-            return false;
+            return Derived::supportsWriteConcern();
         }
 
         void doCheckAuthorization(OperationContext* opCtx) const override {
@@ -115,23 +115,16 @@ public:
 
             {
                 AutoGetDb autoDb(opCtx, _dbName(), MODE_IS);
-                if (!autoDb.getDb()) {
-                    uasserted(ErrorCodes::NamespaceNotFound,
-                              str::stream()
-                                  << "Can't issue _flushDatabaseCacheUpdates on the database "
-                                  << _dbName()
-                                  << " because it does not exist on this shard.");
-                }
 
                 // If the primary is in the critical section, secondaries must wait for the commit
                 // to finish on the primary in case a secondary's caller has an afterClusterTime
                 // inclusive of the commit (and new writes to the committed chunk) that hasn't yet
                 // propagated back to this shard. This ensures the read your own writes causal
                 // consistency guarantee.
-                auto& dss = DatabaseShardingState::get(autoDb.getDb());
-                auto dssLock = DatabaseShardingState::DSSLock::lock(opCtx, &dss);
+                const auto dss = DatabaseShardingState::get(opCtx, _dbName());
+                auto dssLock = DatabaseShardingState::DSSLock::lockShared(opCtx, dss);
 
-                if (auto criticalSectionSignal = dss.getCriticalSectionSignal(
+                if (auto criticalSectionSignal = dss->getCriticalSectionSignal(
                         ShardingMigrationCriticalSection::kRead, dssLock)) {
                     oss.setMigrationCriticalSectionSignal(criticalSectionSignal);
                 }
@@ -139,8 +132,12 @@ public:
 
             oss.waitForMigrationCriticalSectionSignal(opCtx);
 
-            if (request().getSyncFromConfig()) {
-                LOG(1) << "Forcing remote routing table refresh for " << _dbName();
+            if (Base::request().getSyncFromConfig()) {
+                LOGV2_DEBUG(21981,
+                            1,
+                            "Forcing remote routing table refresh for {db}",
+                            "Forcing remote routing table refresh",
+                            "db"_attr = _dbName());
                 forceDatabaseRefresh(opCtx, _dbName());
             }
 
@@ -151,10 +148,30 @@ public:
 
     private:
         StringData _dbName() const {
-            return request().getCommandParameter();
+            return Base::request().getCommandParameter();
         }
     };
-} _flushDatabaseCacheUpdatesCmd;
+};
+
+class FlushDatabaseCacheUpdatesCmd final
+    : public FlushDatabaseCacheUpdatesCmdBase<FlushDatabaseCacheUpdatesCmd> {
+public:
+    using Request = _flushDatabaseCacheUpdates;
+
+    static bool supportsWriteConcern() {
+        return false;
+    }
+} _flushDatabaseCacheUpdates;
+
+class FlushDatabaseCacheUpdatesWithWriteConcernCmd final
+    : public FlushDatabaseCacheUpdatesCmdBase<FlushDatabaseCacheUpdatesWithWriteConcernCmd> {
+public:
+    using Request = _flushDatabaseCacheUpdatesWithWriteConcern;
+
+    static bool supportsWriteConcern() {
+        return true;
+    }
+} _flushDatabaseCacheUpdatesWithWriteConcern;
 
 }  // namespace
 }  // namespace mongo

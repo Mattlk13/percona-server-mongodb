@@ -47,10 +47,10 @@ requireSSLProvider('apple', function() {
                 return log.search('Certificate selector returned no results') >= 0;
             }
             // Valid search criteria should show our Subject Names.
-            const certOK = log.search('Server Certificate Name: ' + cert.name) >= 0;
-            const clusOK = log.search('Client Certificate Name: ' + cluster.name) >= 0;
+            const certOK = log.search('\"name\":\"' + cert.name) >= 0;
+            const clusOK = log.search('\"name\":\"' + cluster.name) >= 0;
             return certOK && clusOK;
-        }, "Starting Mongod with " + tojson(opts), 10000);
+        }, "Starting Mongod with " + tojson(opts), 60000);
 
         try {
             MongoRunner.stopMongod(mongod);

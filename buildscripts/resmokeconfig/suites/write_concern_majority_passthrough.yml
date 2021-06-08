@@ -6,18 +6,11 @@ selector:
   exclude_files:
   # Operations within a transaction do not support write concern.
   - jstests/core/txns/**/*.js
-  # These tests are not expected to pass with replica-sets:
-  - jstests/core/dbadmin.js
-  - jstests/core/opcounters_write_cmd.js
-  - jstests/core/read_after_optime.js
-  - jstests/core/capped_update.js
-  # These tests attempt to read from the "system.profile" collection, which may be missing entries
-  # if a write was performed on the primary of the replica set instead.
-  - jstests/core/*profile*.js
   # The shellkillop.js test spawns a parallel shell without using startParallelShell() and therefore
   # doesn't inherit the w="majority" write concern when performing its writes.
   - jstests/core/shellkillop.js
   exclude_with_any_tags:
+  - assumes_standalone_mongod
   ##
   # The next three tags correspond to the special errors thrown by the
   # set_read_and_write_concerns.js override when it refuses to replace the readConcern or
@@ -37,6 +30,9 @@ selector:
   # "Cowardly refusing to run test with overridden read preference when it reads from a
   #  non-replicated collection: ..."
   - assumes_read_preference_unchanged
+  # These tests attempt to read from the "system.profile" collection, which may be missing entries
+  # if a write was performed on the primary of the replica set instead.
+  - requires_profiling
 
 executor:
   archive:
@@ -53,7 +49,6 @@ executor:
         testingReplication = true;
         load('jstests/libs/override_methods/set_read_and_write_concerns.js');
         load('jstests/libs/override_methods/set_read_preference_secondary.js');
-        load('jstests/libs/override_methods/causally_consistent_index_builds.js');
       readMode: commands
   hooks:
   # The CheckReplDBHash hook waits until all operations have replicated to and have been applied
@@ -72,5 +67,4 @@ executor:
     # This suite requires w="majority" writes to be applied on all secondaries. By using a 2-node
     # replica set and having secondaries vote, the majority of the replica set is all nodes.
     num_nodes: 2
-    voting_secondaries: true
     use_replica_set_connection_string: true

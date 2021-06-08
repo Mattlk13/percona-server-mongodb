@@ -3,14 +3,18 @@
 The API also provides methods to access specific fields present in the mongodb/mongo
 configuration file.
 """
+from __future__ import annotations
 
 import datetime
 import distutils.spawn  # pylint: disable=no-name-in-module
 import re
+from typing import Set
 
 import yaml
 
 import buildscripts.util.runcommand as runcommand
+
+ENTERPRISE_MODULE_NAME = "enterprise"
 
 
 def parse_evergreen_file(path, evergreen_binary="evergreen"):
@@ -79,9 +83,17 @@ class EvergreenProjectConfig(object):  # pylint: disable=too-many-instance-attri
         """Get the list of build variant names."""
         return list(self._variants_by_name.keys())
 
-    def get_variant(self, variant_name):
+    def get_variant(self, variant_name: str) -> Variant:
         """Return the variant with the given name as a Variant instance."""
         return self._variants_by_name.get(variant_name)
+
+    def get_required_variants(self) -> Set[Variant]:
+        """Get the list of required build variants."""
+        return {variant for variant in self.variants if variant.is_required_variant()}
+
+    def get_task_names_by_tag(self, tag):
+        """Return the list of tasks that have the given tag."""
+        return list(task.name for task in self.tasks if tag in task.tags)
 
 
 class Task(object):
@@ -111,12 +123,20 @@ class Task(object):
     @property
     def generate_resmoke_tasks_command(self):
         """Return the 'generate resmoke tasks' command if found, or None."""
-        return self._find_func_command("generate resmoke tasks")
+        func = self._find_func_command("generate resmoke tasks")
+        return func if func is not None else self._find_func_command(
+            "generate randomized multiversion tasks")
+
+    @property
+    def generate_randomized_multiversion_command(self):
+        """Return the 'generate resmoke tasks' command if found, or None."""
+        return self._find_func_command("generate randomized multiversion tasks")
 
     @property
     def is_generate_resmoke_task(self):
         """Return True if 'generate resmoke tasks' command is found."""
-        return self.generate_resmoke_tasks_command is not None
+        return (self.generate_resmoke_tasks_command is not None
+                or self.generate_randomized_multiversion_command is not None)
 
     @property
     def run_tests_command(self):
@@ -251,6 +271,10 @@ class Variant(object):
         for task in self.tasks:
             self.distro_names.update(task.run_on)
 
+    def __repr__(self):
+        """Create a string version of object for debugging."""
+        return self.name
+
     @property
     def name(self):
         """Get the build variant name."""
@@ -276,6 +300,10 @@ class Variant(object):
         modules = self.raw.get("modules")
         return modules if modules is not None else []
 
+    def is_enterprise_build(self) -> bool:
+        """Determine if this build variant include the enterprise module."""
+        return ENTERPRISE_MODULE_NAME in set(self.modules)
+
     @property
     def run_on(self):
         """Get build variant run_on parameter as a list of distro names."""
@@ -286,6 +314,10 @@ class Variant(object):
     def task_names(self):
         """Get list of task names."""
         return [t.name for t in self.tasks]
+
+    def is_required_variant(self) -> bool:
+        """Return True if the variant is a required variant."""
+        return self.display_name.startswith("! ")
 
     def get_task(self, task_name):
         """Return the task with the given name as an instance of VariantTask.
@@ -307,6 +339,11 @@ class Variant(object):
         return self.raw.get("expansions", {}).get(name)
 
     @property
+    def expansions(self):
+        """Get the expansions."""
+        return self.raw.get("expansions", [])
+
+    @property
     def test_flags(self):
         """Get the value of the test_flags expansion or None if not found."""
         return self.expansion("test_flags")
@@ -325,6 +362,10 @@ class VariantTask(Task):
         Task.__init__(self, task.raw)
         self.run_on = run_on
         self.variant = variant
+
+    def __repr__(self):
+        """Create a string representation of object for debugging."""
+        return f"{self.variant}: {self.name}"
 
     @property
     def combined_resmoke_args(self):
@@ -351,15 +392,22 @@ class ResmokeArgs(object):
         return re.compile(r"(?P<name_value>--{}[=\s](?P<value>([(\w+,\w+)\w]+)))".format(name))
 
     @staticmethod
-    def _get_first_match(resmoke_args, name, group_name=None):
+    def _arg_regex_inclusive_trailing_whitespace(name):
+        """Return the regex for a resmoke arg, including the trailing whitespace if it exists."""
+        return re.compile(r"(?P<name_value>--{}[=\s](?P<value>([(\w+,\w+)\w]+))\s?)".format(name))
+
+    @staticmethod
+    def _get_first_match(resmoke_args, name, group_name=None, include_trailing_space=False):
         """Return first matching occurrence and matching group_name, or None."""
-        matches = re.findall(ResmokeArgs._arg_regex(name), resmoke_args)
+        regex = ResmokeArgs._arg_regex_inclusive_trailing_whitespace(
+            name) if include_trailing_space else ResmokeArgs._arg_regex(name)
+        matches = re.findall(regex, resmoke_args)
         if not matches:
             return None
         if len(matches) > 1:
             raise RuntimeError("More than one match for --{} discovered in {}".format(
                 name, resmoke_args))
-        return re.search(ResmokeArgs._arg_regex(name), resmoke_args).group(group_name)
+        return re.search(regex, resmoke_args).group(group_name)
 
     @staticmethod
     def get_arg(resmoke_args, name):
@@ -370,7 +418,7 @@ class ResmokeArgs(object):
         return ResmokeArgs._get_first_match(resmoke_args, name, "value")
 
     @staticmethod
-    def get_updated_arg(resmoke_args, name, value):
+    def set_updated_arg(resmoke_args, name, value):
         """Add or update the 'resmoke_args' string and set the 'value' from the first --'name'.
 
         Raise an exception in the case there is more than one occurrence of '--name'.
@@ -380,3 +428,20 @@ class ResmokeArgs(object):
             new_name_value = "--{}={}".format(name, value)
             return resmoke_args.replace(name_value, new_name_value)
         return "{} --{}={}".format(resmoke_args, name, value)
+
+    @staticmethod
+    def remove_arg(resmoke_args: str, name: str):
+        """
+        Remove an arg from the 'resmoke_args' string.
+
+        Raise an exception in the case there is more than one occurrence of '--name'.
+
+        :param resmoke_args: The resmoke args being parsed.
+        :param name: The name of the arg to be removed.
+        :return: New resmoke args with the arg removed.
+        """
+        name_value = ResmokeArgs._get_first_match(resmoke_args, name, "name_value",
+                                                  include_trailing_space=True)
+        if name_value:
+            return resmoke_args.replace(name_value, "")
+        return resmoke_args

@@ -1,3 +1,5 @@
+load("jstests/libs/logv2_helpers.js");
+
 const kSnapshotErrors =
     [ErrorCodes.SnapshotTooOld, ErrorCodes.SnapshotUnavailable, ErrorCodes.StaleChunkHistory];
 
@@ -13,27 +15,27 @@ function getCoordinatorFailpoints() {
     const coordinatorFailpointDataArr = [
         {failpoint: "hangBeforeWritingParticipantList", numTimesShouldBeHit: 1},
         {
-          // Test targeting remote nodes for prepare
-          failpoint: "hangWhileTargetingRemoteHost",
-          numTimesShouldBeHit: 2 /* once per remote participant */
+            // Test targeting remote nodes for prepare
+            failpoint: "hangWhileTargetingRemoteHost",
+            numTimesShouldBeHit: 2 /* once per remote participant */
         },
         {
-          // Test targeting local node for prepare
-          failpoint: "hangWhileTargetingLocalHost",
-          numTimesShouldBeHit: 1
+            // Test targeting local node for prepare
+            failpoint: "hangWhileTargetingLocalHost",
+            numTimesShouldBeHit: 1
         },
         {failpoint: "hangBeforeWritingDecision", numTimesShouldBeHit: 1},
         {
-          // Test targeting remote nodes for decision
-          failpoint: "hangWhileTargetingRemoteHost",
-          numTimesShouldBeHit: 2, /* once per remote participant */
-          skip: 2                 /* to skip when the failpoint is hit for prepare */
+            // Test targeting remote nodes for decision
+            failpoint: "hangWhileTargetingRemoteHost",
+            numTimesShouldBeHit: 2, /* once per remote participant */
+            skip: 2                 /* to skip when the failpoint is hit for prepare */
         },
         {
-          // Test targeting local node for decision
-          failpoint: "hangWhileTargetingLocalHost",
-          numTimesShouldBeHit: 1,
-          skip: 1 /* to skip when the failpoint is hit for prepare */
+            // Test targeting local node for decision
+            failpoint: "hangWhileTargetingLocalHost",
+            numTimesShouldBeHit: 1,
+            skip: 1 /* to skip when the failpoint is hit for prepare */
         },
         {failpoint: "hangBeforeDeletingCoordinatorDoc", numTimesShouldBeHit: 1},
     ];
@@ -42,16 +44,29 @@ function getCoordinatorFailpoints() {
     return coordinatorFailpointDataArr.map(failpoint => Object.assign({}, failpoint));
 }
 
-function setFailCommandOnShards(st, mode, commands, code, numShards) {
+function setFailCommandOnShards(st, mode, commands, code, numShards, ns) {
     for (let i = 0; i < numShards; i++) {
         const shardConn = st["rs" + i].getPrimary();
         // Sharding tests require failInternalCommands: true, since the mongos appears to mongod to
         // be an internal client.
-        assert.commandWorked(shardConn.adminCommand({
-            configureFailPoint: "failCommand",
-            mode: mode,
-            data: {errorCode: code, failCommands: commands, failInternalCommands: true}
-        }));
+        if (ns) {
+            assert.commandWorked(shardConn.adminCommand({
+                configureFailPoint: "failCommand",
+                mode: mode,
+                data: {
+                    namespace: ns,
+                    errorCode: code,
+                    failCommands: commands,
+                    failInternalCommands: true
+                }
+            }));
+        } else {
+            assert.commandWorked(shardConn.adminCommand({
+                configureFailPoint: "failCommand",
+                mode: mode,
+                data: {errorCode: code, failCommands: commands, failInternalCommands: true}
+            }));
+        }
     }
 }
 
@@ -70,23 +85,60 @@ function assertNoSuchTransactionOnAllShards(st, lsid, txnNumber) {
 }
 
 function assertNoSuchTransactionOnConn(conn, lsid, txnNumber) {
-    assert.commandFailedWithCode(conn.getDB("foo").runCommand({
-        find: "bar",
-        lsid: lsid,
-        txnNumber: NumberLong(txnNumber),
-        autocommit: false,
-    }),
-                                 ErrorCodes.NoSuchTransaction,
-                                 "expected there to be no active transaction on shard, lsid: " +
-                                     tojson(lsid) + ", txnNumber: " + tojson(txnNumber) +
-                                     ", connection: " + tojson(conn));
+    assert.commandFailedWithCode(
+        conn.getDB("foo").runCommand({
+            find: "bar",
+            lsid: lsid,
+            txnNumber: NumberLong(txnNumber),
+            autocommit: false,
+        }),
+        ErrorCodes.NoSuchTransaction,
+        "expected there to be no active transaction on shard, lsid: " + tojson(lsid) +
+            ", txnNumber: " + tojson(txnNumber) + ", connection: " + tojson(conn));
 }
 
-function waitForFailpoint(hitFailpointStr, numTimes) {
-    assert.soon(function() {
-        const re = new RegExp(hitFailpointStr, 'g' /* find all occurrences */);
-        return (rawMongoProgramOutput().match(re) || []).length == numTimes;
-    }, 'Failed to find "' + hitFailpointStr + '" logged ' + numTimes + ' times');
+function waitForFailpoint(hitFailpointStr, numTimes, timeout) {
+    // Don't run the hang analyzer because we don't expect waitForFailpoint() to always succeed.
+    if (isJsonLogNoConn()) {
+        const hitFailpointRe = /Hit (\w+) failpoint/;
+        const hitRe = /Hit (\w+)/;
+        const matchHitFailpoint = hitFailpointStr.match(hitFailpointRe);
+        const matchHit = hitFailpointStr.match(hitRe);
+        if (matchHitFailpoint) {
+            hitFailpointStr = `(Hit .+ failpoint.*${matchHitFailpoint[1]}|${hitFailpointStr})`;
+        } else {
+            hitFailpointStr = `(Hit .+.*${matchHit[1]}|${hitFailpointStr})`;
+        }
+    }
+    assert.soon(
+        function() {
+            const re = new RegExp(hitFailpointStr, 'g' /* find all occurrences */);
+            return (rawMongoProgramOutput().match(re) || []).length == numTimes;
+        },
+        'Failed to find "' + hitFailpointStr + '" logged ' + numTimes + ' times',
+        timeout,
+        undefined,
+        {runHangAnalyzer: false});
+}
+
+/*
+ * If all shards in the cluster have binVersion "lastest", sets the server parameter for
+ * making the transaction coordinator return decision early to true.
+ * TODO (SERVER-48114): Remove this function.
+ */
+function enableCoordinateCommitReturnImmediatelyAfterPersistingDecision(st) {
+    if (jsTest.options().shardMixedBinVersions ||
+        jsTest.options().useRandomBinVersionsWithinReplicaSet)
+        return;
+
+    st._rs.forEach(rs => {
+        rs.nodes.forEach(node => {
+            assert.commandWorked(node.getDB('admin').runCommand({
+                setParameter: 1,
+                "coordinateCommitReturnImmediatelyAfterPersistingDecision": true
+            }));
+        });
+    });
 }
 
 // Enables the transaction router to retry on stale version (db or shard version) and snapshot

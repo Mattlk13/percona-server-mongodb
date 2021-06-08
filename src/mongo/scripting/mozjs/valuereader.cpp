@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -39,11 +39,11 @@
 #include <js/Date.h>
 
 #include "mongo/base/error_codes.h"
+#include "mongo/logv2/log.h"
 #include "mongo/platform/decimal128.h"
 #include "mongo/scripting/mozjs/implscope.h"
 #include "mongo/scripting/mozjs/objectwrapper.h"
 #include "mongo/util/base64.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace mozjs {
@@ -73,12 +73,13 @@ void ValueReader::fromBSONElement(const BSONElement& elem, const BSONObj& parent
                 JS::AutoValueArray<2> args(_context);
 
                 ValueReader(_context, args[0]).fromStringData(elem.codeWScopeCode());
-                ValueReader(_context, args[1]).fromBSON(elem.codeWScopeObject(), nullptr, readOnly);
+                ValueReader(_context, args[1])
+                    .fromBSON(elem.codeWScopeObject().getOwned(), nullptr, readOnly);
 
                 scope->getProto<CodeInfo>().newInstance(args, _value);
             } else {
                 if (!elem.codeWScopeObject().isEmpty())
-                    warning() << "CodeWScope doesn't transfer to db.eval";
+                    LOGV2_WARNING(23826, "CodeWScope doesn't transfer to db.eval");
                 scope->newFunction(StringData(elem.codeWScopeCode(), elem.codeWScopeCodeLen() - 1),
                                    _value);
             }
@@ -119,8 +120,6 @@ void ValueReader::fromBSONElement(const BSONElement& elem, const BSONObj& parent
             _value.setUndefined();
             return;
         case mongo::RegEx: {
-            // TODO parse into a custom type that can support any patterns and flags SERVER-9803
-
             JS::AutoValueArray<2> args(_context);
 
             ValueReader(_context, args[0]).fromStringData(elem.regex());
@@ -137,7 +136,7 @@ void ValueReader::fromBSONElement(const BSONElement& elem, const BSONObj& parent
             int len;
             const char* data = elem.binData(len);
             std::stringstream ss;
-            base64::encode(ss, data, len);
+            base64::encode(ss, StringData(data, len));
 
             JS::AutoValueArray<2> args(_context);
 

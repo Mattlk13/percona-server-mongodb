@@ -304,6 +304,15 @@ class TestParser(testcase.IDLTestcase):
                     foo: bar
             """))
 
+        # Missing fields
+        self.assert_parse(
+            textwrap.dedent("""
+        structs:
+            foo:
+                description: foo
+                strict: true
+            """))
+
     def test_struct_negative(self):
         # type: () -> None
         """Negative struct test cases."""
@@ -314,15 +323,6 @@ class TestParser(testcase.IDLTestcase):
         structs:
             foo: foo
             """), idl.errors.ERROR_ID_IS_NODE_TYPE)
-
-        # Missing fields
-        self.assert_parse_fail(
-            textwrap.dedent("""
-        structs:
-            foo:
-                description: foo
-                strict: true
-            """), idl.errors.ERROR_ID_EMPTY_FIELDS)
 
         # unknown field
         self.assert_parse_fail(
@@ -390,6 +390,90 @@ class TestParser(testcase.IDLTestcase):
                     foo: bar
             """), idl.errors.ERROR_ID_UNKNOWN_NODE)
 
+    def test_variant_positive(self):
+        # type: () -> None
+        """Positive variant test cases."""
+
+        self.assert_parse(
+            textwrap.dedent("""
+        structs:
+            foo:
+                description: foo
+                fields:
+                    my_variant_field1:
+                        type:
+                            variant: [int, string]
+                    my_variant_field2:
+                        type:
+                            variant:
+                            - string
+                            - array<string>
+                            - object
+            """))
+
+    def test_variant_negative(self):
+        # type: () -> None
+        """Negative variant test cases."""
+
+        self.assert_parse_fail(
+            textwrap.dedent("""
+        structs:
+            foo:
+                description: foo
+                fields:
+                    my_variant_field:
+                        type:
+                            variant: {}
+            """), idl.errors.ERROR_ID_IS_NODE_TYPE)
+
+        self.assert_parse_fail(
+            textwrap.dedent("""
+        structs:
+            foo:
+                description: foo
+                fields:
+                    my_variant_field:
+                        type:
+                            variant: 1
+            """), idl.errors.ERROR_ID_IS_NODE_TYPE)
+
+        self.assert_parse_fail(
+            textwrap.dedent("""
+        structs:
+            foo:
+                description: foo
+                fields:
+                    my_variant_field:
+                        type:
+                            variant: []
+                            unknown_option: true
+            """), idl.errors.ERROR_ID_UNKNOWN_NODE)
+
+        self.assert_parse_fail(
+            textwrap.dedent("""
+        structs:
+            foo:
+                description: foo
+                fields:
+                    my_variant_field:
+                        type:
+                            variant:
+                            - string
+                            - {variant: [string, int]}
+            """), idl.errors.ERROR_ID_IS_NODE_TYPE)
+
+        self.assert_parse_fail(
+            textwrap.dedent("""
+        structs:
+            foo:
+                description: foo
+                generate_comparison_operators: true
+                fields:
+                    my_variant_field:
+                        type:
+                            variant: [string, int]
+            """), idl.errors.ERROR_ID_VARIANT_COMPARISON)
+
     def test_field_positive(self):
         # type: () -> None
         """Positive field test cases."""
@@ -418,6 +502,7 @@ class TestParser(testcase.IDLTestcase):
                         ignore: true
                         cpp_name: bar
                         comparison_order: 3
+                        unstable: true
             """))
 
         # Test false bools
@@ -432,6 +517,7 @@ class TestParser(testcase.IDLTestcase):
                         type: string
                         optional: false
                         ignore: false
+                        unstable: false
             """))
 
     def test_field_negative(self):
@@ -799,7 +885,7 @@ class TestParser(testcase.IDLTestcase):
                 deserializer: foo
                 default: foo
 
-        structs: 
+        structs:
             foo:
                 description: foo
                 strict: true
@@ -837,13 +923,17 @@ class TestParser(testcase.IDLTestcase):
             foo:
                 description: foo
                 strict: true
+                command_name: foo
                 namespace: ignored
+                api_version: 1
+                is_deprecated: true
                 immutable: true
                 inline_chained_structs: true
                 generate_comparison_operators: true
                 cpp_name: foo
                 fields:
                     foo: bar
+                reply_type: foo_reply_struct
             """))
 
         # All fields with false for bools
@@ -852,13 +942,50 @@ class TestParser(testcase.IDLTestcase):
         commands:
             foo:
                 description: foo
+                command_name: foo
                 strict: false
                 namespace: ignored
+                api_version: 1
+                is_deprecated: false
                 immutable: false
                 inline_chained_structs: false
                 generate_comparison_operators: false
                 fields:
                     foo: bar
+                reply_type: foo_reply_struct
+            """))
+
+        # All fields with false for bools, empty api_version
+        self.assert_parse(
+            textwrap.dedent("""
+        commands:
+            foo:
+                description: foo
+                command_name: foo
+                strict: false
+                namespace: ignored
+                api_version: ""
+                is_deprecated: false
+                immutable: false
+                inline_chained_structs: false
+                generate_comparison_operators: false
+                fields:
+                    foo: bar
+                reply_type: foo_reply_struct
+            """))
+
+        # Quoted api_version
+        self.assert_parse(
+            textwrap.dedent("""
+        commands:
+            foo:
+                description: foo
+                command_name: foo
+                namespace: ignored
+                api_version: "1"
+                fields:
+                    foo: bar
+                reply_type: foo_reply_struct
             """))
 
         # Namespace ignored
@@ -867,7 +994,9 @@ class TestParser(testcase.IDLTestcase):
         commands:
             foo:
                 description: foo
+                command_name: foo
                 namespace: ignored
+                api_version: ""
                 fields:
                     foo: bar
             """))
@@ -878,7 +1007,9 @@ class TestParser(testcase.IDLTestcase):
         commands:
             foo:
                 description: foo
+                command_name: foo
                 namespace: concatenate_with_db
+                api_version: ""
                 fields:
                     foo: bar
             """))
@@ -889,8 +1020,22 @@ class TestParser(testcase.IDLTestcase):
         commands:
             foo:
                 description: foo
+                command_name: foo
                 namespace: ignored
+                api_version: ""
                 strict: true
+            """))
+
+        # Reply type permitted without api_version
+        self.assert_parse(
+            textwrap.dedent("""
+        commands:
+            foo:
+                description: foo
+                command_name: foo
+                namespace: ignored
+                api_version: ""
+                reply_type: foo_reply_struct
             """))
 
     def test_command_negative(self):
@@ -910,7 +1055,9 @@ class TestParser(testcase.IDLTestcase):
         commands:
             foo:
                 description: foo
+                command_name: foo
                 namespace: ignored
+                api_version: ""
                 foo: bar
                 fields:
                     foo: bar
@@ -922,11 +1069,116 @@ class TestParser(testcase.IDLTestcase):
         commands:
             foo:
                 description: foo
+                command_name: foo
                 strict: bar
                 namespace: ignored
+                api_version: ""
                 fields:
                     foo: bar
             """), idl.errors.ERROR_ID_IS_NODE_VALID_BOOL)
+
+        # command_name is required
+        self.assert_parse_fail(
+            textwrap.dedent("""
+        commands:
+            foo:
+                description: foo
+                namespace: ignored
+                api_version: ""
+                fields:
+                    foo: bar
+            """), idl.errors.ERROR_ID_MISSING_REQUIRED_FIELD)
+
+        # command_name is a scalar
+        self.assert_parse_fail(
+            textwrap.dedent("""
+        commands:
+            foo:
+                description: foo
+                command_name: [1]
+                namespace: ignored
+                api_version: ""
+                fields:
+                    foo: bar
+            """), idl.errors.ERROR_ID_IS_NODE_TYPE, True)
+
+        self.assert_parse_fail(
+            textwrap.dedent("""
+        commands:
+            foo:
+                description: foo
+                command_name: ["1"]
+                namespace: ignored
+                api_version: ""
+                fields:
+                    foo: bar
+            """), idl.errors.ERROR_ID_IS_NODE_TYPE, True)
+
+        # is_deprecated is a bool
+        self.assert_parse_fail(
+            textwrap.dedent("""
+        commands:
+            foo:
+                description: foo
+                command_name: foo
+                namespace: ignored
+                api_version: ""
+                is_deprecated: bar
+                fields:
+                    foo: bar
+            """), idl.errors.ERROR_ID_IS_NODE_VALID_BOOL)
+
+        # api_version is required
+        self.assert_parse_fail(
+            textwrap.dedent("""
+        commands:
+            foo:
+                description: foo
+                command_name: foo
+                namespace: ignored
+                fields:
+                    foo: bar
+            """), idl.errors.ERROR_ID_MISSING_REQUIRED_FIELD, True)
+
+        # api_version is a scalar
+        self.assert_parse_fail(
+            textwrap.dedent("""
+        commands:
+            foo:
+                description: foo
+                command_name: foo
+                namespace: ignored
+                api_version: [1]
+                fields:
+                    foo: bar
+                reply_type: foo_reply_struct
+            """), idl.errors.ERROR_ID_IS_NODE_TYPE, True)
+
+        self.assert_parse_fail(
+            textwrap.dedent("""
+        commands:
+            foo:
+                description: foo
+                command_name: foo
+                namespace: ignored
+                api_version: ["1"]
+                fields:
+                    foo: bar
+                reply_type: foo_reply_struct
+            """), idl.errors.ERROR_ID_IS_NODE_TYPE, True)
+
+        # Must specify reply_type if api_version is non-empty
+        self.assert_parse_fail(
+            textwrap.dedent("""
+        commands:
+            foo:
+                description: foo
+                command_name: foo
+                namespace: ignored
+                api_version: 1
+                fields:
+                    foo: bar
+            """), idl.errors.ERROR_ID_MISSING_REPLY_TYPE)
 
         # Namespace is required
         self.assert_parse_fail(
@@ -934,6 +1186,8 @@ class TestParser(testcase.IDLTestcase):
         commands:
             foo:
                 description: foo
+                command_name: foo
+                api_version: ""
                 fields:
                     foo: bar
             """), idl.errors.ERROR_ID_MISSING_REQUIRED_FIELD)
@@ -944,7 +1198,9 @@ class TestParser(testcase.IDLTestcase):
         commands:
             foo:
                 description: foo
+                command_name: foo
                 namespace: foo
+                api_version: ""
                 fields:
                     foo: bar
             """), idl.errors.ERROR_ID_BAD_COMMAND_NAMESPACE)
@@ -964,13 +1220,15 @@ class TestParser(testcase.IDLTestcase):
         # Commands and structs with same name
         self.assert_parse_fail(
             test_preamble + textwrap.dedent("""
-            commands: 
+            commands:
                 foo:
                     description: foo
+                    command_name: foo
                     namespace: ignored
+                    api_version: ""
                     fields:
                         foo: string
-            
+
             structs:
                 foo:
                     description: foo
@@ -981,14 +1239,29 @@ class TestParser(testcase.IDLTestcase):
         # Commands and types with same name
         self.assert_parse_fail(
             test_preamble + textwrap.dedent("""
-            commands: 
+            commands:
                 string:
                     description: foo
+                    command_name: foo
                     namespace: ignored
+                    api_version: ""
                     strict: true
                     fields:
                         foo: string
             """), idl.errors.ERROR_ID_DUPLICATE_SYMBOL)
+
+        self.assert_parse_fail(
+            textwrap.dedent("""
+            commands:
+                foo:
+                    description: foo
+                    command_name: string
+                    namespace: ignored
+                    api_version: ""
+                    strict: true
+                    fields:
+                        foo: string
+            """) + test_preamble, idl.errors.ERROR_ID_DUPLICATE_SYMBOL)
 
         # Namespace concatenate_with_db
         self.assert_parse_fail(
@@ -996,11 +1269,26 @@ class TestParser(testcase.IDLTestcase):
         commands:
             foo:
                 description: foo
+                command_name: foo
                 namespace: concatenate_with_db
+                api_version: ""
                 type: foobar
                 fields:
                     foo: bar
             """), idl.errors.ERROR_ID_IS_COMMAND_TYPE_EXTRANEOUS)
+
+        # Reply type must be a scalar, not a mapping
+        self.assert_parse_fail(
+            textwrap.dedent("""
+        commands:
+            foo:
+                description: foo
+                command_name: foo
+                namespace: ignored
+                api_version: ""
+                reply_type:
+                    arbitrary_field: foo
+            """), idl.errors.ERROR_ID_IS_NODE_TYPE)
 
     def test_command_doc_sequence_positive(self):
         # type: () -> None
@@ -1013,11 +1301,13 @@ class TestParser(testcase.IDLTestcase):
         commands:
             foo:
                 description: foo
+                command_name: foo
                 namespace: ignored
+                api_version: ""
                 fields:
                     foo:
                         type: bar
-                        supports_doc_sequence: false 
+                        supports_doc_sequence: false
             """))
 
         # supports_doc_sequence can be true
@@ -1026,7 +1316,9 @@ class TestParser(testcase.IDLTestcase):
         commands:
             foo:
                 description: foo
+                command_name: foo
                 namespace: ignored
+                api_version: ""
                 fields:
                     foo:
                         type: bar
@@ -1044,7 +1336,9 @@ class TestParser(testcase.IDLTestcase):
         commands:
             foo:
                 description: foo
+                command_name: foo
                 namespace: ignored
+                api_version: ""
                 fields:
                     foo:
                         type: bar
@@ -1060,8 +1354,10 @@ class TestParser(testcase.IDLTestcase):
         commands:
             foo:
                 description: foo
+                command_name: foo
                 strict: true
                 namespace: type
+                api_version: ""
                 type: string
                 fields:
                     foo: bar
@@ -1073,8 +1369,10 @@ class TestParser(testcase.IDLTestcase):
         commands:
             foo:
                 description: foo
+                command_name: foo
                 strict: true
                 namespace: type
+                api_version: ""
                 type: array<string>
                 fields:
                     foo: bar
@@ -1086,8 +1384,10 @@ class TestParser(testcase.IDLTestcase):
         commands:
             foo:
                 description: foo
+                command_name: foo
                 strict: true
                 namespace: type
+                api_version: ""
                 type: string
             """))
 
@@ -1101,10 +1401,49 @@ class TestParser(testcase.IDLTestcase):
         commands:
             foo:
                 description: foo
+                command_name: foo
                 namespace: type
+                api_version: ""
                 fields:
                     foo: bar
             """), idl.errors.ERROR_ID_MISSING_REQUIRED_FIELD)
+
+    def test_unstable_positive(self):
+        # type: () -> None
+        """Positive unstable-field test cases."""
+        for unstable in ("true", "false"):
+            self.assert_parse(
+                textwrap.dedent(f"""
+            commands:
+                foo:
+                    description: foo
+                    command_name: foo
+                    namespace: ignored
+                    api_version: "1"
+                    fields:
+                        foo:
+                            type: bar
+                            unstable: {unstable}
+                    reply_type: foo_reply_struct
+                """))
+
+    def test_unstable_negative(self):
+        # type: () -> None
+        """Negative unstable-field test cases."""
+        self.assert_parse_fail(
+            textwrap.dedent("""
+        commands:
+            foo:
+                description: foo
+                command_name: foo
+                namespace: ignored
+                api_version: ""
+                fields:
+                    foo:
+                        type: bar
+                        unstable: true
+                reply_type: foo_reply_struct
+            """), idl.errors.ERROR_ID_UNSTABLE_NO_API_VERSION)
 
     def test_scalar_or_mapping_negative(self):
         # type: () -> None
@@ -1122,6 +1461,404 @@ class TestParser(testcase.IDLTestcase):
                 - one
                 - two
             """), idl.errors.ERROR_ID_IS_NODE_TYPE_SCALAR_OR_MAPPING)
+
+    def test_feature_flag(self):
+        # type: () -> None
+        """Test feature flag."""
+
+        # Missing default
+        self.assert_parse_fail(
+            textwrap.dedent("""
+            feature_flags:
+                featureFlagToaster:
+                    description: "Make toast"
+                    cpp_varname: gToaster
+            """), idl.errors.ERROR_ID_MISSING_REQUIRED_FIELD)
+
+    def _test_field_list(self, field_list_name, should_forward_name):
+        # type: (str, str) -> None
+        """Positive field list test cases."""
+
+        # Generic field with no options
+        self.assert_parse(
+            textwrap.dedent(f"""
+        {field_list_name}:
+            foo:
+                description: foo
+                fields:
+                    foo: {{}}
+            """))
+
+        # All fields with true for bools
+        self.assert_parse(
+            textwrap.dedent(f"""
+        {field_list_name}:
+            foo:
+                description: foo
+                fields:
+                    foo:
+                        {should_forward_name}: true
+            """))
+
+        # All fields with false for bools
+        self.assert_parse(
+            textwrap.dedent(f"""
+        {field_list_name}:
+            foo:
+                description: foo
+                fields:
+                    foo:
+                        {should_forward_name}: false
+            """))
+
+        # cpp_name.
+        self.assert_parse(
+            textwrap.dedent(f"""
+        {field_list_name}:
+            foo:
+                description: foo
+                cpp_name: foo
+                fields:
+                    foo: {{}}
+            """))
+
+    def _test_field_list_negative(self, field_list_name, should_forward_name):
+        # type: (str, str) -> None
+        """Negative field list test cases."""
+
+        # Field list as a scalar
+        self.assert_parse_fail(
+            textwrap.dedent(f"""
+        {field_list_name}:
+            foo: 1
+            """), idl.errors.ERROR_ID_IS_NODE_TYPE)
+
+        # No description
+        self.assert_parse_fail(
+            textwrap.dedent(f"""
+        {field_list_name}:
+            foo:
+                fields:
+                    foo: {{}}
+            """), idl.errors.ERROR_ID_MISSING_REQUIRED_FIELD)
+
+        # Unknown option
+        self.assert_parse_fail(
+            textwrap.dedent(f"""
+        {field_list_name}:
+            foo:
+                description: foo
+                foo: bar
+                fields:
+                    foo: {{}}
+            """), idl.errors.ERROR_ID_UNKNOWN_NODE)
+
+        # forward_to_shards is a bool.
+        self.assert_parse_fail(
+            textwrap.dedent(f"""
+        {field_list_name}:
+            foo:
+                description: foo
+                fields:
+                    foo:
+                        {should_forward_name}: asdf
+            """), idl.errors.ERROR_ID_IS_NODE_VALID_BOOL)
+
+        # forward_from_shards is a bool
+        self.assert_parse_fail(
+            textwrap.dedent(f"""
+        {field_list_name}:
+            foo:
+                description: foo
+                fields:
+                    foo:
+                        {should_forward_name}: asdf
+            """), idl.errors.ERROR_ID_IS_NODE_VALID_BOOL)
+
+    def test_generic_arguments_list(self):
+        # type: () -> None
+        """Positive generic argument list test cases."""
+        self._test_field_list("generic_argument_lists", "forward_to_shards")
+
+    def test_generic_arguments_list_negative(self):
+        # type: () -> None
+        """Negative generic argument list test cases."""
+        self._test_field_list_negative("generic_argument_lists", "forward_to_shards")
+
+    def test_generic_reply_fields_list(self):
+        # type: () -> None
+        """Positive generic reply fields list test cases."""
+        self._test_field_list("generic_reply_field_lists", "forward_from_shards")
+
+    def test_generic_reply_fields_list_negative(self):
+        # type: () -> None
+        """Negative generic reply fields list test cases."""
+        self._test_field_list_negative("generic_reply_field_lists", "forward_from_shards")
+
+    def test_command_alias(self):
+        # type: () -> None
+        """Test the 'command_alis' field."""
+
+        # The 'command_name' and 'command_alias' fields cannot have same value.
+        self.assert_parse_fail(
+            textwrap.dedent("""
+        commands:
+            foo:
+                description: foo
+                command_name: foo
+                command_alias: foo
+                namespace: ignored
+                api_version: 1
+                fields:
+                    foo:
+                        type: bar
+                reply_type: foo_reply_struct
+            """), idl.errors.ERROR_ID_COMMAND_DUPLICATES_NAME_AND_ALIAS)
+
+    def test_access_checks_positive(self):
+        # type: () -> None
+        """Positive access_check test cases."""
+
+        self.assert_parse(
+            textwrap.dedent("""
+        commands:
+            foo:
+                description: foo
+                command_name: foo
+                api_version: 1
+                namespace: ignored
+                access_check:
+                    ignore: true
+                fields:
+                    foo: bar
+                reply_type: foo_reply_struct
+            """))
+
+        self.assert_parse(
+            textwrap.dedent("""
+        commands:
+            foo:
+                description: foo
+                command_name: foo
+                api_version: 1
+                namespace: ignored
+                access_check:
+                    none: true
+                fields:
+                    foo: bar
+                reply_type: foo_reply_struct
+            """))
+
+        self.assert_parse(
+            textwrap.dedent("""
+        commands:
+            foo:
+                description: foo
+                command_name: foo
+                api_version: 1
+                namespace: ignored
+                access_check:
+                    simple:
+                        check: is_authenticated
+                fields:
+                    foo: bar
+                reply_type: foo_reply_struct
+            """))
+
+        self.assert_parse(
+            textwrap.dedent("""
+        commands:
+            foo:
+                description: foo
+                command_name: foo
+                api_version: 1
+                namespace: ignored
+                access_check:
+                    complex:
+                        - privilege:
+                            resource_pattern: foo
+                            action_type: foo
+                        - privilege:
+                            resource_pattern: foo
+                            action_type: foo
+                        - check: is_authenticated
+                fields:
+                    foo: bar
+                reply_type: foo_reply_struct
+            """))
+
+        self.assert_parse(
+            textwrap.dedent("""
+        commands:
+            foo:
+                description: foo
+                command_name: foo
+                api_version: 1
+                namespace: ignored
+                access_check:
+                    simple:
+                        privilege:
+                            resource_pattern: foo
+                            action_type: foo
+                fields:
+                    foo: bar
+                reply_type: foo_reply_struct
+            """))
+
+    def test_access_checks_negative(self):
+        # type: () -> None
+        """Negative access_check test cases."""
+
+        # check and privilege are present
+        self.assert_parse_fail(
+            textwrap.dedent("""
+        commands:
+            foo:
+                description: foo
+                command_name: foo
+                api_version: 1
+                namespace: ignored
+                access_check:
+                    simple:
+                        check: foo
+                        privilege:
+                            resource_pattern: foo
+                            action_type: foo
+                fields:
+                    foo: bar
+                reply_type: foo_reply_struct
+            """), idl.errors.ERROR_ID_EITHER_CHECK_OR_PRIVILEGE)
+
+        # simple: true fails
+        self.assert_parse_fail(
+            textwrap.dedent("""
+        commands:
+            foo:
+                description: foo
+                command_name: foo
+                api_version: 1
+                namespace: ignored
+                access_check:
+                    simple: true
+                fields:
+                    foo: bar
+                reply_type: foo_reply_struct
+            """), idl.errors.ERROR_ID_IS_NODE_TYPE)
+
+        # simple empty fails
+        self.assert_parse_fail(
+            textwrap.dedent("""
+        commands:
+            foo:
+                description: foo
+                command_name: foo
+                api_version: 1
+                namespace: ignored
+                access_check:
+                    simple: {}
+                fields:
+                    foo: bar
+                reply_type: foo_reply_struct
+            """), idl.errors.ERROR_ID_EITHER_CHECK_OR_PRIVILEGE)
+
+        # duplicate access_check - none and simple
+        self.assert_parse_fail(
+            textwrap.dedent("""
+        commands:
+            foo:
+                description: foo
+                command_name: foo
+                api_version: 1
+                namespace: ignored
+                access_check:
+                    none: true
+                    simple:
+                        privilege:
+                            resource_pattern: foo
+                            action_type: foo
+                fields:
+                    foo: bar
+                reply_type: foo_reply_struct
+            """), idl.errors.ERROR_ID_EMPTY_ACCESS_CHECK)
+
+        # duplicate access_check - none and complex
+        self.assert_parse_fail(
+            textwrap.dedent("""
+        commands:
+            foo:
+                description: foo
+                command_name: foo
+                api_version: 1
+                namespace: ignored
+                access_check:
+                    none: true
+                    complex:
+                        - privilege:
+                            resource_pattern: foo
+                            action_type: foo
+                        - privilege:
+                            resource_pattern: foo
+                            action_type: foo
+                        - check: is_authenticated
+                fields:
+                    foo: bar
+                reply_type: foo_reply_struct
+            """), idl.errors.ERROR_ID_EMPTY_ACCESS_CHECK)
+
+        # duplicate access_check - simple and complex
+        self.assert_parse_fail(
+            textwrap.dedent("""
+        commands:
+            foo:
+                description: foo
+                command_name: foo
+                api_version: 1
+                namespace: ignored
+                access_check:
+                    simple:
+                        privilege:
+                            resource_pattern: foo
+                            action_type: foo
+                    complex:
+                        - privilege:
+                            resource_pattern: foo
+                            action_type: foo
+                        - privilege:
+                            resource_pattern: foo
+                            action_type: foo
+                        - check: is_authenticated
+                fields:
+                    foo: bar
+                reply_type: foo_reply_struct
+            """), idl.errors.ERROR_ID_EMPTY_ACCESS_CHECK)
+
+        # duplicate access_check - none, simple and complex
+        self.assert_parse_fail(
+            textwrap.dedent("""
+        commands:
+            foo:
+                description: foo
+                command_name: foo
+                api_version: 1
+                namespace: ignored
+                access_check:
+                    none: true
+                    simple:
+                        privilege:
+                            resource_pattern: foo
+                            action_type: foo
+                    complex:
+                        - privilege:
+                            resource_pattern: foo
+                            action_type: foo
+                        - privilege:
+                            resource_pattern: foo
+                            action_type: foo
+                        - check: is_authenticated
+                fields:
+                    foo: bar
+                reply_type: foo_reply_struct
+            """), idl.errors.ERROR_ID_EMPTY_ACCESS_CHECK)
 
 
 if __name__ == '__main__':

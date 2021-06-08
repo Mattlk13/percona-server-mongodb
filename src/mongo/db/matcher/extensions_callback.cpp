@@ -97,6 +97,14 @@ ExtensionsCallback::extractTextMatchExpressionParams(BSONElement text) {
     return {std::move(params)};
 }
 
+StatusWithMatchExpression ExtensionsCallback::parseText(BSONElement text) const {
+    auto textParams = extractTextMatchExpressionParams(text);
+    if (!textParams.isOK()) {
+        return textParams.getStatus();
+    }
+    return createText(std::move(textParams.getValue()));
+}
+
 StatusWith<WhereMatchExpressionBase::WhereParams>
 ExtensionsCallback::extractWhereMatchExpressionParams(BSONElement where) {
     WhereMatchExpressionBase::WhereParams params;
@@ -105,11 +113,9 @@ ExtensionsCallback::extractWhereMatchExpressionParams(BSONElement where) {
         case mongo::String:
         case mongo::Code:
             params.code = where._asCode();
-            params.scope = BSONObj();
             break;
         case mongo::CodeWScope:
-            params.code = where._asCode();
-            params.scope = where.codeWScopeObject().getOwned();
+            uasserted(4649201, "$where no longer supports deprecated BSON type CodeWScope");
             break;
         default:
             return {ErrorCodes::BadValue, "$where got bad type"};
@@ -120,6 +126,15 @@ ExtensionsCallback::extractWhereMatchExpressionParams(BSONElement where) {
     }
 
     return params;
+}
+
+StatusWithMatchExpression ExtensionsCallback::parseWhere(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx, BSONElement where) const {
+    auto whereParams = extractWhereMatchExpressionParams(where);
+    if (!whereParams.isOK()) {
+        return whereParams.getStatus();
+    }
+    return {createWhere(expCtx, std::move(whereParams.getValue()))};
 }
 
 }  // namespace mongo

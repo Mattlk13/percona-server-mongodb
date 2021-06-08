@@ -27,39 +27,45 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/client/async_client.h"
 
+#include <memory>
+
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/client/authenticate.h"
+#include "mongo/client/sasl_client_authenticate.h"
 #include "mongo/config.h"
+#include "mongo/db/auth/sasl_command_constants.h"
 #include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/wire_version.h"
 #include "mongo/executor/egress_tag_closer_manager.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/factory.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/legacy_request_builder.h"
 #include "mongo/rpc/metadata/client_metadata.h"
 #include "mongo/rpc/reply_interface.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/log.h"
 #include "mongo/util/net/socket_utils.h"
 #include "mongo/util/net/ssl_manager.h"
+#include "mongo/util/net/ssl_peer_info.h"
 #include "mongo/util/version.h"
 
 namespace mongo {
 
-Future<AsyncDBClient::Handle> AsyncDBClient::connect(const HostAndPort& peer,
-                                                     transport::ConnectSSLMode sslMode,
-                                                     ServiceContext* const context,
-                                                     transport::ReactorHandle reactor,
-                                                     Milliseconds timeout) {
+Future<AsyncDBClient::Handle> AsyncDBClient::connect(
+    const HostAndPort& peer,
+    transport::ConnectSSLMode sslMode,
+    ServiceContext* const context,
+    transport::ReactorHandle reactor,
+    Milliseconds timeout,
+    std::shared_ptr<const transport::SSLConnectionContext> transientSSLContext) {
     auto tl = context->getTransportLayer();
-    return tl->asyncConnect(peer, sslMode, std::move(reactor), timeout)
+    return tl->asyncConnect(peer, sslMode, std::move(reactor), timeout, transientSSLContext)
         .then([peer, context](transport::SessionHandle session) {
             return std::make_shared<AsyncDBClient>(peer, std::move(session), context);
         });
@@ -85,8 +91,8 @@ BSONObj AsyncDBClient::_buildIsMasterRequest(const std::string& appName,
 
     _compressorManager.clientBegin(&bob);
 
-    if (WireSpec::instance().isInternalClient) {
-        WireSpec::appendInternalClientWireVersion(WireSpec::instance().outgoing, &bob);
+    if (auto wireSpec = WireSpec::instance().get(); wireSpec->isInternalClient) {
+        WireSpec::appendInternalClientWireVersion(wireSpec->outgoing, &bob);
     }
 
     if (hook) {
@@ -101,14 +107,17 @@ void AsyncDBClient::_parseIsMasterResponse(BSONObj request,
     uassert(50786,
             "Expected opQuery response to isMaster",
             response->getProtocol() == rpc::Protocol::kOpQuery);
+    auto wireSpec = WireSpec::instance().get();
     auto responseBody = response->getCommandReply();
     uassertStatusOK(getStatusFromCommandResult(responseBody));
 
     auto protocolSet = uassertStatusOK(rpc::parseProtocolSetFromIsMasterReply(responseBody));
-    auto validateStatus =
-        rpc::validateWireVersion(WireSpec::instance().outgoing, protocolSet.version);
+    auto validateStatus = rpc::validateWireVersion(wireSpec->outgoing, protocolSet.version);
     if (!validateStatus.isOK()) {
-        warning() << "remote host has incompatible wire version: " << validateStatus;
+        LOGV2_WARNING(23741,
+                      "Remote host has incompatible wire version: {error}",
+                      "Remote host has incompatible wire version",
+                      "error"_attr = validateStatus);
         uasserted(validateStatus.code(),
                   str::stream() << "remote host has incompatible wire version: "
                                 << validateStatus.reason());
@@ -117,12 +126,12 @@ void AsyncDBClient::_parseIsMasterResponse(BSONObj request,
     auto& egressTagManager = executor::EgressTagCloserManager::get(_svcCtx);
     // Tag outgoing connection so it can be kept open on FCV upgrade if it is not to a
     // server with a lower binary version.
-    if (protocolSet.version.maxWireVersion >= WireSpec::instance().outgoing.maxWireVersion) {
+    if (protocolSet.version.maxWireVersion >= wireSpec->outgoing.maxWireVersion) {
         egressTagManager.mutateTags(
             _peer, [](transport::Session::TagMask tags) { return transport::Session::kKeepOpen; });
     }
 
-    auto clientProtocols = rpc::computeProtocolSet(WireSpec::instance().outgoing);
+    auto clientProtocols = rpc::computeProtocolSet(wireSpec->outgoing);
     invariant(clientProtocols != rpc::supports::kNone);
     // Set the operation protocol
     _negotiatedProtocol = uassertStatusOK(rpc::negotiate(protocolSet.protocolSet, clientProtocols));
@@ -147,15 +156,18 @@ Future<void> AsyncDBClient::authenticate(const BSONObj& params) {
     // We will only have a valid clientName if SSL is enabled.
     std::string clientName;
 #ifdef MONGO_CONFIG_SSL
-    if (getSSLManager()) {
-        clientName = getSSLManager()->getSSLConfiguration().clientSubjectName.toString();
+    auto sslConfiguration = _session->getSSLConfiguration();
+    if (sslConfiguration) {
+        clientName = sslConfiguration->clientSubjectName.toString();
     }
 #endif
 
     return auth::authenticateClient(params, remote(), clientName, _makeAuthRunCommandHook());
 }
 
-Future<void> AsyncDBClient::authenticateInternal(boost::optional<std::string> mechanismHint) {
+Future<void> AsyncDBClient::authenticateInternal(
+    boost::optional<std::string> mechanismHint,
+    std::shared_ptr<auth::InternalAuthParametersProvider> authProvider) {
     // If no internal auth information is set, don't bother trying to authenticate.
     if (!auth::isInternalAuthSet()) {
         return Future<void>::makeReady();
@@ -163,12 +175,53 @@ Future<void> AsyncDBClient::authenticateInternal(boost::optional<std::string> me
     // We will only have a valid clientName if SSL is enabled.
     std::string clientName;
 #ifdef MONGO_CONFIG_SSL
-    if (getSSLManager()) {
-        clientName = getSSLManager()->getSSLConfiguration().clientSubjectName.toString();
+    auto sslConfiguration = _session->getSSLConfiguration();
+    if (sslConfiguration) {
+        clientName = sslConfiguration->clientSubjectName.toString();
     }
 #endif
 
-    return auth::authenticateInternalClient(clientName, mechanismHint, _makeAuthRunCommandHook());
+    return auth::authenticateInternalClient(clientName,
+                                            mechanismHint,
+                                            auth::StepDownBehavior::kKillConnection,
+                                            _makeAuthRunCommandHook(),
+                                            std::move(authProvider));
+}
+
+Future<bool> AsyncDBClient::completeSpeculativeAuth(std::shared_ptr<SaslClientSession> session,
+                                                    std::string authDB,
+                                                    BSONObj specAuth,
+                                                    auth::SpeculativeAuthType speculativeAuthType) {
+    if (specAuth.isEmpty()) {
+        // No reply could mean failed auth, or old server.
+        // A false reply will result in an explicit auth later.
+        return false;
+    }
+
+    if (speculativeAuthType == auth::SpeculativeAuthType::kNone) {
+        return Status(ErrorCodes::BadValue,
+                      str::stream() << "Received unexpected isMaster."
+                                    << auth::kSpeculativeAuthenticate << " reply");
+    }
+
+    if (speculativeAuthType == auth::SpeculativeAuthType::kAuthenticate) {
+        return specAuth.hasField(saslCommandUserFieldName);
+    }
+
+    invariant(speculativeAuthType == auth::SpeculativeAuthType::kSaslStart);
+    invariant(session);
+
+    return asyncSaslConversation(_makeAuthRunCommandHook(),
+                                 session,
+                                 BSON(saslContinueCommandName << 1),
+                                 specAuth,
+                                 std::move(authDB),
+                                 kSaslClientLogLevelDefault)
+        // Swallow failure even if the initial saslStart was okay.
+        // It's possible for our speculative authentication to fail
+        // while explicit auth succeeds if we're in a keyfile rollover state.
+        // The first passphrase can fail, but later ones may be okay.
+        .onCompletion([](Status status) { return status.isOK(); });
 }
 
 Future<void> AsyncDBClient::initWireVersion(const std::string& appName,
@@ -178,39 +231,46 @@ Future<void> AsyncDBClient::initWireVersion(const std::string& appName,
     // have to communicate with servers that do not support other protocols.
     auto requestMsg =
         rpc::legacyRequestFromOpMsgRequest(OpMsgRequest::fromDBAndBody("admin", requestObj));
-    auto clkSource = _svcCtx->getFastClockSource();
-    auto start = clkSource->now();
-
-    return _call(requestMsg).then([this, requestObj, hook, clkSource, start](Message response) {
-        auto cmdReply = rpc::makeReply(&response);
-        _parseIsMasterResponse(requestObj, cmdReply);
-        if (hook) {
-            auto millis = duration_cast<Milliseconds>(clkSource->now() - start);
-            executor::RemoteCommandResponse cmdResp(*cmdReply, millis);
-            uassertStatusOK(hook->validateHost(_peer, requestObj, std::move(cmdResp)));
-        }
-    });
+    auto msgId = nextMessageId();
+    return _call(requestMsg, msgId)
+        .then([msgId, this]() { return _waitForResponse(msgId); })
+        .then([this, requestObj, hook, timer = Timer{}](Message response) {
+            auto cmdReply = rpc::makeReply(&response);
+            _parseIsMasterResponse(requestObj, cmdReply);
+            if (hook) {
+                executor::RemoteCommandResponse cmdResp(*cmdReply, timer.elapsed());
+                uassertStatusOK(hook->validateHost(_peer, requestObj, std::move(cmdResp)));
+            }
+        });
 }
 
-Future<Message> AsyncDBClient::_call(Message request, const BatonHandle& baton) {
+Future<void> AsyncDBClient::_call(Message request, int32_t msgId, const BatonHandle& baton) {
     auto swm = _compressorManager.compressMessage(request);
     if (!swm.isOK()) {
         return swm.getStatus();
     }
 
     request = std::move(swm.getValue());
-    auto msgId = nextMessageId();
     request.header().setId(msgId);
     request.header().setResponseToMsgId(0);
+#ifdef MONGO_CONFIG_SSL
+    if (!SSLPeerInfo::forSession(_session).isTLS) {
+        OpMsg::appendChecksum(&request);
+    }
+#else
     OpMsg::appendChecksum(&request);
+#endif
 
-    return _session->asyncSinkMessage(request, baton)
-        .then([this, baton] { return _session->asyncSourceMessage(baton); })
-        .then([this, msgId](Message response) -> StatusWith<Message> {
+    return _session->asyncSinkMessage(request, baton);
+}
+
+Future<Message> AsyncDBClient::_waitForResponse(boost::optional<int32_t> msgId,
+                                                const BatonHandle& baton) {
+    return _session->asyncSourceMessage(baton).then(
+        [this, msgId](Message response) -> StatusWith<Message> {
             uassert(50787,
                     "ResponseId did not match sent message ID.",
-                    response.header().getResponseToMsgId() == msgId);
-
+                    msgId ? response.header().getResponseToMsgId() == msgId : true);
             if (response.operation() == dbCompressed) {
                 return _compressorManager.decompressMessage(response);
             } else {
@@ -219,10 +279,31 @@ Future<Message> AsyncDBClient::_call(Message request, const BatonHandle& baton) 
         });
 }
 
-Future<rpc::UniqueReply> AsyncDBClient::runCommand(OpMsgRequest request, const BatonHandle& baton) {
+Future<rpc::UniqueReply> AsyncDBClient::runCommand(OpMsgRequest request,
+                                                   const BatonHandle& baton,
+                                                   bool fireAndForget) {
     invariant(_negotiatedProtocol);
     auto requestMsg = rpc::messageFromOpMsgRequest(*_negotiatedProtocol, std::move(request));
-    return _call(std::move(requestMsg), baton)
+    if (fireAndForget) {
+        OpMsg::setFlag(&requestMsg, OpMsg::kMoreToCome);
+    }
+    auto msgId = nextMessageId();
+    auto future = _call(std::move(requestMsg), msgId, baton);
+
+    if (fireAndForget) {
+        return std::move(future).then([msgId, this]() -> Future<rpc::UniqueReply> {
+            // Return a mock status OK response since we do not expect a real response.
+            OpMsgBuilder builder;
+            builder.setBody(BSON("ok" << 1));
+            Message responseMsg = builder.finish();
+            responseMsg.header().setResponseToMsgId(msgId);
+            responseMsg.header().setId(msgId);
+            return rpc::UniqueReply(responseMsg, rpc::makeReply(&responseMsg));
+        });
+    }
+
+    return std::move(future)
+        .then([msgId, baton, this]() { return _waitForResponse(msgId, baton); })
         .then([this](Message response) -> Future<rpc::UniqueReply> {
             return rpc::UniqueReply(response, rpc::makeReply(&response));
         });
@@ -230,19 +311,52 @@ Future<rpc::UniqueReply> AsyncDBClient::runCommand(OpMsgRequest request, const B
 
 Future<executor::RemoteCommandResponse> AsyncDBClient::runCommandRequest(
     executor::RemoteCommandRequest request, const BatonHandle& baton) {
-    auto clkSource = _svcCtx->getPreciseClockSource();
-    auto start = clkSource->now();
+    auto startTimer = Timer();
     auto opMsgRequest = OpMsgRequest::fromDBAndBody(
         std::move(request.dbname), std::move(request.cmdObj), std::move(request.metadata));
-    return runCommand(std::move(opMsgRequest), baton)
-        .then([start, clkSource, this](rpc::UniqueReply response) {
-            auto duration = duration_cast<Milliseconds>(clkSource->now() - start);
-            return executor::RemoteCommandResponse(*response, duration);
-        })
-        .onError([start, clkSource](Status status) {
-            auto duration = duration_cast<Milliseconds>(clkSource->now() - start);
-            return executor::RemoteCommandResponse(status, duration);
+    auto fireAndForget =
+        request.fireAndForgetMode == executor::RemoteCommandRequest::FireAndForgetMode::kOn;
+    return runCommand(std::move(opMsgRequest), baton, fireAndForget)
+        .then([this, startTimer = std::move(startTimer)](rpc::UniqueReply response) {
+            return executor::RemoteCommandResponse(*response, startTimer.elapsed());
         });
+}
+
+Future<executor::RemoteCommandResponse> AsyncDBClient::_continueReceiveExhaustResponse(
+    ClockSource::StopWatch stopwatch, boost::optional<int32_t> msgId, const BatonHandle& baton) {
+    return _waitForResponse(msgId, baton)
+        .then([stopwatch, msgId, baton, this](Message responseMsg) mutable {
+            bool isMoreToComeSet = OpMsg::isFlagSet(responseMsg, OpMsg::kMoreToCome);
+            rpc::UniqueReply response = rpc::UniqueReply(responseMsg, rpc::makeReply(&responseMsg));
+            auto rcResponse = executor::RemoteCommandResponse(
+                *response, duration_cast<Milliseconds>(stopwatch.elapsed()), isMoreToComeSet);
+            return rcResponse;
+        });
+}
+
+Future<executor::RemoteCommandResponse> AsyncDBClient::awaitExhaustCommand(
+    const BatonHandle& baton) {
+    return _continueReceiveExhaustResponse(ClockSource::StopWatch(), boost::none, baton);
+}
+
+Future<executor::RemoteCommandResponse> AsyncDBClient::runExhaustCommand(OpMsgRequest request,
+                                                                         const BatonHandle& baton) {
+    invariant(_negotiatedProtocol);
+    auto requestMsg = rpc::messageFromOpMsgRequest(*_negotiatedProtocol, std::move(request));
+    OpMsg::setFlag(&requestMsg, OpMsg::kExhaustSupported);
+
+    auto msgId = nextMessageId();
+    return _call(std::move(requestMsg), msgId, baton).then([msgId, baton, this]() mutable {
+        return _continueReceiveExhaustResponse(ClockSource::StopWatch(), msgId, baton);
+    });
+}
+
+Future<executor::RemoteCommandResponse> AsyncDBClient::beginExhaustCommandRequest(
+    executor::RemoteCommandRequest request, const BatonHandle& baton) {
+    auto opMsgRequest = OpMsgRequest::fromDBAndBody(
+        std::move(request.dbname), std::move(request.cmdObj), std::move(request.metadata));
+
+    return runExhaustCommand(std::move(opMsgRequest), baton);
 }
 
 void AsyncDBClient::cancel(const BatonHandle& baton) {

@@ -50,29 +50,27 @@ public:
     StatusWith<Value> next() override;
 
 private:
-    Lock::DBLock _dbLock;
-    Lock::CollectionLock _collectionLock;
+    AutoGetOplog _oplogRead;
     OldClientContext _ctx;
     std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> _exec;
 };
 
 OplogIteratorLocal::OplogIteratorLocal(OperationContext* opCtx)
-    : _dbLock(opCtx, NamespaceString::kRsOplogNamespace.db(), MODE_IS),
-      _collectionLock(opCtx, NamespaceString::kRsOplogNamespace, MODE_S),
+    : _oplogRead(opCtx, OplogAccessMode::kRead),
       _ctx(opCtx, NamespaceString::kRsOplogNamespace.ns()),
-      _exec(InternalPlanner::collectionScan(
-          opCtx,
-          NamespaceString::kRsOplogNamespace.ns(),
-          _ctx.db()->getCollection(opCtx, NamespaceString::kRsOplogNamespace),
-          PlanExecutor::NO_YIELD,
-          InternalPlanner::BACKWARD)) {}
+      _exec(_oplogRead.getCollection()
+                ? InternalPlanner::collectionScan(opCtx,
+                                                  &_oplogRead.getCollection(),
+                                                  PlanYieldPolicy::YieldPolicy::NO_YIELD,
+                                                  InternalPlanner::BACKWARD)
+                : nullptr) {}
 
 StatusWith<OplogInterface::Iterator::Value> OplogIteratorLocal::next() {
     BSONObj obj;
     RecordId recordId;
 
     PlanExecutor::ExecState state;
-    if (PlanExecutor::ADVANCED != (state = _exec->getNext(&obj, &recordId))) {
+    if (!_exec || PlanExecutor::ADVANCED != (state = _exec->getNext(&obj, &recordId))) {
         return StatusWith<Value>(ErrorCodes::CollectionIsEmpty,
                                  "no more operations in local oplog");
     }
@@ -80,7 +78,7 @@ StatusWith<OplogInterface::Iterator::Value> OplogIteratorLocal::next() {
     // Non-yielding collection scans from InternalPlanner will never error.
     invariant(PlanExecutor::ADVANCED == state || PlanExecutor::IS_EOF == state);
 
-    return StatusWith<Value>(std::make_pair(obj, recordId));
+    return StatusWith<Value>(std::make_pair(obj.getOwned(), recordId));
 }
 
 }  // namespace

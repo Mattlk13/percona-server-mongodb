@@ -26,7 +26,7 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kFTDC
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kFTDC
 
 #include "mongo/platform/basic.h"
 
@@ -42,9 +42,9 @@
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/executor/connection_pool_stats.h"
 #include "mongo/executor/task_executor_pool.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/grid.h"
 #include "mongo/stdx/thread.h"
-#include "mongo/util/log.h"
 #include "mongo/util/synchronized_value.h"
 
 namespace mongo {
@@ -76,7 +76,7 @@ public:
         stats.appendToBSON(builder, true /* forFTDC */);
 
         // All replica sets being tracked.
-        globalRSMonitorManager.report(&builder, true /* forFTDC */);
+        ReplicaSetMonitorManager::get()->report(&builder, true /* forFTDC */);
     }
 
     std::string name() const override {
@@ -86,7 +86,14 @@ public:
 
 void registerMongoSCollectors(FTDCController* controller) {
     // PoolStats
-    controller->addPeriodicCollector(stdx::make_unique<ConnPoolStatsCollector>());
+    controller->addPeriodicCollector(std::make_unique<ConnPoolStatsCollector>());
+
+    // GetDefaultRWConcern
+    controller->addOnRotateCollector(std::make_unique<FTDCSimpleInternalCommandCollector>(
+        "getDefaultRWConcern",
+        "getDefaultRWConcern",
+        "",
+        BSON("getDefaultRWConcern" << 1 << "inMemory" << true)));
 }
 
 void startMongoSFTDC() {
@@ -101,8 +108,9 @@ void startMongoSFTDC() {
 
     if (directory.empty()) {
         if (serverGlobalParams.logpath.empty()) {
-            warning() << "FTDC is disabled because neither '--logpath' nor set parameter "
-                         "'diagnosticDataCollectionDirectoryPath' are specified.";
+            LOGV2_WARNING(23911,
+                          "FTDC is disabled because neither '--logpath' nor set parameter "
+                          "'diagnosticDataCollectionDirectoryPath' are specified.");
             startMode = FTDCStartMode::kSkipStart;
         } else {
             directory = boost::filesystem::absolute(

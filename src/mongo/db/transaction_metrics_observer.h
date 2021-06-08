@@ -31,7 +31,7 @@
 
 #include "mongo/db/curop.h"
 #include "mongo/db/server_transactions_metrics.h"
-#include "mongo/db/single_transaction_stats.h"
+#include "mongo/db/stats/single_transaction_stats.h"
 #include "mongo/db/stats/top.h"
 
 namespace mongo {
@@ -70,9 +70,12 @@ public:
     /**
      * Updates relevant metrics when a transaction commits.
      */
-    void onCommit(ServerTransactionsMetrics* serverTransactionsMetrics,
+    void onCommit(OperationContext* opCtx,
+                  ServerTransactionsMetrics* serverTransactionsMetrics,
                   TickSource* tickSource,
-                  Top* top);
+                  Top* top,
+                  size_t operationCount,
+                  size_t oplogOperationBytes);
 
     /**
      * Updates relevant metrics when a transaction aborts.

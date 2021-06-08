@@ -59,7 +59,7 @@ public:
     SetElementNode(mutablebson::Element elemToSet) : _elemToSet(elemToSet) {}
 
     std::unique_ptr<UpdateNode> clone() const final {
-        return stdx::make_unique<SetElementNode>(*this);
+        return std::make_unique<SetElementNode>(*this);
     }
 
     void setCollator(const CollatorInterface* collator) final {}
@@ -81,8 +81,8 @@ public:
     }
 
 protected:
-    ModifierNode::ModifyResult updateExistingElement(
-        mutablebson::Element* element, std::shared_ptr<FieldRef> elementPath) const final {
+    ModifierNode::ModifyResult updateExistingElement(mutablebson::Element* element,
+                                                     const FieldRef& elementPath) const final {
         invariant(element->setValueElement(_elemToSet));
         return ModifyResult::kNormalUpdate;
     }
@@ -133,8 +133,8 @@ Status RenameNode::init(BSONElement modExpr,
     // Though we could treat this as a no-op, it is illegal in the current implementation.
     if (fromFieldRef == toFieldRef) {
         return Status(ErrorCodes::BadValue,
-                      str::stream() << "The source and target field for $rename must differ: "
-                                    << modExpr);
+                      str::stream()
+                          << "The source and target field for $rename must differ: " << modExpr);
     }
 
     if (fromFieldRef.isPrefixOf(toFieldRef) || toFieldRef.isPrefixOf(fromFieldRef)) {
@@ -166,17 +166,17 @@ UpdateExecutor::ApplyResult RenameNode::apply(ApplyParams applyParams,
                                               UpdateNodeApplyParams updateNodeApplyParams) const {
     // It would make sense to store fromFieldRef and toFieldRef as members during
     // RenameNode::init(), but FieldRef is not copyable.
-    auto fromFieldRef = std::make_shared<FieldRef>(_val.fieldName());
+    FieldRef fromFieldRef(_val.fieldName());
     FieldRef toFieldRef(_val.valueStringData());
 
     mutablebson::Document& document = applyParams.element.getDocument();
 
-    size_t fromIdxFound;
+    FieldIndex fromIdxFound;
     mutablebson::Element fromElement(document.end());
     auto status =
-        pathsupport::findLongestPrefix(*fromFieldRef, document.root(), &fromIdxFound, &fromElement);
+        pathsupport::findLongestPrefix(fromFieldRef, document.root(), &fromIdxFound, &fromElement);
 
-    if (!status.isOK() || !fromElement.ok() || fromIdxFound != (fromFieldRef->numParts() - 1)) {
+    if (!status.isOK() || !fromElement.ok() || fromIdxFound != (fromFieldRef.numParts() - 1)) {
         // We could safely remove this restriction (thereby treating a rename with a non-viable
         // source path as a no-op), but most updates fail on an attempt to update a non-viable path,
         // so we throw an error for consistency.
@@ -188,7 +188,7 @@ UpdateExecutor::ApplyResult RenameNode::apply(ApplyParams applyParams,
         // The element we want to rename does not exist. When that happens, we treat the operation
         // as a no-op. The attempted from/to paths are still considered modified.
         if (applyParams.modifiedPaths) {
-            applyParams.modifiedPaths->keepShortest(*fromFieldRef);
+            applyParams.modifiedPaths->keepShortest(fromFieldRef);
             applyParams.modifiedPaths->keepShortest(toFieldRef);
         }
         return ApplyResult::noopResult();
@@ -203,12 +203,10 @@ UpdateExecutor::ApplyResult RenameNode::apply(ApplyParams applyParams,
             auto idElem = mutablebson::findFirstChildNamed(document.root(), "_id");
             uasserted(ErrorCodes::BadValue,
                       str::stream() << "The source field cannot be an array element, '"
-                                    << fromFieldRef->dottedField()
-                                    << "' in doc with "
+                                    << fromFieldRef.dottedField() << "' in doc with "
                                     << (idElem.ok() ? idElem.toString() : "no id")
                                     << " has an array field called '"
-                                    << currentElement.getFieldName()
-                                    << "'");
+                                    << currentElement.getFieldName() << "'");
         }
     }
 
@@ -225,12 +223,10 @@ UpdateExecutor::ApplyResult RenameNode::apply(ApplyParams applyParams,
             auto idElem = mutablebson::findFirstChildNamed(document.root(), "_id");
             uasserted(ErrorCodes::BadValue,
                       str::stream() << "The destination field cannot be an array element, '"
-                                    << toFieldRef.dottedField()
-                                    << "' in doc with "
+                                    << toFieldRef.dottedField() << "' in doc with "
                                     << (idElem.ok() ? idElem.toString() : "no id")
                                     << " has an array field called '"
-                                    << currentElement.getFieldName()
-                                    << "'");
+                                    << currentElement.getFieldName() << "'");
         }
     }
 
@@ -244,9 +240,18 @@ UpdateExecutor::ApplyResult RenameNode::apply(ApplyParams applyParams,
     ApplyParams unsetParams(applyParams);
     unsetParams.element = fromElement;
 
-    UpdateNodeApplyParams unsetUpdateNodeApplyParams;
-    unsetUpdateNodeApplyParams.pathToCreate = std::make_shared<FieldRef>();
-    unsetUpdateNodeApplyParams.pathTaken = fromFieldRef;
+    // Renames never "go through" arrays, so we're guaranteed all of the parts of the path are
+    // of type kFieldName.
+    auto pathTaken = std::make_shared<RuntimeUpdatePath>(
+        fromFieldRef,
+        std::vector<RuntimeUpdatePath::ComponentType>(
+            fromFieldRef.numParts(), RuntimeUpdatePath::ComponentType::kFieldName));
+
+    UpdateNodeApplyParams unsetUpdateNodeApplyParams{
+        std::make_shared<FieldRef>(),
+        pathTaken,
+        updateNodeApplyParams.logBuilder,
+    };
 
     UnsetNode unsetElement;
     auto unsetElementApplyResult = unsetElement.apply(unsetParams, unsetUpdateNodeApplyParams);

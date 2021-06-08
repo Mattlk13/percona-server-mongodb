@@ -10,7 +10,7 @@ auditTestShard(
     'removeShard',
     function(st) {
         var port = allocatePorts(10)[9];
-        var conn1 = MongoRunner.runMongod({dbpath: '/data/db/' + jsTestName() + '-extraShard-' + port, port: port});
+        var conn1 = MongoRunner.runMongod({dbpath: '/data/db/' + jsTestName() + '-extraShard-' + port, port: port,  shardsvr: ""});
 
         var hostandport = conn1.host;
         assert.commandWorked(st.s0.adminCommand({addshard: hostandport, name: 'removable'}));

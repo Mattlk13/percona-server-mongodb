@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/db/jsobj.h"
@@ -52,12 +53,6 @@ namespace mongo {
 class KeyPattern {
 public:
     /**
-     * Is the provided key pattern the index over the ID field?
-     * The always required ID index is always {_id: 1} or {_id: -1}.
-     */
-    static bool isIdKeyPattern(const BSONObj& pattern);
-
-    /**
      * Is the provided key pattern ordered increasing or decreasing or not?
      */
     static bool isOrderedKeyPattern(const BSONObj& pattern);
@@ -68,9 +63,19 @@ public:
     static bool isHashedKeyPattern(const BSONObj& pattern);
 
     /**
-     * Constructs a new key pattern based on a BSON document
+     * Constructs a new key pattern based on a BSON document.
+     * Used as an interface to the IDL parser.
+     */
+    static KeyPattern fromBSON(const BSONObj& pattern) {
+        return KeyPattern(pattern.getOwned());
+    }
+
+    /**
+     * Constructs a new key pattern based on a BSON document.
      */
     KeyPattern(const BSONObj& pattern);
+
+    explicit KeyPattern() = default;
 
     /**
      * Returns a BSON representation of this KeyPattern.
@@ -80,7 +85,7 @@ public:
     }
 
     /**
-     * Returns a string representation of this KeyPattern
+     * Returns a string representation of this KeyPattern.
      */
     std::string toString() const {
         return str::stream() << *this;

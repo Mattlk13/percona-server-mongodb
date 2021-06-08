@@ -51,22 +51,23 @@ public:
         {
             WriteUnitOfWork wunit(&_opCtx);
 
-            _collection = _database->getCollection(&_opCtx, nss());
-            if (_collection) {
+            auto collection =
+                CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespaceForMetadataWrite(
+                    &_opCtx, CollectionCatalog::LifetimeMode::kManagedInWriteUnitOfWork, nss());
+            if (collection) {
                 _database->dropCollection(&_opCtx, nss()).transitional_ignore();
             }
-            _collection = _database->createCollection(&_opCtx, nss());
+            collection = _database->createCollection(&_opCtx, nss());
 
-            IndexCatalog* indexCatalog = _collection->getIndexCatalog();
-            auto indexSpec =
-                BSON("v" << static_cast<int>(IndexDescriptor::kLatestIndexVersion) << "ns" << ns()
-                         << "key"
-                         << BSON("a" << 1)
-                         << "name"
-                         << "a_1");
+            IndexCatalog* indexCatalog = collection->getIndexCatalog();
+            auto indexSpec = BSON("v" << static_cast<int>(IndexDescriptor::kLatestIndexVersion)
+                                      << "key" << BSON("a" << 1) << "name"
+                                      << "a_1");
             uassertStatusOK(indexCatalog->createIndexOnEmptyCollection(&_opCtx, indexSpec));
 
             wunit.commit();
+
+            _collection = collection;
         }
     }
 
@@ -116,7 +117,7 @@ protected:
     OldClientContext _context;
 
     Database* _database;
-    Collection* _collection;
+    CollectionPtr _collection;
 
     DBDirectClient _client;
 };
@@ -126,7 +127,7 @@ public:
     void run() {
         insert("{\"a\":\"b\"}");
         insert("{\"c\":\"d\"}");
-        ASSERT_EQUALS(2ULL, _client.count(ns(), fromjson("{}")));
+        ASSERT_EQUALS(2ULL, _client.count(nss(), fromjson("{}")));
     }
 };
 
@@ -136,7 +137,7 @@ public:
         insert("{\"a\":\"b\"}");
         insert("{\"a\":\"b\",\"x\":\"y\"}");
         insert("{\"a\":\"c\"}");
-        ASSERT_EQUALS(2ULL, _client.count(ns(), fromjson("{\"a\":\"b\"}")));
+        ASSERT_EQUALS(2ULL, _client.count(nss(), fromjson("{\"a\":\"b\"}")));
     }
 };
 
@@ -146,7 +147,7 @@ public:
         insert("{\"a\":\"b\"}");
         insert("{\"a\":\"c\"}");
         insert("{\"d\":\"e\"}");
-        ASSERT_EQUALS(1ULL, _client.count(ns(), fromjson("{\"a\":\"b\"}")));
+        ASSERT_EQUALS(1ULL, _client.count(nss(), fromjson("{\"a\":\"b\"}")));
     }
 };
 
@@ -156,13 +157,13 @@ public:
         insert("{\"a\":\"c\"}");
         insert("{\"a\":\"b\"}");
         insert("{\"a\":\"d\"}");
-        ASSERT_EQUALS(1ULL, _client.count(ns(), fromjson("{\"a\":/^b/}")));
+        ASSERT_EQUALS(1ULL, _client.count(nss(), fromjson("{\"a\":/^b/}")));
     }
 };
 
-class All : public Suite {
+class All : public OldStyleSuiteSpecification {
 public:
-    All() : Suite("count") {}
+    All() : OldStyleSuiteSpecification("count") {}
 
     void setupTests() {
         add<Basic>();
@@ -172,6 +173,6 @@ public:
     }
 };
 
-SuiteInstance<All> myall;
+OldStyleSuiteInitializer<All> myall;
 
 }  // namespace CountTests

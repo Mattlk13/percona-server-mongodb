@@ -52,15 +52,6 @@
  *   Correct: MONGO_COMPILER_NORETURN void myAbortFunction();
  *
  *
- * MONGO_COMPILER_VARIABLE_UNUSED
- *
- *   Instructs the compiler not to warn if it detects no use of the decorated variable.
- *   Typically only useful for variables that are always declared but only used in
- *   conditionally-compiled code.
- *
- *   Correct: MONGO_COMPILER_VARIABLE_UNUSED int ignored;
- *
- *
  * MONGO_COMPILER_ALIGN_TYPE(ALIGNMENT)
  *
  *   Instructs the compiler to use the given minimum alignment for the decorated type.
@@ -144,6 +135,13 @@
  *    adversarial inputs, but for some reason the compiler cannot figure this out on its own, for
  *    example after a call to a function that never returns but cannot be labeled with
  *    MONGO_COMPILER_NORETURN. In almost all cases MONGO_UNREACHABLE is preferred.
+ *
+ *
+ * MONGO_COMPILER_NOINLINE
+ *
+ *    Tells the compiler that it should not attempt to inline a function.  This option is not
+ *    guaranteed to eliminate all optimizations, it only is used to prevent a function from being
+ *    inlined.
  *
  *
  * MONGO_WARN_UNUSED_RESULT_CLASS

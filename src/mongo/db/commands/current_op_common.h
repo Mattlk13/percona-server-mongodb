@@ -29,11 +29,9 @@
 
 #pragma once
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
-
 #include "mongo/db/commands.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/pipeline/aggregation_request.h"
+#include "mongo/db/pipeline/aggregate_command_gen.h"
 #include "mongo/db/query/cursor_response.h"
 
 namespace mongo {
@@ -72,11 +70,11 @@ private:
     virtual void modifyPipeline(std::vector<BSONObj>* pipeline) const {};
 
     /**
-     * Runs the aggregation specified by the supplied AggregationRequest, returning a CursorResponse
-     * if successful or a Status containing the error otherwise.
+     * Runs the aggregation specified by the supplied AggregateCommandRequest, returning a
+     * CursorResponse if successful or a Status containing the error otherwise.
      */
-    virtual StatusWith<CursorResponse> runAggregation(OperationContext* opCtx,
-                                                      const AggregationRequest& request) const = 0;
+    virtual StatusWith<CursorResponse> runAggregation(
+        OperationContext* opCtx, const AggregateCommandRequest& request) const = 0;
 
     /**
      * Allows overriders to optionally write additional data to the response object before the final

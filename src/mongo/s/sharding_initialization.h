@@ -30,11 +30,12 @@
 #pragma once
 
 #include <boost/optional.hpp>
+#include <functional>
+#include <memory>
 
 #include "mongo/base/string_data.h"
 #include "mongo/bson/oid.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/s/client/shard_registry.h"
 
 namespace mongo {
 
@@ -52,18 +53,8 @@ class TaskExecutor;
 
 namespace rpc {
 class EgressMetadataHook;
-using ShardingEgressMetadataHookBuilder = stdx::function<std::unique_ptr<EgressMetadataHook>()>;
+using ShardingEgressMetadataHookBuilder = std::function<std::unique_ptr<EgressMetadataHook>()>;
 }  // namespace rpc
-
-/**
- * Fixed process identifier for the dist lock manager running on a config server.
- */
-constexpr auto kDistLockProcessIdForConfigServer = "ConfigServer"_sd;
-
-/**
- * Generates a uniform string to be used as a process id for the distributed lock manager.
- */
-std::string generateDistLockProcessId(OperationContext* opCtx);
 
 /**
  * Constructs a TaskExecutor which contains the required configuration for the sharding subsystem.
@@ -72,22 +63,30 @@ std::unique_ptr<executor::TaskExecutor> makeShardingTaskExecutor(
     std::unique_ptr<executor::NetworkInterface> net);
 
 /**
- * Takes in the connection string for reaching the config servers and initializes the global
- * ShardingCatalogClient, ShardingCatalogManager, ShardRegistry, and Grid objects.
+ * Initializes the global ShardingCatalogClient, ShardingCatalogManager, and Grid objects.
  */
 Status initializeGlobalShardingState(OperationContext* opCtx,
-                                     const ConnectionString& configCS,
-                                     StringData distLockProcessId,
-                                     std::unique_ptr<ShardFactory> shardFactory,
                                      std::unique_ptr<CatalogCache> catalogCache,
+                                     std::unique_ptr<ShardRegistry> shardRegistry,
                                      rpc::ShardingEgressMetadataHookBuilder hookBuilder,
                                      boost::optional<size_t> taskExecutorPoolSize);
 
-
 /**
  * Loads cluster ID and waits for the reload of the Shard Registry.
-*/
+ */
 
 Status waitForShardRegistryReload(OperationContext* opCtx);
+
+/**
+ * Pre-caches mongod routing info for the calling process.
+ */
+
+Status preCacheMongosRoutingInfo(OperationContext* opCtx);
+
+/**
+ * Warms up connections to shards with best effort strategy.
+ */
+
+Status preWarmConnectionPool(OperationContext* opCtx);
 
 }  // namespace mongo

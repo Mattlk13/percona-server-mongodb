@@ -30,13 +30,13 @@
 #pragma once
 
 #include <boost/filesystem/path.hpp>
+#include <functional>
 #include <string>
 #include <vector>
 
 #include "mongo/platform/atomic_word.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/duration.h"
 
@@ -51,7 +51,7 @@ class OperationContext;
  *
  * It is pluggable for testing purposes.
  */
-using WatchdogDeathCallback = stdx::function<void(void)>;
+using WatchdogDeathCallback = std::function<void(void)>;
 
 /**
  * The OS specific implementation of WatchdogDeathCallback that kills the process.
@@ -204,7 +204,7 @@ private:
     stdx::thread _thread;
 
     // Lock to protect _state and control _thread
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH("WatchdogPeriodicThread::_mutex");
     stdx::condition_variable _condvar;
 };
 
@@ -367,7 +367,7 @@ private:
     };
 
     // Lock to protect _state and control _thread
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH("WatchdogMonitor::_mutex");
 
     // State of watchdog
     State _state{State::kNotStarted};

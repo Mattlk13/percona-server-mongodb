@@ -30,11 +30,11 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/client.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/storage/durable_catalog.h"
 #include "mongo/dbtests/dbtests.h"
 
 namespace IndexCatalogTests {
@@ -108,6 +108,55 @@ private:
     Database* _db;
 };
 
+class IndexCatalogEntryDroppedTest {
+public:
+    IndexCatalogEntryDroppedTest() {
+        const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
+        OperationContext& opCtx = *opCtxPtr;
+        Lock::DBLock lk(&opCtx, _nss.db(), MODE_X);
+        OldClientContext ctx(&opCtx, _nss.ns());
+        WriteUnitOfWork wuow(&opCtx);
+
+        _db = ctx.db();
+        _coll = _db->createCollection(&opCtx, _nss);
+        _catalog = _coll->getIndexCatalog();
+        wuow.commit();
+    }
+
+    void run() {
+        const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
+        OperationContext& opCtx = *opCtxPtr;
+        dbtests::WriteContextForTests ctx(&opCtx, _nss.ns());
+
+        const IndexDescriptor* idDesc = _catalog->findIdIndex(&opCtx);
+        std::shared_ptr<const IndexCatalogEntry> entry = _catalog->getEntryShared(idDesc);
+
+        ASSERT_FALSE(entry->isDropped());
+
+        {
+            Lock::CollectionLock lk(&opCtx, _nss, MODE_X);
+            WriteUnitOfWork wuow(&opCtx);
+            ASSERT_OK(_db->dropCollection(&opCtx, _nss));
+            ASSERT_FALSE(entry->isDropped());
+        }
+
+        ASSERT_FALSE(entry->isDropped());
+
+        {
+            Lock::CollectionLock lk(&opCtx, _nss, MODE_X);
+            WriteUnitOfWork wuow(&opCtx);
+            ASSERT_OK(_db->dropCollection(&opCtx, _nss));
+            wuow.commit();
+            ASSERT_TRUE(entry->isDropped());
+        }
+    }
+
+private:
+    IndexCatalog* _catalog;
+    Collection* _coll;
+    Database* _db;
+};
+
 /**
  * Test for IndexCatalog::refreshEntry().
  */
@@ -143,13 +192,11 @@ public:
         dbtests::WriteContextForTests ctx(&opCtx, _nss.ns());
         const std::string indexName = "x_1";
 
-        ASSERT_OK(dbtests::createIndexFromSpec(
-            &opCtx,
-            _nss.ns(),
-            BSON("name" << indexName << "ns" << _nss.ns() << "key" << BSON("x" << 1) << "v"
-                        << static_cast<int>(kIndexVersion)
-                        << "expireAfterSeconds"
-                        << 5)));
+        ASSERT_OK(dbtests::createIndexFromSpec(&opCtx,
+                                               _nss.ns(),
+                                               BSON("name" << indexName << "key" << BSON("x" << 1)
+                                                           << "v" << static_cast<int>(kIndexVersion)
+                                                           << "expireAfterSeconds" << 5)));
 
         const IndexDescriptor* desc = _catalog->findIndexByName(&opCtx, indexName);
         ASSERT(desc);
@@ -158,7 +205,8 @@ public:
         // Change value of "expireAfterSeconds" on disk.
         {
             WriteUnitOfWork wuow(&opCtx);
-            _coll->getCatalogEntry()->updateTTLSetting(&opCtx, "x_1", 10);
+            opCtx.getServiceContext()->getStorageEngine()->getCatalog()->updateTTLSetting(
+                &opCtx, _coll->getCatalogId(), "x_1", 10);
             wuow.commit();
         }
 
@@ -183,14 +231,15 @@ private:
     Database* _db;
 };
 
-class IndexCatalogTests : public Suite {
+class IndexCatalogTests : public OldStyleSuiteSpecification {
 public:
-    IndexCatalogTests() : Suite("indexcatalogtests") {}
+    IndexCatalogTests() : OldStyleSuiteSpecification("indexcatalogtests") {}
     void setupTests() {
         add<IndexIteratorTests>();
+        add<IndexCatalogEntryDroppedTest>();
         add<RefreshEntry>();
     }
 };
 
-SuiteInstance<IndexCatalogTests> indexCatalogTests;
-}
+OldStyleSuiteInitializer<IndexCatalogTests> indexCatalogTests;
+}  // namespace IndexCatalogTests

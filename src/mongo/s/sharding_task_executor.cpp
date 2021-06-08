@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -38,6 +38,7 @@
 #include "mongo/db/logical_time.h"
 #include "mongo/db/operation_time_tracker.h"
 #include "mongo/executor/thread_pool_task_executor.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/metadata/sharding_metadata.h"
 #include "mongo/s/client/shard_registry.h"
@@ -45,7 +46,6 @@
 #include "mongo/s/grid.h"
 #include "mongo/s/is_mongos.h"
 #include "mongo/s/transaction_router.h"
-#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
@@ -68,6 +68,14 @@ void ShardingTaskExecutor::shutdown() {
 
 void ShardingTaskExecutor::join() {
     _executor->join();
+}
+
+SharedSemiFuture<void> ShardingTaskExecutor::joinAsync() {
+    return _executor->joinAsync();
+}
+
+bool ShardingTaskExecutor::isShuttingDown() const {
+    return _executor->isShuttingDown();
 }
 
 void ShardingTaskExecutor::appendDiagnosticBSON(mongo::BSONObjBuilder* builder) const {
@@ -110,18 +118,18 @@ StatusWith<TaskExecutor::CallbackHandle> ShardingTaskExecutor::scheduleWorkAt(Da
     return _executor->scheduleWorkAt(when, std::move(work));
 }
 
-StatusWith<TaskExecutor::CallbackHandle> ShardingTaskExecutor::scheduleRemoteCommand(
-    const RemoteCommandRequest& request,
-    const RemoteCommandCallbackFn& cb,
+StatusWith<TaskExecutor::CallbackHandle> ShardingTaskExecutor::scheduleRemoteCommandOnAny(
+    const RemoteCommandRequestOnAny& request,
+    const RemoteCommandOnAnyCallbackFn& cb,
     const BatonHandle& baton) {
 
     // schedule the user's callback if there is not opCtx
     if (!request.opCtx) {
-        return _executor->scheduleRemoteCommand(request, cb, baton);
+        return _executor->scheduleRemoteCommandOnAny(request, cb, baton);
     }
 
-    boost::optional<RemoteCommandRequest> requestWithFixedLsid = [&] {
-        boost::optional<RemoteCommandRequest> newRequest;
+    boost::optional<RemoteCommandRequestOnAny> requestWithFixedLsid = [&] {
+        boost::optional<RemoteCommandRequestOnAny> newRequest;
 
         if (!request.opCtx->getLogicalSessionId()) {
             return newRequest;
@@ -160,38 +168,66 @@ StatusWith<TaskExecutor::CallbackHandle> ShardingTaskExecutor::scheduleRemoteCom
 
     auto clusterGLE = ClusterLastErrorInfo::get(request.opCtx->getClient());
 
-    auto shardingCb = [ timeTracker, clusterGLE, cb, grid = Grid::get(request.opCtx) ](
-        const TaskExecutor::RemoteCommandCallbackArgs& args) {
+    auto shardingCb = [timeTracker,
+                       clusterGLE,
+                       cb,
+                       grid = Grid::get(request.opCtx),
+                       hosts = request.target](
+                          const TaskExecutor::RemoteCommandOnAnyCallbackArgs& args) {
         ON_BLOCK_EXIT([&cb, &args]() { cb(args); });
 
-        // Update replica set monitor info.
-        auto shard = grid->shardRegistry()->getShardForHostNoReload(args.request.target);
-        if (!shard) {
-            LOG(1) << "Could not find shard containing host: " << args.request.target.toString();
-        }
-
         if (!args.response.isOK()) {
+            HostAndPort target;
+
+            if (args.response.target) {
+                target = *args.response.target;
+            } else {
+                target = hosts.front();
+            }
+
+            auto shard = grid->shardRegistry()->getShardForHostNoReload(target);
+
+            if (!shard) {
+                LOGV2_DEBUG(22870,
+                            1,
+                            "Could not find shard containing host: {host}",
+                            "Could not find shard containing host",
+                            "host"_attr = target);
+            }
+
             if (isMongos() && args.response.status == ErrorCodes::IncompatibleWithUpgradedServer) {
-                severe()
-                    << "This mongos server must be upgraded. It is attempting to communicate with "
-                       "an upgraded cluster with which it is incompatible. Error: '"
-                    << args.response.status.toString()
-                    << "' Crashing in order to bring attention to the incompatibility, rather "
-                       "than erroring endlessly.";
-                fassertNoTrace(50710, false);
+                LOGV2_FATAL_NOTRACE(
+                    50710,
+                    "This mongos server must be upgraded. It is attempting to communicate "
+                    "with an upgraded cluster with which it is incompatible. Error: {error} "
+                    "Crashing in order to bring attention to the incompatibility, rather than "
+                    "erroring endlessly.",
+                    "This mongos is attempting to communicate with an upgraded cluster with which "
+                    "it is incompatible, so this mongos should be upgraded. Crashing in order to "
+                    "bring attention to the incompatibility rather than erroring endlessly.",
+                    "error"_attr = args.response.status);
             }
 
             if (shard) {
-                shard->updateReplSetMonitor(args.request.target, args.response.status);
+                shard->updateReplSetMonitor(target, args.response.status);
             }
 
-            LOG(1) << "Error processing the remote request, not updating operationTime or gLE";
+            LOGV2_DEBUG(22871,
+                        1,
+                        "Error processing the remote request, not updating operationTime or gLE",
+                        "error"_attr = args.response.status);
+
             return;
         }
 
+        invariant(args.response.target);
+
+        auto target = *args.response.target;
+
+        auto shard = grid->shardRegistry()->getShardForHostNoReload(target);
+
         if (shard) {
-            shard->updateReplSetMonitor(args.request.target,
-                                        getStatusFromCommandResult(args.response.data));
+            shard->updateReplSetMonitor(target, getStatusFromCommandResult(args.response.data));
         }
 
         // Update the logical clock.
@@ -208,24 +244,42 @@ StatusWith<TaskExecutor::CallbackHandle> ShardingTaskExecutor::scheduleRemoteCom
             if (swShardingMetadata.isOK()) {
                 auto shardingMetadata = std::move(swShardingMetadata.getValue());
 
-                auto shardConn = ConnectionString::parse(args.request.target.toString());
+                auto shardConn = ConnectionString::parse(target.toString());
                 if (!shardConn.isOK()) {
-                    severe() << "got bad host string in saveGLEStats: " << args.request.target;
+                    LOGV2_ERROR(22874,
+                                "Could not parse connection string to update getLastError stats: "
+                                "{connectionString}",
+                                "Could not parse connection string to update getLastError stats",
+                                "connectionString"_attr = target);
                 }
 
                 clusterGLE->addHostOpTime(shardConn.getValue(),
                                           HostOpTime(shardingMetadata.getLastOpTime(),
                                                      shardingMetadata.getLastElectionId()));
             } else if (swShardingMetadata.getStatus() != ErrorCodes::NoSuchKey) {
-                warning() << "Got invalid sharding metadata "
-                          << redact(swShardingMetadata.getStatus()) << " metadata object was '"
-                          << redact(args.response.data) << "'";
+                LOGV2_WARNING(22872,
+                              "Got invalid sharding metadata {error} "
+                              "metadata object was '{response}'",
+                              "Could not parse sharding metadata from response",
+                              "error"_attr = redact(swShardingMetadata.getStatus()),
+                              "response"_attr = redact(args.response.data));
             }
         }
     };
 
-    return _executor->scheduleRemoteCommand(
+    return _executor->scheduleRemoteCommandOnAny(
         requestWithFixedLsid ? *requestWithFixedLsid : request, shardingCb, baton);
+}
+
+StatusWith<TaskExecutor::CallbackHandle> ShardingTaskExecutor::scheduleExhaustRemoteCommandOnAny(
+    const RemoteCommandRequestOnAny& request,
+    const RemoteCommandOnAnyCallbackFn& cb,
+    const BatonHandle& baton) {
+    MONGO_UNREACHABLE;
+}
+
+bool ShardingTaskExecutor::hasTasks() {
+    MONGO_UNREACHABLE;
 }
 
 void ShardingTaskExecutor::cancel(const CallbackHandle& cbHandle) {

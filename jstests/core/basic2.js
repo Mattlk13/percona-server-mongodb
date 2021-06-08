@@ -1,4 +1,7 @@
-// @tags: [requires_non_retryable_writes, requires_fastcount]
+// @tags: [
+//   requires_fastcount,
+//   requires_non_retryable_writes,
+// ]
 
 t = db.getCollection("basic2");
 t.drop();

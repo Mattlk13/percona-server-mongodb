@@ -58,13 +58,7 @@ HostAndPort::HostAndPort(StringData text) {
     uassertStatusOK(initialize(text));
 }
 
-// Normalize hostname by lowercasing ASCII uppercase characters. Ignore non-ASCII characters.
-// Assume input is ASCII or UTF-8.
-HostAndPort::HostAndPort(const std::string& h, int p) : _host(str::toLower(h)), _port(p) {}
-
-HostAndPort::HostAndPort(SockAddr addr) : _addr(std::move(addr)) {
-    uassertStatusOK(initialize(_addr->toString(true)));
-}
+HostAndPort::HostAndPort(const std::string& h, int p) : _host(h), _port(p) {}
 
 bool HostAndPort::operator<(const HostAndPort& r) const {
     const int cmp = host().compare(r.host());
@@ -86,7 +80,7 @@ int HostAndPort::port() const {
 bool HostAndPort::isLocalHost() const {
     return (_host == "localhost" || str::startsWith(_host.c_str(), "127.") || _host == "::1" ||
             _host == "anonymous unix socket" || _host.c_str()[0] == '/'  // unix socket
-            );
+    );
 }
 
 bool HostAndPort::isDefaultRoute() const {
@@ -108,38 +102,23 @@ bool HostAndPort::isDefaultRoute() const {
 
 std::string HostAndPort::toString() const {
     StringBuilder ss;
-    append(ss);
+    ss << *this;
     return ss.str();
 }
 
-template <typename SinkFunc>
-static void appendGeneric(const HostAndPort& hp, const SinkFunc& write) {
+void HostAndPort::_appendToVisitor(AppendVisitor& write) const {
     // wrap ipv6 addresses in []s for roundtrip-ability
-    if (hp.host().find(':') != std::string::npos) {
+    if (host().find(':') != std::string::npos) {
         write("[");
-        write(hp.host());
+        write(host());
         write("]");
     } else {
-        write(hp.host());
+        write(host());
     }
-    if (hp.host().find('/') == std::string::npos) {
+    if (host().find('/') == std::string::npos) {
         write(":");
-        write(hp.port());
+        write(port());
     }
-}
-
-template <typename Stream>
-static Stream& appendToStream(const HostAndPort& hp, Stream& sink) {
-    appendGeneric(hp, [&sink](const auto& v) { sink << v; });
-    return sink;
-}
-
-void HostAndPort::append(StringBuilder& sink) const {
-    appendToStream(*this, sink);
-}
-
-void HostAndPort::append(fmt::writer& sink) const {
-    appendGeneric(*this, [&sink](const auto& v) { sink.write(v); });
 }
 
 bool HostAndPort::empty() const {
@@ -156,8 +135,8 @@ Status HostAndPort::initialize(StringData s) {
     if (openBracketPos != std::string::npos) {
         if (openBracketPos != 0) {
             return Status(ErrorCodes::FailedToParse,
-                          str::stream() << "'[' present, but not first character in "
-                                        << s.toString());
+                          str::stream()
+                              << "'[' present, but not first character in " << s.toString());
         }
         if (closeBracketPos == std::string::npos) {
             return Status(ErrorCodes::FailedToParse,
@@ -171,37 +150,35 @@ Status HostAndPort::initialize(StringData s) {
             // If the last colon is inside the brackets, then there must not be a port.
             if (s.size() != closeBracketPos + 1) {
                 return Status(ErrorCodes::FailedToParse,
-                              str::stream() << "missing colon after ']' before the port in "
-                                            << s.toString());
+                              str::stream()
+                                  << "missing colon after ']' before the port in " << s.toString());
             }
             colonPos = std::string::npos;
         } else if (colonPos != closeBracketPos + 1) {
             return Status(ErrorCodes::FailedToParse,
                           str::stream() << "Extraneous characters between ']' and pre-port ':'"
-                                        << " in "
-                                        << s.toString());
+                                        << " in " << s.toString());
         }
     } else if (closeBracketPos != std::string::npos) {
         return Status(ErrorCodes::FailedToParse,
                       str::stream() << "']' present without '[' in " << s.toString());
     } else if (s.find(':') != colonPos) {
         return Status(ErrorCodes::FailedToParse,
-                      str::stream() << "More than one ':' detected. If this is an ipv6 address,"
-                                    << " it needs to be surrounded by '[' and ']'; "
-                                    << s.toString());
+                      str::stream()
+                          << "More than one ':' detected. If this is an ipv6 address,"
+                          << " it needs to be surrounded by '[' and ']'; " << s.toString());
     }
 
     if (hostPart.empty()) {
         return Status(ErrorCodes::FailedToParse,
                       str::stream() << "Empty host component parsing HostAndPort from \""
-                                    << str::escape(s.toString())
-                                    << "\"");
+                                    << str::escape(s.toString()) << "\"");
     }
 
     int port;
     if (colonPos != std::string::npos) {
         const StringData portPart = s.substr(colonPos + 1);
-        Status status = parseNumberFromStringWithBase(portPart, 10, &port);
+        Status status = NumberParser().base(10)(portPart, &port);
         if (!status.isOK()) {
             return status;
         }
@@ -209,28 +186,14 @@ Status HostAndPort::initialize(StringData s) {
             return Status(ErrorCodes::FailedToParse,
                           str::stream() << "Port number " << port
                                         << " out of range parsing HostAndPort from \""
-                                        << str::escape(s.toString())
-                                        << "\"");
+                                        << str::escape(s.toString()) << "\"");
         }
     } else {
         port = -1;
     }
-
-    _host = str::toLower(hostPart);
+    _host = hostPart.toString();
     _port = port;
     return Status::OK();
-}
-
-std::ostream& operator<<(std::ostream& os, const HostAndPort& hp) {
-    return appendToStream(hp, os);
-}
-
-StringBuilder& operator<<(StringBuilder& os, const HostAndPort& hp) {
-    return appendToStream(hp, os);
-}
-
-StackStringBuilder& operator<<(StackStringBuilder& os, const HostAndPort& hp) {
-    return appendToStream(hp, os);
 }
 
 }  // namespace mongo

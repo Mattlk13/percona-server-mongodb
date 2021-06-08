@@ -1,47 +1,53 @@
 /**
  * Tests that only the internal user will be able to advance the config server opTime.
  */
+
+// The index consistency checker doesn't take into account that
+// authentication is needed for contacting shard0 of this cluster
+TestData.skipCheckingIndexesConsistentAcrossCluster = true;
+
 (function() {
 
-    "use strict";
+"use strict";
 
-    // TODO: Remove 'shardAsReplicaSet: false' when SERVER-32672 is fixed.
-    var st = new ShardingTest(
-        {shards: 1, other: {keyFile: 'jstests/libs/key1', shardAsReplicaSet: false}});
+function getConfigOpTime() {
+    var srvStatus = assert.commandWorked(shardTestDB.serverStatus());
+    assert.hasFields(srvStatus, ['sharding']);
+    return srvStatus.sharding.lastSeenConfigServerOpTime.ts;
+}
 
-    var adminUser = {db: "admin", username: "foo", password: "bar"};
+var st = new ShardingTest({shards: 1, other: {keyFile: 'jstests/libs/key1'}});
 
-    st.s.getDB(adminUser.db).createUser({user: 'foo', pwd: 'bar', roles: jsTest.adminUserRoles});
+const mongosAdminDB = st.s.getDB('admin');
+mongosAdminDB.createUser({user: 'foo', pwd: 'bar', roles: jsTest.adminUserRoles});
+mongosAdminDB.auth('foo', 'bar');
 
-    st.s.getDB('admin').auth('foo', 'bar');
+st.adminCommand({enableSharding: 'test'});
+st.adminCommand({shardCollection: 'test.user', key: {x: 1}});
 
-    st.adminCommand({enableSharding: 'test'});
-    st.adminCommand({shardCollection: 'test.user', key: {x: 1}});
+const shardAdminDB = st.rs0.getPrimary().getDB('admin');
+const shardTestDB = st.rs0.getPrimary().getDB('test');
 
-    st.d0.getDB('admin').createUser({user: 'user', pwd: 'pwd', roles: jsTest.adminUserRoles});
-    st.d0.getDB('admin').auth('user', 'pwd');
+// ConfigOpTime can't be advanced without the correct permissions
+shardAdminDB.createUser({user: 'user', pwd: 'pwd', roles: jsTest.adminUserRoles});
+shardAdminDB.auth('user', 'pwd');
+const newTimestamp = Timestamp(getConfigOpTime().getTime() + 1000, 0);
+const metadata = {
+    $configServerState: {opTime: {ts: newTimestamp, t: -1}}
+};
+var res = shardTestDB.runCommandWithMetadata({ping: 1}, metadata);
+assert.commandFailedWithCode(res.commandReply, ErrorCodes.Unauthorized);
+assert(timestampCmp(getConfigOpTime(), newTimestamp) < 0, "Unexpected ConfigOpTime advancement");
 
-    var maxSecs = Math.pow(2, 32) - 1;
-    var metadata = {$configServerState: {opTime: {ts: Timestamp(maxSecs, 0), t: maxSecs}}};
-    var res = st.d0.getDB('test').runCommandWithMetadata({ping: 1}, metadata);
+// Advance configOpTime
+shardAdminDB.createUser({user: 'internal', pwd: 'pwd', roles: ['__system']});
+shardAdminDB.auth('internal', 'pwd');
+res = shardTestDB.runCommandWithMetadata({ping: 1}, metadata);
+assert.commandWorked(res.commandReply);
+assert(timestampCmp(getConfigOpTime(), newTimestamp) >= 0,
+       "ConfigOpTime did not advanced as expected");
 
-    assert.commandFailedWithCode(res.commandReply, ErrorCodes.Unauthorized);
-
-    // Make sure that the config server optime did not advance.
-    var status = st.d0.getDB('test').runCommand({serverStatus: 1});
-    assert.neq(null, status.sharding);
-    assert.lt(status.sharding.lastSeenConfigServerOpTime.t, maxSecs);
-
-    st.d0.getDB('admin').createUser({user: 'internal', pwd: 'pwd', roles: ['__system']});
-    st.d0.getDB('admin').auth('internal', 'pwd');
-
-    res = st.d0.getDB('test').runCommandWithMetadata({ping: 1}, metadata);
-    assert.commandWorked(res.commandReply);
-
-    status = st.d0.getDB('test').runCommand({serverStatus: 1});
-    assert.neq(null, status.sharding);
-    assert.eq(status.sharding.lastSeenConfigServerOpTime.t, maxSecs);
-
-    st.stop();
-
+mongosAdminDB.logout();
+shardAdminDB.logout();
+st.stop();
 })();

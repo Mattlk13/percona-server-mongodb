@@ -38,10 +38,12 @@
 
 #include <fmt/format.h>
 
+#include "mongo/platform/compiler.h"
 #include "mongo/stdx/type_traits.h"
-#define MONGO_INCLUDE_INVARIANT_H_WHITELISTED
+#include "mongo/util/ctype.h"
+#define MONGO_ALLOW_INCLUDE_INVARIANT_H
 #include "mongo/util/invariant.h"
-#undef MONGO_INCLUDE_INVARIANT_H_WHITELISTED
+#undef MONGO_ALLOW_INCLUDE_INVARIANT_H
 
 namespace mongo {
 
@@ -59,6 +61,7 @@ namespace mongo {
  *    rawData() terminates with a null.
  */
 class StringData {
+    /** Tag used to bypass the invariant of the {c,len} constructor. */
     struct TrustedInitTag {};
     constexpr StringData(const char* c, size_t len, TrustedInitTag) : _data(c), _size(len) {}
 
@@ -88,20 +91,15 @@ public:
 
     /**
      * Constructs a StringData with an explicit length. 'c' must
-     * either be NULL (in which case len must be zero), or be a
+     * either be nullptr (in which case len must be zero), or be a
      * pointer into a character array. The StringData will refer to
      * the first 'len' characters starting at 'c'. The range of
-     * characters c to c+len must be valid.
+     * characters in the half-open interval `[c, c + len)` must be valid.
      */
-    StringData(const char* c, size_t len) : StringData(c, len, TrustedInitTag()) {
-        invariant(_data || (_size == 0));
+    constexpr StringData(const char* c, size_t len) : StringData(c, len, TrustedInitTag()) {
+        if (!MONGO_likely(_data || (_size == 0)))
+            invariant(0, "StringData(nullptr,len) requires len==0");
     }
-
-    /**
-     * Constructs a StringData from a user defined literal.  This allows
-     * for constexpr creation of StringData's that are known at compile time.
-     */
-    constexpr friend StringData operator"" _sd(const char* c, std::size_t len);
 
     explicit operator std::string() const {
         return toString();
@@ -115,14 +113,8 @@ public:
      * We template the second parameter to ensure if StringData is called with 0 in the second
      * parameter, the (ptr,len) constructor is chosen instead.
      */
-    template <
-        typename InputIt,
-        typename = stdx::enable_if_t<std::is_same<StringData::const_iterator, InputIt>::value>>
-    StringData(InputIt begin, InputIt end) {
-        invariant(begin && end);
-        _data = begin;
-        _size = std::distance(begin, end);
-    }
+    template <typename T, std::enable_if_t<std::is_same_v<const char*, T>, int> = 0>
+    constexpr StringData(T begin, T end) : StringData(begin, end - begin) {}
 
     /**
      * Returns -1, 0, or 1 if 'this' is less, equal, or greater than 'other' in
@@ -139,7 +131,7 @@ public:
 
     void copyTo(char* dest, bool includeEndingNull) const;
 
-    StringData substr(size_t pos, size_t n = std::numeric_limits<size_t>::max()) const;
+    constexpr StringData substr(size_t pos, size_t n = std::numeric_limits<size_t>::max()) const;
 
     //
     // finders
@@ -226,10 +218,6 @@ inline bool operator>=(StringData lhs, StringData rhs) {
 
 std::ostream& operator<<(std::ostream& stream, StringData value);
 
-constexpr StringData operator"" _sd(const char* c, std::size_t len) {
-    return StringData(c, len, StringData::TrustedInitTag{});
-}
-
 inline int StringData::compare(StringData other) const {
     // It is illegal to pass nullptr to memcmp. It is an invariant of
     // StringData that if _data is nullptr, _size is zero. If asked to
@@ -251,20 +239,10 @@ inline int StringData::compare(StringData other) const {
 }
 
 inline bool StringData::equalCaseInsensitive(StringData other) const {
-    if (other.size() != size())
-        return false;
-
-    for (size_t x = 0; x < size(); x++) {
-        char a = _data[x];
-        char b = other._data[x];
-        if (a == b)
-            continue;
-        if (tolower(a) == tolower(b))
-            continue;
-        return false;
-    }
-
-    return true;
+    return size() == other.size() &&
+        std::equal(begin(), end(), other.begin(), other.end(), [](char a, char b) {
+               return ctype::toLower(a) == ctype::toLower(b);
+           });
 }
 
 inline void StringData::copyTo(char* dest, bool includeEndingNull) const {
@@ -279,21 +257,20 @@ inline size_t StringData::find(char c, size_t fromPos) const {
         return std::string::npos;
 
     const void* x = memchr(_data + fromPos, c, _size - fromPos);
-    if (x == 0)
+    if (x == nullptr)
         return std::string::npos;
     return static_cast<size_t>(static_cast<const char*>(x) - _data);
 }
 
 inline size_t StringData::find(StringData needle, size_t fromPos) const {
     size_t mx = size();
+    if (fromPos > mx)
+        return std::string::npos;
     size_t needleSize = needle.size();
 
     if (needleSize == 0)
-        return 0;
+        return fromPos;
     else if (needleSize > mx)
-        return std::string::npos;
-
-    if (fromPos > size())
         return std::string::npos;
 
     mx -= needleSize;
@@ -307,8 +284,9 @@ inline size_t StringData::find(StringData needle, size_t fromPos) const {
 
 inline size_t StringData::rfind(char c, size_t fromPos) const {
     const size_t sz = size();
-    if (fromPos > sz)
-        fromPos = sz;
+    if (sz < 1)
+        return std::string::npos;
+    fromPos = std::min(fromPos, sz - 1) + 1;
 
     for (const char* cur = _data + fromPos; cur > _data; --cur) {
         if (*(cur - 1) == c)
@@ -317,7 +295,7 @@ inline size_t StringData::rfind(char c, size_t fromPos) const {
     return std::string::npos;
 }
 
-inline StringData StringData::substr(size_t pos, size_t n) const {
+constexpr StringData StringData::substr(size_t pos, size_t n) const {
     if (pos > size())
         throw std::out_of_range("out of range");
 
@@ -354,8 +332,29 @@ inline std::string operator+(StringData lhs, std::string rhs) {
     return rhs;
 }
 
-constexpr fmt::string_view to_string_view(StringData s) noexcept {
-    return fmt::string_view(s.rawData(), s.size());
+inline namespace literals {
+
+/**
+ * Makes a constexpr StringData from a user defined literal (e.g. "hello"_sd).
+ * This allows for constexpr creation of `StringData` that are known at compile time.
+ */
+constexpr StringData operator"" _sd(const char* c, std::size_t len) {
+    return {c, len};
 }
+}  // namespace literals
 
 }  // namespace mongo
+
+namespace fmt {
+template <>
+class formatter<mongo::StringData> : formatter<fmt::string_view> {
+    using Base = formatter<fmt::string_view>;
+
+public:
+    using Base::parse;
+    template <typename FormatContext>
+    auto format(const mongo::StringData& s, FormatContext& fc) {
+        return Base::format(fmt::string_view{s.rawData(), s.size()}, fc);
+    }
+};
+}  // namespace fmt

@@ -41,7 +41,8 @@ struct QueryPlannerParams {
     QueryPlannerParams()
         : options(DEFAULT),
           indexFiltersApplied(false),
-          maxIndexedSolutions(internalQueryPlannerMaxIndexedSolutions.load()) {}
+          maxIndexedSolutions(internalQueryPlannerMaxIndexedSolutions.load()),
+          allowRIDRange(false) {}
 
     enum Options {
         // You probably want to set this.
@@ -65,39 +66,70 @@ struct QueryPlannerParams {
         // See the comment on ShardFilterStage for details.
         INCLUDE_SHARD_FILTER = 1 << 2,
 
-        // Set this if you don't want any plans with a blocking sort stage.  All sorts must be
-        // provided by an index.
-        NO_BLOCKING_SORT = 1 << 3,
-
         // Set this if you want to turn on index intersection.
-        INDEX_INTERSECTION = 1 << 4,
+        INDEX_INTERSECTION = 1 << 3,
 
-        // Indicate to the planner that the caller is requesting a count operation, possibly through
-        // a count command, or as part of an aggregation pipeline.
-        IS_COUNT = 1 << 5,
+        // Indicate to the planner that this query could be eligible for count optimization. For
+        // example, the query {$group: {_id: null, sum: {$sum: 1}}} is a count-like operation and
+        // could be eligible for the COUNT_SCAN.
+        IS_COUNT = 1 << 4,
 
         // Set this if you want to handle batchSize properly with sort(). If limits on SORT
         // stages are always actually limits, then this should be left off. If they are
         // sometimes to be interpreted as batchSize, then this should be turned on.
-        SPLIT_LIMITED_SORT = 1 << 6,
-
-        // Set this if you don't want any plans with a non-covered projection stage. All projections
-        // must be provided/covered by an index.
-        NO_UNCOVERED_PROJECTIONS = 1 << 7,
+        SPLIT_LIMITED_SORT = 1 << 5,
 
         // Set this to generate covered whole IXSCAN plans.
-        GENERATE_COVERED_IXSCANS = 1 << 8,
+        GENERATE_COVERED_IXSCANS = 1 << 6,
 
         // Set this to track the most recent timestamp seen by this cursor while scanning the oplog.
-        TRACK_LATEST_OPLOG_TS = 1 << 9,
+        TRACK_LATEST_OPLOG_TS = 1 << 7,
 
         // Set this so that collection scans on the oplog wait for visibility before reading.
-        OPLOG_SCAN_WAIT_FOR_VISIBLE = 1 << 10,
+        OPLOG_SCAN_WAIT_FOR_VISIBLE = 1 << 8,
 
         // Set this so that getExecutorDistinct() will only use a plan that _guarantees_ it will
         // return exactly one document per value of the distinct field. See the comments above the
         // declaration of getExecutorDistinct() for more detail.
-        STRICT_DISTINCT_ONLY = 1 << 11,
+        STRICT_DISTINCT_ONLY = 1 << 9,
+
+        // Instruct the planner that the caller is expecting to consume the record ids associated
+        // with documents returned by the plan. Any generated query solution must not discard record
+        // ids. In some cases, record ids can be discarded as an optimization when they will not be
+        // consumed downstream.
+        PRESERVE_RECORD_ID = 1 << 10,
+
+        // Set this on an oplog scan to uassert that the oplog has not already rolled over the
+        // minimum 'ts' timestamp specified in the query.
+        ASSERT_MIN_TS_HAS_NOT_FALLEN_OFF_OPLOG = 1 << 11,
+
+        // Instruct the plan enumerator to enumerate contained $ors in a special order. $or
+        // enumeration can generate an exponential number of plans, and is therefore limited at some
+        // arbitrary cutoff controlled by a parameter. When this limit is hit, the order of
+        // enumeration is important. For example, a query like the following has a "contained $or"
+        // (within an $and):
+        // {a: 1, $or: [{b: 1, c: 1}, {b: 2, c: 2}]}
+        // For this query if there are indexes a_b={a: 1, b: 1} and a_c={a: 1, c: 1}, the normal
+        // enumeration order would output assignments [a_b, a_b], [a_c, a_b], [a_b, a_c], then [a_c,
+        // a_c]. This flag will instruct the enumerator to instead prefer a different order. It's
+        // hard to summarize, but perhaps the phrases "lockstep enumeration", "simultaneous
+        // advancement", or "parallel iteration" will help the reader. The effect is to give earlier
+        // enumeration to plans which use the same index of alternative across all branches. In this
+        // order, we would get assignments [a_b, a_b], [a_c, a_c], [a_c, a_b], then [a_b, a_c]. This
+        // is thought to be helpful in general, but particularly in cases where all children of the
+        // $or use the same fields and have the same indexes available, as in this example.
+        ENUMERATE_OR_CHILDREN_LOCKSTEP = 1 << 12,
+
+        // Instructs the planner to produce a plan which will *not* check at runtime that the node's
+        // replica set member state allows reads. Typically, replica set members will only serve
+        // reads to clients if thet are in parimary or secondary state. Client reads are disallowed
+        // in other states, e.g. during initial sync. Internal operations, on the other hand, can
+        // use this flag to exempt themselves from this repl set note state requirement.
+        OMIT_REPL_STATE_PERMITS_READS_CHECK = 1 << 13,
+
+        // Ensure that any plan generated returns data that is "owned." That is, all BSONObjs are
+        // in an "owned" state and are not pointing to data that belongs to the storage engine.
+        RETURN_OWNED_DATA = 1 << 14,
     };
 
     // See Options enum above.
@@ -118,6 +150,10 @@ struct QueryPlannerParams {
     // plans via the MultiPlanStage, and the set of possible plans is very large for certain
     // index+query combinations.
     size_t maxIndexedSolutions;
+
+    // Set if we allow optimization which converts "_id" predicates into range collection scan using
+    // minRecord and maxRecord.
+    bool allowRIDRange;
 };
 
 }  // namespace mongo

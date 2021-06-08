@@ -33,6 +33,7 @@
 
 #include "mongo/client/connection_string.h"
 #include "mongo/db/query/explain_options.h"
+#include "mongo/db/request_execution_context.h"
 #include "mongo/s/client/shard.h"
 
 namespace mongo {
@@ -42,7 +43,7 @@ struct DbResponse;
 class Message;
 class NamespaceString;
 class OperationContext;
-class QueryRequest;
+class FindCommandRequest;
 
 /**
  * Legacy interface for processing client read/write/cmd requests.
@@ -74,7 +75,7 @@ public:
      * with the result from the operation. Doesn't send any response back and does not throw on
      * errors.
      */
-    static void writeOp(OperationContext* opCtx, DbMessage* dbm);
+    static void writeOp(std::shared_ptr<RequestExecutionContext> rec);
 
     /**
      * Executes a command from either OP_QUERY or OP_MSG wire protocols.
@@ -82,7 +83,7 @@ public:
      * Catches StaleConfigException errors and retries the command automatically after refreshing
      * the metadata for the failing namespace.
      */
-    static DbResponse clientCommand(OperationContext* opCtx, const Message& message);
+    static Future<DbResponse> clientCommand(std::shared_ptr<RequestExecutionContext> rec);
 
     /**
      * Helper to run an explain of a find operation on the shards. Fills 'out' with the result of
@@ -92,40 +93,11 @@ public:
      * $explain modifier.
      */
     static void explainFind(OperationContext* opCtx,
-                            const BSONObj& findCommand,
-                            const QueryRequest& qr,
+                            const BSONObj& findCommandObj,
+                            const FindCommandRequest& findCommand,
                             ExplainOptions::Verbosity verbosity,
                             const ReadPreferenceSetting& readPref,
                             BSONObjBuilder* out);
-
-    struct CommandResult {
-        CommandResult() = default;
-        CommandResult(ShardId shardId, ConnectionString target, BSONObj result)
-            : shardTargetId(std::move(shardId)),
-              target(std::move(target)),
-              result(std::move(result)) {}
-        ShardId shardTargetId;
-        ConnectionString target;
-        BSONObj result;
-    };
-
-    /**
-     * Executes a command against a particular database, and targets the command based on a
-     * collection in that database, according to 'targetingQuery' and 'targetingCollation'. If
-     * 'targetingCollation' is empty, the collection default collation is used for targeting.
-     *
-     * This version should be used by internal commands when possible.
-     *
-     * TODO: Replace these methods and all other methods of command dispatch with a more general
-     * command op framework.
-     */
-    static void commandOp(OperationContext* opCtx,
-                          const std::string& db,
-                          const BSONObj& command,
-                          const std::string& versionedNS,
-                          const BSONObj& targetingQuery,
-                          const BSONObj& targetingCollation,
-                          std::vector<CommandResult>* results);
 };
 
 }  // namespace mongo

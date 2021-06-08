@@ -29,29 +29,18 @@
 
 #pragma once
 
-#include <memory>
-#include <string>
-
 #include <boost/optional.hpp>
+#include <memory>
 
-#include "mongo/base/secure_allocator.h"
-#include "mongo/base/shim.h"
 #include "mongo/base/status.h"
-#include "mongo/bson/mutable/element.h"
 #include "mongo/bson/oid.h"
 #include "mongo/db/auth/action_set.h"
+#include "mongo/db/auth/builtin_roles.h"
 #include "mongo/db/auth/privilege_format.h"
 #include "mongo/db/auth/resource_pattern.h"
-#include "mongo/db/auth/role_graph.h"
 #include "mongo/db/auth/user.h"
-#include "mongo/db/auth/user_name.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/server_options.h"
-#include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/mutex.h"
-#include "mongo/stdx/unordered_map.h"
 
 namespace mongo {
 
@@ -59,7 +48,6 @@ class AuthorizationSession;
 class AuthzManagerExternalState;
 class OperationContext;
 class ServiceContext;
-class UserDocumentParser;
 
 /**
  * Internal secret key info.
@@ -92,11 +80,11 @@ public:
     static AuthorizationManager* get(ServiceContext& service);
     static void set(ServiceContext* service, std::unique_ptr<AuthorizationManager> authzManager);
 
-    virtual ~AuthorizationManager() = default;
+    static std::unique_ptr<AuthorizationManager> create(ServiceContext* serviceContext);
 
     AuthorizationManager() = default;
 
-    static MONGO_DECLARE_SHIM(()->std::unique_ptr<AuthorizationManager>) create;
+    virtual ~AuthorizationManager() = default;
 
     static constexpr StringData USERID_FIELD_NAME = "userId"_sd;
     static constexpr StringData USER_NAME_FIELD_NAME = "user"_sd;
@@ -109,13 +97,11 @@ public:
 
     static const NamespaceString adminCommandNamespace;
     static const NamespaceString rolesCollectionNamespace;
-    static const NamespaceString usersAltCollectionNamespace;
     static const NamespaceString usersBackupCollectionNamespace;
     static const NamespaceString usersCollectionNamespace;
     static const NamespaceString versionCollectionNamespace;
     static const NamespaceString defaultTempUsersCollectionNamespace;  // for mongorestore
     static const NamespaceString defaultTempRolesCollectionNamespace;  // for mongorestore
-
 
     /**
      * Status to be returned when authentication fails. Being consistent about our returned Status
@@ -199,7 +185,12 @@ public:
     virtual Status getAuthorizationVersion(OperationContext* opCtx, int* version) = 0;
 
     /**
-     * Returns the user cache generation identifier.
+     * The value reported by this method must change every time some persisted authorization rule
+     * gets modified. It serves as a means for consumers of authorization data to discover that
+     * something changed and that they need to re-cache.
+     *
+     * The most prominent consumer of this value is MongoS, which uses it to determine whether it
+     * needs to re-fetch the authentication info from the config server.
      */
     virtual OID getCacheGeneration() = 0;
 
@@ -223,19 +214,57 @@ public:
     /**
      * Delegates method call to the underlying AuthzManagerExternalState.
      */
-    virtual Status getRoleDescription(OperationContext* opCtx,
-                                      const RoleName& roleName,
-                                      PrivilegeFormat privilegeFormat,
-                                      AuthenticationRestrictionsFormat,
-                                      BSONObj* result) = 0;
+    virtual Status rolesExist(OperationContext* opCtx, const std::vector<RoleName>& roleNames) = 0;
 
     /**
-     * Convenience wrapper for getRoleDescription() defaulting formats to kOmit.
+     * Options for what data resolveRoles() should mine from the role tree.
+     *
+     * kRoles:        Collect RoleNames in the "roles" field in each role document for subordinates.
+     * kPrivileges:   Examine the "privileges" field in each role document and
+     *                merge "actions" for identicate "resource" patterns.
+     * kRestrictions: Collect the "authenticationRestrictions" field in each role document.
+     *
+     * kDirectOnly:   If specified, only the RoleNames explicitly supplied to resolveRoles()
+     *                will be examined.
+     *                If not specified, then resolveRoles() will continue examining all
+     *                subordinate roles until the tree has been exhausted.
+     *
+     * kAll, kDirectRoles, kDirectPrivileges, kDirectRestrictions, and kDirectAll
+     * exist as convenience aliases for combinations of the above flags.
      */
-    Status getRoleDescription(OperationContext* ctx, const RoleName& roleName, BSONObj* result) {
-        return getRoleDescription(
-            ctx, roleName, PrivilegeFormat::kOmit, AuthenticationRestrictionsFormat::kOmit, result);
-    }
+    enum ResolveRoleOption : std::uint8_t {
+
+        kRoles = 0x01,
+        kPrivileges = 0x02,
+        kRestrictions = 0x04,
+        kAll = kRoles | kPrivileges | kRestrictions,
+
+        // Only collect from the first pass.
+        kDirectOnly = 0x10,
+
+        kDirectRoles = kRoles | kDirectOnly,
+        kDirectPrivileges = kPrivileges | kDirectOnly,
+        kDirectRestrictions = kRestrictions | kDirectOnly,
+        kDirectAll = kAll | kDirectOnly,
+    };
+
+    /**
+     * Return type for resolveRoles().
+     * Each member will be populated ONLY IF their corresponding Option flag was specifed.
+     * Otherwise, they will be equal to boost::none.
+     */
+    struct ResolvedRoleData {
+        boost::optional<stdx::unordered_set<RoleName>> roles;
+        boost::optional<PrivilegeVector> privileges;
+        boost::optional<RestrictionDocuments> restrictions;
+    };
+
+    /**
+     * Delegates method call to the underlying AuthzManagerExternalState.
+     */
+    virtual StatusWith<ResolvedRoleData> resolveRoles(OperationContext* opCtx,
+                                                      const std::vector<RoleName>& roleNames,
+                                                      ResolveRoleOption option) = 0;
 
     /**
      * Delegates method call to the underlying AuthzManagerExternalState.
@@ -244,7 +273,15 @@ public:
                                        const std::vector<RoleName>& roleName,
                                        PrivilegeFormat privilegeFormat,
                                        AuthenticationRestrictionsFormat,
-                                       BSONObj* result) = 0;
+                                       std::vector<BSONObj>* result) = 0;
+
+    /**
+     * Delegates method call to the underlying AuthzManagerExternalState.
+     */
+    virtual Status getRolesAsUserFragment(OperationContext* opCtx,
+                                          const std::vector<RoleName>& roleName,
+                                          AuthenticationRestrictionsFormat,
+                                          BSONObj* result) = 0;
 
     /**
      * Delegates method call to the underlying AuthzManagerExternalState.
@@ -269,9 +306,8 @@ public:
     /**
      * Validate the ID associated with a known user while refreshing session cache.
      */
-    virtual StatusWith<UserHandle> acquireUserForSessionRefresh(OperationContext* opCtx,
-                                                                const UserName& userName,
-                                                                const User::UserId& uid) = 0;
+    virtual StatusWith<UserHandle> reacquireUser(OperationContext* opCtx,
+                                                 const UserHandle& user) = 0;
 
     /**
      * Marks the given user as invalid and removes it from the user cache.
@@ -286,7 +322,7 @@ public:
     /**
      * Initializes the authorization manager.  Depending on what version the authorization
      * system is at, this may involve building up the user cache and/or the roles graph.
-     * Call this function at startup and after resynchronizing a slave/secondary.
+     * Call this function at startup and after resynchronizing a secondary.
      */
     virtual Status initialize(OperationContext* opCtx) = 0;
 
@@ -303,19 +339,11 @@ public:
     virtual void updatePinnedUsersList(std::vector<UserName> names) = 0;
 
     /**
-     * Parses privDoc and fully initializes the user object (credentials, roles, and privileges)
-     * with the information extracted from the privilege document.
-     * This should never be called from outside the AuthorizationManager - the only reason it's
-     * public instead of private is so it can be unit tested.
-     */
-    virtual Status _initializeUserFromPrivilegeDocument(User* user, const BSONObj& privDoc) = 0;
-
-    /**
      * Hook called by replication code to let the AuthorizationManager observe changes
      * to relevant collections.
      */
     virtual void logOp(OperationContext* opCtx,
-                       const char* opstr,
+                       StringData opstr,
                        const NamespaceString& nss,
                        const BSONObj& obj,
                        const BSONObj* patt) = 0;

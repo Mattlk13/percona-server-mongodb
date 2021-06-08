@@ -31,46 +31,60 @@
 
 #include "mongo/db/exec/requires_collection_stage.h"
 
-#include "mongo/db/catalog/collection_catalog.h"
+#include "mongo/db/query/plan_yield_policy.h"
 
 namespace mongo {
 
-template <typename CollectionT>
-void RequiresCollectionStageBase<CollectionT>::doSaveState() {
+void RequiresCollectionStage::doSaveState() {
     doSaveStateRequiresCollection();
-
-    // A stage may not access storage while in a saved state.
-    _collection = nullptr;
 }
 
-template <typename CollectionT>
-void RequiresCollectionStageBase<CollectionT>::doRestoreState() {
-    invariant(!_collection);
+void RequiresCollectionStage::doRestoreState(const RestoreContext& context) {
+    if (context.type() == RestoreContext::RestoreType::kExternal) {
+        // RequiresCollectionStage requires a collection to be provided in restore. However, it may
+        // be null in case the collection got dropped or renamed.
+        auto collPtr = context.collection();
+        invariant(collPtr);
+        _collection = collPtr;
 
-    const CollectionCatalog& catalog = CollectionCatalog::get(getOpCtx());
-    _collection = catalog.lookupCollectionByUUID(_collectionUUID);
-    uassert(ErrorCodes::QueryPlanKilled,
-            str::stream() << "collection dropped. UUID " << _collectionUUID,
-            _collection);
+        // If we restore externally and get a null Collection we need to figure out if this was a
+        // drop or rename. The external lookup could have been done for UUID or namespace.
+        const auto& coll = *collPtr;
+
+        // If collection exists uuid does not match assume lookup was over namespace and treat this
+        // as a drop.
+        if (coll && coll->uuid() != _collectionUUID) {
+            PlanYieldPolicy::throwCollectionDroppedError(_collectionUUID);
+        }
+
+        // If we didn't get a valid collection but can still find the UUID in the catalog then we
+        // treat this as a rename.
+        if (!coll) {
+            auto catalog = CollectionCatalog::get(opCtx());
+            auto newNss = catalog->lookupNSSByUUID(opCtx(), _collectionUUID);
+            if (newNss && *newNss != _nss) {
+                PlanYieldPolicy::throwCollectionRenamedError(_nss, *newNss, _collectionUUID);
+            }
+        }
+    }
+
+    const auto& coll = *_collection;
+
+    if (!coll) {
+        PlanYieldPolicy::throwCollectionDroppedError(_collectionUUID);
+    }
+
+    // TODO SERVER-31695: Allow queries to survive collection rename, rather than throwing here
+    // when a rename has happened during yield.
+    if (const auto& newNss = coll->ns(); newNss != _nss) {
+        PlanYieldPolicy::throwCollectionRenamedError(_nss, newNss, _collectionUUID);
+    }
 
     uassert(ErrorCodes::QueryPlanKilled,
-            str::stream()
-                << "Database epoch changed due to a database-level event such as 'restartCatalog'.",
-            getDatabaseEpoch(_collection) == _databaseEpoch);
-
-    // TODO SERVER-31695: Allow queries to survive collection rename, rather than throwing here when
-    // a rename has happened during yield.
-    uassert(ErrorCodes::QueryPlanKilled,
-            str::stream() << "collection renamed from '" << _nss.ns() << "' to '"
-                          << _collection->ns().ns()
-                          << "'. UUID "
-                          << _collectionUUID,
-            _nss == _collection->ns());
+            "the catalog was closed and reopened",
+            getCatalogEpoch() == _catalogEpoch);
 
     doRestoreStateRequiresCollection();
 }
-
-template class RequiresCollectionStageBase<const Collection*>;
-template class RequiresCollectionStageBase<Collection*>;
 
 }  // namespace mongo

@@ -77,12 +77,15 @@ public:
     Status dropReplicatedDatabases(OperationContext* opCtx) override;
 
     Status createOplog(OperationContext* opCtx, const NamespaceString& nss) override;
-    StatusWith<size_t> getOplogMaxSize(OperationContext* opCtx,
-                                       const NamespaceString& nss) override;
+    StatusWith<size_t> getOplogMaxSize(OperationContext* opCtx) override;
 
     Status createCollection(OperationContext* opCtx,
                             const NamespaceString& nss,
                             const CollectionOptions& options) override;
+
+    Status createIndexesOnEmptyCollection(OperationContext* opCtx,
+                                          const NamespaceString& nss,
+                                          const std::vector<BSONObj>& secondaryIndexSpecs) override;
 
     Status dropCollection(OperationContext* opCtx, const NamespaceString& nss) override;
 
@@ -96,6 +99,7 @@ public:
     Status setIndexIsMultikey(OperationContext* opCtx,
                               const NamespaceString& nss,
                               const std::string& indexName,
+                              const KeyStringSet& multikeyMetadataKeys,
                               const MultikeyPaths& paths,
                               Timestamp ts) override;
 
@@ -143,6 +147,14 @@ public:
                           const NamespaceString& nss,
                           const BSONObj& filter) override;
 
+    boost::optional<BSONObj> findOplogEntryLessThanOrEqualToTimestamp(
+        OperationContext* opCtx, const CollectionPtr& oplog, const Timestamp& timestamp) override;
+
+    boost::optional<BSONObj> findOplogEntryLessThanOrEqualToTimestampRetryOnWCE(
+        OperationContext* opCtx, const CollectionPtr& oplog, const Timestamp& timestamp) override;
+
+    Timestamp getLatestOplogTimestamp(OperationContext* opCtx) override;
+
     StatusWith<StorageInterface::CollectionSize> getCollectionSize(
         OperationContext* opCtx, const NamespaceString& nss) override;
 
@@ -153,28 +165,26 @@ public:
                               const NamespaceStringOrUUID& nsOrUUID,
                               long long newCount) override;
 
-    StatusWith<OptionalCollectionUUID> getCollectionUUID(OperationContext* opCtx,
-                                                         const NamespaceString& nss) override;
+    StatusWith<UUID> getCollectionUUID(OperationContext* opCtx,
+                                       const NamespaceString& nss) override;
 
-    Status upgradeNonReplicatedUniqueIndexes(OperationContext* opCtx) override;
-
-    void setStableTimestamp(ServiceContext* serviceCtx, Timestamp snapshotName) override;
+    void setStableTimestamp(ServiceContext* serviceCtx,
+                            Timestamp snapshotName,
+                            bool force = false) override;
 
     void setInitialDataTimestamp(ServiceContext* serviceCtx, Timestamp snapshotName) override;
 
-    StatusWith<Timestamp> recoverToStableTimestamp(OperationContext* opCtx) override;
+    Timestamp recoverToStableTimestamp(OperationContext* opCtx) override;
 
     bool supportsRecoverToStableTimestamp(ServiceContext* serviceCtx) const override;
 
     bool supportsRecoveryTimestamp(ServiceContext* serviceCtx) const override;
 
+    void initializeStorageControlsForReplication(ServiceContext* serviceCtx) const override;
+
     boost::optional<Timestamp> getRecoveryTimestamp(ServiceContext* serviceCtx) const override;
 
-    bool supportsDocLocking(ServiceContext* serviceCtx) const override;
-
-    Timestamp getAllCommittedTimestamp(ServiceContext* serviceCtx) const override;
-
-    Timestamp getOldestOpenReadTimestamp(ServiceContext* serviceCtx) const override;
+    Timestamp getAllDurableTimestamp(ServiceContext* serviceCtx) const override;
 
     /**
      * Checks that the "admin" database contains a supported version of the auth data schema.
@@ -190,10 +200,10 @@ public:
     boost::optional<Timestamp> getLastStableRecoveryTimestamp(
         ServiceContext* serviceCtx) const override;
 
-    boost::optional<Timestamp> getLastStableCheckpointTimestampDeprecated(
-        ServiceContext* serviceCtx) const override;
-
     Timestamp getPointInTimeReadTimestamp(OperationContext* opCtx) const override;
+
+    void setPinnedOplogTimestamp(OperationContext* opCtx,
+                                 const Timestamp& pinnedTimestamp) const override;
 
 private:
     const NamespaceString _rollbackIdNss;

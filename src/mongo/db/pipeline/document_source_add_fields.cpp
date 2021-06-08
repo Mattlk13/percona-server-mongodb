@@ -34,32 +34,55 @@
 #include <boost/optional.hpp>
 #include <boost/smart_ptr/intrusive_ptr.hpp>
 
+#include "mongo/db/exec/add_fields_projection_executor.h"
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
-#include "mongo/db/pipeline/parsed_add_fields.h"
 
 namespace mongo {
-
 using boost::intrusive_ptr;
-using parsed_aggregation_projection::ParsedAddFields;
 
 REGISTER_DOCUMENT_SOURCE(addFields,
                          LiteParsedDocumentSourceDefault::parse,
-                         DocumentSourceAddFields::createFromBson);
+                         DocumentSourceAddFields::createFromBson,
+                         LiteParsedDocumentSource::AllowedWithApiStrict::kAlways);
 REGISTER_DOCUMENT_SOURCE(set,
                          LiteParsedDocumentSourceDefault::parse,
-                         DocumentSourceAddFields::createFromBson);
+                         DocumentSourceAddFields::createFromBson,
+                         LiteParsedDocumentSource::AllowedWithApiStrict::kAlways);
 
 intrusive_ptr<DocumentSource> DocumentSourceAddFields::create(
-    BSONObj addFieldsSpec, const intrusive_ptr<ExpressionContext>& expCtx, StringData stageName) {
+    BSONObj addFieldsSpec,
+    const intrusive_ptr<ExpressionContext>& expCtx,
+    StringData userSpecifiedName) {
 
     const bool isIndependentOfAnyCollection = false;
     intrusive_ptr<DocumentSourceSingleDocumentTransformation> addFields(
         new DocumentSourceSingleDocumentTransformation(
             expCtx,
-            ParsedAddFields::create(expCtx, addFieldsSpec),
-            stageName.toString(),
+            [&]() {
+                try {
+                    return projection_executor::AddFieldsProjectionExecutor::create(expCtx,
+                                                                                    addFieldsSpec);
+                } catch (DBException& ex) {
+                    ex.addContext("Invalid " + userSpecifiedName.toString());
+                    throw;
+                }
+            }(),
+            userSpecifiedName == kStageName ? kStageName : kAliasNameSet,
             isIndependentOfAnyCollection));
     return addFields;
+}
+
+intrusive_ptr<DocumentSource> DocumentSourceAddFields::create(
+    const FieldPath& fieldPath,
+    const intrusive_ptr<Expression>& expr,
+    const intrusive_ptr<ExpressionContext>& expCtx) {
+
+    const bool isIndependentOfAnyCollection = false;
+    return make_intrusive<DocumentSourceSingleDocumentTransformation>(
+        expCtx,
+        projection_executor::AddFieldsProjectionExecutor::create(expCtx, fieldPath, expr),
+        kStageName,
+        isIndependentOfAnyCollection);
 }
 
 intrusive_ptr<DocumentSource> DocumentSourceAddFields::createFromBson(
@@ -74,4 +97,4 @@ intrusive_ptr<DocumentSource> DocumentSourceAddFields::createFromBson(
 
     return DocumentSourceAddFields::create(elem.Obj(), expCtx, specifiedName);
 }
-}
+}  // namespace mongo

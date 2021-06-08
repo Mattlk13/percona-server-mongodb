@@ -1,6 +1,6 @@
 var t = db.geo_s2weirdpolys;
 t.drop();
-t.ensureIndex({geo: "2dsphere"});
+t.createIndex({geo: "2dsphere"});
 
 var centerPoint = {"type": "Point", "coordinates": [0.5, 0.5]};
 var edgePoint = {"type": "Point", "coordinates": [0, 0.5]};
@@ -73,9 +73,7 @@ assert.writeError(t.insert({geo: polyWithBiggerHole}));
 // Test 6: Holes cannot share more than one vertex with exterior loop
 var polySharedVertices = {
     "type": "Polygon",
-    "coordinates": [
-        [[0, 0], [0, 1], [1, 1], [1, 0], [0, 0]],
-        [[0, 0], [0.1, 0.9], [1, 1], [0.9, 0.1], [0, 0]]
-    ]
+    "coordinates":
+        [[[0, 0], [0, 1], [1, 1], [1, 0], [0, 0]], [[0, 0], [0.1, 0.9], [1, 1], [0.9, 0.1], [0, 0]]]
 };
 assert.writeError(t.insert({geo: polySharedVertices}));

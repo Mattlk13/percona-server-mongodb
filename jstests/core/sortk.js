@@ -2,11 +2,10 @@
 // SERVER-5063 and SERVER-1205.
 
 // @tags: [
-//     requires_non_retryable_writes,
-//
-//     # Uses $where operator
-//     requires_scripting,
-//     assumes_balancer_off
+//   assumes_balancer_off,
+//   requires_non_retryable_writes,
+//   # Uses $where operator
+//   requires_scripting,
 // ]
 
 t = db.jstests_sortk;
@@ -23,7 +22,7 @@ function resetCollection() {
 }
 
 resetCollection();
-t.ensureIndex({a: 1, b: 1});
+t.createIndex({a: 1, b: 1});
 
 function simpleQuery(extraFields, sort, hint) {
     query = {a: {$in: [1, 2]}};
@@ -93,7 +92,7 @@ assert.eq(3, simpleQueryWithLimit(-3).itcount());
 
 // The index ordering is reversed.
 resetCollection();
-t.ensureIndex({a: 1, b: -1});
+t.createIndex({a: 1, b: -1});
 
 // The sort order is consistent with the index order.
 assert.eq(5, simpleQuery({}, {b: -1}, {a: 1, b: -1}).limit(-1)[0].b);
@@ -103,7 +102,7 @@ assert.eq(0, simpleQuery({}, {b: 1}, {a: 1, b: -1}).limit(-1)[0].b);
 
 // An equality constraint precedes the $in constraint.
 t.drop();
-t.ensureIndex({a: 1, b: 1, c: 1});
+t.createIndex({a: 1, b: 1, c: 1});
 t.save({a: 0, b: 0, c: -1});
 t.save({a: 0, b: 2, c: 1});
 t.save({a: 1, b: 1, c: 1});

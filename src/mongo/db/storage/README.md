@@ -20,6 +20,9 @@ module would at least have the following files:
 
 See <https://github.com/mongodb-partners/mongo-rocks> for a good example of the structure.
 
+For more context and information on how this API is used, see the
+[Execution Architecture Guide](https://github.com/mongodb/mongo/blob/master/src/mongo/db/catalog/README.md).
+
 
 Concepts
 --------
@@ -28,15 +31,15 @@ Concepts
 A database contains one or more collections, each with a number of indexes, and a catalog listing
 them. All MongoDB collections are implemented with record stores: one for the documents themselves,
 and one for each index. By using the KVEngine class, you only have to deal with the abstraction, as
-the KVStorageEngine implements the StorageEngine interface, using record stores for catalogs and
+the StorageEngineImpl implements the StorageEngine interface, using record stores for catalogs and
 indexes.
 
 #### Record Identities
 A RecordId is a unique identifier, assigned by the storage engine, for a specific document or entry
 in a record store at a given time. For storage engines based in the KVEngine the record identity is
-fixed, but other storage engines, such as MMAPv1, may change it when updating a document. Note that
-changing record ids can be very expensive, as indexes map to the RecordId. A single document with a
-large array may have thousands of index entries, resulting in very expensive updates.
+fixed, but other storage engines may change it when updating a document. Note that changing record
+ids can be very expensive, as indexes map to the RecordId. A single document with a large array may
+have thousands of index entries, resulting in very expensive updates.
 
 #### Cloning and bulk operations
 Currently all cloning, [initial sync][] and other operations are done in terms of operating on
@@ -45,15 +48,11 @@ individual documents, though there is a BulkBuilder class for more efficiently b
 ### Locking and Concurrency
 MongoDB uses multi-granular intent locking; see the [Concurrency FAQ][]. In all cases, this will
 ensure that operations to meta-data, such as creation and deletion of record stores, are serialized
-with respect to other accesses. Storage engines can choose to support document-level concurrency,
-in which case the storage engine is responsible for any additional synchronization necessary. For
-storage engines not supporting document-level concurrency, MongoDB will use shared/exclusive locks
-at the collection level, so all record store accesses will be serialized.
+with respect to other accesses.
 
 MongoDB uses [two-phase locking][] (2PL) to guarantee serializability of accesses to resources it
-manages. For storage engines that support document level concurrency, MongoDB will only use intent
-locks for the most common operations, leaving synchronization at the record store layer up to the
-storage engine.
+manages. MongoDB will only use intent locks for the most common operations, leaving synchronization
+at the record store layer up to the storage engine.
 
 ### Transactions
 Each operation creates an OperationContext with a new RecoveryUnit, implemented by the storage
@@ -74,10 +73,10 @@ Storage engines must ensure that atomicity and isolation guarantees span all rec
 otherwise the guarantee of atomic updates on a document and all its indexes would be violated.
 
 #### Isolation
-Storage engines must provide snapshot isolation, either through locking (as is the case for the
-MMAPv1 engine), through multi-version concurrency control (MVCC) or otherwise. The first read
-implicitly establishes the snapshot. Operations can always see all changes they make in the context
-of a recovery unit, but other operations cannot until a successful commit.
+Storage engines must provide snapshot isolation, either through locking, through multi-version
+concurrency control (MVCC) or otherwise. The first read implicitly establishes the snapshot.
+Operations can always see all changes they make in the context of a recovery unit, but other
+operations cannot until a successful commit.
 
 #### Durability
 Once a transaction is committed, it is not necessarily durable: if, and only if the server fails,

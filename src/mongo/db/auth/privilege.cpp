@@ -54,7 +54,7 @@ void Privilege::addPrivilegesToPrivilegeVector(PrivilegeVector* privileges,
     }
 }
 
-Privilege::Privilege(const ResourcePattern& resource, const ActionType& action)
+Privilege::Privilege(const ResourcePattern& resource, const ActionType action)
     : _resource(resource) {
     _actions.addAction(action);
 }
@@ -69,7 +69,7 @@ void Privilege::removeActions(const ActionSet& actionsToRemove) {
     _actions.removeAllActionsFromSet(actionsToRemove);
 }
 
-bool Privilege::includesAction(const ActionType& action) const {
+bool Privilege::includesAction(const ActionType action) const {
     return _actions.contains(action);
 }
 
@@ -82,6 +82,43 @@ BSONObj Privilege::toBSON() const {
     std::string errmsg;
     invariant(ParsedPrivilege::privilegeToParsedPrivilege(*this, &pp, &errmsg));
     return pp.toBSON();
+}
+
+Privilege Privilege::fromBSON(const BSONElement elem) {
+    uassert(
+        ErrorCodes::BadValue, "Privilege documents must be of type object", elem.type() == Object);
+    return fromBSON(elem.Obj());
+}
+
+Privilege Privilege::fromBSON(BSONObj obj) {
+    ParsedPrivilege pp;
+    std::string errmsg;
+    if (!pp.parseBSON(obj, &errmsg)) {
+        uasserted(ErrorCodes::BadValue,
+                  str::stream() << "Unable to parse privilege document: " << obj
+                                << ", error: " << errmsg);
+    }
+    Privilege ret;
+    std::vector<std::string> unrecognized;
+    uassertStatusOK(ParsedPrivilege::parsedPrivilegeToPrivilege(pp, &ret, &unrecognized));
+
+    if (!unrecognized.empty()) {
+        StringBuilder sb;
+        sb << "Unrecognized action";
+        if (unrecognized.size() > 1) {
+            sb << 's';
+        }
+        sb << ": ";
+        for (std::size_t i = 0; i < unrecognized.size(); ++i) {
+            if (i > 0) {
+                sb << ", ";
+            }
+            sb << unrecognized[i];
+        }
+        uasserted(ErrorCodes::BadValue, sb.str());
+    }
+
+    return ret;
 }
 
 Status Privilege::getBSONForPrivileges(const PrivilegeVector& privileges,

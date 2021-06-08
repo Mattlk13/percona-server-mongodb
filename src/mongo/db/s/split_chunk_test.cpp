@@ -27,22 +27,21 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
 #include <boost/optional.hpp>
 
-#include "mongo/client/remote_command_targeter_mock.h"
 #include "mongo/db/json.h"
+#include "mongo/db/s/shard_server_test_fixture.h"
 #include "mongo/db/s/sharding_initialization_mongod.h"
 #include "mongo/db/s/split_chunk.h"
 #include "mongo/db/server_options.h"
-#include "mongo/executor/network_interface_mock.h"
 #include "mongo/executor/remote_command_request.h"
 #include "mongo/executor/remote_command_response.h"
 #include "mongo/executor/task_executor.h"
-#include "mongo/s/catalog/dist_lock_manager_mock.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog/type_collection.h"
 #include "mongo/s/catalog/type_database.h"
@@ -50,11 +49,8 @@
 #include "mongo/s/catalog_cache_loader.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
-#include "mongo/s/shard_server_test_fixture.h"
 #include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/s/write_ops/batched_command_response.h"
-#include "mongo/unittest/unittest.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
@@ -83,7 +79,7 @@ public:
         ASSERT_OK(_db.validate());
 
         // Set up the collections collection
-        _coll.setNs(_nss);
+        _coll.setNss(_nss);
         _coll.setEpoch(_epoch);
         _coll.setUpdatedAt(Date_t::fromMillisSinceEpoch(ChunkVersion(1, 3, _epoch).toLong()));
         _coll.setKeyPattern(BSON("_id" << 1));
@@ -98,12 +94,6 @@ public:
         setUpChunkRanges();
         setUpChunkVersions();
     }
-
-    /**
-     * Tells the DistLockManagerMock instance to expect a lock, and logs the corresponding
-     * information.
-     */
-    void expectLock();
 
     /**
      * Returns the mock response that correspond with particular requests. For example, dbResponse
@@ -165,16 +155,6 @@ void SplitChunkTest::setUpChunkVersions() {
         ChunkVersion(1, 1, _epoch), ChunkVersion(1, 2, _epoch), ChunkVersion(1, 3, _epoch)};
 }
 
-void SplitChunkTest::expectLock() {
-    dynamic_cast<DistLockManagerMock*>(distLock())
-        ->expectLock(
-            [this](StringData name, StringData whyMessage, Milliseconds) {
-                LOG(0) << name;
-                LOG(0) << whyMessage;
-            },
-            Status::OK());
-}
-
 void SplitChunkTest::commitChunkSplitResponse(bool isOk) {
     onCommand([&](const RemoteCommandRequest& request) {
         return isOk ? BSON("ok" << 1) : BSON("ok" << 0);
@@ -223,8 +203,6 @@ TEST_F(SplitChunkTest, HashedKeyPatternNumberLongSplitKeys) {
         validSplitKeys.push_back(BSON("foo" << i));
     }
 
-    expectLock();
-
     // Call the splitChunk function asynchronously on a different thread, so that we do not block,
     // and so we can construct the mock responses to requests made by splitChunk below.
     auto future = launchAsync([&] {
@@ -268,8 +246,6 @@ TEST_F(SplitChunkTest, HashedKeyPatternIntegerSplitKeys) {
     std::vector<BSONObj> invalidSplitKeys{
         BSON("foo" << -1), BSON("foo" << 0), BSON("foo" << 1), BSON("foo" << 42)};
 
-    expectLock();
-
     // Call the splitChunk function asynchronously on a different thread, so that we do not block,
     // and so we can construct the mock responses to requests made by splitChunk below.
     auto future = launchAsync([&] {
@@ -305,8 +281,6 @@ TEST_F(SplitChunkTest, HashedKeyPatternDoubleSplitKeys) {
     // to be converted to NumberLong types.
     std::vector<BSONObj> invalidSplitKeys{
         BSON("foo" << 47.21230129), BSON("foo" << 1.0), BSON("foo" << 0.0), BSON("foo" << -0.001)};
-
-    expectLock();
 
     // Call the splitChunk function asynchronously on a different thread, so that we do not block,
     // and so we can construct the mock responses to requests made by splitChunk below.
@@ -350,8 +324,6 @@ TEST_F(SplitChunkTest, HashedKeyPatternStringSplitKeys) {
                                           BSON("foo"
                                                << "")};
 
-    expectLock();
-
     // Call the splitChunk function asynchronously on a different thread, so that we do not block,
     // and so we can construct the mock responses to requests made by splitChunk below.
     auto future = launchAsync([&] {
@@ -390,8 +362,6 @@ TEST_F(SplitChunkTest, ValidRangeKeyPatternSplitKeys) {
                                         BSON("foo"
                                              << ""),
                                         BSON("foo" << 3.1415926535)};
-
-    expectLock();
 
     // Call the splitChunk function asynchronously on a different thread, so that we do not block,
     // and so we can construct the mock responses to requests made by splitChunk below.
@@ -434,8 +404,6 @@ TEST_F(SplitChunkTest, SplitChunkWithNoErrors) {
     for (int i = 256; i < 1024; i += 256) {
         splitKeys.push_back(BSON("foo" << i));
     }
-
-    expectLock();
 
     // Call the splitChunk function asynchronously on a different thread, so that we do not block,
     // and so we can construct the mock responses to requests made by splitChunk below.
@@ -496,8 +464,6 @@ TEST_F(SplitChunkTest, AttemptSplitWithConfigsvrError) {
         splitKeys.push_back(BSON("foo" << i));
     }
 
-    expectLock();
-
     // Call the splitChunk function asynchronously on a different thread, so that we do not block,
     // and so we can construct the mock responses to requests made by splitChunk below.
     auto future = launchAsync([&] {
@@ -540,8 +506,6 @@ TEST_F(SplitChunkTest, AttemptSplitOnNoDatabases) {
         splitKeys.push_back(BSON("foo" << i));
     }
 
-    expectLock();
-
     // Call the splitChunk function asynchronously on a different thread, so that we do not block,
     // and so we can construct the mock responses to requests made by splitChunk below.
     auto future = launchAsync([&] {
@@ -573,8 +537,6 @@ TEST_F(SplitChunkTest, AttemptSplitOnNoCollections) {
     for (int i = 256; i < 1024; i += 256) {
         splitKeys.push_back(BSON("foo" << i));
     }
-
-    expectLock();
 
     // Call the splitChunk function asynchronously on a different thread, so that we do not block,
     // and so we can construct the mock responses to requests made by splitChunk below.
@@ -610,8 +572,6 @@ TEST_F(SplitChunkTest, AttemptSplitOnNoChunks) {
     for (int i = 256; i < 1024; i += 256) {
         splitKeys.push_back(BSON("foo" << i));
     }
-
-    expectLock();
 
     // Call the splitChunk function asynchronously on a different thread, so that we do not block,
     // and so we can construct the mock responses to requests made by splitChunk below.
@@ -654,8 +614,6 @@ TEST_F(SplitChunkTest, NoCollectionAfterSplit) {
         splitKeys.push_back(BSON("foo" << i));
     }
 
-    expectLock();
-
     // Call the splitChunk function asynchronously on a different thread, so that we do not block,
     // and so we can construct the mock responses to requests made by splitChunk below.
     auto future = launchAsync([&] {
@@ -697,8 +655,6 @@ TEST_F(SplitChunkTest, NoChunksAfterSplit) {
     for (int i = 256; i < 1024; i += 256) {
         splitKeys.push_back(BSON("foo" << i));
     }
-
-    expectLock();
 
     // Call the splitChunk function asynchronously on a different thread, so that we do not block,
     // and so we can construct the mock responses to requests made by splitChunk below.

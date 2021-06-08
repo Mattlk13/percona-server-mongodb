@@ -1,6 +1,6 @@
 // mongo.js
 
-// Defined in mongo.cpp
+// Defined in mongojs.cpp
 
 if (!Mongo.prototype) {
     throw Error("Mongo.prototype not defined");
@@ -28,13 +28,23 @@ if (typeof mongoInject == "function") {
 }
 
 Mongo.prototype.setSlaveOk = function(value) {
-    if (value == undefined)
-        value = true;
-    this.slaveOk = value;
+    print(
+        "WARNING: setSlaveOk() is deprecated and may be removed in the next major release. Please use setSecondaryOk() instead.");
+    this.setSecondaryOk(value);
 };
 
 Mongo.prototype.getSlaveOk = function() {
-    return this.slaveOk || false;
+    print(
+        "WARNING: getSlaveOk() is deprecated and may be removed in the next major release. Please use getSecondaryOk() instead.");
+    return this.getSecondaryOk();
+};
+
+Mongo.prototype.setSecondaryOk = function(value = true) {
+    this.secondaryOk = value;
+};
+
+Mongo.prototype.getSecondaryOk = function() {
+    return this.secondaryOk || false;
 };
 
 Mongo.prototype.getDB = function(name) {
@@ -45,7 +55,7 @@ Mongo.prototype.getDB = function(name) {
     // There is a weird issue where typeof(db._name) !== "string" when the db name
     // is created from objects returned from native C++ methods.
     // This hack ensures that the db._name is always a string.
-    if (typeof(name) === "object") {
+    if (typeof (name) === "object") {
         name = name.toString();
     }
     return new DB(this, name);
@@ -84,7 +94,6 @@ Mongo.prototype.getDBs = function(driverSession = this._getDefaultSession(),
                                   filter = undefined,
                                   nameOnly = undefined,
                                   authorizedDatabases = undefined) {
-
     return function(driverSession, filter, nameOnly, authorizedDatabases) {
         'use strict';
 
@@ -224,21 +233,27 @@ Mongo.prototype.tojson = Mongo.prototype.toString;
  * @param mode {string} read preference mode to use. Pass null to disable read
  *     preference.
  * @param tagSet {Array.<Object>} optional. The list of tags to use, order matters.
- *     Note that this object only keeps a shallow copy of this array.
+ * @param hedgeOptions {<Object>} optional. The hedge options of the form {enabled: <bool>}.
  */
-Mongo.prototype.setReadPref = function(mode, tagSet) {
-    if ((this._readPrefMode === "primary") && (typeof(tagSet) !== "undefined") &&
-        (Object.keys(tagSet).length > 0)) {
-        // we allow empty arrays/objects or no tagSet for compatibility reasons
-        throw Error("Can not supply tagSet with readPref mode primary");
+Mongo.prototype.setReadPref = function(mode, tagSet, hedgeOptions) {
+    if (this._readPrefMode === "primary") {
+        if ((typeof (tagSet) !== "undefined") && (Object.keys(tagSet).length > 0)) {
+            // we allow empty arrays/objects or no tagSet for compatibility reasons
+            throw Error("Cannot supply tagSet with readPref mode \"primary\"");
+        }
+        if ((typeof (hedgeOptions) === "object") && hedgeOptions.enabled) {
+            throw Error("Cannot enable hedging with readPref mode \"primary\"");
+        }
     }
-    this._setReadPrefUnsafe(mode, tagSet);
+
+    this._setReadPrefUnsafe(mode, tagSet, hedgeOptions);
 };
 
 // Set readPref without validating. Exposed so we can test the server's readPref validation.
-Mongo.prototype._setReadPrefUnsafe = function(mode, tagSet) {
+Mongo.prototype._setReadPrefUnsafe = function(mode, tagSet, hedgeOptions) {
     this._readPrefMode = mode;
     this._readPrefTagSet = tagSet;
+    this._readPrefHedgeOptions = hedgeOptions;
 };
 
 Mongo.prototype.getReadPrefMode = function() {
@@ -249,18 +264,33 @@ Mongo.prototype.getReadPrefTagSet = function() {
     return this._readPrefTagSet;
 };
 
+Mongo.prototype.getReadPrefHedgeOptions = function() {
+    return this._readPrefHedgeOptions;
+};
+
 // Returns a readPreference object of the type expected by mongos.
 Mongo.prototype.getReadPref = function() {
-    var obj = {}, mode, tagSet;
-    if (typeof(mode = this.getReadPrefMode()) === "string") {
+    let obj = {};
+
+    const mode = this.getReadPrefMode();
+    if (typeof (mode) === "string") {
         obj.mode = mode;
     } else {
         return null;
     }
+
     // Server Selection Spec: - if readPref mode is "primary" then the tags field MUST
     // be absent. Ensured by setReadPref.
-    if (Array.isArray(tagSet = this.getReadPrefTagSet())) {
+    const tagSet = this.getReadPrefTagSet();
+    if (Array.isArray(tagSet)) {
         obj.tags = tagSet;
+    }
+
+    // Hedged Reads Spec: - if readPref mode is "primary" then the hegde.enabled MUST
+    // be false. Ensured by setReadPref.
+    const hedgeOptions = this.getReadPrefHedgeOptions();
+    if (typeof (hedgeOptions) === "object") {
+        obj.hedge = hedgeOptions;
     }
 
     return obj;
@@ -288,7 +318,7 @@ Mongo.prototype.getReadConcern = function() {
     return this._readConcernLevel;
 };
 
-connect = function(url, user, pass) {
+connect = function(url, user, pass, apiParameters) {
     if (url instanceof MongoURI) {
         user = url.user;
         pass = url.password;
@@ -339,11 +369,18 @@ connect = function(url, user, pass) {
     }
     chatty("connecting to: " + safeURL);
     try {
-        var m = new Mongo(url);
+        var m = new Mongo(url, undefined /* encryptedDBClientCallback */, apiParameters);
     } catch (e) {
-        if (url.indexOf(".mongodb.net") != -1) {
-            print("\n\n*** It looks like this is a MongoDB Atlas cluster. Please ensure that your" +
-                  " IP whitelist allows connections from your network.\n\n");
+        var dest;
+        if (url.indexOf(".query.mongodb.net") != -1) {
+            dest = "MongoDB Atlas Data Lake";
+        } else if (url.indexOf(".mongodb.net") != -1) {
+            dest = "MongoDB Atlas cluster";
+        }
+
+        if (dest) {
+            print(`\n\n*** You have failed to connect to a ${dest}. Please ensure` +
+                  " that your IP allowlist allows connections from your network.\n\n");
         }
 
         throw e;
@@ -381,7 +418,8 @@ connect = function(url, user, pass) {
     return db;
 };
 
-/** deprecated, use writeMode below
+/**
+ * deprecated, use writeMode below
  *
  */
 Mongo.prototype.useWriteCommands = function() {
@@ -410,7 +448,6 @@ Mongo.prototype.hasExplainCommand = function() {
  */
 
 Mongo.prototype.writeMode = function() {
-
     if ('_writeMode' in this) {
         return this._writeMode;
     }
@@ -485,6 +522,22 @@ Mongo.prototype.readMode = function() {
     return this._readMode;
 };
 
+/**
+ * Run a function while forcing a certain readMode, and then return the readMode to its original
+ * setting afterwards. Passes this connection to the given function, and returns the function's
+ * result.
+ */
+Mongo.prototype._runWithForcedReadMode = function(forcedReadMode, fn) {
+    let origReadMode = this.readMode();
+    this.forceReadMode(forcedReadMode);
+    try {
+        var res = fn(this);
+    } finally {
+        this.forceReadMode(origReadMode);
+    }
+    return res;
+};
+
 //
 // Write Concern can be set at the connection level, and is used for all write operations unless
 // overridden at the collection level.
@@ -538,9 +591,9 @@ Mongo.prototype.startSession = function startSession(options = {}) {
 
     // Only log this message if we are running a test
     if (typeof TestData === "object" && TestData.testName) {
-        jsTest.log("New session started with sessionID: " +
-                   tojsononeline(newDriverSession.getSessionId()) + " and options: " +
-                   tojsononeline(options));
+        print("New session started with sessionID: " +
+              tojsononeline(newDriverSession.getSessionId()) +
+              " and options: " + tojsononeline(options));
     }
 
     return newDriverSession;
@@ -560,7 +613,7 @@ Mongo.prototype._getDefaultSession = function getDefaultSession() {
                     this._setDummyDefaultSession();
                 } else {
                     print("ERROR: Implicit session failed: " + e.message);
-                    throw(e);
+                    throw (e);
                 }
             }
         } else {
@@ -632,6 +685,26 @@ Mongo.prototype._extractChangeStreamOptions = function(options) {
     if (options.hasOwnProperty("startAtOperationTime")) {
         changeStreamOptions.startAtOperationTime = options.startAtOperationTime;
         delete options.startAtOperationTime;
+    }
+
+    if (options.hasOwnProperty("fullDocumentBeforeChange")) {
+        changeStreamOptions.fullDocumentBeforeChange = options.fullDocumentBeforeChange;
+        delete options.fullDocumentBeforeChange;
+    }
+
+    if (options.hasOwnProperty("allChangesForCluster")) {
+        changeStreamOptions.allChangesForCluster = options.allChangesForCluster;
+        delete options.allChangesForCluster;
+    }
+
+    if (options.hasOwnProperty("allowToRunOnConfigDB")) {
+        changeStreamOptions.allowToRunOnConfigDB = options.allowToRunOnConfigDB;
+        delete options.allowToRunOnConfigDB;
+    }
+
+    if (options.hasOwnProperty("allowToRunOnSystemNS")) {
+        changeStreamOptions.allowToRunOnSystemNS = options.allowToRunOnSystemNS;
+        delete options.allowToRunOnSystemNS;
     }
 
     return [{$changeStream: changeStreamOptions}, options];

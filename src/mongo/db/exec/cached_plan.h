@@ -56,13 +56,13 @@ class PlanYieldPolicy;
  */
 class CachedPlanStage final : public RequiresAllIndicesStage {
 public:
-    CachedPlanStage(OperationContext* opCtx,
-                    Collection* collection,
+    CachedPlanStage(ExpressionContext* expCtx,
+                    const CollectionPtr& collection,
                     WorkingSet* ws,
                     CanonicalQuery* cq,
                     const QueryPlannerParams& params,
                     size_t decisionWorks,
-                    PlanStage* root);
+                    std::unique_ptr<PlanStage> root);
 
     bool isEOF() final;
 
@@ -90,14 +90,6 @@ public:
 
 private:
     /**
-     * Passes stats from the trial period run of the cached plan to the plan cache.
-     *
-     * If the plan cache entry is deleted before we get a chance to update it, then this
-     * is a no-op.
-     */
-    void updatePlanCache();
-
-    /**
      * Uses the QueryPlanner and the MultiPlanStage to re-generate candidate plans for this
      * query and select a new winner.
      *
@@ -106,7 +98,7 @@ private:
      *
      * We only modify the plan cache if 'shouldCache' is true.
      */
-    Status replan(PlanYieldPolicy* yieldPolicy, bool shouldCache);
+    Status replan(PlanYieldPolicy* yieldPolicy, bool shouldCache, std::string reason);
 
     /**
      * May yield during the cached plan stage's trial period or replanning phases.

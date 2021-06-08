@@ -30,12 +30,11 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/client/remote_command_targeter_mock.h"
+#include "mongo/db/s/shard_server_test_fixture.h"
 #include "mongo/db/s/transaction_coordinator_futures_util.h"
 #include "mongo/s/catalog/sharding_catalog_client_mock.h"
 #include "mongo/s/catalog/type_shard.h"
-#include "mongo/s/shard_server_test_fixture.h"
 #include "mongo/unittest/barrier.h"
-#include "mongo/unittest/unittest.h"
 
 namespace mongo {
 namespace txn {
@@ -251,7 +250,7 @@ TEST(TransactionCoordinatorFuturesUtilTest,
     promises[0].setError(errorStatus1);
     ASSERT(!resultFuture.isReady());
 
-    Status errorStatus2{ErrorCodes::NotMaster, "dummy error"};
+    Status errorStatus2{ErrorCodes::NotWritablePrimary, "dummy error"};
     promises[1].setError(errorStatus2);
     ASSERT(!resultFuture.isReady());
 
@@ -293,12 +292,11 @@ protected:
     // expected shards. We cannot mock the network responses for the ShardRegistry reload, since the
     // ShardRegistry reload is done over DBClient, not the NetworkInterface, and there is no
     // DBClientMock analogous to the NetworkInterfaceMock.
-    std::unique_ptr<ShardingCatalogClient> makeShardingCatalogClient(
-        std::unique_ptr<DistLockManager> distLockManager) override {
+    std::unique_ptr<ShardingCatalogClient> makeShardingCatalogClient() override {
 
         class StaticCatalogClient final : public ShardingCatalogClientMock {
         public:
-            StaticCatalogClient() : ShardingCatalogClientMock(nullptr) {}
+            StaticCatalogClient() = default;
 
             StatusWith<repl::OpTimeWith<std::vector<ShardType>>> getAllShards(
                 OperationContext* opCtx, repl::ReadConcernLevel readConcern) override {
@@ -315,7 +313,7 @@ protected:
             }
         };
 
-        return stdx::make_unique<StaticCatalogClient>();
+        return std::make_unique<StaticCatalogClient>();
     }
 
     static std::vector<ShardId> makeThreeShardIdsList() {
@@ -359,7 +357,7 @@ TEST_F(AsyncWorkSchedulerTest, ScheduledBlockingWorkSucceeds) {
     unittest::Barrier barrier(2);
     auto pf = makePromiseFuture<int>();
     auto future =
-        async.scheduleWork([&barrier, future = std::move(pf.future) ](OperationContext * opCtx) {
+        async.scheduleWork([&barrier, future = std::move(pf.future)](OperationContext* opCtx) {
             barrier.countDownAndWait();
             return future.get(opCtx);
         });
@@ -377,7 +375,7 @@ TEST_F(AsyncWorkSchedulerTest, ScheduledBlockingWorkThrowsException) {
     unittest::Barrier barrier(2);
     auto pf = makePromiseFuture<int>();
     auto future =
-        async.scheduleWork([&barrier, future = std::move(pf.future) ](OperationContext * opCtx) {
+        async.scheduleWork([&barrier, future = std::move(pf.future)](OperationContext* opCtx) {
             barrier.countDownAndWait();
             future.get(opCtx);
             uasserted(ErrorCodes::InternalError, "Test error");
@@ -396,7 +394,7 @@ TEST_F(AsyncWorkSchedulerTest, ScheduledBlockingWorkInSucceeds) {
     auto pf = makePromiseFuture<int>();
     auto future = async.scheduleWorkIn(
         Milliseconds{10},
-        [future = std::move(pf.future)](OperationContext * opCtx) { return future.get(opCtx); });
+        [future = std::move(pf.future)](OperationContext* opCtx) { return future.get(opCtx); });
 
     pf.promise.emplaceValue(5);
     ASSERT(!future.isReady());
@@ -643,11 +641,11 @@ TEST_F(AsyncWorkSchedulerTest, DestroyingSchedulerCapturedInFutureCallback) {
     future.get();
 }
 
-TEST_F(AsyncWorkSchedulerTest, NotifiesRemoteCommandTargeter_CmdResponseNotMasterError) {
+TEST_F(AsyncWorkSchedulerTest, NotifiesRemoteCommandTargeter_CmdResponseNotWritablePrimaryError) {
     ASSERT_EQ(0UL, getShardTargeterMock(kShardIds[1])->getAndClearMarkedDownHosts().size());
 
     scheduleAWSRemoteCommandWithResponse(kShardIds[1],
-                                         BSON("ok" << 0 << "code" << ErrorCodes::NotMaster
+                                         BSON("ok" << 0 << "code" << ErrorCodes::NotWritablePrimary
                                                    << "errmsg"
                                                    << "dummy"));
 
@@ -684,7 +682,7 @@ TEST_F(AsyncWorkSchedulerTest, DoesNotNotifyRemoteCommandTargeter_CmdResponseOth
     ASSERT_EQ(0UL, getShardTargeterMock(kShardIds[1])->getAndClearMarkedDownHosts().size());
 }
 
-TEST_F(AsyncWorkSchedulerTest, NotifiesRemoteCommandTargeter_WCNotMasterError) {
+TEST_F(AsyncWorkSchedulerTest, NotifiesRemoteCommandTargeter_WCNotPrimaryError) {
     ASSERT_EQ(0UL, getShardTargeterMock(kShardIds[1])->getAndClearMarkedDownHosts().size());
 
     scheduleAWSRemoteCommandWithResponse(

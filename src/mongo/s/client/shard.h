@@ -36,6 +36,7 @@
 #include "mongo/client/read_preference.h"
 #include "mongo/db/logical_time.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/pipeline/aggregation_request_helper.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/executor/remote_command_response.h"
@@ -89,6 +90,7 @@ public:
 
     enum class RetryPolicy {
         kIdempotent,
+        kIdempotentOrCursorInvalidated,
         kNotIdempotent,
         kNoRetry,
     };
@@ -108,14 +110,6 @@ public:
      * Returns the current connection string for the shard.
      */
     virtual const ConnectionString getConnString() const = 0;
-
-    /**
-     * Returns the connection string that was used to create the Shard from the ShardFactory.  The
-     * current connection string may be different.
-     * NOTE: Chances are this isn't the method you want.  When in doubt, prefer to use
-     * getConnString() instead.
-     */
-    virtual const ConnectionString originalConnString() const = 0;
 
     /**
      * Returns the RemoteCommandTargeter for the hosts in this shard.
@@ -205,14 +199,26 @@ public:
                                          const BSONObj& cmdObj) = 0;
 
     /**
-    * Runs a cursor command, exhausts the cursor, and pulls all data into memory. Performs retries
-    * if the command fails in accordance with the kIdempotent RetryPolicy.
-    */
+     * Runs a cursor command, exhausts the cursor, and pulls all data into memory. Performs retries
+     * if the command fails in accordance with the kIdempotent RetryPolicy.
+     */
     StatusWith<QueryResponse> runExhaustiveCursorCommand(OperationContext* opCtx,
                                                          const ReadPreferenceSetting& readPref,
                                                          const std::string& dbName,
                                                          const BSONObj& cmdObj,
                                                          Milliseconds maxTimeMSOverride);
+
+    /**
+     * Synchronously run the aggregation request, with a best effort honoring of request
+     * options. `callback` will be called with the batch contained in each response. `callback`
+     * should return `true` to execute another getmore. Returning `false` will send a
+     * `killCursors`. If the aggregation results are exhausted, there will be no additional calls to
+     * `callback`.
+     */
+    virtual Status runAggregation(
+        OperationContext* opCtx,
+        const AggregateCommandRequest& aggRequest,
+        std::function<bool(const std::vector<BSONObj>& batch)> callback) = 0;
 
     /**
      * Runs a write command against a shard. This is separate from runCommand, because write
@@ -225,20 +231,22 @@ public:
                                                 RetryPolicy retryPolicy);
 
     /**
-    * Warning: This method exhausts the cursor and pulls all data into memory.
-    * Do not use other than for very small (i.e., admin or metadata) collections.
-    * Performs retries if the query fails in accordance with the kIdempotent RetryPolicy.
-    *
-    * ShardRemote instances expect "readConcernLevel" to always be kMajorityReadConcern, whereas
-    * ShardLocal instances expect either kLocalReadConcern or kMajorityReadConcern.
-    */
-    StatusWith<QueryResponse> exhaustiveFindOnConfig(OperationContext* opCtx,
-                                                     const ReadPreferenceSetting& readPref,
-                                                     const repl::ReadConcernLevel& readConcernLevel,
-                                                     const NamespaceString& nss,
-                                                     const BSONObj& query,
-                                                     const BSONObj& sort,
-                                                     const boost::optional<long long> limit);
+     * Warning: This method exhausts the cursor and pulls all data into memory.
+     * Do not use other than for very small (i.e., admin or metadata) collections.
+     * Performs retries if the query fails in accordance with the kIdempotent RetryPolicy.
+     *
+     * ShardRemote instances expect "readConcernLevel" to always be kMajorityReadConcern, whereas
+     * ShardLocal instances expect either kLocalReadConcern or kMajorityReadConcern.
+     */
+    StatusWith<QueryResponse> exhaustiveFindOnConfig(
+        OperationContext* opCtx,
+        const ReadPreferenceSetting& readPref,
+        const repl::ReadConcernLevel& readConcernLevel,
+        const NamespaceString& nss,
+        const BSONObj& query,
+        const BSONObj& sort,
+        const boost::optional<long long> limit,
+        const boost::optional<BSONObj>& hint = boost::none);
 
     /**
      * Builds an index on a config server collection.
@@ -312,7 +320,8 @@ private:
         const NamespaceString& nss,
         const BSONObj& query,
         const BSONObj& sort,
-        boost::optional<long long> limit) = 0;
+        boost::optional<long long> limit,
+        const boost::optional<BSONObj>& hint = boost::none) = 0;
 
     /**
      * Identifier of the shard as obtained from the configuration data (i.e. shard0000).

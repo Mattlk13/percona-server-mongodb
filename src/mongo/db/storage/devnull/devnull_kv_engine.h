@@ -65,22 +65,29 @@ public:
                                                                   StringData ident) override;
 
     virtual Status createSortedDataInterface(OperationContext* opCtx,
+                                             const CollectionOptions& collOptions,
                                              StringData ident,
                                              const IndexDescriptor* desc) {
         return Status::OK();
     }
 
-    virtual SortedDataInterface* getSortedDataInterface(OperationContext* opCtx,
-                                                        StringData ident,
-                                                        const IndexDescriptor* desc);
-
-    virtual Status dropIdent(OperationContext* opCtx, StringData ident) {
+    virtual Status dropSortedDataInterface(OperationContext* opCtx, StringData ident) {
         return Status::OK();
     }
 
-    virtual bool supportsDocLocking() const {
-        return true;
+    virtual std::unique_ptr<SortedDataInterface> getSortedDataInterface(
+        OperationContext* opCtx,
+        const CollectionOptions& collOptions,
+        StringData ident,
+        const IndexDescriptor* desc);
+
+    virtual Status dropIdent(RecoveryUnit* ru,
+                             StringData ident,
+                             StorageEngine::DropIdentCallback&& onDrop) {
+        return Status::OK();
     }
+
+    virtual void dropIdentForImport(OperationContext* opCtx, StringData ident) {}
 
     virtual bool supportsDirectoryPerDB() const {
         return false;
@@ -96,10 +103,6 @@ public:
     virtual bool isEphemeral() const {
         return true;
     }
-
-    virtual int64_t getCacheOverflowTableInsertCount(OperationContext* opCtx) const override;
-
-    virtual void setCacheOverflowTableInsertCountForTest(int insertCount) override;
 
     virtual int64_t getIdentSize(OperationContext* opCtx, StringData ident) {
         return 1;
@@ -121,11 +124,7 @@ public:
 
     void setJournalListener(JournalListener* jl) final {}
 
-    virtual Timestamp getAllCommittedTimestamp() const override {
-        return Timestamp();
-    }
-
-    virtual Timestamp getOldestOpenReadTimestamp() const override {
+    virtual Timestamp getAllDurableTimestamp() const override {
         return Timestamp();
     }
 
@@ -139,8 +138,8 @@ public:
 
     virtual void endBackup(OperationContext* opCtx) {}
 
-    virtual StatusWith<std::vector<std::string>> beginNonBlockingBackup(
-        OperationContext* opCtx) override;
+    virtual StatusWith<std::unique_ptr<StorageEngine::StreamingCursor>> beginNonBlockingBackup(
+        OperationContext* opCtx, const StorageEngine::BackupOptions& options) override;
 
     virtual void endNonBlockingBackup(OperationContext* opCtx) override {}
 
@@ -151,9 +150,19 @@ public:
         return boost::none;
     }
 
+    virtual Timestamp getOldestTimestamp() const override {
+        return Timestamp();
+    }
+
+    virtual boost::optional<Timestamp> getRecoveryTimestamp() const {
+        return boost::none;
+    }
+
+    virtual void setPinnedOplogTimestamp(const Timestamp& pinnedTimestamp) {}
+
 private:
     std::shared_ptr<void> _catalogInfo;
 
-    int _overflowTableInsertCountForTest;
+    int _cachePressureForTest;
 };
-}
+}  // namespace mongo

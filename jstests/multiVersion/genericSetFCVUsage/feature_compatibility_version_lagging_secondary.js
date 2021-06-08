@@ -1,14 +1,15 @@
 // Tests that a primary with upgrade featureCompatibilityVersion cannot connect with a secondary
 // with a lower binary version.
 (function() {
-    "use strict";
+"use strict";
 
-    load("jstests/libs/feature_compatibility_version.js");
-    load("jstests/libs/write_concern_util.js");
+load("jstests/libs/write_concern_util.js");
 
-    const latest = "latest";
-    const downgrade = "last-stable";
+const latest = "latest";
 
+function runTest(downgradeVersion) {
+    jsTestLog("Running test with downgradeVersion: " + downgradeVersion);
+    const downgradeFCV = binVersionToFCV(downgradeVersion);
     // Start a new replica set with two latest version nodes.
     let rst = new ReplSetTest({
         nodes: [{binVersion: latest}, {binVersion: latest, rsConfig: {priority: 0}}],
@@ -20,18 +21,24 @@
     let primary = rst.getPrimary();
     let latestSecondary = rst.getSecondary();
 
+    // The default WC is majority and stopServerReplication will prevent satisfying any majority
+    // writes.
+    assert.commandWorked(primary.adminCommand(
+        {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
+
     // Set the featureCompatibilityVersion to the downgrade version so that a downgrade node can
     // join the set.
     assert.commandWorked(
-        primary.getDB("admin").runCommand({setFeatureCompatibilityVersion: lastStableFCV}));
+        primary.getDB("admin").runCommand({setFeatureCompatibilityVersion: downgradeFCV}));
 
     // Add a downgrade node to the set.
-    let downgradeSecondary = rst.add({binVersion: downgrade, rsConfig: {priority: 0}});
+    let downgradeSecondary = rst.add({binVersion: downgradeVersion, rsConfig: {priority: 0}});
     rst.reInitiate();
 
     // Wait for the downgrade secondary to finish initial sync.
     rst.awaitSecondaryNodes();
     rst.awaitReplication();
+    rst.waitForAllNewlyAddedRemovals();
 
     // Stop replication on the downgrade secondary.
     stopServerReplication(downgradeSecondary);
@@ -49,5 +56,8 @@
 
     restartServerReplication(downgradeSecondary);
     rst.stopSet();
+}
 
+runTest('last-continuous');
+runTest('last-lts');
 })();

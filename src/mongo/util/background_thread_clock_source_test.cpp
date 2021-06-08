@@ -29,9 +29,11 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/stdx/memory.h"
-#include "mongo/unittest/unittest.h"
 #include "mongo/util/background_thread_clock_source.h"
+
+#include <memory>
+
+#include "mongo/unittest/unittest.h"
 #include "mongo/util/clock_source.h"
 #include "mongo/util/clock_source_mock.h"
 #include "mongo/util/system_clock_source.h"
@@ -46,12 +48,12 @@ public:
     void setUpClocks(Milliseconds granularity) {
         auto csMock = std::make_unique<ClockSourceMock>();
         _csMock = csMock.get();
-        _btcs = stdx::make_unique<BackgroundThreadClockSource>(std::move(csMock), granularity);
+        _btcs = std::make_unique<BackgroundThreadClockSource>(std::move(csMock), granularity);
     }
 
     void setUpRealClocks(Milliseconds granularity) {
-        _btcs = stdx::make_unique<BackgroundThreadClockSource>(
-            std::make_unique<SystemClockSource>(), granularity);
+        _btcs = std::make_unique<BackgroundThreadClockSource>(std::make_unique<SystemClockSource>(),
+                                                              granularity);
     }
 
     void tearDown() override {
@@ -102,7 +104,7 @@ TEST_F(BTCSTest, NowWorks) {
     const auto then = _btcs->now();
     sleepFor(Milliseconds(100));
     const auto now = _btcs->now();
-    ASSERT_GT(now, then);
+    ASSERT_GTE(now, then);
     ASSERT_LTE(now, _btcs->now());
 }
 

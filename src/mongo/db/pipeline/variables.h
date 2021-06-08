@@ -29,14 +29,17 @@
 
 #pragma once
 
+#include <memory>
+
+#include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/pipeline/document.h"
-#include "mongo/db/pipeline/runtime_constants_gen.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/db/pipeline/legacy_runtime_constants_gen.h"
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/util/string_map.h"
 
 namespace mongo {
+class ExpressionContext;
+class VariablesParseState;
 
 /**
  * The state used as input and working space for Expressions.
@@ -50,7 +53,7 @@ public:
     /**
      * Generate runtime constants using the current local and cluster times.
      */
-    static RuntimeConstants generateRuntimeConstants(OperationContext* opCtx);
+    static LegacyRuntimeConstants generateRuntimeConstants(OperationContext* opCtx);
 
     /**
      * Generates Variables::Id and keeps track of the number of Ids handed out. Each successive Id
@@ -70,21 +73,22 @@ public:
 
     Variables() = default;
 
-    static void uassertValidNameForUserWrite(StringData varName);
-    static void uassertValidNameForUserRead(StringData varName);
-
     static bool isUserDefinedVariable(Variables::Id id) {
         return id >= 0;
     }
 
     // Ids for builtin variables.
-    static constexpr Variables::Id kRootId = Id(-1);
-    static constexpr Variables::Id kRemoveId = Id(-2);
-    static constexpr Variables::Id kNowId = Id(-3);
-    static constexpr Variables::Id kClusterTimeId = Id(-4);
+    static constexpr auto kRootId = Id(-1);
+    static constexpr auto kRemoveId = Id(-2);
+    static constexpr auto kNowId = Id(-3);
+    static constexpr auto kClusterTimeId = Id(-4);
+    static constexpr auto kJsScopeId = Id(-5);
+    static constexpr auto kIsMapReduceId = Id(-6);
 
     // Map from builtin var name to reserved id number.
     static const StringMap<Id> kBuiltinVarNameToId;
+    static const std::map<StringData, std::function<void(const Value&)>> kSystemVarValidators;
+    static const std::map<Id, std::string> kIdToBuiltinVarName;
 
     /**
      * Sets the value of a user-defined variable. Illegal to use with the reserved builtin variables
@@ -105,6 +109,14 @@ public:
     Value getValue(Variables::Id id, const Document& root) const;
 
     /**
+     * Gets the value of a user-defined or system variable. Skips user-facing checks and does not
+     * return the Document for ROOT.
+     */
+    auto getValue(Variables::Id id) const {
+        return getValue(id, Document{});
+    }
+
+    /**
      * Gets the value of a user-defined variable. Should only be called when we know 'id' represents
      * a user-defined variable.
      */
@@ -114,8 +126,8 @@ public:
      * Returns whether a constant value for 'id' has been defined using setConstantValue().
      */
     bool hasConstantValue(Variables::Id id) const {
-
-        return _valueList.size() > static_cast<size_t>(id) && _valueList[id].isConstant;
+        auto it = _definitions.find(id);
+        return (it != _definitions.end() && it->second.isConstant);
     }
 
     /**
@@ -129,19 +141,39 @@ public:
     }
 
     /**
-     * Serializes runtime constants. This is used to send the constants to shards.
+     * Set the runtime constants. It is a programming error to call this more than once.
      */
-    RuntimeConstants getRuntimeConstants() const;
-
-    /**
-     * Deserialize runtime constants.
-     */
-    void setRuntimeConstants(const RuntimeConstants& constants);
+    void setLegacyRuntimeConstants(const LegacyRuntimeConstants& constants);
 
     /**
      * Set the runtime constants using the current local and cluster times.
      */
     void setDefaultRuntimeConstants(OperationContext* opCtx);
+
+    /**
+     * Seed let parameters with the given BSONObj.
+     */
+    void seedVariablesWithLetParameters(ExpressionContext* const expCtx,
+                                        const BSONObj letParameters);
+
+    bool hasValue(Variables::Id id) const {
+        return _definitions.find(id) != _definitions.end();
+    };
+
+    void appendSystemVariables(BSONObjBuilder& bob) const;
+
+    /**
+     * Copies this Variables and 'vps' to the Variables and VariablesParseState objects in 'expCtx'.
+     * The VariablesParseState's 'idGenerator' in 'expCtx' is replaced with the pointer to the
+     * 'idGenerator' in the new copy of the Variables instance.
+     *
+     * Making such a copy is a way to ensure that variables visible to a new "scope" (a subpipeline)
+     * end up with lexical scoping and do not leak into the execution of the parent pipeline at
+     * runtime.
+     */
+    void copyToExpCtx(const VariablesParseState& vps, ExpressionContext* expCtx) const;
+
+    LegacyRuntimeConstants transitionalExtractRuntimeConstants() const;
 
 private:
     struct ValueAndState {
@@ -156,7 +188,7 @@ private:
     void setValue(Id id, const Value& value, bool isConstant);
 
     static auto getBuiltinVariableName(Variables::Id variable) {
-        for (auto & [ name, id ] : kBuiltinVarNameToId) {
+        for (auto& [name, id] : kBuiltinVarNameToId) {
             if (variable == id) {
                 return name;
             }
@@ -165,8 +197,7 @@ private:
     }
 
     IdGenerator _idGenerator;
-    std::vector<ValueAndState> _valueList;
-    stdx::unordered_map<Id, Value> _runtimeConstants;
+    stdx::unordered_map<Id, ValueAndState> _definitions;
 };
 
 /**
@@ -211,6 +242,18 @@ public:
     std::set<Variables::Id> getDefinedVariableIDs() const;
 
     /**
+     * Serializes a map from name to values of defined variables.
+     */
+    BSONObj serialize(const Variables& vars) const;
+
+    /**
+     * Splits defined variables into runtime constants and "the rest" as a transitional tool while
+     * we phase out using LegacyRuntimeConstants.
+     */
+    std::pair<LegacyRuntimeConstants, BSONObj> transitionalCompatibilitySerialize(
+        const Variables& vars) const;
+
+    /**
      * Return a copy of this VariablesParseState. Will replace the copy's '_idGenerator' pointer
      * with 'idGenerator'.
      */
@@ -227,5 +270,4 @@ private:
     StringMap<Variables::Id> _variables;
     Variables::Id _lastSeen = -1;
 };
-
 }  // namespace mongo

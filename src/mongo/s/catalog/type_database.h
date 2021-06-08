@@ -34,7 +34,7 @@
 
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/s/database_version_gen.h"
+#include "mongo/s/database_version.h"
 #include "mongo/s/shard_id.h"
 
 namespace mongo {
@@ -55,15 +55,9 @@ public:
     DatabaseType(const std::string& dbName,
                  const ShardId& primaryShard,
                  bool sharded,
-                 DatabaseVersion);
+                 DatabaseVersion dbVersion);
 
-#ifdef _WIN32
-    // TODO: Remove this when Microsoft's implementation of std::future doesn't require a default
-    // constructor.
-    // This type should not normally have a default constructor, however Microsoft's implementation
-    // of future requires one in violation of the standard so we're providing one only for Windows.
     DatabaseType() = default;
-#endif
 
     // Name of the databases collection in the config server.
     static const NamespaceString ConfigNS;
@@ -109,7 +103,7 @@ public:
     }
     void setSharded(bool sharded);
 
-    DatabaseVersion getVersion() const {
+    const DatabaseVersion& getVersion() const {
         return _version;
     }
     void setVersion(const DatabaseVersion& version);
@@ -117,7 +111,7 @@ public:
 private:
     std::string _name;
     ShardId _primary;
-    bool _sharded;
+    bool _sharded{false};
     DatabaseVersion _version;
 };
 

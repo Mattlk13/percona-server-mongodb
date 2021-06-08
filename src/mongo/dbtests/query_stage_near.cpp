@@ -45,7 +45,6 @@
 #include "mongo/db/exec/queued_data_stage.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/dbtests/dbtests.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/unittest.h"
 
 namespace {
@@ -54,7 +53,6 @@ using namespace mongo;
 using std::shared_ptr;
 using std::unique_ptr;
 using std::vector;
-using stdx::make_unique;
 
 const std::string kTestNamespace = "test.coll";
 const BSONObj kTestKeyPattern = BSON("testIndex" << 1);
@@ -62,23 +60,38 @@ const BSONObj kTestKeyPattern = BSON("testIndex" << 1);
 class QueryStageNearTest : public unittest::Test {
 public:
     void setUp() override {
+        _expCtx =
+            make_intrusive<ExpressionContext>(_opCtx, nullptr, NamespaceString(kTestNamespace));
+
         directClient.createCollection(kTestNamespace);
         ASSERT_OK(dbtests::createIndex(_opCtx, kTestNamespace, kTestKeyPattern));
 
         _autoColl.emplace(_opCtx, NamespaceString{kTestNamespace});
-        auto* coll = _autoColl->getCollection();
+        const auto& coll = _autoColl->getCollection();
         ASSERT(coll);
-        _mockGeoIndex = coll->getIndexCatalog()->findIndexByKeyPatternAndCollationSpec(
-            _opCtx, kTestKeyPattern, BSONObj{});
+        _mockGeoIndex = coll->getIndexCatalog()->findIndexByKeyPatternAndOptions(
+            _opCtx, kTestKeyPattern, _makeMinimalIndexSpec(kTestKeyPattern));
         ASSERT(_mockGeoIndex);
     }
 
+    const CollectionPtr& getCollection() const {
+        return _autoColl->getCollection();
+    }
+
 protected:
+    BSONObj _makeMinimalIndexSpec(BSONObj keyPattern) {
+        return BSON(IndexDescriptor::kKeyPatternFieldName
+                    << keyPattern << IndexDescriptor::kIndexVersionFieldName
+                    << IndexDescriptor::getDefaultIndexVersion());
+    }
+
     const ServiceContext::UniqueOperationContext _uniqOpCtx = cc().makeOperationContext();
     OperationContext* const _opCtx = _uniqOpCtx.get();
     DBDirectClient directClient{_opCtx};
 
-    boost::optional<AutoGetCollectionForRead> _autoColl;
+    boost::intrusive_ptr<ExpressionContext> _expCtx;
+
+    boost::optional<AutoGetCollectionForReadMaybeLockFree> _autoColl;
     const IndexDescriptor* _mockGeoIndex;
 };
 
@@ -97,46 +110,51 @@ public:
         double max;
     };
 
-    MockNearStage(OperationContext* opCtx,
+    MockNearStage(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                   WorkingSet* workingSet,
+                  const CollectionPtr& coll,
                   const IndexDescriptor* indexDescriptor)
-        : NearStage(
-              opCtx, "MOCK_DISTANCE_SEARCH_STAGE", STAGE_UNKNOWN, workingSet, indexDescriptor),
+        : NearStage(expCtx.get(),
+                    "MOCK_DISTANCE_SEARCH_STAGE",
+                    STAGE_UNKNOWN,
+                    workingSet,
+                    coll,
+                    indexDescriptor),
           _pos(0) {}
 
     void addInterval(vector<BSONObj> data, double min, double max) {
-        _intervals.push_back(stdx::make_unique<MockInterval>(data, min, max));
+        _intervals.push_back(std::make_unique<MockInterval>(data, min, max));
     }
 
-    virtual StatusWith<CoveredInterval*> nextInterval(OperationContext* opCtx,
-                                                      WorkingSet* workingSet,
-                                                      const Collection* collection) {
+    std::unique_ptr<CoveredInterval> nextInterval(OperationContext* opCtx,
+                                                  WorkingSet* workingSet,
+                                                  const CollectionPtr& collection) final {
         if (_pos == static_cast<int>(_intervals.size()))
-            return StatusWith<CoveredInterval*>(NULL);
+            return nullptr;
 
         const MockInterval& interval = *_intervals[_pos++];
 
         bool lastInterval = _pos == static_cast<int>(_intervals.size());
 
-        auto queuedStage = make_unique<QueuedDataStage>(opCtx, workingSet);
+        auto queuedStage = std::make_unique<QueuedDataStage>(expCtx(), workingSet);
 
         for (unsigned int i = 0; i < interval.data.size(); i++) {
             // Add all documents from the lastInterval into the QueuedDataStage.
             const WorkingSetID id = workingSet->allocate();
             WorkingSetMember* member = workingSet->get(id);
-            member->obj = Snapshotted<BSONObj>(SnapshotId(), interval.data[i]);
+            member->doc = {SnapshotId(), Document{interval.data[i]}};
             workingSet->transitionToOwnedObj(id);
             queuedStage->pushBack(id);
         }
 
         _children.push_back(std::move(queuedStage));
-        return StatusWith<CoveredInterval*>(
-            new CoveredInterval(_children.back().get(), interval.min, interval.max, lastInterval));
+        return std::make_unique<CoveredInterval>(
+            _children.back().get(), interval.min, interval.max, lastInterval);
     }
 
-    StatusWith<double> computeDistance(WorkingSetMember* member) final {
+    double computeDistance(WorkingSetMember* member) final {
         ASSERT(member->hasObj());
-        return StatusWith<double>(member->obj.value()["distance"].numberDouble());
+        return member->doc.value()["distance"].getDouble();
     }
 
     virtual StageState initialize(OperationContext* opCtx,
@@ -158,7 +176,7 @@ static vector<BSONObj> advanceStage(PlanStage* stage, WorkingSet* workingSet) {
 
     while (PlanStage::NEED_TIME == state) {
         while (PlanStage::ADVANCED == (state = stage->work(&nextMemberID))) {
-            results.push_back(workingSet->get(nextMemberID)->obj.value());
+            results.push_back(workingSet->get(nextMemberID)->doc.value().toBson());
         }
     }
 
@@ -180,7 +198,7 @@ TEST_F(QueryStageNearTest, Basic) {
     vector<BSONObj> mockData;
     WorkingSet workingSet;
 
-    MockNearStage nearStage(_opCtx, &workingSet, _mockGeoIndex);
+    MockNearStage nearStage(_expCtx.get(), &workingSet, getCollection(), _mockGeoIndex);
 
     // First set of results
     mockData.clear();
@@ -215,11 +233,11 @@ TEST_F(QueryStageNearTest, EmptyResults) {
     vector<BSONObj> mockData;
     WorkingSet workingSet;
 
-    AutoGetCollectionForRead autoColl(_opCtx, NamespaceString{kTestNamespace});
-    auto* coll = autoColl.getCollection();
+    AutoGetCollectionForReadMaybeLockFree autoColl(_opCtx, NamespaceString{kTestNamespace});
+    const auto& coll = autoColl.getCollection();
     ASSERT(coll);
 
-    MockNearStage nearStage(_opCtx, &workingSet, _mockGeoIndex);
+    MockNearStage nearStage(_expCtx.get(), &workingSet, coll, _mockGeoIndex);
 
     // Empty set of results
     mockData.clear();
@@ -236,4 +254,4 @@ TEST_F(QueryStageNearTest, EmptyResults) {
     ASSERT_EQUALS(results.size(), 3u);
     assertAscendingAndValid(results);
 }
-}
+}  // namespace

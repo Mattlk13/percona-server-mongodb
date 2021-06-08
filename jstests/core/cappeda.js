@@ -1,4 +1,11 @@
-// @tags: [requires_capped]
+/**
+ * @tags: [
+ *   requires_capped,
+ *   # capped collections connot be sharded
+ *   assumes_unsharded_collection,
+ * ]
+ */
+
 t = db.scan_capped_id;
 t.drop();
 
@@ -22,7 +29,7 @@ function u() {
 // assert.throws( q , [] , "A1" );
 // assert.throws( u , [] , "B1" );
 
-t.ensureIndex({_id: 1});
+t.createIndex({_id: 1});
 
 assert.eq(1, q().x);
 q();

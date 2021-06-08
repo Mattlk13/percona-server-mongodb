@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include <functional>
 #include <iosfwd>
 #include <memory>
 #include <string>
@@ -42,9 +43,8 @@
 #include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/service_context.h"
 #include "mongo/executor/task_executor.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/mutex.h"
 
 namespace mongo {
 namespace repl {
@@ -57,19 +57,12 @@ class MultiApplier {
 
 public:
     /**
-     * Operations sorted by timestamp in ascending order.
-     */
-    using Operations = std::vector<OplogEntry>;
-
-    using OperationPtrs = std::vector<const OplogEntry*>;
-
-    /**
      * Callback function to report final status of applying operations.
      */
     using CallbackFn = unique_function<void(const Status&)>;
 
     using MultiApplyFn =
-        stdx::function<StatusWith<OpTime>(OperationContext*, MultiApplier::Operations)>;
+        std::function<StatusWith<OpTime>(OperationContext*, std::vector<OplogEntry>)>;
 
     /**
      * Creates MultiApplier in inactive state.
@@ -85,7 +78,7 @@ public:
      * contained in 'operations' are not validated.
      */
     MultiApplier(executor::TaskExecutor* executor,
-                 const Operations& operations,
+                 const std::vector<OplogEntry>& operations,
                  const MultiApplyFn& multiApply,
                  CallbackFn onCompletion);
 
@@ -144,12 +137,12 @@ private:
     // Not owned by us.
     executor::TaskExecutor* _executor;
 
-    Operations _operations;
+    std::vector<OplogEntry> _operations;
     MultiApplyFn _multiApply;
     CallbackFn _onCompletion;
 
     // Protects member data of this MultiApplier.
-    mutable stdx::mutex _mutex;
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("MultiApplier::_mutex");
 
     stdx::condition_variable _condition;
 

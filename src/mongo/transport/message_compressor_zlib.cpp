@@ -27,12 +27,11 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
-
 #include "mongo/platform/basic.h"
 
+#include <memory>
+
 #include "mongo/base/init.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/transport/message_compressor_registry.h"
 #include "mongo/transport/message_compressor_zlib.h"
 
@@ -84,7 +83,6 @@ MONGO_INITIALIZER_GENERAL(ZlibMessageCompressorInit,
                           ("AllCompressorsRegistered"))
 (InitializerContext* context) {
     auto& compressorRegistry = MessageCompressorRegistry::get();
-    compressorRegistry.registerImplementation(stdx::make_unique<ZlibMessageCompressor>());
-    return Status::OK();
+    compressorRegistry.registerImplementation(std::make_unique<ZlibMessageCompressor>());
 }
 }  // namespace mongo

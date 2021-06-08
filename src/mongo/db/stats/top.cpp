@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -35,7 +35,6 @@
 
 #include "mongo/db/jsobj.h"
 #include "mongo/db/service_context.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -84,12 +83,6 @@ void Top::record(OperationContext* opCtx,
 
     auto hashedNs = UsageMap::hasher().hashed_key(ns);
     stdx::lock_guard<SimpleMutex> lk(_lock);
-
-    if ((command || logicalOp == LogicalOp::opQuery) &&
-        _collDropNs.find(ns.toString()) != _collDropNs.end()) {
-        _collDropNs.erase(ns.toString());
-        return;
-    }
 
     CollectionData& coll = _usage[hashedNs];
     _record(opCtx, coll, logicalOp, lockType, micros, readWriteType);
@@ -140,15 +133,9 @@ void Top::_record(OperationContext* opCtx,
     }
 }
 
-void Top::collectionDropped(const NamespaceString& nss, bool databaseDropped) {
+void Top::collectionDropped(const NamespaceString& nss) {
     stdx::lock_guard<SimpleMutex> lk(_lock);
     _usage.erase(nss.ns());
-
-    if (!databaseDropped) {
-        // If a collection drop occurred, there will be a subsequent call to record for this
-        // collection namespace which must be ignored. This does not apply to a database drop.
-        _collDropNs.insert(nss.toString());
-    }
 }
 
 void Top::cloneMap(Top::UsageMap& out) const {
@@ -205,7 +192,7 @@ void Top::appendLatencyStats(const NamespaceString& nss,
     auto hashedNs = UsageMap::hasher().hashed_key(nss.ns());
     stdx::lock_guard<SimpleMutex> lk(_lock);
     BSONObjBuilder latencyStatsBuilder;
-    _usage[hashedNs].opLatencyHistogram.append(includeHistograms, &latencyStatsBuilder);
+    _usage[hashedNs].opLatencyHistogram.append(includeHistograms, false, &latencyStatsBuilder);
     builder->append("ns", nss.ns());
     builder->append("latencyStats", latencyStatsBuilder.obj());
 }
@@ -213,13 +200,18 @@ void Top::appendLatencyStats(const NamespaceString& nss,
 void Top::incrementGlobalLatencyStats(OperationContext* opCtx,
                                       uint64_t latency,
                                       Command::ReadWriteType readWriteType) {
+    if (!opCtx->shouldIncrementLatencyStats())
+        return;
+
     stdx::lock_guard<SimpleMutex> guard(_lock);
     _incrementHistogram(opCtx, latency, &_globalHistogramStats, readWriteType);
 }
 
-void Top::appendGlobalLatencyStats(bool includeHistograms, BSONObjBuilder* builder) {
+void Top::appendGlobalLatencyStats(bool includeHistograms,
+                                   bool slowMSBucketsOnly,
+                                   BSONObjBuilder* builder) {
     stdx::lock_guard<SimpleMutex> guard(_lock);
-    _globalHistogramStats.append(includeHistograms, builder);
+    _globalHistogramStats.append(includeHistograms, slowMSBucketsOnly, builder);
 }
 
 void Top::incrementGlobalTransactionLatencyStats(uint64_t latency) {

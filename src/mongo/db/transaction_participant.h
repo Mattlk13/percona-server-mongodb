@@ -33,6 +33,8 @@
 #include <iostream>
 #include <map>
 
+#include "mongo/db/api_parameters.h"
+#include "mongo/db/catalog/uncommitted_collections.h"
 #include "mongo/db/commands/txn_cmds_gen.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/locker.h"
@@ -46,11 +48,12 @@
 #include "mongo/db/session.h"
 #include "mongo/db/session_catalog.h"
 #include "mongo/db/session_txn_record_gen.h"
-#include "mongo/db/single_transaction_stats.h"
+#include "mongo/db/stats/single_transaction_stats.h"
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/transaction_metrics_observer.h"
 #include "mongo/idl/mutable_observer_registry.h"
+#include "mongo/logv2/attribute_storage.h"
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/concurrency/with_lock.h"
@@ -92,12 +95,10 @@ class TransactionParticipant {
             kNone = 1 << 0,
             kInProgress = 1 << 1,
             kPrepared = 1 << 2,
-            kCommittingWithoutPrepare = 1 << 3,
-            kCommittingWithPrepare = 1 << 4,
-            kCommitted = 1 << 5,
-            kAbortedWithoutPrepare = 1 << 6,
-            kAbortedWithPrepare = 1 << 7,
-            kExecutedRetryableWrite = 1 << 8,
+            kCommitted = 1 << 3,
+            kAbortedWithoutPrepare = 1 << 4,
+            kAbortedWithPrepare = 1 << 5,
+            kExecutedRetryableWrite = 1 << 6,
         };
 
         using StateSet = int;
@@ -114,7 +115,7 @@ class TransactionParticipant {
             StateFlag newState,
             TransitionValidation shouldValidate = TransitionValidation::kValidateTransition);
 
-        bool inMultiDocumentTransaction() const {
+        bool isOpen() const {
             return _state == kInProgress || _state == kPrepared;
         }
 
@@ -128,14 +129,6 @@ class TransactionParticipant {
 
         bool isPrepared() const {
             return _state == kPrepared;
-        }
-
-        bool isCommittingWithoutPrepare() const {
-            return _state == kCommittingWithoutPrepare;
-        }
-
-        bool isCommittingWithPrepare() const {
-            return _state == kCommittingWithPrepare;
         }
 
         bool isCommitted() const {
@@ -196,15 +189,15 @@ public:
         TxnResources(WithLock, OperationContext* opCtx, StashStyle stashStyle) noexcept;
         ~TxnResources();
 
-        // Rule of 5: because we have a class-defined destructor, we need to explictly specify
+        // Rule of 5: because we have a class-defined destructor, we need to explicitly specify
         // the move operator and move assignment operator.
         TxnResources(TxnResources&&) = default;
         TxnResources& operator=(TxnResources&&) = default;
 
         /**
-         * Returns a const pointer to the stashed lock state, or nullptr if no stashed locks exist.
+         * Returns a pointer to the stashed lock state, or nullptr if no stashed locks exist.
          */
-        const Locker* locker() const {
+        Locker* locker() const {
             return _locker.get();
         }
 
@@ -215,26 +208,39 @@ public:
         void release(OperationContext* opCtx);
 
         /**
+         * Returns the stored API parameters.
+         */
+        const APIParameters& getAPIParameters() const {
+            return _apiParameters;
+        }
+
+        /**
          * Returns the read concern arguments.
          */
         const repl::ReadConcernArgs& getReadConcernArgs() const {
             return _readConcernArgs;
         }
 
+        void setNoEvictionAfterRollback();
+
     private:
         bool _released = false;
         std::unique_ptr<Locker> _locker;
         std::unique_ptr<Locker::LockSnapshot> _lockSnapshot;
         std::unique_ptr<RecoveryUnit> _recoveryUnit;
+        APIParameters _apiParameters;
         repl::ReadConcernArgs _readConcernArgs;
         WriteUnitOfWork::RecoveryUnitState _ruState;
+        std::shared_ptr<UncommittedCollections::UncommittedCollectionsMap> _uncommittedCollections;
     };
 
     /**
-     *  An RAII object that stashes the recovery unit from the `opCtx` onto the stack and keeps
-     *  using the same locker of `opCtx`. The locker opts out of two-phase locking of the
-     *  current WUOW. At destruction it unstashes the recovery unit back onto the `opCtx` and
-     *  restores the locker state relevant to the original WUOW.
+     *  An RAII object that will allow the current transaction to be set aside so that a separate
+     *  transaction can be created. It stashes the recovery unit from the `opCtx` onto the stack and
+     *  keeps using the same locker of `opCtx`. The locker opts out of two-phase locking of the
+     *  current WUOW. At destruction the original transaction will be restored by unstashing the
+     *  recovery unit back onto the `opCtx` and restoring the locker state relevant to the original
+     *  WUOW.
      */
     class SideTransactionBlock {
     public:
@@ -288,13 +294,13 @@ public:
         bool expiredAsOf(Date_t when) const;
 
         /**
-         * Returns whether we are in a multi-document transaction, which means we have an active
-         * transaction which has autocommit:false and has not been committed or aborted. It is
-         * possible that the current transaction is stashed onto the stack via a
+         * Returns whether we are in an open multi-document transaction, which means we have an
+         * active transaction which has autocommit:false and has not been committed or aborted. It
+         * is possible that the current transaction is stashed onto the stack via a
          * `SideTransactionBlock`.
          */
-        bool inMultiDocumentTransaction() const {
-            return o().txnState.inMultiDocumentTransaction();
+        bool transactionIsOpen() const {
+            return o().txnState.isOpen();
         };
 
         bool transactionIsCommitted() const {
@@ -309,13 +315,12 @@ public:
             return o().txnState.isPrepared();
         }
 
-        /**
-         * Returns true if we are in an active multi-document transaction or if the transaction has
-         * been aborted. This is used to cover the case where a transaction has been aborted, but
-         * the OperationContext state has not been cleared yet.
-         */
-        bool inActiveOrKilledMultiDocumentTransaction() const {
-            return o().txnState.inMultiDocumentTransaction() || o().txnState.isAborted();
+        bool transactionIsInProgress() const {
+            return o().txnState.isInProgress();
+        }
+
+        bool transactionIsInRetryableWriteMode() const {
+            return o().txnState.isInRetryableWriteMode();
         }
 
         /**
@@ -328,6 +333,8 @@ public:
         /**
          * If this session is not holding stashed locks in txnResourceStash (transaction is active),
          * reports the current state of the session using the provided builder.
+         *
+         * The Client lock for the given OperationContext must be held when calling this method.
          */
         void reportUnstashedState(OperationContext* opCtx, BSONObjBuilder* builder) const;
 
@@ -355,6 +362,11 @@ public:
      */
     class Participant : public Observer {
     public:
+        // Indicates whether the future lock requests should have timeouts.
+        enum class MaxLockTimeout { kNotAllowed, kAllowed };
+        // Indicates whether we should opt out of the ticket mechanism.
+        enum class AcquireTicket { kNoSkip, kSkip };
+
         explicit Participant(OperationContext* opCtx);
         explicit Participant(const SessionToKill& session);
 
@@ -370,6 +382,12 @@ public:
          * holding a lock.
          */
         void refreshFromStorageIfNeeded(OperationContext* opCtx);
+
+        /*
+         * Same as above, but does not retrieve full transaction history and should be called
+         * only when oplog reads are not possible.
+         */
+        void refreshFromStorageIfNeededNoOplogEntryFetch(OperationContext* opCtx);
 
         /**
          * Starts a new transaction (and if the txnNumber is newer aborts any in-progress
@@ -397,7 +415,7 @@ public:
          * currently active one or the last one which committed
          *   - PreparedTransactionInProgress - if the transaction is in the prepared state and a new
          * transaction or retryable write is attempted
-         *   - NotMaster - if the node is not a primary when this method is called.
+         *   - NotWritablePrimary - if the node is not a primary when this method is called.
          *   - IncompleteTransactionHistory - if an attempt is made to begin a retryable write for a
          * TransactionParticipant that is not in retryable write mode. This is expected behavior if
          * a retryable write has been upgraded to a transaction by the server, which can happen e.g.
@@ -417,13 +435,14 @@ public:
                                                        TxnNumber txnNumber);
 
         /**
-         * If the participant is in prepare, returns a future whose promise is fulfilled when the
-         * participant transitions out of prepare.
+         * If the participant is in prepare, returns a future whose promise is fulfilled when
+         * the participant transitions out of prepare.
          *
          * If the participant is not in prepare, returns an immediately ready future.
          *
-         * The caller should not wait on the future with the session checked out, since that will
-         * prevent the promise from being able to be fulfilled, i.e., will cause a deadlock.
+         * The caller should not wait on the future with the session checked out, since that
+         * will prevent the promise from being able to be fulfilled, i.e., will cause a
+         * deadlock.
          */
         SharedSemiFuture<void> onExitPrepare() const;
 
@@ -453,6 +472,16 @@ public:
                                      boost::optional<repl::OpTime> prepareOptime);
 
         /**
+         * Sets the prepare optime used for recovery.
+         */
+        void setPrepareOpTimeForRecovery(OperationContext* opCtx, repl::OpTime prepareOpTime);
+
+        /**
+         * Gets the prepare optime used for recovery. Returns a null optime if unset.
+         */
+        const repl::OpTime getPrepareOpTimeForRecovery() const;
+
+        /**
          * Commits the transaction, including committing the write unit of work and updating
          * transaction state.
          *
@@ -474,34 +503,10 @@ public:
                                        Timestamp commitTimestamp,
                                        boost::optional<repl::OpTime> commitOplogEntryOpTime);
 
-        /**
-         * Aborts the transaction, if it is not in the "prepared" state.
-         */
-        void abortTransactionIfNotPrepared(OperationContext* opCtx);
-
         /*
          * Aborts the transaction, releasing transaction resources.
          */
-        void abortActiveTransaction(OperationContext* opCtx);
-
-        /*
-         * If the transaction is prepared, stash its resources. If not, it's the same as
-         * abortActiveTransaction.
-         */
-        void abortActiveUnpreparedOrStashPreparedTransaction(OperationContext* opCtx);
-
-        /**
-         * Abort the transaction and write an abort oplog entry unconditionally.
-         */
-        void abortTransactionForStepUp(OperationContext* opCtx);
-
-        /**
-         * Aborts the storage transaction of the prepared transaction on this participant by
-         * releasing its resources. Also invalidates the session and the current transaction state.
-         * Avoids writing any oplog entries or making any changes to the transaction table since the
-         * state for prepared transactions will be re-constituted during replication recovery.
-         */
-        void abortPreparedTransactionForRollback(OperationContext* opCtx);
+        void abortTransaction(OperationContext* opCtx);
 
         /**
          * Adds a stored operation to the list of stored operations for the current multi-document
@@ -537,24 +542,6 @@ public:
         void refreshLocksForPreparedTransaction(OperationContext* opCtx, bool yieldLocks);
 
         /**
-         * May only be called while a multi-document transaction is not committed and adds the
-         * multi-key path info to the set of path infos to be updated at commit time.
-         */
-        void addUncommittedMultikeyPathInfo(MultikeyPathInfo info) {
-            invariant(inMultiDocumentTransaction());
-            p().multikeyPathInfo.emplace_back(std::move(info));
-        }
-
-        /**
-         * May only be called while a mutil-document transaction is not committed and returns the
-         * path infos which have been added so far.
-         */
-        const std::vector<MultikeyPathInfo>& getUncommittedMultikeyPathInfos() const {
-            invariant(inMultiDocumentTransaction());
-            return p().multikeyPathInfo;
-        }
-
-        /**
          * Called after a write under the specified transaction completes while the node is a
          * primary and specifies the statement ids which were written. Must be called while the
          * caller is still in the write's WUOW. Updates the on-disk state of the session to match
@@ -566,12 +553,8 @@ public:
          * match.
          */
         void onWriteOpCompletedOnPrimary(OperationContext* opCtx,
-                                         TxnNumber txnNumber,
                                          std::vector<StmtId> stmtIdsWritten,
-                                         const repl::OpTime& lastStmtIdWriteOpTime,
-                                         Date_t lastStmtIdWriteDate,
-                                         boost::optional<DurableTxnStateEnum> txnState,
-                                         boost::optional<repl::OpTime> startOpTime);
+                                         const SessionTxnRecord& sessionTxnRecord);
 
         /**
          * Called after an entry for the specified session and transaction has been written to the
@@ -582,11 +565,13 @@ public:
          * Throws if the session has been invalidated or the active transaction number is newer than
          * the one specified.
          */
-        void onMigrateCompletedOnPrimary(OperationContext* opCtx,
-                                         TxnNumber txnNumber,
-                                         std::vector<StmtId> stmtIdsWritten,
-                                         const repl::OpTime& lastStmtIdWriteOpTime,
-                                         Date_t oplogLastStmtIdWriteDate);
+        void onRetryableWriteCloningCompleted(OperationContext* opCtx,
+                                              std::vector<StmtId> stmtIdsWritten,
+                                              const SessionTxnRecord& sessionTxnRecord);
+
+        void onTxnMigrateCompletedOnPrimary(OperationContext* opCtx,
+                                            std::vector<StmtId> stmtIdsWritten,
+                                            const SessionTxnRecord& sessionTxnRecord);
 
         /**
          * Checks whether the given statementId for the specified transaction has already executed
@@ -624,6 +609,19 @@ public:
          */
         void shutdown(OperationContext* opCtx);
 
+        /**
+         * Returns the API parameters stored in the transaction resources stash if it exists and we
+         * are not in a retryable write. Otherwise, returns the API parameters decorating the opCtx.
+         */
+        APIParameters getAPIParameters(OperationContext* opCtx) const;
+
+        /**
+         * Locks and sets "lastWriteOpTime". The function should only advance the "lastWriteOpTime"
+         * with the only exception of reseting it to null timestamp if the storage transaction is
+         * aborted.
+         */
+        void setLastWriteOpTime(OperationContext* opCtx, const repl::OpTime& lastWriteOpTime);
+
         //
         // Methods for use in C++ unit tests, only. Beware: these methods may not adhere to the
         // concurrency control rules.
@@ -633,12 +631,28 @@ public:
             OperationContext* opCtx,
             const SingleThreadedLockStats* lockStats,
             bool committed,
+            const APIParameters& apiParameters,
             const repl::ReadConcernArgs& readConcernArgs) const {
 
             TerminationCause terminationCause =
                 committed ? TerminationCause::kCommitted : TerminationCause::kAborted;
-            return _transactionInfoForLog(opCtx, lockStats, terminationCause, readConcernArgs);
+            return _transactionInfoForLog(
+                opCtx, lockStats, terminationCause, apiParameters, readConcernArgs);
         }
+
+        BSONObj getTransactionInfoBSONForLogForTest(
+            OperationContext* opCtx,
+            const SingleThreadedLockStats* lockStats,
+            bool committed,
+            const APIParameters& apiParameters,
+            const repl::ReadConcernArgs& readConcernArgs) const {
+
+            TerminationCause terminationCause =
+                committed ? TerminationCause::kCommitted : TerminationCause::kAborted;
+            return _transactionInfoBSONForLog(
+                opCtx, lockStats, terminationCause, apiParameters, readConcernArgs);
+        }
+
 
         SingleTransactionStats getSingleTransactionStatsForTest() const {
             return o().transactionMetricsObserver.getSingleTransactionStats();
@@ -657,11 +671,7 @@ public:
             stdx::lock_guard<Client> lk(*opCtx->getClient());
             o(lk).prepareOpTime = prepareOpTime;
             o(lk).txnState.transitionTo(TransactionState::kPrepared);
-        }
-
-        void transitionToCommittingWithPrepareforTest(OperationContext* opCtx) {
-            stdx::lock_guard<Client> lk(*opCtx->getClient());
-            o(lk).txnState.transitionTo(TransactionState::kCommittingWithPrepare);
+            opCtx->lockState()->unlockRSTLforPrepare();
         }
 
         void transitionToAbortedWithoutPrepareforTest(OperationContext* opCtx) {
@@ -674,13 +684,12 @@ public:
             o(lk).txnState.transitionTo(TransactionState::kAbortedWithPrepare);
         }
 
+        void setCommittedStmtIdsForTest(std::vector<int> stmtIdsCommitted);
+
     private:
         boost::optional<repl::OpTime> _checkStatementExecuted(StmtId stmtId) const;
 
-        UpdateRequest _makeUpdateRequest(const repl::OpTime& newLastWriteOpTime,
-                                         Date_t newLastWriteDate,
-                                         boost::optional<DurableTxnStateEnum> newState,
-                                         boost::optional<repl::OpTime> startOpTime) const;
+        UpdateRequest _makeUpdateRequest(const SessionTxnRecord& sessionTxnRecord) const;
 
         void _registerUpdateCacheOnCommit(OperationContext* opCtx,
                                           std::vector<StmtId> stmtIdsWritten,
@@ -696,7 +705,9 @@ public:
         // Finishes committing the multi-document transaction after the storage-transaction has been
         // committed, the oplog entry has been inserted into the oplog, and the transactions table
         // has been updated.
-        void _finishCommitTransaction(OperationContext* opCtx);
+        void _finishCommitTransaction(OperationContext* opCtx,
+                                      size_t operationCount,
+                                      size_t oplogOperationBytes) noexcept;
 
         // Commits the storage-transaction on the OperationContext.
         //
@@ -707,11 +718,17 @@ public:
         void _stashActiveTransaction(OperationContext* opCtx);
 
         // Abort the transaction if it's in one of the expected states and clean up the transaction
-        // states associated with the opCtx.
-        // If 'writeOplog' is true, logs an 'abortTransaction' oplog entry if writes are replicated.
+        // states associated with the opCtx.  Write an abort oplog entry if specified by the
+        // needToWriteAbortEntry state bool.
         void _abortActiveTransaction(OperationContext* opCtx,
-                                     TransactionState::StateSet expectedStates,
-                                     bool writeOplog);
+                                     TransactionState::StateSet expectedStates);
+
+        // Factors out code for clarity from _abortActiveTransaction.
+        void _finishAbortingActiveTransaction(OperationContext* opCtx,
+                                              TransactionState::StateSet expectedStates);
+
+        // Aborts a prepared transaction.
+        void _abortActivePreparedTransaction(OperationContext* opCtx);
 
         // Releases stashed transaction resources to abort the transaction on the session.
         void _abortTransactionOnSession(OperationContext* opCtx);
@@ -729,6 +746,7 @@ public:
         void _logSlowTransaction(OperationContext* opCtx,
                                  const SingleThreadedLockStats* lockStats,
                                  TerminationCause terminationCause,
+                                 APIParameters apiParameters,
                                  repl::ReadConcernArgs readConcernArgs);
 
         // This method returns a string with information about a slow transaction. The format of the
@@ -738,6 +756,20 @@ public:
         std::string _transactionInfoForLog(OperationContext* opCtx,
                                            const SingleThreadedLockStats* lockStats,
                                            TerminationCause terminationCause,
+                                           APIParameters apiParameters,
+                                           repl::ReadConcernArgs readConcernArgs) const;
+
+        void _transactionInfoForLog(OperationContext* opCtx,
+                                    const SingleThreadedLockStats* lockStats,
+                                    TerminationCause terminationCause,
+                                    APIParameters apiParameters,
+                                    repl::ReadConcernArgs readConcernArgs,
+                                    logv2::DynamicAttributes* pAttrs) const;
+
+        BSONObj _transactionInfoBSONForLog(OperationContext* opCtx,
+                                           const SingleThreadedLockStats* lockStats,
+                                           TerminationCause terminationCause,
+                                           APIParameters apiParameters,
                                            repl::ReadConcernArgs readConcernArgs) const;
 
         // Bumps up the transaction number of this transaction and perform the necessary cleanup.
@@ -753,6 +785,9 @@ public:
         // number.
         void _continueMultiDocumentTransaction(OperationContext* opCtx, TxnNumber txnNumber);
 
+        // Implementation of public refreshFromStorageIfNeeded methods.
+        void _refreshFromStorageIfNeeded(OperationContext* opCtx, bool fetchOplogEntries);
+
         // Helper that invalidates the session state and activeTxnNumber. Also resets the single
         // transaction stats because the session is no longer valid.
         void _invalidate(WithLock);
@@ -764,9 +799,36 @@ public:
         // invalidating a transaction, or starting a new transaction.
         void _resetTransactionState(WithLock wl, TransactionState::StateFlag state);
 
-        // Releases the resources held in *o().txnResources to the operation context.
-        // o().txnResources must be engaged prior to calling this.
-        void _releaseTransactionResourcesToOpCtx(OperationContext* opCtx);
+        /* Releases the resources held in *o().txnResources to the operation context.
+         * o().txnResources must be engaged prior to calling this.
+         *
+         * maxLockTimeout will determine whether future lock requests should have lock timeouts.
+         *  - MaxLockTimeout::kNotAllowed will clear the lock timeout.
+         *  - MaxLockTimeout::kAllowed will set the timeout as
+         *    MaxTransactionLockRequestTimeoutMillis.
+         *
+         * acquireTicket will determine we should acquire ticket on unstashing the transaction
+         * resources.
+         *  - AcquireTicket::kSkip will not acquire ticket.
+         *  - AcquireTicket::kNoSkip will retain the default behavior which is to acquire ticket.
+         *
+         * Below is the expected behavior.
+         * -----------------------------------------------------------------------------
+         * |                |                       |               |                  |
+         * |                |      PRIMARY          |  SECONDARY    | STATE TRANSITION |
+         * |                |                       |               |                  |
+         * |----------------|-----------------------|---------------|------------------|
+         * |                | Commit/   | Other Txn |               |                  |
+         * |                | Abort Cmd | Cmds      |               |                  |
+         * |                |-----------------------|               |                  |
+         * |acquireTicket   | kSkip     |  kNoSkip  |  kNoSkip      |     kNoSkip      |
+         * |----------------|-----------------------|---------------|------------------|
+         * |maxLockTimeout  |     kAllowed          | kNotAllowed   |  kNotAllowed     |
+         * -----------------------------------------------------------------------------
+         */
+        void _releaseTransactionResourcesToOpCtx(OperationContext* opCtx,
+                                                 MaxLockTimeout maxLockTimeout,
+                                                 AcquireTicket acquireTicket);
 
         TransactionParticipant::PrivateState& p() {
             return _tp->_p;
@@ -882,6 +944,12 @@ private:
         // Track the prepareOpTime, the OpTime of the 'prepare' oplog entry for a transaction.
         repl::OpTime prepareOpTime;
 
+        // The prepare optime of the transaction. This is exposed to consumers who may need to know
+        // the optime of the prepare oplog entry during replication recovery. It is stored
+        // separately from the 'prepareOpTime' since it serves a different purpose and may be
+        // updated at different times.
+        repl::OpTime recoveryPrepareOpTime;
+
         // Tracks and updates transaction metrics upon the appropriate transaction event.
         TransactionMetricsObserver transactionMetricsObserver;
     } _o;
@@ -908,14 +976,12 @@ private:
         // Total size in bytes of all operations within the _transactionOperations vector.
         size_t transactionOperationBytes{0};
 
+        // Number of operations that have pre-images to be written to noop oplog entries.
+        size_t numberOfPreImagesToWrite{0};
+
         // The autocommit setting of this transaction. Should always be false for multi-statement
         // transaction. Currently only needed for diagnostics reporting.
         boost::optional<bool> autoCommit;
-
-        // Contains uncommitted multi-key path info entries which were modified under this
-        // transaction so they can be applied to subsequent opreations before the transaction
-        // commits
-        std::vector<MultikeyPathInfo> multikeyPathInfo;
 
         //
         // Retryable writes state
@@ -929,6 +995,12 @@ private:
         // opTime. Used for fast retryability check and retrieving the previous write's data without
         // having to scan through the oplog.
         CommittedStatementTimestampMap activeTxnCommittedStatements;
+
+        // Set to true if we need to write an "abort" oplog entry in the case of an abort.  This
+        // is the case when we have (or may have) written or replicated an oplog entry for the
+        // transaction.
+        bool needToWriteAbortEntry{false};
+
     } _p;
 };
 

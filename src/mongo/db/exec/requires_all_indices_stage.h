@@ -30,7 +30,7 @@
 #pragma once
 
 #include "mongo/db/exec/requires_collection_stage.h"
-#include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/query/all_indices_required_checker.h"
 
 namespace mongo {
 
@@ -41,42 +41,32 @@ namespace mongo {
  */
 class RequiresAllIndicesStage : public RequiresCollectionStage {
 public:
-    RequiresAllIndicesStage(const char* stageType, OperationContext* opCtx, const Collection* coll)
-        : RequiresCollectionStage(stageType, opCtx, coll) {
-        auto allEntriesShared = coll->getIndexCatalog()->getAllReadyEntriesShared();
-        _indexCatalogEntries.reserve(allEntriesShared.size());
-        _indexNames.reserve(allEntriesShared.size());
-        for (auto&& index : allEntriesShared) {
-            _indexCatalogEntries.emplace_back(index);
-            _indexNames.push_back(index->descriptor()->indexName());
-        }
-    }
+    RequiresAllIndicesStage(const char* stageType,
+                            ExpressionContext* expCtx,
+                            const CollectionPtr& coll)
+        : RequiresCollectionStage(stageType, expCtx, coll), _allIndicesRequiredChecker(coll) {}
 
     virtual ~RequiresAllIndicesStage() = default;
 
 protected:
     void doSaveStateRequiresCollection() override final {}
 
-    void doRestoreStateRequiresCollection() override final;
+    void doRestoreStateRequiresCollection() override final {
+        if (_allIndicesRequiredChecker) {
+            _allIndicesRequiredChecker->check();
+        }
+    }
 
     /**
      * Subclasses may call this to indicate that they no longer require all indices on the
      * collection to survive. After calling this, yield recovery will never fail.
      */
     void releaseAllIndicesRequirement() {
-        _indexCatalogEntries.clear();
-        _indexNames.clear();
+        _allIndicesRequiredChecker = boost::none;
     }
 
 private:
-    // This stage holds weak pointers to all of the index catalog entries known at the time of
-    // construction. During yield recovery, we attempt to lock each weak pointer in order to
-    // determine whether an index we rely on has been destroyed. If any index has been destroyed,
-    // then we throw a query-fatal exception during restore.
-    std::vector<std::weak_ptr<const IndexCatalogEntry>> _indexCatalogEntries;
-
-    // The names of the indices above. Used for error reporting.
-    std::vector<std::string> _indexNames;
+    boost::optional<AllIndicesRequiredChecker> _allIndicesRequiredChecker;
 };
 
 }  // namespace mongo

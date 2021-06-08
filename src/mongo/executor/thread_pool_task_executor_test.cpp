@@ -29,6 +29,8 @@
 
 #include "mongo/platform/basic.h"
 
+#include <memory>
+
 #include "mongo/base/checked_cast.h"
 #include "mongo/base/init.h"
 #include "mongo/base/status.h"
@@ -39,10 +41,9 @@
 #include "mongo/executor/thread_pool_mock.h"
 #include "mongo/executor/thread_pool_task_executor.h"
 #include "mongo/executor/thread_pool_task_executor_test_fixture.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/barrier.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 
 namespace mongo {
 namespace executor {
@@ -50,12 +51,11 @@ namespace {
 
 MONGO_INITIALIZER(ThreadPoolExecutorCommonTests)(InitializerContext*) {
     addTestsForExecutor("ThreadPoolExecutorCommon", [](std::unique_ptr<NetworkInterfaceMock> net) {
-        return makeThreadPoolTestExecutor(std::move(net));
+        return makeSharedThreadPoolTestExecutor(std::move(net));
     });
-    return Status::OK();
 }
 
-TEST_F(ThreadPoolExecutorTest, TimelyCancelationOfScheduleWorkAt) {
+TEST_F(ThreadPoolExecutorTest, TimelyCancellationOfScheduleWorkAt) {
     auto net = getNet();
     auto& executor = getExecutor();
     launchExecutorThread();
@@ -86,6 +86,9 @@ TEST_F(ThreadPoolExecutorTest, Schedule) {
     });
     barrier.countDownAndWait();
     ASSERT_OK(status1);
+    // Wait for the executor to stop to ensure the scheduled job does not outlive current scope.
+    executor.shutdown();
+    executor.join();
 }
 
 TEST_F(ThreadPoolExecutorTest, ScheduleAfterShutdown) {
@@ -108,10 +111,13 @@ TEST_F(ThreadPoolExecutorTest, OnEvent) {
     };
     ASSERT_OK(executor.onEvent(event, std::move(cb)).getStatus());
     // Callback was moved from.
-    ASSERT(!cb);
+    ASSERT(!cb);  // NOLINT(bugprone-use-after-move)
     executor.signalEvent(event);
     barrier.countDownAndWait();
     ASSERT_OK(status1);
+    // Wait for the executor to stop to ensure the scheduled job does not outlive current scope.
+    executor.shutdown();
+    executor.join();
 }
 
 TEST_F(ThreadPoolExecutorTest, OnEventAfterShutdown) {
@@ -126,7 +132,7 @@ TEST_F(ThreadPoolExecutorTest, OnEventAfterShutdown) {
                   executor.onEvent(event, std::move(cb)).getStatus());
 
     // Callback was not moved from, it is still valid and we can call it to set status1.
-    ASSERT(static_cast<bool>(cb));
+    ASSERT(cb);  // NOLINT(bugprone-use-after-move)
     TaskExecutor::CallbackArgs args(&executor, {}, Status::OK());
     cb(args);
     ASSERT_OK(status1);
@@ -214,11 +220,11 @@ TEST_F(ThreadPoolExecutorTest, ShutdownAndScheduleWorkRaceDoesNotCrash) {
                   })
                   .getStatus());
 
-    auto fpTPTE1 = getGlobalFailPointRegistry()->getFailPoint(
-        "scheduleIntoPoolSpinsUntilThreadPoolTaskExecutorShutsDown");
+    auto fpTPTE1 =
+        globalFailPointRegistry().find("scheduleIntoPoolSpinsUntilThreadPoolTaskExecutorShutsDown");
     fpTPTE1->setMode(FailPoint::alwaysOn);
     barrier.countDownAndWait();
-    MONGO_FAIL_POINT_PAUSE_WHILE_SET((*fpTPTE1));
+    (*fpTPTE1).pauseWhileSet();
     executor.shutdown();
     executor.join();
     ASSERT_OK(status1);
@@ -246,11 +252,11 @@ TEST_F(ThreadPoolExecutorTest, ShutdownAndScheduleRaceDoesNotCrash) {
         amRunningRecursively = false;
     });
 
-    auto fpTPTE1 = getGlobalFailPointRegistry()->getFailPoint(
-        "scheduleIntoPoolSpinsUntilThreadPoolTaskExecutorShutsDown");
+    auto fpTPTE1 =
+        globalFailPointRegistry().find("scheduleIntoPoolSpinsUntilThreadPoolTaskExecutorShutsDown");
     fpTPTE1->setMode(FailPoint::alwaysOn);
     barrier.countDownAndWait();
-    MONGO_FAIL_POINT_PAUSE_WHILE_SET((*fpTPTE1));
+    (*fpTPTE1).pauseWhileSet();
     executor.shutdown();
     executor.join();
     ASSERT_OK(status1);

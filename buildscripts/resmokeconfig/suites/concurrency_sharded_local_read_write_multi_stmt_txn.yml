@@ -5,7 +5,7 @@ selector:
   - jstests/concurrency/fsm_workloads/**/*.js
   exclude_files:
   ##
-  # Blacklists from concurrency_sharded_replication
+  # Denylists from concurrency_sharded_replication
   ##
 
   # SERVER-13116 distinct isn't sharding aware
@@ -15,7 +15,6 @@ selector:
 
   # SERVER-17397 Drops of sharded namespaces may not fully succeed
   - jstests/concurrency/fsm_workloads/create_database.js
-  - jstests/concurrency/fsm_workloads/drop_database.js
 
   # Disabled due to SERVER-33753, '.count() without a predicate can be wrong on sharded
   # collections'. This bug is problematic for these workloads because they assert on count()
@@ -25,19 +24,6 @@ selector:
   # $lookup and $graphLookup are not supported on sharded collections.
   - jstests/concurrency/fsm_workloads/agg_graph_lookup.js
   - jstests/concurrency/fsm_workloads/view_catalog_cycle_lookup.js
-
-  # Disabled due to SERVER-20057, 'Concurrent, sharded mapReduces can fail when temporary
-  # namespaces collide across mongos processes'
-  - jstests/concurrency/fsm_workloads/map_reduce_drop.js
-  - jstests/concurrency/fsm_workloads/map_reduce_inline.js
-  - jstests/concurrency/fsm_workloads/map_reduce_interrupt.js
-  - jstests/concurrency/fsm_workloads/map_reduce_merge.js
-  - jstests/concurrency/fsm_workloads/map_reduce_merge_nonatomic.js
-  - jstests/concurrency/fsm_workloads/map_reduce_reduce.js
-  - jstests/concurrency/fsm_workloads/map_reduce_reduce_nonatomic.js
-  - jstests/concurrency/fsm_workloads/map_reduce_replace.js
-  - jstests/concurrency/fsm_workloads/map_reduce_replace_nonexistent.js
-  - jstests/concurrency/fsm_workloads/map_reduce_replace_remove.js
 
   # Disabled due to MongoDB restrictions and/or workload restrictions
 
@@ -55,7 +41,7 @@ selector:
 
   # compact can only be run against a standalone mongod
   - jstests/concurrency/fsm_workloads/compact.js
-  - jstests/concurrency/fsm_workloads/compact_simultaneous_padding_bytes.js
+  - jstests/concurrency/fsm_workloads/compact_while_creating_indexes.js
 
   # convertToCapped can't be run on mongos processes
   - jstests/concurrency/fsm_workloads/convert_to_capped_collection.js
@@ -74,12 +60,16 @@ selector:
   # can cause OOM kills on test hosts
   - jstests/concurrency/fsm_workloads/findAndModify_update_grow.js
 
-  # cannot ensureIndex after dropDatabase without sharding first
+  # cannot createIndex after dropDatabase without sharding first
   - jstests/concurrency/fsm_workloads/plan_cache_drop_database.js
 
   # reIndex is not supported in mongos.
   - jstests/concurrency/fsm_workloads/reindex.js
   - jstests/concurrency/fsm_workloads/reindex_background.js
+  - jstests/concurrency/fsm_workloads/reindex_writeconflict.js
+
+  # The WTWriteConflictException failpoint is not supported on mongos.
+  - jstests/concurrency/fsm_workloads/collmod_writeconflict.js
 
   # our .remove(query, {justOne: true}) calls lack shard keys
   - jstests/concurrency/fsm_workloads/remove_single_document.js
@@ -102,10 +92,7 @@ selector:
   - jstests/concurrency/fsm_workloads/yield_and_hashed.js
   - jstests/concurrency/fsm_workloads/yield_and_sorted.js
 
-  # TODO Unblacklist (SERVER-35538).
-  - jstests/concurrency/fsm_workloads/database_versioning.js
-
-  # TODO Unblacklist (SERVER-38852).
+  # TODO Undenylist (SERVER-38852).
   - jstests/concurrency/fsm_workloads/agg_out_interrupt_cleanup.js
 
   # serverStatus does not include transaction metrics on mongos.
@@ -116,7 +103,7 @@ selector:
   - jstests/concurrency/fsm_workloads/multi_statement_transaction_all_commands_same_session.js
 
   ##
-  # Blacklists from concurrency_replication_multi_stmt_txn
+  # Denylists from concurrency_replication_multi_stmt_txn
   ##
 
   # Relies on having one thread observe writes from the other threads, which won't become visible
@@ -133,7 +120,7 @@ selector:
   - jstests/concurrency/fsm_workloads/view_catalog_direct_system_writes.js
 
   ##
-  # Blacklists from concurrency_sharded_multi_stmt_txn
+  # Denylists from concurrency_sharded_multi_stmt_txn
   ##
 
   # Use updates that do not contain the shard key, so they are rejected before any commands are
@@ -142,19 +129,13 @@ selector:
   - jstests/concurrency/fsm_workloads/update_rename.js
   - jstests/concurrency/fsm_workloads/update_rename_noindex.js
 
-  # TODO SERVER-38387: Incorrectly sends a shardCollection command that will fail with
-  # InvalidOptions, which is normally ignored but this error is re-thrown with transactions enabled,
-  # failing the workload.
-  - jstests/concurrency/fsm_workloads/agg_out.js
+  # Time-series collections are not supported on mongos.
+  - jstests/concurrency/fsm_workloads/create_timeseries_collection.js
 
   exclude_with_any_tags:
   - does_not_support_causal_consistency
   - requires_replication
-  # The touch command does not exist on mongos, which is enforced before session information is
-  # parsed, causing state functions in these workloads to fail before starting a transaction despite
-  # sending a command with startTransaction=true, leading to an infinite loop in the auto
-  # transaction retry override.
-  - requires_touch
+  - assumes_balancer_on
   # Sharing cursors between state functions will fail in this suite because it will attempt to use
   # the same cursor in multiple transactions.
   - state_functions_share_cursor
@@ -163,6 +144,14 @@ selector:
   - state_functions_share_transaction
   # Are meant to test transactions with snapshot read concern.
   - assumes_snapshot_transactions
+  # Tests which expect commands to fail and catch the error can cause transactions to abort and
+  # retry indefinitely.
+  - catches_command_failures
+  # mongos has no system.profile collection.
+  - requires_profiling
+  # mongos does not support inserts on timeseries collections
+  - requires_timeseries
+  - does_not_support_transactions
 
 executor:
   archive:
@@ -190,11 +179,11 @@ executor:
           runningWithCausalConsistency: false
           runningWithSessions: true
           traceExceptions: false
-          usingReplicaSetShards: true
   hooks:
   - class: CheckReplDBHashInBackground
   - class: CheckReplDBHash
   - class: ValidateCollections
+  - class: CheckOrphansDeleted
   - class: CleanupConcurrencyWorkloads
   fixture:
     class: ShardedClusterFixture
@@ -209,6 +198,7 @@ executor:
     mongod_options:
       set_parameters:
         enableTestCommands: 1
+        roleGraphInvalidationIsFatal: 1
     num_rs_nodes_per_shard: 3
     num_shards: 2
     num_mongos: 2

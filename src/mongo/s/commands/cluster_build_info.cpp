@@ -27,15 +27,42 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/commands.h"
+#include "mongo/db/request_execution_context.h"
+#include "mongo/executor/async_request_executor.h"
+#include "mongo/util/future.h"
 #include "mongo/util/version.h"
 
 namespace mongo {
 namespace {
+
+class ClusterBuildInfoExecutor final : public AsyncRequestExecutor {
+public:
+    ClusterBuildInfoExecutor() : AsyncRequestExecutor("ClusterBuildInfoExecutor") {}
+
+    Status handleRequest(std::shared_ptr<RequestExecutionContext> rec) {
+        auto result = rec->getReplyBuilder()->getBodyBuilder();
+        VersionInfoInterface::instance().appendBuildInfo(&result);
+        return Status::OK();
+    }
+
+    static ClusterBuildInfoExecutor* get(ServiceContext* svc);
+};
+
+const auto getClusterBuildInfoExecutor =
+    ServiceContext::declareDecoration<ClusterBuildInfoExecutor>();
+ClusterBuildInfoExecutor* ClusterBuildInfoExecutor::get(ServiceContext* svc) {
+    return const_cast<ClusterBuildInfoExecutor*>(&getClusterBuildInfoExecutor(svc));
+}
+
+const auto clusterBuildInfoExecutorRegisterer = ServiceContext::ConstructorActionRegisterer{
+    "ClusterBuildInfoExecutor",
+    [](ServiceContext* ctx) { getClusterBuildInfoExecutor(ctx).start(); },
+    [](ServiceContext* ctx) { getClusterBuildInfoExecutor(ctx).stop(); }};
 
 class ClusterCmdBuildInfo : public BasicCommand {
 public:
@@ -68,6 +95,11 @@ public:
              BSONObjBuilder& result) {
         VersionInfoInterface::instance().appendBuildInfo(&result);
         return true;
+    }
+
+    Future<void> runAsync(std::shared_ptr<RequestExecutionContext> rec, std::string) override {
+        auto opCtx = rec->getOpCtx();
+        return ClusterBuildInfoExecutor::get(opCtx->getServiceContext())->schedule(std::move(rec));
     }
 
 } cmdBuildInfo;

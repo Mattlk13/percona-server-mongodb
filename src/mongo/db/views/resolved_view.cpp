@@ -33,7 +33,10 @@
 
 #include "mongo/base/init.h"
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/db/pipeline/aggregation_request.h"
+#include "mongo/db/pipeline/document_source_index_stats.h"
+#include "mongo/db/pipeline/document_source_internal_convert_bucket_index_stats.h"
+#include "mongo/db/pipeline/document_source_internal_unpack_bucket.h"
+#include "mongo/db/timeseries/timeseries_field_names.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 
 namespace mongo {
@@ -87,8 +90,8 @@ std::shared_ptr<const ErrorExtraInfo> ResolvedView::parse(const BSONObj& cmdRepl
     return std::make_shared<ResolvedView>(fromBSON(cmdReply));
 }
 
-AggregationRequest ResolvedView::asExpandedViewAggregation(
-    const AggregationRequest& request) const {
+AggregateCommandRequest ResolvedView::asExpandedViewAggregation(
+    const AggregateCommandRequest& request) const {
     // Perform the aggregation on the resolved namespace.  The new pipeline consists of two parts:
     // first, 'pipeline' in this ResolvedView; then, the pipeline in 'request'.
     std::vector<BSONObj> resolvedPipeline;
@@ -97,21 +100,49 @@ AggregationRequest ResolvedView::asExpandedViewAggregation(
     resolvedPipeline.insert(
         resolvedPipeline.end(), request.getPipeline().begin(), request.getPipeline().end());
 
-    AggregationRequest expandedRequest{_namespace, resolvedPipeline};
+    // $indexStats needs special handling for time-series-collections. Normally for a regular read,
+    // $_internalUnpackBucket unpacks the buckets entries into time-series document format and then
+    // passes the time-series documents on through the pipeline. Instead we need to read the buckets
+    // collection's index stats unmodified and then pass the results through an additional stage to
+    // specially convert them to the time-series collection's schema, and then onward. There is no
+    // need for the $_internalUnpackBucket stage with $indexStats, so we remove it.
+    if (resolvedPipeline.size() >= 2 &&
+        resolvedPipeline[0][DocumentSourceInternalUnpackBucket::kStageNameInternal] &&
+        resolvedPipeline[1][DocumentSourceIndexStats::kStageName]) {
+        // Clear the $_internalUnpackBucket stage.
+        auto unpackStage = resolvedPipeline[0];
+        resolvedPipeline[0] = resolvedPipeline[1];
+
+        // Grab the $_internalUnpackBucket stage's time-series collection schema options and pass
+        // them into the $_internalConvertBucketIndexStats stage to use for schema conversion.
+        BSONObjBuilder builder;
+        for (const auto& elem :
+             unpackStage[DocumentSourceInternalUnpackBucket::kStageNameInternal].Obj()) {
+            if (elem.fieldNameStringData() == timeseries::kTimeFieldName ||
+                elem.fieldNameStringData() == timeseries::kMetaFieldName) {
+                builder.append(elem);
+            }
+        }
+        resolvedPipeline[1] =
+            BSON(DocumentSourceInternalConvertBucketIndexStats::kStageName << builder.obj());
+    }
+
+    AggregateCommandRequest expandedRequest{_namespace, resolvedPipeline};
 
     if (request.getExplain()) {
         expandedRequest.setExplain(request.getExplain());
     } else {
-        expandedRequest.setBatchSize(request.getBatchSize());
+        expandedRequest.setCursor(request.getCursor());
     }
 
     expandedRequest.setHint(request.getHint());
-    expandedRequest.setComment(request.getComment());
     expandedRequest.setMaxTimeMS(request.getMaxTimeMS());
     expandedRequest.setReadConcern(request.getReadConcern());
     expandedRequest.setUnwrappedReadPref(request.getUnwrappedReadPref());
-    expandedRequest.setBypassDocumentValidation(request.shouldBypassDocumentValidation());
-    expandedRequest.setAllowDiskUse(request.shouldAllowDiskUse());
+    expandedRequest.setBypassDocumentValidation(request.getBypassDocumentValidation());
+    expandedRequest.setAllowDiskUse(request.getAllowDiskUse());
+    expandedRequest.setIsMapReduceCommand(request.getIsMapReduceCommand());
+    expandedRequest.setLet(request.getLet());
 
     // Operations on a view must always use the default collation of the view. We must have already
     // checked that if the user's request specifies a collation, it matches the collation of the

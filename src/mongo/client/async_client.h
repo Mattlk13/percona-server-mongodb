@@ -40,6 +40,7 @@
 #include "mongo/rpc/unique_message.h"
 #include "mongo/transport/baton.h"
 #include "mongo/transport/message_compressor_manager.h"
+#include "mongo/transport/ssl_connection_context.h"
 #include "mongo/transport/transport_layer.h"
 #include "mongo/util/future.h"
 
@@ -54,19 +55,36 @@ public:
 
     using Handle = std::shared_ptr<AsyncDBClient>;
 
-    static Future<Handle> connect(const HostAndPort& peer,
-                                  transport::ConnectSSLMode sslMode,
-                                  ServiceContext* const context,
-                                  transport::ReactorHandle reactor,
-                                  Milliseconds timeout);
+    static Future<Handle> connect(
+        const HostAndPort& peer,
+        transport::ConnectSSLMode sslMode,
+        ServiceContext* const context,
+        transport::ReactorHandle reactor,
+        Milliseconds timeout,
+        std::shared_ptr<const transport::SSLConnectionContext> transientSSLContext = nullptr);
 
     Future<executor::RemoteCommandResponse> runCommandRequest(
         executor::RemoteCommandRequest request, const BatonHandle& baton = nullptr);
-    Future<rpc::UniqueReply> runCommand(OpMsgRequest request, const BatonHandle& baton = nullptr);
+    Future<rpc::UniqueReply> runCommand(OpMsgRequest request,
+                                        const BatonHandle& baton = nullptr,
+                                        bool fireAndForget = false);
+
+    Future<executor::RemoteCommandResponse> beginExhaustCommandRequest(
+        executor::RemoteCommandRequest request, const BatonHandle& baton = nullptr);
+    Future<executor::RemoteCommandResponse> runExhaustCommand(OpMsgRequest request,
+                                                              const BatonHandle& baton = nullptr);
+    Future<executor::RemoteCommandResponse> awaitExhaustCommand(const BatonHandle& baton = nullptr);
 
     Future<void> authenticate(const BSONObj& params);
 
-    Future<void> authenticateInternal(boost::optional<std::string> mechanismHint);
+    Future<void> authenticateInternal(
+        boost::optional<std::string> mechanismHint,
+        std::shared_ptr<auth::InternalAuthParametersProvider> authProvider);
+
+    Future<bool> completeSpeculativeAuth(std::shared_ptr<SaslClientSession> session,
+                                         std::string authDB,
+                                         BSONObj specAuth,
+                                         auth::SpeculativeAuthType speculativeAuthtype);
 
     Future<void> initWireVersion(const std::string& appName,
                                  executor::NetworkConnectionHook* const hook);
@@ -81,7 +99,13 @@ public:
     const HostAndPort& local() const;
 
 private:
-    Future<Message> _call(Message request, const BatonHandle& baton = nullptr);
+    Future<executor::RemoteCommandResponse> _continueReceiveExhaustResponse(
+        ClockSource::StopWatch stopwatch,
+        boost::optional<int32_t> msgId,
+        const BatonHandle& baton = nullptr);
+    Future<Message> _waitForResponse(boost::optional<int32_t> msgId,
+                                     const BatonHandle& baton = nullptr);
+    Future<void> _call(Message request, int32_t msgId, const BatonHandle& baton = nullptr);
     BSONObj _buildIsMasterRequest(const std::string& appName,
                                   executor::NetworkConnectionHook* hook);
     void _parseIsMasterResponse(BSONObj request,

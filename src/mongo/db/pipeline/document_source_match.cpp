@@ -31,33 +31,37 @@
 
 #include "mongo/db/pipeline/document_source_match.h"
 
+#include <algorithm>
+#include <memory>
+
+#include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/expression_algo.h"
 #include "mongo/db/matcher/expression_array.h"
 #include "mongo/db/matcher/expression_leaf.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/matcher/extensions_callback_noop.h"
-#include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/document_path_support.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/util/ctype.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
 
 using boost::intrusive_ptr;
 using std::pair;
-using std::unique_ptr;
 using std::string;
+using std::unique_ptr;
 using std::vector;
 
 REGISTER_DOCUMENT_SOURCE(match,
                          LiteParsedDocumentSourceDefault::parse,
-                         DocumentSourceMatch::createFromBson);
+                         DocumentSourceMatch::createFromBson,
+                         LiteParsedDocumentSource::AllowedWithApiStrict::kAlways);
 
 const char* DocumentSourceMatch::getSourceName() const {
-    return "$match";
+    return kStageName.rawData();
 }
 
 Value DocumentSourceMatch::serialize(boost::optional<ExplainOptions::Verbosity> explain) const {
@@ -79,9 +83,7 @@ intrusive_ptr<DocumentSource> DocumentSourceMatch::optimize() {
     return this;
 }
 
-DocumentSource::GetNextResult DocumentSourceMatch::getNext() {
-    pExpCtx->checkForInterrupt();
-
+DocumentSource::GetNextResult DocumentSourceMatch::doGetNext() {
     // The user facing error should have been generated earlier.
     massert(17309, "Should never call getNext on a $match stage with $text clause", !_isTextQuery);
 
@@ -113,6 +115,10 @@ Pipeline::SourceContainer::iterator DocumentSourceMatch::doOptimizeAt(
     Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container) {
     invariant(*itr == this);
 
+    if (std::next(itr) == container->end()) {
+        return container->end();
+    }
+
     auto nextMatch = dynamic_cast<DocumentSourceMatch*>((*std::next(itr)).get());
 
     // Since a text search must use an index, it must be the first stage in the pipeline. We cannot
@@ -141,14 +147,8 @@ namespace {
 // input is well formed.
 
 bool isAllDigits(StringData str) {
-    if (str.empty())
-        return false;
-
-    for (size_t i = 0; i < str.size(); i++) {
-        if (!isdigit(str[i]))
-            return false;
-    }
-    return true;
+    return !str.empty() &&
+        std::all_of(str.begin(), str.end(), [](char c) { return ctype::isDigit(c); });
 }
 
 bool isFieldnameRedactSafe(StringData fieldName) {
@@ -188,15 +188,12 @@ Document redactSafePortionDollarOps(BSONObj expr) {
         if (field.fieldName()[0] != '$')
             continue;
 
-        if (field.fieldNameStringData() == "$eq") {
-            if (isTypeRedactSafeInComparison(field.type())) {
-                output[field.fieldNameStringData()] = Value(field);
-            }
+        auto keyword = MatchExpressionParser::parsePathAcceptingKeyword(field);
+        if (!keyword) {
             continue;
         }
 
-        switch (*MatchExpressionParser::parsePathAcceptingKeyword(field,
-                                                                  PathAcceptingKeyword::EQUALITY)) {
+        switch (*keyword) {
             // These are always ok
             case PathAcceptingKeyword::TYPE:
             case PathAcceptingKeyword::REGEX:
@@ -210,6 +207,7 @@ Document redactSafePortionDollarOps(BSONObj expr) {
                 break;
 
             // These are ok if the type of the rhs is allowed in comparisons
+            case PathAcceptingKeyword::EQUALITY:
             case PathAcceptingKeyword::LESS_THAN_OR_EQUAL:
             case PathAcceptingKeyword::GREATER_THAN_OR_EQUAL:
             case PathAcceptingKeyword::LESS_THAN:
@@ -265,11 +263,14 @@ Document redactSafePortionDollarOps(BSONObj expr) {
             }
 
             // These are never allowed
-            case PathAcceptingKeyword::EQUALITY:  // This actually means unknown
             case PathAcceptingKeyword::EXISTS:
             case PathAcceptingKeyword::GEO_INTERSECTS:
             case PathAcceptingKeyword::GEO_NEAR:
             case PathAcceptingKeyword::INTERNAL_EXPR_EQ:
+            case PathAcceptingKeyword::INTERNAL_EXPR_GT:
+            case PathAcceptingKeyword::INTERNAL_EXPR_GTE:
+            case PathAcceptingKeyword::INTERNAL_EXPR_LT:
+            case PathAcceptingKeyword::INTERNAL_EXPR_LTE:
             case PathAcceptingKeyword::INTERNAL_SCHEMA_ALL_ELEM_MATCH_FROM_INDEX:
             case PathAcceptingKeyword::INTERNAL_SCHEMA_BIN_DATA_ENCRYPTED_TYPE:
             case PathAcceptingKeyword::INTERNAL_SCHEMA_BIN_DATA_SUBTYPE:
@@ -381,9 +382,22 @@ void DocumentSourceMatch::joinMatchWith(intrusive_ptr<DocumentSourceMatch> other
 
 pair<intrusive_ptr<DocumentSourceMatch>, intrusive_ptr<DocumentSourceMatch>>
 DocumentSourceMatch::splitSourceBy(const std::set<std::string>& fields,
-                                   const StringMap<std::string>& renames) {
+                                   const StringMap<std::string>& renames) && {
+    return std::move(*this).splitSourceByFunc(fields, renames, expression::isIndependentOf);
+}
+
+pair<intrusive_ptr<DocumentSourceMatch>, intrusive_ptr<DocumentSourceMatch>>
+DocumentSourceMatch::extractMatchOnFieldsAndRemainder(const std::set<std::string>& fields,
+                                                      const StringMap<std::string>& renames) && {
+    return std::move(*this).splitSourceByFunc(fields, renames, expression::isOnlyDependentOn);
+}
+
+pair<intrusive_ptr<DocumentSourceMatch>, intrusive_ptr<DocumentSourceMatch>>
+DocumentSourceMatch::splitSourceByFunc(const std::set<std::string>& fields,
+                                       const StringMap<std::string>& renames,
+                                       expression::ShouldSplitExprFunc func) && {
     pair<unique_ptr<MatchExpression>, unique_ptr<MatchExpression>> newExpr(
-        expression::splitMatchExpressionBy(std::move(_expression), fields, renames));
+        expression::splitMatchExpressionBy(std::move(_expression), fields, renames, func));
 
     invariant(newExpr.first || newExpr.second);
 
@@ -443,8 +457,7 @@ boost::intrusive_ptr<DocumentSourceMatch> DocumentSourceMatch::descendMatchOnPat
         invariant(expression::isPathPrefixOf(descendOn, leafPath));
 
         auto newPath = leafPath.substr(descendOn.size() + 1);
-        if (node->getCategory() == MatchExpression::MatchCategory::kLeaf &&
-            node->matchType() != MatchExpression::TYPE_OPERATOR) {
+        if (node->getCategory() == MatchExpression::MatchCategory::kLeaf) {
             auto leafNode = static_cast<LeafMatchExpression*>(node);
             leafNode->setPath(newPath);
         } else if (node->getCategory() == MatchExpression::MatchCategory::kArrayMatching) {
@@ -471,6 +484,10 @@ intrusive_ptr<DocumentSource> DocumentSourceMatch::createFromBson(
     return DocumentSourceMatch::create(elem.Obj(), pExpCtx);
 }
 
+bool DocumentSourceMatch::hasQuery() const {
+    return true;
+}
+
 BSONObj DocumentSourceMatch::getQuery() const {
     return _predicate;
 }
@@ -483,7 +500,7 @@ DepsTracker::State DocumentSourceMatch::getDependencies(DepsTracker* deps) const
         // A $text aggregation field should return EXHAUSTIVE_FIELDS, since we don't necessarily
         // know what field it will be searching without examining indices.
         deps->needWholeDocument = true;
-        deps->setNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE, true);
+        deps->setNeedsMetadata(DocumentMetadataFields::kTextScore, true);
         return DepsTracker::State::EXHAUSTIVE_FIELDS;
     }
 
@@ -492,7 +509,7 @@ DepsTracker::State DocumentSourceMatch::getDependencies(DepsTracker* deps) const
 
 DocumentSourceMatch::DocumentSourceMatch(const BSONObj& query,
                                          const intrusive_ptr<ExpressionContext>& expCtx)
-    : DocumentSource(expCtx) {
+    : DocumentSource(kStageName, expCtx) {
     rebuild(query);
 }
 
@@ -501,8 +518,9 @@ void DocumentSourceMatch::rebuild(BSONObj filter) {
     _expression = uassertStatusOK(MatchExpressionParser::parse(
         _predicate, pExpCtx, ExtensionsCallbackNoop(), Pipeline::kAllowedMatcherFeatures));
     _isTextQuery = isTextQuery(_predicate);
-    _dependencies = DepsTracker(_isTextQuery ? DepsTracker::MetadataAvailable::kTextScore
-                                             : DepsTracker::MetadataAvailable::kNoMetadata);
+    _dependencies =
+        DepsTracker(_isTextQuery ? DepsTracker::kAllMetadata & ~DepsTracker::kOnlyTextScore
+                                 : DepsTracker::kAllMetadata);
     getDependencies(&_dependencies);
 }
 

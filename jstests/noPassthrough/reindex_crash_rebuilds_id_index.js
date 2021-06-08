@@ -9,44 +9,50 @@
  */
 (function() {
 
-    load("jstests/libs/get_index_helpers.js");  // For GetIndexHelpers.
+load("jstests/libs/get_index_helpers.js");  // For GetIndexHelpers.
 
-    const baseName = 'reindex_crash_rebuilds_id_index';
-    const collName = baseName;
-    const dbpath = MongoRunner.dataPath + baseName + '/';
-    resetDbpath(dbpath);
+// This test triggers an unclean shutdown, which may cause inaccurate fast counts.
+TestData.skipEnforceFastCountOnValidate = true;
 
-    const mongodOptions = {dbpath: dbpath, noCleanData: true};
-    let conn = MongoRunner.runMongod(mongodOptions);
+const baseName = 'reindex_crash_rebuilds_id_index';
+const collName = baseName;
+const dbpath = MongoRunner.dataPath + baseName + '/';
+resetDbpath(dbpath);
 
-    let testDB = conn.getDB('test');
-    let testColl = testDB.getCollection(collName);
+const mongodOptions = {
+    dbpath: dbpath,
+    noCleanData: true
+};
+let conn = MongoRunner.runMongod(mongodOptions);
 
-    // Insert a single document and create the collection.
-    testColl.insert({a: 1});
-    let spec = GetIndexHelpers.findByKeyPattern(testColl.getIndexes(), {_id: 1});
-    assert.neq(null, spec, "_id index not found");
-    assert.eq("_id_", spec.name, tojson(spec));
+let testDB = conn.getDB('test');
+let testColl = testDB.getCollection(collName);
 
-    // Enable a failpoint that causes reIndex to crash after dropping the indexes but before
-    // rebuilding them.
-    assert.commandWorked(
-        testDB.adminCommand({configureFailPoint: 'reIndexCrashAfterDrop', mode: 'alwaysOn'}));
-    assert.throws(() => testColl.runCommand({reIndex: collName}));
+// Insert a single document and create the collection.
+testColl.insert({a: 1});
+let spec = GetIndexHelpers.findByKeyPattern(testColl.getIndexes(), {_id: 1});
+assert.neq(null, spec, "_id index not found");
+assert.eq("_id_", spec.name, tojson(spec));
 
-    // The server should have crashed from the failpoint.
-    MongoRunner.stopMongod(conn, null, {allowedExitCode: MongoRunner.EXIT_ABRUPT});
+// Enable a failpoint that causes reIndex to crash after dropping the indexes but before
+// rebuilding them.
+assert.commandWorked(
+    testDB.adminCommand({configureFailPoint: 'reIndexCrashAfterDrop', mode: 'alwaysOn'}));
+assert.throws(() => testColl.runCommand({reIndex: collName}));
 
-    // The server should start up successfully after rebuilding the _id index.
-    conn = MongoRunner.runMongod(mongodOptions);
-    testDB = conn.getDB('test');
-    testColl = testDB.getCollection(collName);
-    assert(testColl.exists());
+// The server should have crashed from the failpoint.
+MongoRunner.stopMongod(conn, null, {allowedExitCode: MongoRunner.EXIT_ABRUPT});
 
-    // The _id index should exist.
-    spec = GetIndexHelpers.findByKeyPattern(testColl.getIndexes(), {_id: 1});
-    assert.neq(null, spec, "_id index not found");
-    assert.eq("_id_", spec.name, tojson(spec));
+// The server should start up successfully after rebuilding the _id index.
+conn = MongoRunner.runMongod(mongodOptions);
+testDB = conn.getDB('test');
+testColl = testDB.getCollection(collName);
+assert(testColl.exists());
 
-    MongoRunner.stopMongod(conn);
+// The _id index should exist.
+spec = GetIndexHelpers.findByKeyPattern(testColl.getIndexes(), {_id: 1});
+assert.neq(null, spec, "_id index not found");
+assert.eq("_id_", spec.name, tojson(spec));
+
+MongoRunner.stopMongod(conn);
 })();

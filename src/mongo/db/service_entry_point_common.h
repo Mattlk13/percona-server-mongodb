@@ -34,21 +34,22 @@
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/rpc/message.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/future.h"
 #include "mongo/util/polymorphic_scoped.h"
 
 namespace mongo {
 
-MONGO_FAIL_POINT_DECLARE(rsStopGetMore);
-MONGO_FAIL_POINT_DECLARE(respondWithNotPrimaryInCommandDispatch);
+extern FailPoint rsStopGetMore;
+extern FailPoint respondWithNotPrimaryInCommandDispatch;
 
-// When active, we won't check if we are master in command dispatch. Activate this if you want to
+// When active, we won't check if we are primary in command dispatch. Activate this if you want to
 // test failing during command execution.
-MONGO_FAIL_POINT_DECLARE(skipCheckingForNotMasterInCommandDispatch);
+extern FailPoint skipCheckingForNotPrimaryInCommandDispatch;
 
 /**
  * Helpers for writing ServiceEntryPointImpl implementations from a reusable core.
- * Implementations are ServiceEntryPointMongo and ServiceEntryPointEmbedded, which share
+ * Implementations are ServiceEntryPointMongod and ServiceEntryPointEmbedded, which share
  * most of their code, but vary in small details captured by the Hooks customization
  * interface.
  */
@@ -60,6 +61,8 @@ struct ServiceEntryPointCommon {
     public:
         virtual ~Hooks();
         virtual bool lockedForWriting() const = 0;
+        virtual void setPrepareConflictBehaviorForReadConcern(
+            OperationContext* opCtx, const CommandInvocation* invocation) const = 0;
         virtual void waitForReadConcern(OperationContext* opCtx,
                                         const CommandInvocation* invocation,
                                         const OpMsgRequest& request) const = 0;
@@ -81,7 +84,15 @@ struct ServiceEntryPointCommon {
 
         virtual void attachCurOpErrInfo(OperationContext* opCtx, const BSONObj& replyObj) const = 0;
 
-        virtual void handleException(const DBException& e, OperationContext* opCtx) const = 0;
+        virtual bool refreshDatabase(OperationContext* opCtx, const StaleDbRoutingVersion& se) const
+            noexcept = 0;
+
+        virtual bool refreshCollection(OperationContext* opCtx, const StaleConfigInfo& se) const
+            noexcept = 0;
+
+        virtual bool refreshCatalogCache(
+            OperationContext* opCtx, const ShardCannotRefreshDueToLocksHeldInfo& refreshInfo) const
+            noexcept = 0;
 
         virtual void advanceConfigOpTimeFromRequestMetadata(OperationContext* opCtx) const = 0;
 
@@ -96,7 +107,9 @@ struct ServiceEntryPointCommon {
                                          BSONObjBuilder* metadataBob) const = 0;
     };
 
-    static DbResponse handleRequest(OperationContext* opCtx, const Message& m, const Hooks& hooks);
+    static Future<DbResponse> handleRequest(OperationContext* opCtx,
+                                            const Message& m,
+                                            std::unique_ptr<const Hooks> hooks) noexcept;
 
     /**
      * Produce a new object based on cmdObj, but with redactions applied as specified by

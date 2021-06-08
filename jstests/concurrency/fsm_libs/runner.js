@@ -5,18 +5,16 @@ load('jstests/concurrency/fsm_libs/cluster.js');
 load('jstests/concurrency/fsm_libs/parse_config.js');
 load('jstests/concurrency/fsm_libs/thread_mgr.js');
 load('jstests/concurrency/fsm_utils/name_utils.js');  // for uniqueCollName and uniqueDBName
-load('jstests/concurrency/fsm_utils/setup_teardown_functions.js');
 
 var runner = (function() {
-
     function validateExecutionMode(mode) {
         var allowedKeys = ['composed', 'parallel', 'serial'];
 
         Object.keys(mode).forEach(function(option) {
             assert.contains(option,
                             allowedKeys,
-                            'invalid option: ' + tojson(option) + '; valid options are: ' +
-                                tojson(allowedKeys));
+                            'invalid option: ' + tojson(option) +
+                                '; valid options are: ' + tojson(allowedKeys));
         });
 
         mode.composed = mode.composed || false;
@@ -45,8 +43,7 @@ var runner = (function() {
             'dbNamePrefix',
             'iterationMultiplier',
             'sessionOptions',
-            'stepdownPermittedFile',
-            'steppingDownFile',
+            'stepdownFiles',
             'threadMultiplier'
         ];
 
@@ -62,8 +59,8 @@ var runner = (function() {
         Object.keys(options).forEach(function(option) {
             assert.contains(option,
                             allowedKeys,
-                            'invalid option: ' + tojson(option) + '; valid options are: ' +
-                                tojson(allowedKeys));
+                            'invalid option: ' + tojson(option) +
+                                '; valid options are: ' + tojson(allowedKeys));
         });
 
         if (typeof options.subsetSize !== 'undefined') {
@@ -101,16 +98,18 @@ var runner = (function() {
                    1,
                    'expected iterationMultiplier to be greater than or equal to 1');
 
-        if (typeof options.stepdownPermittedFile !== 'undefined') {
+        if (typeof options.stepdownFiles !== 'undefined') {
             assert.eq('string',
-                      typeof options.stepdownPermittedFile,
-                      'expected stepdownPermittedFile to be a string');
-        }
+                      typeof options.stepdownFiles.permitted,
+                      'expected stepdownFiles.permitted to be a string');
 
-        if (typeof options.steppingDownFile !== 'undefined') {
             assert.eq('string',
-                      typeof options.steppingDownFile,
-                      'expected steppingDownFile to be a string');
+                      typeof options.stepdownFiles.idleRequest,
+                      'expected stepdownFiles.idleRequest to be a string');
+
+            assert.eq('string',
+                      typeof options.stepdownFiles.idleAck,
+                      'expected stepdownFiles.idleAck to be a string');
         }
 
         options.threadMultiplier = options.threadMultiplier || 1;
@@ -124,18 +123,18 @@ var runner = (function() {
     }
 
     function validateCleanupOptions(options) {
-        var allowedKeys = ['dropDatabaseBlacklist', 'keepExistingDatabases', 'validateCollections'];
+        var allowedKeys = ['dropDatabaseDenylist', 'keepExistingDatabases', 'validateCollections'];
 
         Object.keys(options).forEach(function(option) {
             assert.contains(option,
                             allowedKeys,
-                            'invalid option: ' + tojson(option) + '; valid options are: ' +
-                                tojson(allowedKeys));
+                            'invalid option: ' + tojson(option) +
+                                '; valid options are: ' + tojson(allowedKeys));
         });
 
-        if (typeof options.dropDatabaseBlacklist !== 'undefined') {
-            assert(Array.isArray(options.dropDatabaseBlacklist),
-                   'expected dropDatabaseBlacklist to be an array');
+        if (typeof options.dropDatabaseDenylist !== 'undefined') {
+            assert(Array.isArray(options.dropDatabaseDenylist),
+                   'expected dropDatabaseDenylist to be an array');
         }
 
         if (typeof options.keepExistingDatabases !== 'undefined') {
@@ -246,15 +245,13 @@ var runner = (function() {
         });
     }
 
-    function dropAllDatabases(db, blacklist) {
+    function dropAllDatabases(db, denylist) {
         var res = db.adminCommand('listDatabases');
         assert.commandWorked(res);
 
         res.databases.forEach(function(dbInfo) {
-            if (!Array.contains(blacklist, dbInfo.name)) {
-                var res = db.getSiblingDB(dbInfo.name).dropDatabase();
-                assert.commandWorked(res);
-                assert.eq(dbInfo.name, res.dropped);
+            if (!Array.contains(denylist, dbInfo.name)) {
+                assert.commandWorked(db.getSiblingDB(dbInfo.name).dropDatabase());
             }
         });
     }
@@ -336,8 +333,8 @@ var runner = (function() {
 
             // Special case message when threads all have the same trace
             if (numUniqueTraces === 1) {
-                return pluralize('thread', stackTraces.length) + ' threw\n\n' +
-                    indent(uniqueTraces[0].value, 8);
+                return pluralize('thread', stackTraces.length) + ' with tids ' +
+                    JSON.stringify(stackTids) + ' threw\n\n' + indent(uniqueTraces[0].value, 8);
             }
 
             var summary = pluralize('exception', stackTraces.length) + ' were thrown, ' +
@@ -390,7 +387,7 @@ var runner = (function() {
     function setIterations(config) {
         // This property must be enumerable because of SERVER-21338, which prevents
         // objects with non-enumerable properties from being serialized properly in
-        // ScopedThreads.
+        // Threads.
         Object.defineProperty(
             config.data, 'iterations', {enumerable: true, value: config.iterations});
     }
@@ -398,21 +395,9 @@ var runner = (function() {
     function setThreadCount(config) {
         // This property must be enumerable because of SERVER-21338, which prevents
         // objects with non-enumerable properties from being serialized properly in
-        // ScopedThreads.
+        // Threads.
         Object.defineProperty(
             config.data, 'threadCount', {enumerable: true, value: config.threadCount});
-    }
-
-    function useDropDistLockFailPoint(cluster, clusterOptions) {
-        assert(cluster.isSharded(), 'cluster is not sharded');
-
-        // For sharded clusters, enable a fail point that allows dropCollection to wait longer
-        // to acquire the distributed lock. This prevents tests from failing if the distributed
-        // lock is already held by the balancer or by a workload operation. The increased wait
-        // is shorter than the distributed-lock-takeover period because otherwise the node
-        // would be assumed to be down and the lock would be overtaken.
-        clusterOptions.setupFunctions.config.push(increaseDropDistLockTimeout);
-        clusterOptions.teardownFunctions.config.push(resetDropDistLockTimeout);
     }
 
     function loadWorkloadContext(workloads, context, executionOptions, applyMultipliers) {
@@ -440,7 +425,7 @@ var runner = (function() {
     }
 
     function cleanupWorkload(
-        workload, context, cluster, errors, header, dbHashBlacklist, cleanupOptions) {
+        workload, context, cluster, errors, header, dbHashDenylist, cleanupOptions) {
         // Returns true if the workload's teardown succeeds and false if the workload's
         // teardown fails.
 
@@ -449,7 +434,7 @@ var runner = (function() {
         try {
             // Ensure that all data has replicated correctly to the secondaries before calling the
             // workload's teardown method.
-            cluster.checkReplicationConsistency(dbHashBlacklist, phase);
+            cluster.checkReplicationConsistency(dbHashDenylist, phase);
         } catch (e) {
             errors.push(new WorkloadFailure(
                 e.toString(), e.stack, 'main', header + ' checking consistency on secondaries'));
@@ -509,7 +494,7 @@ var runner = (function() {
                               executionOptions,
                               errors,
                               maxAllowedThreads,
-                              dbHashBlacklist,
+                              dbHashDenylist,
                               configServerData,
                               cleanupOptions) {
         var cleanup = [];
@@ -552,9 +537,9 @@ var runner = (function() {
                 const session = cluster.getDB('test').getSession();
 
                 // JavaScript objects backed by C++ objects (e.g. BSON values from a command
-                // response) do not serialize correctly when passed through the ScopedThread
+                // response) do not serialize correctly when passed through the Thread
                 // constructor. To work around this behavior, we instead pass a stringified form of
-                // the JavaScript object through the ScopedThread constructor and use eval() to
+                // the JavaScript object through the Thread constructor and use eval() to
                 // rehydrate it.
                 executionOptions.sessionOptions.initialClusterTime =
                     tojson(session.getClusterTime());
@@ -583,7 +568,7 @@ var runner = (function() {
                                                                          cluster,
                                                                          errors,
                                                                          'Foreground',
-                                                                         dbHashBlacklist,
+                                                                         dbHashDenylist,
                                                                          cleanupOptions));
             teardownFailed = cleanupResults.some(success => (success === false));
 
@@ -602,7 +587,7 @@ var runner = (function() {
         throwError(errors);
 
         // Ensure that all operations replicated correctly to the secondaries.
-        cluster.checkReplicationConsistency(dbHashBlacklist,
+        cluster.checkReplicationConsistency(dbHashDenylist,
                                             'after workload-group teardown and data clean-up');
     }
 
@@ -644,26 +629,23 @@ var runner = (function() {
         var threadMgr = new ThreadManager(clusterOptions, executionMode);
 
         var cluster = new Cluster(clusterOptions);
-        if (cluster.isSharded()) {
-            useDropDistLockFailPoint(cluster, clusterOptions);
-        }
         cluster.setup();
 
         // Clean up the state left behind by other tests in the concurrency suite
         // to avoid having too many open files.
 
         // List of DBs that will not be dropped.
-        var dbBlacklist = ['admin', 'config', 'local', '$external'];
+        var dbDenylist = ['admin', 'config', 'local', '$external'];
 
         // List of DBs that dbHash is not run on.
-        var dbHashBlacklist = ['local'];
+        var dbHashDenylist = ['local'];
 
-        if (cleanupOptions.dropDatabaseBlacklist) {
-            dbBlacklist.push(...cleanupOptions.dropDatabaseBlacklist);
-            dbHashBlacklist.push(...cleanupOptions.dropDatabaseBlacklist);
+        if (cleanupOptions.dropDatabaseDenylist) {
+            dbDenylist.push(...cleanupOptions.dropDatabaseDenylist);
+            dbHashDenylist.push(...cleanupOptions.dropDatabaseDenylist);
         }
         if (!cleanupOptions.keepExistingDatabases) {
-            dropAllDatabases(cluster.getDB('test'), dbBlacklist);
+            dropAllDatabases(cluster.getDB('test'), dbDenylist);
         }
 
         var maxAllowedThreads = 100 * executionOptions.threadMultiplier;
@@ -696,7 +678,7 @@ var runner = (function() {
                                  executionOptions,
                                  errors,
                                  maxAllowedThreads,
-                                 dbHashBlacklist,
+                                 dbHashDenylist,
                                  configServerData,
                                  cleanupOptions);
             });
@@ -751,7 +733,6 @@ var runner = (function() {
             loadWorkloadContext,
         }
     };
-
 })();
 
 var runWorkloadsSerially = runner.serial;

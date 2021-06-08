@@ -27,12 +27,13 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kAccessControl
-
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/auth/authz_manager_external_state_d.h"
 
+#include <memory>
+
+#include "mongo/base/shim.h"
 #include "mongo/base/status.h"
 #include "mongo/db/auth/authz_session_external_state_d.h"
 #include "mongo/db/auth/user_name.h"
@@ -44,9 +45,7 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/storage_engine.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -56,14 +55,14 @@ AuthzManagerExternalStateMongod::~AuthzManagerExternalStateMongod() = default;
 
 std::unique_ptr<AuthzSessionExternalState>
 AuthzManagerExternalStateMongod::makeAuthzSessionExternalState(AuthorizationManager* authzManager) {
-    return stdx::make_unique<AuthzSessionExternalStateMongod>(authzManager);
+    return std::make_unique<AuthzSessionExternalStateMongod>(authzManager);
 }
 Status AuthzManagerExternalStateMongod::query(
     OperationContext* opCtx,
     const NamespaceString& collectionName,
     const BSONObj& query,
     const BSONObj& projection,
-    const stdx::function<void(const BSONObj&)>& resultProcessor) {
+    const std::function<void(const BSONObj&)>& resultProcessor) {
     try {
         DBDirectClient client(opCtx);
         client.query(resultProcessor, collectionName, query, &projection);
@@ -77,7 +76,7 @@ Status AuthzManagerExternalStateMongod::findOne(OperationContext* opCtx,
                                                 const NamespaceString& collectionName,
                                                 const BSONObj& query,
                                                 BSONObj* result) {
-    AutoGetCollectionForReadCommand ctx(opCtx, collectionName);
+    AutoGetCollectionForReadCommandMaybeLockFree ctx(opCtx, collectionName);
 
     BSONObj found;
     if (Helpers::findOne(opCtx, ctx.getCollection(), query, found)) {
@@ -89,9 +88,22 @@ Status AuthzManagerExternalStateMongod::findOne(OperationContext* opCtx,
                                 << query);
 }
 
-MONGO_REGISTER_SHIM(AuthzManagerExternalState::create)
-()->std::unique_ptr<AuthzManagerExternalState> {
+bool AuthzManagerExternalStateMongod::hasOne(OperationContext* opCtx,
+                                             const NamespaceString& collectionName,
+                                             const BSONObj& query) {
+    AutoGetCollectionForReadCommandMaybeLockFree ctx(opCtx, collectionName);
+    return !Helpers::findOne(opCtx, ctx.getCollection(), query, false).isNull();
+}
+
+namespace {
+
+std::unique_ptr<AuthzManagerExternalState> authzManagerExternalStateCreateImpl() {
     return std::make_unique<AuthzManagerExternalStateMongod>();
 }
+
+auto authzManagerExternalStateCreateRegistration = MONGO_WEAK_FUNCTION_REGISTRATION(
+    AuthzManagerExternalState::create, authzManagerExternalStateCreateImpl);
+
+}  // namespace
 
 }  // namespace mongo

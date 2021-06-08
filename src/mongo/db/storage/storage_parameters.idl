@@ -51,9 +51,42 @@ server_parameters:
             lte: { expr: 'StorageGlobalParams::kMaxSyncdelaySecs' }
     journalCommitInterval:
         description: 'Number of milliseconds between journal commits'
-        set_at: runtime
+        set_at: [ startup, runtime ]
         cpp_varname: 'storageGlobalParams.journalCommitIntervalMs'
-        default: 100
         validator:
             gte: 1
             lte: { expr: 'StorageGlobalParams::kMaxJournalCommitIntervalMs' }
+    takeUnstableCheckpointOnShutdown:
+        description: 'Take unstable checkpoint on shutdown'
+        cpp_vartype: bool
+        cpp_varname: gTakeUnstableCheckpointOnShutdown
+        set_at: startup
+        default: false
+    operationMemoryPoolBlockInitialSizeKB:
+        description: 'Initial block size in KB for the per operation temporary object memory pool'
+        set_at: [ startup, runtime ]
+        cpp_vartype: AtomicWord<int32_t>
+        cpp_varname: gOperationMemoryPoolBlockInitialSizeKB
+        default: 1
+        validator:
+            gte: 1
+    operationMemoryPoolBlockMaxSizeKB:
+        description: 'Maximum block size in KB for the per operation temporary object memory pool'
+        set_at: [ startup, runtime ]
+        cpp_vartype: AtomicWord<int32_t>
+        cpp_varname: gOperationMemoryPoolBlockMaxSizeKB
+        default: 2048
+        validator:
+            gte: 1
+
+feature_flags:
+    featureFlagLockFreeReads:
+        description: "Support for lock-free reads."
+        cpp_varname: feature_flags::gLockFreeReads
+        version: 4.9
+        default: true
+    featureFlagTimeseriesCollection:
+        description: "When enabled, support for time-series collections"
+        cpp_varname: feature_flags::gTimeseriesCollection
+        default: true
+        version: 5.0

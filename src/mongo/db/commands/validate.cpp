@@ -27,42 +27,51 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/collection_catalog_entry.h"
+#include "mongo/db/catalog/collection_validation.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/db_raii.h"
 #include "mongo/db/query/internal_plans.h"
+#include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/storage/record_store.h"
-#include "mongo/db/views/view_catalog.h"
-#include "mongo/util/fail_point_service.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
 
-using std::endl;
-using std::string;
-using std::stringstream;
-
+// Sets the 'valid' result field to false and returns immediately.
 MONGO_FAIL_POINT_DEFINE(validateCmdCollectionNotValid);
 
 namespace {
 
-// Protects `_validationQueue`
-stdx::mutex _validationMutex;
+// Protects the state below.
+Mutex _validationMutex;
 
-// Wakes up `_validationQueue`
+// Holds the set of full `databaseName.collectionName` namespace strings in progress. Validation
+// commands register themselves in this data structure so that subsequent commands on the same
+// namespace will wait rather than run in parallel.
+std::set<std::string> _validationsInProgress;
+
+// This is waited upon if there is found to already be a validation command running on the targeted
+// namespace, as _validationsInProgress would indicate. This is signaled when a validation command
+// finishes on any namespace.
 stdx::condition_variable _validationNotifier;
 
-// Holds the set of full `database.collections` namespace strings in progress.
-std::set<std::string> _validationsInProgress;
 }  // namespace
 
+/**
+ * Example validate command:
+ *   {
+ *       validate: "collectionNameWithoutTheDBPart",
+ *       full: <bool>  // If true, a more thorough (and slower) collection validation is performed.
+ *       background: <bool>  // If true, performs validation on the checkpoint of the collection.
+ *   }
+ */
 class ValidateCmd : public BasicCommand {
 public:
     ValidateCmd() : BasicCommand("validate") {}
@@ -72,14 +81,30 @@ public:
     }
 
     std::string help() const override {
-        return "Validate contents of a namespace by scanning its data structures for correctness.  "
-               "Slow.\n"
-               "Add full:true option to do a more thorough check";
+        return str::stream() << "Validate contents of a namespace by scanning its data structures "
+                             << "for correctness.\nThis is a slow operation.\n"
+                             << "\tAdd {full: true} option to do a more thorough check.\n"
+                             << "\tAdd {background: true} to validate in the background.\n"
+                             << "\tAdd {repair: true} to run repair mode.\n"
+                             << "Cannot specify both {full: true, background: true}.";
     }
 
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
+
+    bool allowsAfterClusterTime(const BSONObj& cmd) const override {
+        return false;
+    }
+
+    bool canIgnorePrepareConflicts() const override {
+        return false;
+    }
+
+    bool maintenanceOk() const override {
+        return false;
+    }
+
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
                                        std::vector<Privilege>* out) const {
@@ -87,67 +112,84 @@ public:
         actions.addAction(ActionType::validate);
         out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
     }
-    //{ validate: "collectionnamewithoutthedbpart" [, full: <bool> } */
 
     bool run(OperationContext* opCtx,
-             const string& dbname,
+             const std::string& dbname,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) {
-        if (MONGO_FAIL_POINT(validateCmdCollectionNotValid)) {
+        if (MONGO_unlikely(validateCmdCollectionNotValid.shouldFail())) {
             result.appendBool("valid", false);
             return true;
         }
 
         const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbname, cmdObj));
+        bool background = cmdObj["background"].trueValue();
 
-        const bool full = cmdObj["full"].trueValue();
-
-        ValidateCmdLevel level = kValidateNormal;
-
-        if (full) {
-            level = kValidateFull;
+        // Background validation is not supported on the ephemeralForTest storage engine due to its
+        // lack of support for timestamps. Switch the mode to foreground validation instead.
+        if (background && storageGlobalParams.engine == "ephemeralForTest") {
+            LOGV2(4775400,
+                  "ephemeralForTest does not support background validation, switching to "
+                  "foreground validation");
+            background = false;
         }
 
-        if (cmdObj["scandata"]) {
-            const char* deprecationWarning =
-                "the scandata option is deprecated and will be removed in a future release";
-            result.append("note", deprecationWarning);
+        const bool fullValidate = cmdObj["full"].trueValue();
+        if (background && fullValidate) {
+            uasserted(ErrorCodes::CommandNotSupported,
+                      str::stream() << "Running the validate command with both { background: true }"
+                                    << " and { full: true } is not supported.");
         }
 
-        if (!nss.isNormal() && full) {
-            uasserted(ErrorCodes::CommandFailed,
-                      "Can only run full validate on a regular collection");
+        const bool enforceFastCount = cmdObj["enforceFastCount"].trueValue();
+        if (background && enforceFastCount) {
+            uasserted(ErrorCodes::CommandNotSupported,
+                      str::stream() << "Running the validate command with both { background: true }"
+                                    << " and { enforceFastCount: true } is not supported.");
+        }
+
+        const bool repair = cmdObj["repair"].trueValue();
+        if (background && repair) {
+            uasserted(ErrorCodes::CommandNotSupported,
+                      str::stream() << "Running the validate command with both {background: true }"
+                                    << " and { repair: true } is not supported.");
+        }
+        if (enforceFastCount && repair) {
+            uasserted(ErrorCodes::CommandNotSupported,
+                      str::stream()
+                          << "Running the validate command with both {enforceFastCount: true }"
+                          << " and { repair: true } is not supported.");
+        }
+        repl::ReplicationCoordinator* replCoord = repl::ReplicationCoordinator::get(opCtx);
+        if (repair && replCoord->isReplEnabled()) {
+            uasserted(ErrorCodes::CommandNotSupported,
+                      str::stream()
+                          << "Running the validate command with { repair: true } can only be"
+                          << " performed in standalone mode.");
         }
 
         if (!serverGlobalParams.quiet.load()) {
-            LOG(0) << "CMD: validate " << nss.ns();
+            LOGV2(20514,
+                  "CMD: validate",
+                  "namespace"_attr = nss,
+                  "background"_attr = background,
+                  "full"_attr = fullValidate,
+                  "enforceFastCount"_attr = enforceFastCount,
+                  "repair"_attr = repair);
         }
 
-        AutoGetDb ctx(opCtx, nss.db(), MODE_IX);
-        Lock::CollectionLock collLk(opCtx, nss, MODE_X);
-        Collection* collection = ctx.getDb() ? ctx.getDb()->getCollection(opCtx, nss) : NULL;
-        if (!collection) {
-            if (ctx.getDb() && ViewCatalog::get(ctx.getDb())->lookup(opCtx, nss.ns())) {
-                uasserted(ErrorCodes::CommandNotSupportedOnView, "Cannot validate a view");
-            }
-
-            uasserted(ErrorCodes::NamespaceNotFound, "ns not found");
-        }
-
-        result.append("ns", nss.ns());
-
-        // Only one validation per collection can be in progress, the rest wait in order.
+        // Only one validation per collection can be in progress, the rest wait.
         {
-            stdx::unique_lock<stdx::mutex> lock(_validationMutex);
+            stdx::unique_lock<Latch> lock(_validationMutex);
             try {
-                while (_validationsInProgress.find(nss.ns()) != _validationsInProgress.end()) {
-                    opCtx->waitForConditionOrInterrupt(_validationNotifier, lock);
-                }
+                opCtx->waitForConditionOrInterrupt(_validationNotifier, lock, [&] {
+                    return _validationsInProgress.find(nss.ns()) == _validationsInProgress.end();
+                });
             } catch (AssertionException& e) {
                 CommandHelpers::appendCommandStatusNoThrow(
                     result,
                     {ErrorCodes::CommandFailed,
-                     str::stream() << "Exception during validation: " << e.toString()});
+                     str::stream() << "Exception thrown during validation: " << e.toString()});
                 return false;
             }
 
@@ -155,42 +197,56 @@ public:
         }
 
         ON_BLOCK_EXIT([&] {
-            stdx::lock_guard<stdx::mutex> lock(_validationMutex);
+            stdx::lock_guard<Latch> lock(_validationMutex);
             _validationsInProgress.erase(nss.ns());
             _validationNotifier.notify_all();
         });
 
-        // TODO SERVER-30357: Add support for background validation.
-        const bool background = false;
+        auto mode = [&] {
+            if (background)
+                return CollectionValidation::ValidateMode::kBackground;
+            if (enforceFastCount)
+                return CollectionValidation::ValidateMode::kForegroundFullEnforceFastCount;
+            if (fullValidate)
+                return CollectionValidation::ValidateMode::kForegroundFull;
+            return CollectionValidation::ValidateMode::kForeground;
+        }();
 
-        ValidateResults results;
-        Status status = collection->validate(opCtx, level, background, &results, &result);
+        auto repairMode = [&] {
+            switch (mode) {
+                case CollectionValidation::ValidateMode::kForeground:
+                case CollectionValidation::ValidateMode::kForegroundFull:
+                case CollectionValidation::ValidateMode::kForegroundFullIndexOnly:
+                    // Foreground validation may not repair data while running as a replica set node
+                    // because we do not have timestamps that are required to perform writes.
+                    if (replCoord->isReplEnabled()) {
+                        return CollectionValidation::RepairMode::kNone;
+                    }
+                    if (repair) {
+                        return CollectionValidation::RepairMode::kFixErrors;
+                    }
+                    // Foreground validation will adjust multikey metadata by default.
+                    return CollectionValidation::RepairMode::kAdjustMultikey;
+                default:
+                    return CollectionValidation::RepairMode::kNone;
+            }
+        }();
+
+        if (repair) {
+            opCtx->recoveryUnit()->setPrepareConflictBehavior(
+                PrepareConflictBehavior::kIgnoreConflictsAllowWrites);
+        }
+
+        ValidateResults validateResults;
+        Status status =
+            CollectionValidation::validate(opCtx, nss, mode, repairMode, &validateResults, &result);
         if (!status.isOK()) {
             return CommandHelpers::appendCommandStatusNoThrow(result, status);
         }
 
-        CollectionCatalogEntry* catalogEntry = collection->getCatalogEntry();
-        CollectionOptions opts = catalogEntry->getCollectionOptions(opCtx);
+        validateResults.appendToResultObj(&result, /*debugging=*/false);
 
-        // All collections must have a UUID.
-        if (!opts.uuid) {
-            results.errors.push_back(str::stream() << "UUID missing on collection " << nss.ns()
-                                                   << " but SchemaVersion=3.6");
-            results.valid = false;
-        }
-
-        if (!full) {
-            results.warnings.push_back(
-                "Some checks omitted for speed. use {full:true} option to do more thorough scan.");
-        }
-
-        result.appendBool("valid", results.valid);
-        result.append("warnings", results.warnings);
-        result.append("errors", results.errors);
-        result.append("extraIndexEntries", results.extraIndexEntries);
-        result.append("missingIndexEntries", results.missingIndexEntries);
-
-        if (!results.valid) {
+        if (!validateResults.valid) {
             result.append("advice",
                           "A corrupt namespace has been detected. See "
                           "http://dochub.mongodb.org/core/data-recovery for recovery steps.");
@@ -200,4 +256,4 @@ public:
     }
 
 } validateCmd;
-}
+}  // namespace mongo

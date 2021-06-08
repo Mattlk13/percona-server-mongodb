@@ -27,13 +27,18 @@
  *    it in the license file.
  */
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/query/find_common.h"
 
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/curop.h"
-#include "mongo/db/query/query_request.h"
+#include "mongo/db/curop_failpoint_helpers.h"
+#include "mongo/db/query/canonical_query.h"
+#include "mongo/db/query/query_request_helper.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
 
 namespace mongo {
@@ -48,16 +53,20 @@ MONGO_FAIL_POINT_DEFINE(waitWithPinnedCursorDuringGetMoreBatch);
 
 MONGO_FAIL_POINT_DEFINE(waitBeforeUnpinningOrDeletingCursorAfterGetMoreBatch);
 
+MONGO_FAIL_POINT_DEFINE(failGetMoreAfterCursorCheckout);
+
 const OperationContext::Decoration<AwaitDataState> awaitDataState =
     OperationContext::declareDecoration<AwaitDataState>();
 
-bool FindCommon::enoughForFirstBatch(const QueryRequest& qr, long long numDocs) {
-    if (!qr.getEffectiveBatchSize()) {
+bool FindCommon::enoughForFirstBatch(const FindCommandRequest& findCommand, long long numDocs) {
+    auto effectiveBatchSize =
+        findCommand.getBatchSize() ? findCommand.getBatchSize() : findCommand.getNtoreturn();
+    if (!effectiveBatchSize) {
         // We enforce a default batch size for the initial find if no batch size is specified.
-        return numDocs >= QueryRequest::kDefaultBatchSize;
+        return numDocs >= query_request_helper::kDefaultBatchSize;
     }
 
-    return numDocs >= qr.getEffectiveBatchSize().value();
+    return numDocs >= effectiveBatchSize.value();
 }
 
 bool FindCommon::haveSpaceForNext(const BSONObj& nextDoc, long long numDocs, int bytesBuffered) {
@@ -71,22 +80,19 @@ bool FindCommon::haveSpaceForNext(const BSONObj& nextDoc, long long numDocs, int
     return (bytesBuffered + nextDoc.objsize()) <= kMaxBytesToReturnToClientAtOnce;
 }
 
-BSONObj FindCommon::transformSortSpec(const BSONObj& sortSpec) {
-    BSONObjBuilder comparatorBob;
-
-    for (BSONElement elt : sortSpec) {
-        if (elt.isNumber()) {
-            comparatorBob.append(elt);
-        } else if (QueryRequest::isTextScoreMeta(elt)) {
-            // Sort text score decreasing by default. Field name doesn't matter but we choose
-            // something that a user shouldn't ever have.
-            comparatorBob.append("$metaTextScore", -1);
-        } else {
-            // Sort spec should have been validated before here.
-            fassertFailed(28784);
+void FindCommon::waitInFindBeforeMakingBatch(OperationContext* opCtx, const CanonicalQuery& cq) {
+    auto whileWaitingFunc = [&, hasLogged = false]() mutable {
+        if (!std::exchange(hasLogged, true)) {
+            LOGV2(20908,
+                  "Waiting in find before making batch for query",
+                  "query"_attr = redact(cq.toStringShort()));
         }
-    }
+    };
 
-    return comparatorBob.obj();
+    CurOpFailpointHelpers::waitWhileFailPointEnabled(&mongo::waitInFindBeforeMakingBatch,
+                                                     opCtx,
+                                                     "waitInFindBeforeMakingBatch",
+                                                     std::move(whileWaitingFunc),
+                                                     cq.nss());
 }
 }  // namespace mongo

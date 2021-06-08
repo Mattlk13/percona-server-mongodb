@@ -30,10 +30,25 @@
 #pragma once
 
 #include "mongo/base/string_data.h"
-#include "mongo/crypto/sha_block.h"
+#include "mongo/crypto/hash_block.h"
 #include "mongo/db/auth/sasl_mechanism_registry.h"
 
 namespace mongo {
+
+struct AWSIAMPolicy {
+    static constexpr StringData getName() {
+        return "MONGODB-AWS"_sd;
+    }
+    static SecurityPropertySet getProperties() {
+        return SecurityPropertySet{SecurityProperty::kNoPlainText};
+    }
+    static int securityLevel() {
+        return 1;
+    }
+    static constexpr bool isInternalAuthMech() {
+        return false;
+    }
+};
 
 struct PLAINPolicy {
     static constexpr StringData getName() {
@@ -60,7 +75,7 @@ struct SCRAMSHA1Policy {
         return SecurityPropertySet{SecurityProperty::kNoPlainText, SecurityProperty::kMutualAuth};
     }
     static int securityLevel() {
-        return 1;
+        return 2;
     }
     static constexpr bool isInternalAuthMech() {
         return true;
@@ -77,7 +92,7 @@ struct SCRAMSHA256Policy {
         return SecurityPropertySet{SecurityProperty::kNoPlainText, SecurityProperty::kMutualAuth};
     }
     static int securityLevel() {
-        return true;
+        return 2;
     }
     static constexpr bool isInternalAuthMech() {
         return true;

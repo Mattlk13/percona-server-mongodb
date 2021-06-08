@@ -33,7 +33,6 @@
 
 #include "mongo/db/pipeline/document_source_sort.h"
 #include "mongo/db/query/find_common.h"
-#include "mongo/executor/task_executor_pool.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/query/establish_cursors.h"
 
@@ -41,19 +40,23 @@ namespace mongo {
 
 REGISTER_DOCUMENT_SOURCE(mergeCursors,
                          LiteParsedDocumentSourceDefault::parse,
-                         DocumentSourceMergeCursors::createFromBson);
+                         DocumentSourceMergeCursors::createFromBson,
+                         LiteParsedDocumentSource::AllowedWithApiStrict::kInternal);
 
 constexpr StringData DocumentSourceMergeCursors::kStageName;
 
 DocumentSourceMergeCursors::DocumentSourceMergeCursors(
-    executor::TaskExecutor* executor,
-    AsyncResultsMergerParams armParams,
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    AsyncResultsMergerParams armParams,
     boost::optional<BSONObj> ownedParamsSpec)
-    : DocumentSource(expCtx),
+    : DocumentSource(kStageName, expCtx),
       _armParamsObj(std::move(ownedParamsSpec)),
-      _executor(executor),
-      _armParams(std::move(armParams)) {}
+      _armParams(std::move(armParams)) {
+    _armParams->setRecordRemoteOpWaitTime(true);
+
+    // Populate the shard ids from the 'RemoteCursor'.
+    recordRemoteCursorShardIds(_armParams->getRemotes());
+}
 
 std::size_t DocumentSourceMergeCursors::getNumRemotes() const {
     if (_armParams) {
@@ -80,10 +83,11 @@ bool DocumentSourceMergeCursors::remotesExhausted() const {
 void DocumentSourceMergeCursors::populateMerger() {
     invariant(!_blockingResultsMerger);
     invariant(_armParams);
+    invariant(_armParams->getRecordRemoteOpWaitTime());
 
     _blockingResultsMerger.emplace(pExpCtx->opCtx,
                                    std::move(*_armParams),
-                                   _executor,
+                                   pExpCtx->mongoProcessInterface->taskExecutor,
                                    pExpCtx->mongoProcessInterface->getResourceYielder());
     _armParams = boost::none;
     // '_blockingResultsMerger' now owns the cursors.
@@ -92,10 +96,11 @@ void DocumentSourceMergeCursors::populateMerger() {
 
 std::unique_ptr<RouterStageMerge> DocumentSourceMergeCursors::convertToRouterStage() {
     invariant(!_blockingResultsMerger, "Expected conversion to happen before execution");
-    return stdx::make_unique<RouterStageMerge>(pExpCtx->opCtx, _executor, std::move(*_armParams));
+    return std::make_unique<RouterStageMerge>(
+        pExpCtx->opCtx, pExpCtx->mongoProcessInterface->taskExecutor, std::move(*_armParams));
 }
 
-DocumentSource::GetNextResult DocumentSourceMergeCursors::getNext() {
+DocumentSource::GetNextResult DocumentSourceMergeCursors::doGetNext() {
     if (!_blockingResultsMerger) {
         populateMerger();
     }
@@ -121,18 +126,12 @@ boost::intrusive_ptr<DocumentSource> DocumentSourceMergeCursors::createFromBson(
             elem.type() == BSONType::Object);
     auto ownedObj = elem.embeddedObject().getOwned();
     auto armParams = AsyncResultsMergerParams::parse(IDLParserErrorContext(kStageName), ownedObj);
-    return new DocumentSourceMergeCursors(
-        Grid::get(expCtx->opCtx)->getExecutorPool()->getArbitraryExecutor(),
-        std::move(armParams),
-        expCtx,
-        std::move(ownedObj));
+    return new DocumentSourceMergeCursors(expCtx, std::move(armParams), std::move(ownedObj));
 }
 
 boost::intrusive_ptr<DocumentSourceMergeCursors> DocumentSourceMergeCursors::create(
-    executor::TaskExecutor* executor,
-    AsyncResultsMergerParams params,
-    const boost::intrusive_ptr<ExpressionContext>& expCtx) {
-    return new DocumentSourceMergeCursors(executor, std::move(params), expCtx);
+    const boost::intrusive_ptr<ExpressionContext>& expCtx, AsyncResultsMergerParams params) {
+    return new DocumentSourceMergeCursors(expCtx, std::move(params));
 }
 
 void DocumentSourceMergeCursors::detachFromOperationContext() {
@@ -154,6 +153,15 @@ void DocumentSourceMergeCursors::doDispose() {
     } else if (_ownCursors) {
         populateMerger();
         _blockingResultsMerger->kill(pExpCtx->opCtx);
+    }
+}
+
+
+void DocumentSourceMergeCursors::recordRemoteCursorShardIds(
+    const std::vector<RemoteCursor>& remoteCursors) {
+    for (const auto& remoteCursor : remoteCursors) {
+        tassert(5549103, "Encountered invalid shard ID", !remoteCursor.getShardId().empty());
+        _shardsWithCursors.emplace(remoteCursor.getShardId().toString());
     }
 }
 

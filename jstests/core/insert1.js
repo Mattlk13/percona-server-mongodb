@@ -1,4 +1,4 @@
-// @tags: [requires_fastcount]
+// @tags: [requires_fastcount, operations_longer_than_stepdown_interval_in_txns]
 
 t = db.insert1;
 t.drop();
@@ -47,7 +47,7 @@ var count = 100 * 1000;
 for (i = 0; i < count; ++i) {
     toInsert.push({_id: i, a: 5});
 }
-assert.writeOK(t.insert(toInsert));
+assert.commandWorked(t.insert(toInsert));
 doc = t.findOne({_id: 1});
 assert.eq(5, doc.a);
 assert.eq(count, t.count(), "bad count");

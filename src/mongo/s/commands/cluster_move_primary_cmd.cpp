@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -36,6 +36,7 @@
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/write_concern_error_detail.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog/type_shard.h"
@@ -44,7 +45,6 @@
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/move_primary_gen.h"
-#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
@@ -96,31 +96,34 @@ public:
                      const std::string& dbname,
                      const BSONObj& cmdObj,
                      BSONObjBuilder& result) {
-
-        auto movePrimaryRequest = MovePrimary::parse(IDLParserErrorContext("MovePrimary"), cmdObj);
+        auto request = MovePrimary::parse(IDLParserErrorContext("MovePrimary"), cmdObj);
 
         const string db = parseNs("", cmdObj);
-        const NamespaceString nss(db);
-
-        ConfigsvrMovePrimary configMovePrimaryRequest;
-        configMovePrimaryRequest.set_configsvrMovePrimary(nss);
-        configMovePrimaryRequest.setTo(movePrimaryRequest.getTo());
+        const StringData toShard(request.getTo());
 
         // Invalidate the routing table cache entry for this database so that we reload the
         // collection the next time it's accessed, even if we receive a failure, e.g. NetworkError.
         ON_BLOCK_EXIT([opCtx, db] { Grid::get(opCtx)->catalogCache()->purgeDatabase(db); });
 
-        auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
+        ShardMovePrimary movePrimaryRequest;
+        movePrimaryRequest.set_shardsvrMovePrimary(NamespaceString(db));
+        movePrimaryRequest.setTo(toShard);
+        movePrimaryRequest.setCommandIsFromRouter(true);
 
-        auto cmdResponse = uassertStatusOK(configShard->runCommandWithFixedRetryAttempts(
+        auto catalogCache = Grid::get(opCtx)->catalogCache();
+        const auto dbInfo = uassertStatusOK(catalogCache->getDatabase(opCtx, db));
+
+        auto cmdResponse = executeCommandAgainstDatabasePrimary(
             opCtx,
-            ReadPreferenceSetting(ReadPreference::PrimaryOnly),
             "admin",
+            dbInfo,
             CommandHelpers::appendMajorityWriteConcern(
-                CommandHelpers::appendPassthroughFields(cmdObj, configMovePrimaryRequest.toBSON())),
-            Shard::RetryPolicy::kIdempotent));
+                CommandHelpers::appendGenericCommandArgs(cmdObj, movePrimaryRequest.toBSON())),
+            ReadPreferenceSetting(ReadPreference::PrimaryOnly),
+            Shard::RetryPolicy::kIdempotent);
 
-        CommandHelpers::filterCommandReplyForPassthrough(cmdResponse.response, &result);
+        const auto remoteResponse = uassertStatusOK(cmdResponse.swResponse);
+        CommandHelpers::filterCommandReplyForPassthrough(remoteResponse.data, &result);
         return true;
     }
 

@@ -149,7 +149,19 @@ void ServerTransactionsMetrics::decrementCurrentPrepared() {
     _currentPrepared.fetchAndSubtract(1);
 }
 
-void ServerTransactionsMetrics::updateStats(TransactionsStats* stats) {
+void ServerTransactionsMetrics::updateLastTransaction(size_t operationCount,
+                                                      size_t oplogOperationBytes,
+                                                      BSONObj writeConcern) {
+    stdx::lock_guard<Latch> lg(_mutex);
+    if (!_lastCommittedTransaction) {
+        _lastCommittedTransaction = LastCommittedTransaction();
+    }
+    _lastCommittedTransaction->setOperationCount(operationCount);
+    _lastCommittedTransaction->setOplogOperationBytes(oplogOperationBytes);
+    _lastCommittedTransaction->setWriteConcern(std::move(writeConcern));
+}
+
+void ServerTransactionsMetrics::updateStats(TransactionsStats* stats, bool includeLastCommitted) {
     stats->setCurrentActive(_currentActive.load());
     stats->setCurrentInactive(_currentInactive.load());
     stats->setCurrentOpen(_currentOpen.load());
@@ -160,6 +172,11 @@ void ServerTransactionsMetrics::updateStats(TransactionsStats* stats) {
     stats->setTotalPreparedThenCommitted(_totalPreparedThenCommitted.load());
     stats->setTotalPreparedThenAborted(_totalPreparedThenAborted.load());
     stats->setCurrentPrepared(_currentPrepared.load());
+
+    stdx::lock_guard<Latch> lg(_mutex);
+    if (_lastCommittedTransaction && includeLastCommitted) {
+        stats->setLastCommittedTransaction(*_lastCommittedTransaction);
+    }
 }
 
 namespace {
@@ -177,12 +194,17 @@ public:
                             const BSONElement& configElement) const override {
         TransactionsStats stats;
 
+        bool includeLastCommitted = true;
+        if (configElement.type() == BSONType::Object) {
+            includeLastCommitted = configElement.Obj()["includeLastCommitted"].trueValue();
+        }
+
         // Retryable writes and multi-document transactions metrics are both included in the same
         // serverStatus section because both utilize similar internal machinery for tracking their
         // lifecycle within a session. Both are assigned transaction numbers, and so both are often
         // referred to as “transactions”.
         RetryableWritesStats::get(opCtx)->updateStats(&stats);
-        ServerTransactionsMetrics::get(opCtx)->updateStats(&stats);
+        ServerTransactionsMetrics::get(opCtx)->updateStats(&stats, includeLastCommitted);
         return stats.toBSON();
     }
 

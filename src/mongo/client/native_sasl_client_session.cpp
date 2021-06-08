@@ -36,9 +36,14 @@
 #include "mongo/client/sasl_plain_client_conversation.h"
 #include "mongo/client/sasl_scram_client_conversation.h"
 #include "mongo/client/scram_client_cache.h"
+#include "mongo/config.h"
 #include "mongo/crypto/sha1_block.h"
 #include "mongo/crypto/sha256_block.h"
 #include "mongo/util/str.h"
+
+#ifdef MONGO_CONFIG_SSL
+#include "mongo/client/sasl_aws_client_conversation.h"
+#endif
 
 namespace mongo {
 namespace {
@@ -49,7 +54,6 @@ SaslClientSession* createNativeSaslClientSession(const std::string mech) {
 
 MONGO_INITIALIZER(NativeSaslClientContext)(InitializerContext* context) {
     SaslClientSession::create = createNativeSaslClientSession;
-    return Status::OK();
 }
 
 // Global cache for SCRAM-SHA-1/256 credentials
@@ -77,6 +81,11 @@ Status NativeSaslClientSession::initialize() {
     } else if (mechanism == "SCRAM-SHA-256") {
         _saslConversation.reset(
             new SaslSCRAMClientConversationImpl<SHA256Block>(this, scramsha256ClientCache));
+#ifdef MONGO_CONFIG_SSL
+        // AWS depends on kms-message which depends on ssl libraries
+    } else if (mechanism == "MONGODB-AWS") {
+        _saslConversation.reset(new SaslAWSClientConversation(this));
+#endif
     } else {
         return Status(ErrorCodes::BadValue,
                       str::stream() << "SASL mechanism " << mechanism << " is not supported");
@@ -98,4 +107,4 @@ Status NativeSaslClientSession::step(StringData inputData, std::string* outputDa
     }
     return status.getStatus();
 }
-}  // namespace
+}  // namespace mongo

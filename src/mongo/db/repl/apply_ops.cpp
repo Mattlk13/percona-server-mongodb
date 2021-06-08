@@ -27,14 +27,13 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/repl/apply_ops.h"
 
 #include "mongo/bson/util/bson_extract.h"
-#include "mongo/db/background.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_holder.h"
@@ -55,9 +54,9 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/session_catalog_mongod.h"
 #include "mongo/db/transaction_participant.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
-#include "mongo/util/fail_point_service.h"
-#include "mongo/util/log.h"
+#include "mongo/util/fail_point.h"
 
 namespace mongo {
 namespace repl {
@@ -99,8 +98,6 @@ bool _parseAreOpsCrudOnly(const BSONObj& applyOpCmd) {
 }
 
 Status _applyOps(OperationContext* opCtx,
-                 const std::string& dbName,
-                 const BSONObj& applyOpCmd,
                  const ApplyOpsCommandInfo& info,
                  repl::OplogApplication::Mode oplogApplicationMode,
                  BSONObjBuilder* result,
@@ -128,7 +125,7 @@ Status _applyOps(OperationContext* opCtx,
         if (*opType != 'c' && !nss.isValid())
             return {ErrorCodes::InvalidNamespace, "invalid ns: " + nss.ns()};
 
-        Status status(ErrorCodes::InternalError, "");
+        Status status = Status::OK();
 
         if (haveWrappingWUOW) {
             // Only CRUD operations are allowed in atomic mode.
@@ -153,39 +150,50 @@ Status _applyOps(OperationContext* opCtx,
             // NamespaceNotFound.
             // Additionally for inserts, we fail early on non-existent collections.
             Lock::CollectionLock collectionLock(opCtx, nss, MODE_IX);
-            auto collection = db->getCollection(opCtx, nss);
+            auto collection =
+                CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss);
             if (!collection && (*opType == 'i' || *opType == 'u')) {
                 uasserted(
                     ErrorCodes::AtomicityFailure,
                     str::stream()
                         << "cannot apply insert or update operation on a non-existent namespace "
-                        << nss.ns()
-                        << " in atomic applyOps mode: "
-                        << redact(opObj));
+                        << nss.ns() << " in atomic applyOps mode: " << redact(opObj));
             }
 
-            // Reject malformed operations in an atomic applyOps.
+            // Reject malformed or over-specified operations in an atomic applyOps.
             try {
                 ReplOperation::parse(IDLParserErrorContext("applyOps"), opObj);
             } catch (...) {
                 uasserted(ErrorCodes::AtomicityFailure,
-                          str::stream()
-                              << "cannot apply a malformed operation in atomic applyOps mode: "
-                              << redact(opObj)
-                              << "; will retry without atomicity: "
-                              << exceptionToStatus().toString());
+                          str::stream() << "cannot apply a malformed or over-specified operation "
+                                           "in atomic applyOps mode: "
+                                        << redact(opObj) << "; will retry without atomicity: "
+                                        << exceptionToStatus().toString());
             }
+
+            BSONObjBuilder builder;
+            builder.appendElements(opObj);
+
+            // Create these required fields and populate them with dummy values before parsing the
+            // BSONObj as an oplog entry.
+            builder.append(OplogEntry::kTimestampFieldName, Timestamp());
+            builder.append(OplogEntry::kWallClockTimeFieldName, Date_t());
+            auto entry = OplogEntry::parse(builder.done());
+
+            // Malformed operations should have already been caught and retried in non-atomic mode.
+            invariant(entry.isOK());
 
             OldClientContext ctx(opCtx, nss.ns());
 
+            const auto& op = entry.getValue();
             status = repl::applyOperation_inlock(
-                opCtx, ctx.db(), opObj, alwaysUpsert, oplogApplicationMode);
+                opCtx, ctx.db(), &op, alwaysUpsert, oplogApplicationMode);
             if (!status.isOK())
                 return status;
 
             // Append completed op, including UUID if available, to 'opsBuilder'.
             if (opsBuilder) {
-                if (opObj.hasField("ui") || !(collection && collection->uuid())) {
+                if (opObj.hasField("ui") || !collection) {
                     // No changes needed to operation document.
                     opsBuilder->append(opObj);
                 } else {
@@ -193,7 +201,7 @@ Status _applyOps(OperationContext* opCtx,
                     auto uuid = collection->uuid();
                     BSONObjBuilder opBuilder;
                     opBuilder.appendElements(opObj);
-                    uuid->appendToBuilder(&opBuilder, "ui");
+                    uuid.appendToBuilder(&opBuilder, "ui");
                     opsBuilder->append(opBuilder.obj());
                 }
             }
@@ -212,16 +220,19 @@ Status _applyOps(OperationContext* opCtx,
                         if (!builder.hasField(OplogEntry::kHashFieldName)) {
                             builder.append(OplogEntry::kHashFieldName, 0LL);
                         }
-                        auto entryObj = builder.done();
-                        auto entry = uassertStatusOK(OplogEntry::parse(entryObj));
+                        if (!builder.hasField(OplogEntry::kWallClockTimeFieldName)) {
+                            builder.append(OplogEntry::kWallClockTimeFieldName, Date_t());
+                        }
+                        auto entry = uassertStatusOK(OplogEntry::parse(builder.done()));
                         if (*opType == 'c') {
                             invariant(opCtx->lockState()->isW());
-                            uassertStatusOK(applyCommand_inlock(
-                                opCtx, opObj, entry, oplogApplicationMode, boost::none));
+                            uassertStatusOK(
+                                applyCommand_inlock(opCtx, entry, oplogApplicationMode));
                             return Status::OK();
                         }
 
-                        AutoGetCollection autoColl(opCtx, nss, MODE_IX);
+                        AutoGetCollection autoColl(
+                            opCtx, nss, fixLockModeForSystemDotViewsChanges(nss, MODE_IX));
                         if (!autoColl.getCollection()) {
                             // For idempotency reasons, return success on delete operations.
                             if (*opType == 'd') {
@@ -231,9 +242,7 @@ Status _applyOps(OperationContext* opCtx,
                                       str::stream()
                                           << "cannot apply insert or update operation on a "
                                              "non-existent namespace "
-                                          << nss.ns()
-                                          << ": "
-                                          << mongo::redact(opObj));
+                                          << nss.ns() << ": " << mongo::redact(opObj));
                         }
 
                         OldClientContext ctx(opCtx, nss.ns());
@@ -243,7 +252,7 @@ Status _applyOps(OperationContext* opCtx,
                         // ops.  This is to leave the door open to parallelizing CRUD op
                         // application in the future.
                         return repl::applyOperation_inlock(
-                            opCtx, ctx.db(), opObj, alwaysUpsert, oplogApplicationMode);
+                            opCtx, ctx.db(), &entry, alwaysUpsert, oplogApplicationMode);
                     });
             } catch (const DBException& ex) {
                 ab.append(false);
@@ -252,20 +261,23 @@ Status _applyOps(OperationContext* opCtx,
                 result->append("codeName", ErrorCodes::errorString(ex.code()));
                 result->append("errmsg", ex.what());
                 result->append("results", ab.arr());
-                return Status(ex.code(), ex.what());
+                return ex.toStatus();
             }
         }
 
         ab.append(status.isOK());
         if (!status.isOK()) {
-            log() << "applyOps error applying: " << status;
+            LOGV2(21064,
+                  "applyOps error applying: {error}",
+                  "applyOps error applying",
+                  "error"_attr = status);
             errors++;
         }
 
         (*numApplied)++;
 
-        if (MONGO_FAIL_POINT(applyOpsPauseBetweenOperations)) {
-            MONGO_FAIL_POINT_PAUSE_WHILE_SET(applyOpsPauseBetweenOperations);
+        if (MONGO_unlikely(applyOpsPauseBetweenOperations.shouldFail())) {
+            applyOpsPauseBetweenOperations.pauseWhileSet();
         }
     }
 
@@ -304,7 +316,8 @@ Status _checkPrecondition(OperationContext* opCtx,
         if (!database) {
             return {ErrorCodes::NamespaceNotFound, "database in ns does not exist: " + nss.ns()};
         }
-        Collection* collection = database->getCollection(opCtx, nss);
+        CollectionPtr collection =
+            CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss);
         if (!collection) {
             return {ErrorCodes::NamespaceNotFound, "collection in ns does not exist: " + nss.ns()};
         }
@@ -312,7 +325,8 @@ Status _checkPrecondition(OperationContext* opCtx,
 
         // applyOps does not allow any extensions, such as $text, $where, $geoNear, $near,
         // $nearSphere, or $expr.
-        boost::intrusive_ptr<ExpressionContext> expCtx(new ExpressionContext(opCtx, collator));
+        boost::intrusive_ptr<ExpressionContext> expCtx(
+            new ExpressionContext(opCtx, CollatorInterface::cloneCollator(collator), nss));
         Matcher matcher(preCondition["res"].Obj(), std::move(expCtx));
         if (!matcher.matches(realres)) {
             result->append("got", realres);
@@ -384,6 +398,7 @@ Status applyOps(OperationContext* opCtx,
     uassert(
         ErrorCodes::BadValue, "applyOps command can't have 'prepare' field", !info.getPrepare());
     uassert(31056, "applyOps command can't have 'partialTxn' field.", !info.getPartialTxn());
+    uassert(31240, "applyOps command can't have 'count' field.", !info.getCount());
 
     // There's only one case where we are allowed to take the database lock instead of the global
     // lock - no preconditions; only CRUD ops; and non-atomic mode.
@@ -398,7 +413,7 @@ Status applyOps(OperationContext* opCtx,
         opCtx->writesAreReplicated() && !replCoord->canAcceptWritesForDatabase(opCtx, dbName);
 
     if (userInitiatedWritesAndNotPrimary)
-        return Status(ErrorCodes::NotMaster,
+        return Status(ErrorCodes::NotWritablePrimary,
                       str::stream() << "Not primary while applying ops to database " << dbName);
 
     if (auto preCondition = info.getPreCondition()) {
@@ -410,8 +425,7 @@ Status applyOps(OperationContext* opCtx,
     }
 
     if (!info.isAtomic()) {
-        return _applyOps(
-            opCtx, dbName, applyOpCmd, info, oplogApplicationMode, result, &numApplied, nullptr);
+        return _applyOps(opCtx, info, oplogApplicationMode, result, &numApplied, nullptr);
     }
 
     // Perform write ops atomically
@@ -422,7 +436,7 @@ Status applyOps(OperationContext* opCtx,
             BSONObjBuilder intermediateResult;
             std::unique_ptr<BSONArrayBuilder> opsBuilder;
             if (opCtx->writesAreReplicated()) {
-                opsBuilder = stdx::make_unique<BSONArrayBuilder>();
+                opsBuilder = std::make_unique<BSONArrayBuilder>();
             }
             WriteUnitOfWork wunit(opCtx);
             numApplied = 0;
@@ -430,8 +444,6 @@ Status applyOps(OperationContext* opCtx,
                 // Suppress replication for atomic operations until end of applyOps.
                 repl::UnreplicatedWritesBlock uwb(opCtx);
                 uassertStatusOK(_applyOps(opCtx,
-                                          dbName,
-                                          applyOpCmd,
                                           info,
                                           oplogApplicationMode,
                                           &intermediateResult,
@@ -440,8 +452,8 @@ Status applyOps(OperationContext* opCtx,
             }
             // Generate oplog entry for all atomic ops collectively.
             if (opCtx->writesAreReplicated()) {
-                // We want this applied atomically on slaves so we rewrite the oplog entry without
-                // the pre-condition for speed.
+                // We want this applied atomically on secondaries so we rewrite the oplog entry
+                // without the pre-condition for speed.
 
                 BSONObjBuilder cmdBuilder;
 
@@ -471,14 +483,7 @@ Status applyOps(OperationContext* opCtx,
     } catch (const DBException& ex) {
         if (ex.code() == ErrorCodes::AtomicityFailure) {
             // Retry in non-atomic mode.
-            return _applyOps(opCtx,
-                             dbName,
-                             applyOpCmd,
-                             info,
-                             oplogApplicationMode,
-                             result,
-                             &numApplied,
-                             nullptr);
+            return _applyOps(opCtx, info, oplogApplicationMode, result, &numApplied, nullptr);
         }
         BSONArrayBuilder ab;
         ++numApplied;
@@ -496,37 +501,46 @@ Status applyOps(OperationContext* opCtx,
 }
 
 // static
-MultiApplier::Operations ApplyOps::extractOperations(const OplogEntry& applyOpsOplogEntry) {
-    MultiApplier::Operations result;
-    extractOperationsTo(applyOpsOplogEntry, applyOpsOplogEntry.toBSON(), &result);
+std::vector<OplogEntry> ApplyOps::extractOperations(const OplogEntry& applyOpsOplogEntry) {
+    std::vector<OplogEntry> result;
+    extractOperationsTo(applyOpsOplogEntry, applyOpsOplogEntry.getEntry().toBSON(), &result);
     return result;
 }
 
+// static
 void ApplyOps::extractOperationsTo(const OplogEntry& applyOpsOplogEntry,
                                    const BSONObj& topLevelDoc,
-                                   MultiApplier::Operations* operations) {
+                                   std::vector<OplogEntry>* operations) {
     uassert(ErrorCodes::TypeMismatch,
             str::stream() << "ApplyOps::extractOperations(): not a command: "
-                          << redact(applyOpsOplogEntry.toBSON()),
+                          << redact(applyOpsOplogEntry.toBSONForLogging()),
             applyOpsOplogEntry.isCommand());
 
     uassert(ErrorCodes::CommandNotSupported,
             str::stream() << "ApplyOps::extractOperations(): not applyOps command: "
-                          << redact(applyOpsOplogEntry.toBSON()),
+                          << redact(applyOpsOplogEntry.toBSONForLogging()),
             OplogEntry::CommandType::kApplyOps == applyOpsOplogEntry.getCommandType());
 
     auto cmdObj = applyOpsOplogEntry.getOperationToApply();
-    auto operationDocs = cmdObj.firstElement().Obj();
+    auto info = ApplyOpsCommandInfo::parse(cmdObj);
+    auto operationDocs = info.getOperations();
+    bool alwaysUpsert = info.getAlwaysUpsert() && !applyOpsOplogEntry.getTxnNumber();
 
-    if (operationDocs.isEmpty()) {
-        return;
-    }
+    for (const auto& operationDoc : operationDocs) {
+        // Make sure that the inner ops are not malformed or over-specified.
+        ReplOperation::parse(IDLParserErrorContext("extractOperations"), operationDoc);
 
-    for (const auto& elem : operationDocs) {
-        auto operationDoc = elem.Obj();
         BSONObjBuilder builder(operationDoc);
+
+        // Oplog entries can have an oddly-named "b" field for "upsert". MongoDB stopped creating
+        // such entries in 4.0, but we can use the "b" field for the extracted entry here.
+        if (alwaysUpsert && !operationDoc.hasField("b")) {
+            builder.append("b", true);
+        }
+
         builder.appendElementsUnique(topLevelDoc);
         auto operation = builder.obj();
+
         operations->emplace_back(operation);
     }
 }

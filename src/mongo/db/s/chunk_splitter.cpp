@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -44,6 +44,7 @@
 #include "mongo/db/s/split_chunk.h"
 #include "mongo/db/s/split_vector.h"
 #include "mongo/db/service_context.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/balancer_configuration.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog_cache.h"
@@ -52,7 +53,6 @@
 #include "mongo/s/grid.h"
 #include "mongo/s/shard_key_pattern.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
@@ -69,6 +69,8 @@ ThreadPool::Options makeDefaultThreadPoolOptions() {
     // Ensure all threads have a client
     options.onCreateThread = [](const std::string& threadName) {
         Client::initThread(threadName.c_str());
+        stdx::lock_guard<Client> lk(cc());
+        cc().setSystemOperationKillableByStepdown(lk);
     };
     return options;
 }
@@ -93,15 +95,15 @@ Status splitChunkAtMultiplePoints(OperationContext* opCtx,
                               << " parts at a time."};
     }
 
-    const auto status = splitChunk(opCtx,
-                                   nss,
-                                   shardKeyPattern.toBSON(),
-                                   chunkRange,
-                                   splitPoints,
-                                   shardId.toString(),
-                                   collectionVersion.epoch());
-
-    return status.getStatus().withContext("split failed");
+    return splitChunk(opCtx,
+                      nss,
+                      shardKeyPattern.toBSON(),
+                      chunkRange,
+                      splitPoints,
+                      shardId.toString(),
+                      collectionVersion.epoch())
+        .getStatus()
+        .withContext("split failed");
 }
 
 /**
@@ -109,14 +111,14 @@ Status splitChunkAtMultiplePoints(OperationContext* opCtx,
  */
 void moveChunk(OperationContext* opCtx, const NamespaceString& nss, const BSONObj& minKey) {
     // We need to have the most up-to-date view of the chunk we are about to move.
-    const auto routingInfo =
+    const auto cm =
         uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss));
 
     uassert(ErrorCodes::NamespaceNotSharded,
             "Could not move chunk. Collection is no longer sharded",
-            routingInfo.cm());
+            cm.isSharded());
 
-    const auto suggestedChunk = routingInfo.cm()->findIntersectingChunkWithSimpleCollation(minKey);
+    const auto suggestedChunk = cm.findIntersectingChunkWithSimpleCollation(minKey);
 
     ChunkType chunkToMove;
     chunkToMove.setNS(nss);
@@ -176,8 +178,7 @@ BSONObj findExtremeKeyForShard(OperationContext* opCtx,
 
         uassert(40618,
                 str::stream() << "failed to initialize cursor during auto split due to "
-                              << "connection problem with "
-                              << client.getServerAddress(),
+                              << "connection problem with " << client.getServerAddress(),
                 cursor.get() != nullptr);
 
         if (cursor->more()) {
@@ -203,14 +204,16 @@ bool isAutoBalanceEnabled(OperationContext* opCtx,
     if (!balancerConfig->shouldBalanceForAutoSplit())
         return false;
 
-    auto collStatus = Grid::get(opCtx)->catalogClient()->getCollection(opCtx, nss);
-    if (!collStatus.isOK()) {
-        log() << "Auto-split for " << nss << " failed to load collection metadata"
-              << causedBy(redact(collStatus.getStatus()));
+    try {
+        return Grid::get(opCtx)->catalogClient()->getCollection(opCtx, nss).getAllowBalance();
+    } catch (const DBException& ex) {
+        LOGV2(21903,
+              "Auto-split for {namespace} failed to load collection metadata: {error}",
+              "Auto-split failed to load collection metadata",
+              "namespace"_attr = nss,
+              "error"_attr = redact(ex));
         return false;
     }
-
-    return collStatus.getValue().value.getAllowBalance();
 }
 
 const auto getChunkSplitter = ServiceContext::declareDecoration<ChunkSplitter>();
@@ -235,29 +238,30 @@ ChunkSplitter& ChunkSplitter::get(ServiceContext* serviceContext) {
 }
 
 void ChunkSplitter::onShardingInitialization(bool isPrimary) {
-    stdx::lock_guard<stdx::mutex> scopedLock(_mutex);
+    stdx::lock_guard<Latch> scopedLock(_mutex);
     _isPrimary = isPrimary;
 }
 
 void ChunkSplitter::onStepUp() {
-    stdx::lock_guard<stdx::mutex> lg(_mutex);
+    stdx::lock_guard<Latch> lg(_mutex);
     if (_isPrimary) {
         return;
     }
     _isPrimary = true;
 
-    log() << "The ChunkSplitter has started and will accept autosplit tasks.";
+    LOGV2(21904, "The ChunkSplitter has started and will accept autosplit tasks");
 }
 
 void ChunkSplitter::onStepDown() {
-    stdx::lock_guard<stdx::mutex> lg(_mutex);
+    stdx::lock_guard<Latch> lg(_mutex);
     if (!_isPrimary) {
         return;
     }
     _isPrimary = false;
 
-    log() << "The ChunkSplitter has stopped and will no longer run new autosplit tasks. Any "
-          << "autosplit tasks that have already started will be allowed to finish.";
+    LOGV2(21905,
+          "The ChunkSplitter has stopped and will no longer run new autosplit tasks. Any autosplit "
+          "tasks that have already started will be allowed to finish");
 }
 
 void ChunkSplitter::waitForIdle() {
@@ -273,8 +277,8 @@ void ChunkSplitter::trySplitting(std::shared_ptr<ChunkSplitStateDriver> chunkSpl
         return;
     }
     _threadPool.schedule(
-        [ this, csd = std::move(chunkSplitStateDriver), nss, min, max, dataWritten ](
-            auto status) noexcept {
+        [ this, csd = std::move(chunkSplitStateDriver), nss, min, max,
+          dataWritten ](auto status) noexcept {
             invariant(status);
 
             _runAutosplit(csd, nss, min, max, dataWritten);
@@ -292,16 +296,25 @@ void ChunkSplitter::_runAutosplit(std::shared_ptr<ChunkSplitStateDriver> chunkSp
 
     try {
         const auto opCtx = cc().makeOperationContext();
-        const auto routingInfo = uassertStatusOK(
-            Grid::get(opCtx.get())->catalogCache()->getCollectionRoutingInfo(opCtx.get(), nss));
 
-        const auto cm = routingInfo.cm();
+        const auto cm = uassertStatusOK(
+            Grid::get(opCtx.get())->catalogCache()->getCollectionRoutingInfo(opCtx.get(), nss));
         uassert(ErrorCodes::NamespaceNotSharded,
                 "Could not split chunk. Collection is no longer sharded",
-                cm);
+                cm.isSharded());
 
-        const auto chunk = cm->findIntersectingChunkWithSimpleCollation(min);
-        const auto& shardKeyPattern = cm->getShardKeyPattern();
+        // Best effort checks that the chunk we're splitting hasn't changed bounds or moved shards
+        // since the auto split task was scheduled. Best effort because the chunk metadata may
+        // change after this point.
+        const auto chunk = cm.findIntersectingChunkWithSimpleCollation(min);
+        uassert(4860100,
+                "Chunk to be auto split has different boundaries than when the split was initiated",
+                chunk.getRange() == ChunkRange(min, max));
+        uassert(4860101,
+                "Chunk to be auto split isn't owned by this shard",
+                ShardingState::get(opCtx.get())->shardId() == chunk.getShardId());
+
+        const auto& shardKeyPattern = cm.getShardKeyPattern();
 
         const auto balancerConfig = Grid::get(opCtx.get())->getBalancerConfiguration();
         // Ensure we have the most up-to-date balancer configuration
@@ -313,31 +326,37 @@ void ChunkSplitter::_runAutosplit(std::shared_ptr<ChunkSplitStateDriver> chunkSp
 
         const uint64_t maxChunkSizeBytes = balancerConfig->getMaxChunkSizeBytes();
 
-        LOG(1) << "about to initiate autosplit: " << redact(chunk.toString())
-               << " dataWritten since last check: " << dataWritten
-               << " maxChunkSizeBytes: " << maxChunkSizeBytes;
+        LOGV2_DEBUG(21906,
+                    1,
+                    "about to initiate autosplit: {chunk} dataWritten since last check: "
+                    "{dataWrittenBytes} maxChunkSizeBytes: {maxChunkSizeBytes}",
+                    "about to initiate autosplit",
+                    "chunk"_attr = redact(chunk.toString()),
+                    "dataWrittenBytes"_attr = dataWritten,
+                    "maxChunkSizeBytes"_attr = maxChunkSizeBytes);
 
         chunkSplitStateDriver->prepareSplit();
-        auto splitPoints = uassertStatusOK(splitVector(opCtx.get(),
-                                                       nss,
-                                                       shardKeyPattern.toBSON(),
-                                                       chunk.getMin(),
-                                                       chunk.getMax(),
-                                                       false,
-                                                       boost::none,
-                                                       boost::none,
-                                                       boost::none,
-                                                       maxChunkSizeBytes));
+        auto splitPoints = splitVector(opCtx.get(),
+                                       nss,
+                                       shardKeyPattern.toBSON(),
+                                       chunk.getMin(),
+                                       chunk.getMax(),
+                                       false,
+                                       boost::none,
+                                       boost::none,
+                                       maxChunkSizeBytes);
 
-        if (splitPoints.size() <= 1) {
-            LOG(1)
-                << "ChunkSplitter attempted split but not enough split points were found for chunk "
-                << redact(chunk.toString());
+        if (splitPoints.empty()) {
+            LOGV2_DEBUG(21907,
+                        1,
+                        "ChunkSplitter attempted split but not enough split points were found for "
+                        "chunk {chunk}",
+                        "ChunkSplitter attempted split but not enough split points were found for "
+                        "chunk",
+                        "chunk"_attr = redact(chunk.toString()));
             // Reset our size estimate that we had prior to splitVector to 0, while still counting
             // the bytes that have been written in parallel to this split task
             chunkSplitStateDriver->abandonPrepare();
-            // No split points means there isn't enough data to split on; 1 split point means we
-            // have between half the chunk size to full chunk size so there is no need to split yet
             return;
         }
 
@@ -374,25 +393,25 @@ void ChunkSplitter::_runAutosplit(std::shared_ptr<ChunkSplitStateDriver> chunkSp
                                                    chunk.getShardId(),
                                                    nss,
                                                    shardKeyPattern,
-                                                   cm->getVersion(),
-                                                   ChunkRange(min, max),
+                                                   cm.getVersion(),
+                                                   chunk.getRange(),
                                                    splitPoints));
         chunkSplitStateDriver->commitSplit();
 
         const bool shouldBalance = isAutoBalanceEnabled(opCtx.get(), nss, balancerConfig);
 
-        log() << "autosplitted " << nss << " chunk: " << redact(chunk.toString()) << " into "
-              << (splitPoints.size() + 1) << " parts (maxChunkSizeBytes " << maxChunkSizeBytes
-              << ")"
-              << (topChunkMinKey.isEmpty() ? "" : " (top chunk migration suggested" +
-                          (std::string)(shouldBalance ? ")" : ", but no migrations allowed)"));
-
-        // Because the ShardServerOpObserver uses the metadata from the CSS for tracking incoming
-        // writes, if we split a chunk but do not force a CSS refresh, subsequent inserts will see
-        // stale metadata and so will not trigger a chunk split. If we force metadata refresh here,
-        // we can limit the amount of time that the op observer is tracking writes on the parent
-        // chunk rather than on its child chunks.
-        forceShardFilteringMetadataRefresh(opCtx.get(), nss, false);
+        LOGV2(21908,
+              "autosplitted {namespace} chunk: {chunk} with {splitPoints} split points "
+              "(maxChunkSizeBytes: {maxChunkSizeBytes}). {extraInfo}",
+              "autosplitted chunk",
+              "namespace"_attr = nss,
+              "chunk"_attr = redact(chunk.toString()),
+              "splitPoints"_attr = splitPoints.size(),
+              "maxChunkSizeBytes"_attr = maxChunkSizeBytes,
+              "extraInfo"_attr =
+                  (topChunkMinKey.isEmpty() ? ""
+                                            : "top chunk migration suggested" +
+                           (std::string)(shouldBalance ? "" : ", but no migrations allowed)")));
 
         // Balance the resulting chunks if the autobalance option is enabled and if we split at the
         // first or last chunk on the collection as part of top chunk optimization.
@@ -406,13 +425,21 @@ void ChunkSplitter::_runAutosplit(std::shared_ptr<ChunkSplitStateDriver> chunkSp
             // assumption that succeeding inserts will fall on the top chunk.
             moveChunk(opCtx.get(), nss, topChunkMinKey);
         } catch (const DBException& ex) {
-            log() << "Top-chunk optimization failed to move chunk "
-                  << redact(ChunkRange(min, max).toString()) << " in collection " << nss
-                  << " after a successful split" << causedBy(redact(ex.toStatus()));
+            LOGV2(21909,
+                  "Top-chunk optimization failed to move chunk {chunk} in collection "
+                  "{namespace} after a successful split: {error}",
+                  "Top-chunk optimization failed to move chunk after a successful split",
+                  "chunk"_attr = redact(ChunkRange(min, max).toString()),
+                  "namespace"_attr = nss,
+                  "error"_attr = redact(ex.toStatus()));
         }
     } catch (const DBException& ex) {
-        log() << "Unable to auto-split chunk " << redact(ChunkRange(min, max).toString())
-              << " in namespace " << nss << causedBy(redact(ex.toStatus()));
+        LOGV2(21910,
+              "Unable to auto-split chunk {chunk} in namespace {namespace}: {error}",
+              "Unable to auto-split chunk",
+              "chunk"_attr = redact(ChunkRange(min, max).toString()),
+              "namespace"_attr = nss,
+              "error"_attr = redact(ex.toStatus()));
     }
 }
 

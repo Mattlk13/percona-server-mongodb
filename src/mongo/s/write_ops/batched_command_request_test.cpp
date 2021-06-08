@@ -29,10 +29,11 @@
 
 #include "mongo/platform/basic.h"
 
+#include <memory>
+
 #include "mongo/bson/json.h"
 #include "mongo/db/ops/write_ops_parsers_test_helpers.h"
 #include "mongo/s/write_ops/batched_command_request.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -43,14 +44,8 @@ TEST(BatchedCommandRequest, BasicInsert) {
 
     BSONObj origInsertRequestObj = BSON("insert"
                                         << "test"
-                                        << "documents"
-                                        << insertArray
-                                        << "writeConcern"
-                                        << BSON("w" << 1)
-                                        << "ordered"
-                                        << true
-                                        << "allowImplicitCollectionCreation"
-                                        << false);
+                                        << "documents" << insertArray << "writeConcern"
+                                        << BSON("w" << 1) << "ordered" << true);
 
     for (auto docSeq : {false, true}) {
         const auto opMsgRequest(toOpMsg("TestDB", origInsertRequestObj, docSeq));
@@ -58,7 +53,6 @@ TEST(BatchedCommandRequest, BasicInsert) {
 
         ASSERT_EQ("TestDB.test", insertRequest.getInsertRequest().getNamespace().ns());
         ASSERT(!insertRequest.hasShardVersion());
-        ASSERT_FALSE(insertRequest.isImplicitCreateAllowed());
     }
 }
 
@@ -69,13 +63,8 @@ TEST(BatchedCommandRequest, InsertWithShardVersion) {
 
     BSONObj origInsertRequestObj = BSON("insert"
                                         << "test"
-                                        << "documents"
-                                        << insertArray
-                                        << "writeConcern"
-                                        << BSON("w" << 1)
-                                        << "ordered"
-                                        << true
-                                        << "shardVersion"
+                                        << "documents" << insertArray << "writeConcern"
+                                        << BSON("w" << 1) << "ordered" << true << "shardVersion"
                                         << BSON_ARRAY(Timestamp(1, 2) << epoch));
 
     for (auto docSeq : {false, true}) {
@@ -84,15 +73,16 @@ TEST(BatchedCommandRequest, InsertWithShardVersion) {
 
         ASSERT_EQ("TestDB.test", insertRequest.getInsertRequest().getNamespace().ns());
         ASSERT(insertRequest.hasShardVersion());
-        ASSERT_EQ(ChunkVersion(1, 2, epoch).toString(), insertRequest.getShardVersion().toString());
+        ASSERT_EQ(ChunkVersion(1, 2, epoch, boost::none /* timestamp */).toString(),
+                  insertRequest.getShardVersion().toString());
     }
 }
 
 TEST(BatchedCommandRequest, InsertCloneWithIds) {
     BatchedCommandRequest batchedRequest([&] {
-        write_ops::Insert insertOp(NamespaceString("xyz.abc"));
-        insertOp.setWriteCommandBase([] {
-            write_ops::WriteCommandBase wcb;
+        write_ops::InsertCommandRequest insertOp(NamespaceString("xyz.abc"));
+        insertOp.setWriteCommandRequestBase([] {
+            write_ops::WriteCommandRequestBase wcb;
             wcb.setOrdered(true);
             wcb.setBypassDocumentValidation(true);
             return wcb;
@@ -105,8 +95,8 @@ TEST(BatchedCommandRequest, InsertCloneWithIds) {
     const auto clonedRequest(BatchedCommandRequest::cloneInsertWithIds(std::move(batchedRequest)));
 
     ASSERT_EQ("xyz.abc", clonedRequest.getNS().ns());
-    ASSERT(clonedRequest.getWriteCommandBase().getOrdered());
-    ASSERT(clonedRequest.getWriteCommandBase().getBypassDocumentValidation());
+    ASSERT(clonedRequest.getWriteCommandRequestBase().getOrdered());
+    ASSERT(clonedRequest.getWriteCommandRequestBase().getBypassDocumentValidation());
     ASSERT_BSONOBJ_EQ(BSON("w" << 2), clonedRequest.getWriteConcern());
 
     const auto& insertDocs = clonedRequest.getInsertRequest().getDocuments();

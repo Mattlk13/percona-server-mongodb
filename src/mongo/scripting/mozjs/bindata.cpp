@@ -31,7 +31,6 @@
 
 #include "mongo/scripting/mozjs/bindata.h"
 
-#include <cctype>
 #include <iomanip>
 
 #include "mongo/bson/bsonobjbuilder.h"
@@ -79,18 +78,8 @@ void hexToBinData(JSContext* cx,
 
     uassert(
         ErrorCodes::BadValue, "BinData hex string must be an even length", hexstr.size() % 2 == 0);
-    auto len = hexstr.size() / 2;
 
-    std::unique_ptr<char[]> data(new char[len]);
-    const char* src = hexstr.c_str();
-    for (size_t i = 0; i < len; i++) {
-        int src_index = i * 2;
-        if (!std::isxdigit(src[src_index]) || !std::isxdigit(src[src_index + 1]))
-            uasserted(ErrorCodes::BadValue, "Invalid hex character in string");
-        data[i] = uassertStatusOK(fromHex(src + src_index));
-    }
-
-    std::string encoded = base64::encode(data.get(), len);
+    std::string encoded = base64::encode(hexblob::decode(hexstr));
     JS::AutoValueArray<2> args(cx);
 
     args[0].setInt32(type);
@@ -135,7 +124,7 @@ void BinDataInfo::Functions::UUID::call(JSContext* cx, JS::CallArgs args) {
         uuid = uassertStatusOK(mongo::UUID::parse(str));
     };
     ConstDataRange cdr = uuid->toCDR();
-    std::string encoded = mongo::base64::encode(cdr.data(), cdr.length());
+    std::string encoded = mongo::base64::encode(StringData(cdr.data(), cdr.length()));
 
     JS::AutoValueArray<2> newArgs(cx);
     newArgs[0].setInt32(newUUID);

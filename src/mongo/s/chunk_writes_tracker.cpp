@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -52,7 +52,7 @@ bool ChunkWritesTracker::shouldSplit(uint64_t maxChunkSize) {
 }
 
 bool ChunkWritesTracker::acquireSplitLock() {
-    stdx::lock_guard<stdx::mutex> lk(_mtx);
+    stdx::lock_guard<Latch> lk(_mtx);
 
     if (!_isLockedForSplitting) {
         _isLockedForSplitting = true;

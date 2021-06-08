@@ -30,20 +30,21 @@
 #pragma once
 
 #include <list>
+#include <memory>
 #include <set>
 
 #include "mongo/bson/bsonobj.h"
 #include "mongo/client/connection_string.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/s/migration_chunk_cloner_source.h"
 #include "mongo/db/s/migration_session_id.h"
 #include "mongo/db/s/session_catalog_migration_source.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/s/request_types/move_chunk_request.h"
 #include "mongo/s/shard_key_pattern.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/util/net/hostandport.h"
 
 namespace mongo {
@@ -51,8 +52,33 @@ namespace mongo {
 class BSONArrayBuilder;
 class BSONObjBuilder;
 class Collection;
+class CollectionPtr;
 class Database;
 class RecordId;
+
+/**
+ * Used to commit work for LogOpForSharding. Used to keep track of changes in documents that are
+ * part of a chunk being migrated.
+ */
+class LogTransactionOperationsForShardingHandler final : public RecoveryUnit::Change {
+public:
+    /**
+     * Invariant: idObj should belong to a document that is part of the active chunk being migrated
+     */
+    LogTransactionOperationsForShardingHandler(ServiceContext* svcCtx,
+                                               const std::vector<repl::ReplOperation>& stmts,
+                                               const repl::OpTime& prepareOrCommitOpTime)
+        : _svcCtx(svcCtx), _stmts(stmts), _prepareOrCommitOpTime(prepareOrCommitOpTime) {}
+
+    void commit(boost::optional<Timestamp>) override;
+
+    void rollback() override{};
+
+private:
+    ServiceContext* _svcCtx;
+    std::vector<repl::ReplOperation> _stmts;
+    const repl::OpTime _prepareOrCommitOpTime;
+};
 
 class MigrationChunkClonerSourceLegacy final : public MigrationChunkClonerSource {
     MigrationChunkClonerSourceLegacy(const MigrationChunkClonerSourceLegacy&) = delete;
@@ -65,7 +91,10 @@ public:
                                      HostAndPort recipientHost);
     ~MigrationChunkClonerSourceLegacy();
 
-    Status startClone(OperationContext* opCtx) override;
+    Status startClone(OperationContext* opCtx,
+                      const UUID& migrationId,
+                      const LogicalSessionId& lsid,
+                      TxnNumber txnNumber) override;
 
     Status awaitUntilCriticalSectionIsAppropriate(OperationContext* opCtx,
                                                   Milliseconds maxTimeToWait) override;
@@ -91,19 +120,11 @@ public:
                     const repl::OpTime& opTime,
                     const repl::OpTime& preImageOpTime) override;
 
-    void onTransactionPrepareOrUnpreparedCommit(OperationContext* opCtx,
-                                                const repl::OpTime& opTime) override;
-
-
-    // Legacy cloner specific functionality
-
-    /**
-     * Returns the migration session id associated with this cloner, so stale sessions can be
-     * disambiguated.
-     */
-    const MigrationSessionId& getSessionId() const {
+    const MigrationSessionId& getSessionId() const override {
         return _sessionId;
     }
+
+    // Legacy cloner specific functionality
 
     /**
      * Returns the rollback ID recorded at the beginning of session migration. If the underlying
@@ -139,7 +160,7 @@ public:
      * NOTE: Must be called with the collection lock held in at least IS mode.
      */
     Status nextCloneBatch(OperationContext* opCtx,
-                          Collection* collection,
+                          const CollectionPtr& collection,
                           BSONArrayBuilder* arrBuilder);
 
     /**
@@ -183,7 +204,7 @@ public:
 
 private:
     friend class LogOpForShardingHandler;
-    friend class LogPrepareOrCommitOpForShardingHandler;
+    friend class LogTransactionOperationsForShardingHandler;
 
     // Represents the states in which the cloner can be
     enum State { kNew, kCloning, kDone };
@@ -199,6 +220,19 @@ private:
      * command response (if succeeded) or the status, if the command failed.
      */
     StatusWith<BSONObj> _callRecipient(const BSONObj& cmdObj);
+
+    StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> _getIndexScanExecutor(
+        OperationContext* opCtx,
+        const CollectionPtr& collection,
+        InternalPlanner::IndexScanOptions scanOption);
+
+    void _nextCloneBatchFromIndexScan(OperationContext* opCtx,
+                                      const CollectionPtr& collection,
+                                      BSONArrayBuilder* arrBuilder);
+
+    void _nextCloneBatchFromCloneLocs(OperationContext* opCtx,
+                                      const CollectionPtr& collection,
+                                      BSONArrayBuilder* arrBuilder);
 
     /**
      * Get the disklocs that belong to the chunk migrated and sort them in _cloneLocs (to avoid
@@ -216,18 +250,20 @@ private:
         const repl::OpTime& opTime,
         SessionCatalogMigrationSource::EntryAtOpTimeType entryAtOpTimeType);
 
-    /*
-     * Consumes the operation track request and appends the relevant document changes to
-     * the appropriate internal data structures (known colloquially as the 'transfer mods queue').
-     * These structures track document changes that are part of a part of a chunk being migrated.
-     * In doing so, this the method also removes the corresponding operation track request from the
-     * operation track requests queue.
-     */
-    void _consumeOperationTrackRequestAndAddToTransferModsQueue(
-        const BSONObj& idObj,
-        const char op,
+    void _addToSessionMigrationOptimeQueueForTransactionCommit(
         const repl::OpTime& opTime,
-        const repl::OpTime& prePostImageOpTime);
+        SessionCatalogMigrationSource::EntryAtOpTimeType entryAtOpTimeType);
+
+    /*
+     * Appends the relevant document changes to the appropriate internal data structures (known
+     * colloquially as the 'transfer mods queue'). These structures track document changes that are
+     * part of a part of a chunk being migrated. In doing so, this the method also removes the
+     * corresponding operation track request from the operation track requests queue.
+     */
+    void _addToTransferModsQueue(const BSONObj& idObj,
+                                 const char op,
+                                 const repl::OpTime& opTime,
+                                 const repl::OpTime& prePostImageOpTime);
 
     /**
      * Adds an operation to the outstanding operation track requests. Returns false if the cloner
@@ -263,7 +299,7 @@ private:
      * function. Should only be used in the cleanup for this class. Should use a lock wrapped
      * around this class's mutex.
      */
-    void _drainAllOutstandingOperationTrackRequests(stdx::unique_lock<stdx::mutex>& lk);
+    void _drainAllOutstandingOperationTrackRequests(stdx::unique_lock<Latch>& lk);
 
     /**
      * Appends to the builder the list of _id of documents that were deleted during migration.
@@ -285,6 +321,12 @@ private:
                            std::list<BSONObj>* updateList,
                            long long initialSize);
 
+    /**
+     * Sends _recvChunkStatus to the recipient shard until it receives 'steady' from the recipient,
+     * an error has occurred, or a timeout is hit.
+     */
+    Status _checkRecipientCloningStatus(OperationContext* opCtx, Milliseconds maxTimeToWait);
+
     // The original move chunk request
     const MoveChunkRequest _args;
 
@@ -303,7 +345,7 @@ private:
     std::unique_ptr<SessionCatalogMigrationSource> _sessionCatalogSource;
 
     // Protects the entries below
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH("MigrationChunkClonerSourceLegacy::_mutex");
 
     // The current state of the cloner
     State _state{kNew};
@@ -314,6 +356,9 @@ private:
     // The estimated average object size during the clone phase. Used for buffer size
     // pre-allocation (initial clone).
     uint64_t _averageObjectSizeForCloneLocs{0};
+
+    // The estimated average object _id size during the clone phase.
+    uint64_t _averageObjectIdSize{0};
 
     // Represents all of the requested but not yet fulfilled operations to be tracked, with regards
     // to the chunk being cloned.
@@ -334,6 +379,23 @@ private:
 
     // Total bytes in _reload + _deleted (xfer mods)
     uint64_t _memoryUsed{0};
+
+    // False if the move chunk request specified ForceJumbo::kDoNotForce, true otherwise.
+    const bool _forceJumbo;
+
+    struct JumboChunkCloneState {
+        // Plan executor for collection scan used to clone docs.
+        std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> clonerExec;
+
+        // The current state of 'clonerExec'.
+        PlanExecutor::ExecState clonerState;
+
+        // Number docs in jumbo chunk cloned so far
+        int docsCloned = 0;
+    };
+
+    // Set only once its discovered a chunk is jumbo
+    boost::optional<JumboChunkCloneState> _jumboChunkCloneState;
 };
 
 }  // namespace mongo

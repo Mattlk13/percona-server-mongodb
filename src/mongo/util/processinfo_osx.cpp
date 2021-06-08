@@ -27,29 +27,25 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 #include "mongo/platform/basic.h"
+
+#include "mongo/util/processinfo.h"
 
 #include <boost/none.hpp>
 #include <boost/optional.hpp>
 
-#include <iostream>
-#include <mach/mach_host.h>
 #include <mach/mach_init.h>
 #include <mach/mach_traps.h>
 #include <mach/task.h>
 #include <mach/task_info.h>
-#include <mach/vm_map.h>
-#include <mach/vm_statistics.h>
 
-#include <sys/mman.h>
 #include <sys/sysctl.h>
 #include <sys/types.h>
 
-#include "mongo/db/jsobj.h"
-#include "mongo/util/log.h"
-#include "mongo/util/processinfo.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 
@@ -75,7 +71,7 @@ int ProcessInfo::getVirtualMemorySize() {
     mach_port_t task;
 
     if ((result = task_for_pid(mach_task_self(), _pid.toNative(), &task)) != KERN_SUCCESS) {
-        std::cout << "error getting task\n";
+        LOGV2(677702, "error getting task");
         return 0;
     }
 
@@ -86,7 +82,7 @@ int ProcessInfo::getVirtualMemorySize() {
 #endif
     mach_msg_type_number_t count = TASK_BASIC_INFO_COUNT;
     if ((result = task_info(task, TASK_BASIC_INFO, (task_info_t)&ti, &count)) != KERN_SUCCESS) {
-        std::cout << "error getting task_info: " << result << std::endl;
+        LOGV2(677703, "error getting task_info", "result"_attr = result);
         return 0;
     }
     return (int)((double)ti.virtual_size / (1024.0 * 1024));
@@ -98,7 +94,7 @@ int ProcessInfo::getResidentSize() {
     mach_port_t task;
 
     if ((result = task_for_pid(mach_task_self(), _pid.toNative(), &task)) != KERN_SUCCESS) {
-        std::cout << "error getting task\n";
+        LOGV2(577704, "error getting task");
         return 0;
     }
 
@@ -110,14 +106,10 @@ int ProcessInfo::getResidentSize() {
 #endif
     mach_msg_type_number_t count = TASK_BASIC_INFO_COUNT;
     if ((result = task_info(task, TASK_BASIC_INFO, (task_info_t)&ti, &count)) != KERN_SUCCESS) {
-        std::cout << "error getting task_info: " << result << std::endl;
+        LOGV2(677705, "error getting task_info", "result"_attr = result);
         return 0;
     }
     return (int)(ti.resident_size / (1024 * 1024));
-}
-
-double ProcessInfo::getSystemMemoryPressurePercentage() {
-    return 0.0;
 }
 
 void ProcessInfo::getExtraInfo(BSONObjBuilder& info) {
@@ -126,7 +118,7 @@ void ProcessInfo::getExtraInfo(BSONObjBuilder& info) {
 
     if (KERN_SUCCESS !=
         task_info(mach_task_self(), TASK_EVENTS_INFO, (integer_t*)&taskInfo, &taskInfoCount)) {
-        std::cout << "error getting extra task_info" << std::endl;
+        LOGV2(677706, "error getting extra task_info");
         return;
     }
 
@@ -145,15 +137,15 @@ Variant getSysctlByName(const char* sysctlName) {
     // NB: sysctlbyname is called once to determine the buffer length, and once to copy
     //     the sysctl value.  Retry if the buffer length grows between calls.
     do {
-        status = sysctlbyname(sysctlName, NULL, &len, NULL, 0);
+        status = sysctlbyname(sysctlName, nullptr, &len, nullptr, 0);
         if (status == -1)
             break;
         value.resize(len);
-        status = sysctlbyname(sysctlName, &*value.begin(), &len, NULL, 0);
+        status = sysctlbyname(sysctlName, &*value.begin(), &len, nullptr, 0);
     } while (status == -1 && errno == ENOMEM);
     if (status == -1) {
         // unrecoverable error from sysctlbyname
-        log() << sysctlName << " unavailable";
+        LOGV2(23351, "{sysctlName} unavailable", "sysctlName"_attr = sysctlName);
         return "";
     }
 
@@ -168,12 +160,16 @@ template <>
 long long getSysctlByName<NumberVal>(const char* sysctlName) {
     long long value = 0;
     size_t len = sizeof(value);
-    if (sysctlbyname(sysctlName, &value, &len, NULL, 0) < 0) {
-        log() << "Unable to resolve sysctl " << sysctlName << " (number) ";
+    if (sysctlbyname(sysctlName, &value, &len, nullptr, 0) < 0) {
+        LOGV2(23352,
+              "Unable to resolve sysctl {sysctlName} (number) ",
+              "sysctlName"_attr = sysctlName);
     }
     if (len > 8) {
-        log() << "Unable to resolve sysctl " << sysctlName << " as integer.  System returned "
-              << len << " bytes.";
+        LOGV2(23353,
+              "Unable to resolve sysctl {sysctlName} as integer.  System returned {len} bytes.",
+              "sysctlName"_attr = sysctlName,
+              "len"_attr = len);
     }
     return value;
 }
@@ -216,28 +212,4 @@ bool ProcessInfo::checkNumaEnabled() {
     return false;
 }
 
-bool ProcessInfo::blockCheckSupported() {
-    return true;
-}
-
-bool ProcessInfo::blockInMemory(const void* start) {
-    char x = 0;
-    if (mincore(alignToStartOfPage(start), getPageSize(), &x)) {
-        log() << "mincore failed: " << errnoWithDescription();
-        return 1;
-    }
-    return x & 0x1;
-}
-
-bool ProcessInfo::pagesInMemory(const void* start, size_t numPages, std::vector<char>* out) {
-    out->resize(numPages);
-    if (mincore(alignToStartOfPage(start), numPages * getPageSize(), &out->front())) {
-        log() << "mincore failed: " << errnoWithDescription();
-        return false;
-    }
-    for (size_t i = 0; i < numPages; ++i) {
-        (*out)[i] &= 0x1;
-    }
-    return true;
-}
-}
+}  // namespace mongo

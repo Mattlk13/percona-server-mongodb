@@ -29,22 +29,58 @@
 
 #pragma once
 
+#include "mongo/db/exec/document_value/value_comparator.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_unwind.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/lookup_set_cache.h"
-#include "mongo/db/pipeline/value_comparator.h"
 
 namespace mongo {
 
 class DocumentSourceGraphLookUp final : public DocumentSource {
 public:
-    static std::unique_ptr<LiteParsedDocumentSourceForeignCollections> liteParse(
-        const AggregationRequest& request, const BSONElement& spec);
+    static constexpr StringData kStageName = "$graphLookup"_sd;
 
-    GetNextResult getNext() final;
+    class LiteParsed : public LiteParsedDocumentSourceForeignCollection {
+    public:
+        LiteParsed(std::string parseTimeName, NamespaceString foreignNss)
+            : LiteParsedDocumentSourceForeignCollection(std::move(parseTimeName),
+                                                        std::move(foreignNss)) {}
+
+        static std::unique_ptr<LiteParsed> parse(const NamespaceString& nss,
+                                                 const BSONElement& spec);
+
+
+        bool allowShardedForeignCollection(NamespaceString nss) const override {
+            return _foreignNss != nss;
+        }
+
+        PrivilegeVector requiredPrivileges(bool isMongos, bool bypassDocumentValidation) const {
+            return {Privilege(ResourcePattern::forExactNamespace(_foreignNss), ActionType::find)};
+        }
+    };
 
     const char* getSourceName() const final;
+
+    const FieldPath& getConnectFromField() const {
+        return _connectFromField;
+    }
+
+    const FieldPath& getConnectToField() const {
+        return _connectToField;
+    }
+
+    Expression* getStartWithField() const {
+        return _startWith.get();
+    }
+
+    boost::optional<BSONObj> getAdditionalFilter() const {
+        return _additionalFilter;
+    };
+
+    void setAdditionalFilter(boost::optional<BSONObj> additionalFilter) {
+        _additionalFilter = additionalFilter ? additionalFilter->getOwned() : additionalFilter;
+    };
 
     void serializeToArray(
         std::vector<Value>& array,
@@ -56,22 +92,14 @@ public:
     GetModPathsReturn getModifiedPaths() const final;
 
     StageConstraints constraints(Pipeline::SplitState pipeState) const final {
-        // TODO SERVER-27533 Until we remove the restriction of only performing lookups from mongos,
-        // this stage must run on mongos if the output collection is sharded.
-        HostTypeRequirement hostRequirement =
-            (pExpCtx->inMongos && pExpCtx->mongoProcessInterface->isSharded(pExpCtx->opCtx, _from))
-            ? HostTypeRequirement::kMongoS
-            : HostTypeRequirement::kPrimaryShard;
-
         StageConstraints constraints(StreamType::kStreaming,
                                      PositionRequirement::kNone,
-                                     hostRequirement,
+                                     HostTypeRequirement::kPrimaryShard,
                                      DiskUseRequirement::kNoDiskUse,
                                      FacetRequirement::kAllowed,
                                      TransactionRequirement::kAllowed,
-                                     hostRequirement == HostTypeRequirement::kMongoS
-                                         ? LookupRequirement::kNotAllowed
-                                         : LookupRequirement::kAllowed);
+                                     LookupRequirement::kAllowed,
+                                     UnionRequirement::kAllowed);
 
         constraints.canSwapWithMatch = true;
         return constraints;
@@ -109,6 +137,7 @@ public:
         BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
 
 protected:
+    GetNextResult doGetNext() final;
     void doDispose() final;
 
     /**
@@ -229,6 +258,12 @@ private:
     // If we absorbed a $unwind that specified 'includeArrayIndex', this is used to populate that
     // field, tracking how many results we've returned so far for the current input document.
     long long _outputIndex;
+
+    // Holds variables defined both in this stage and in parent pipelines. These are copied to the
+    // '_fromExpCtx' ExpressionContext's 'variables' and 'variablesParseState' for use in the
+    // '_fromPipeline' execution.
+    Variables _variables;
+    VariablesParseState _variablesParseState;
 };
 
 }  // namespace mongo

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -39,20 +39,19 @@
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/speculative_majority_read_info.h"
-#include "mongo/db/s/implicit_create_collection.h"
+#include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/scoped_operation_completion_sharding_actions.h"
 #include "mongo/db/s/shard_filtering_metadata_refresh.h"
 #include "mongo/db/s/sharding_config_optime_gossip.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/service_entry_point_common.h"
-#include "mongo/logger/redaction.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/metadata/config_server_metadata.h"
 #include "mongo/rpc/metadata/sharding_metadata.h"
-#include "mongo/s/cannot_implicitly_create_collection_info.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/shard_cannot_refresh_due_to_locks_held_exception.h"
 #include "mongo/s/stale_exception.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -64,26 +63,35 @@ public:
         return mongo::lockedForWriting();
     }
 
+    void setPrepareConflictBehaviorForReadConcern(
+        OperationContext* opCtx, const CommandInvocation* invocation) const override {
+        const auto prepareConflictBehavior = invocation->canIgnorePrepareConflicts()
+            ? PrepareConflictBehavior::kIgnoreConflicts
+            : PrepareConflictBehavior::kEnforce;
+        mongo::setPrepareConflictBehaviorForReadConcern(
+            opCtx, repl::ReadConcernArgs::get(opCtx), prepareConflictBehavior);
+    }
+
     void waitForReadConcern(OperationContext* opCtx,
                             const CommandInvocation* invocation,
                             const OpMsgRequest& request) const override {
-        const auto prepareConflictBehavior = invocation->canIgnorePrepareConflicts()
-            ? PrepareConflictBehavior::kIgnore
-            : PrepareConflictBehavior::kEnforce;
-
-        Status rcStatus = mongo::waitForReadConcern(opCtx,
-                                                    repl::ReadConcernArgs::get(opCtx),
-                                                    invocation->allowsAfterClusterTime(),
-                                                    prepareConflictBehavior);
+        Status rcStatus = mongo::waitForReadConcern(
+            opCtx, repl::ReadConcernArgs::get(opCtx), invocation->allowsAfterClusterTime());
 
         if (!rcStatus.isOK()) {
             if (ErrorCodes::isExceededTimeLimitError(rcStatus.code())) {
                 const int debugLevel =
                     serverGlobalParams.clusterRole == ClusterRole::ConfigServer ? 0 : 2;
-                LOG(debugLevel) << "Command on database " << request.getDatabase()
-                                << " timed out waiting for read concern to be satisfied. Command: "
-                                << redact(ServiceEntryPointCommon::getRedactedCopyForLogging(
-                                       invocation->definition(), request.body));
+                LOGV2_DEBUG(21975,
+                            debugLevel,
+                            "Command on database {db} timed out waiting for read concern to be "
+                            "satisfied. Command: {command}. Info: {error}",
+                            "Command timed out waiting for read concern to be satisfied",
+                            "db"_attr = request.getDatabase(),
+                            "command"_attr =
+                                redact(ServiceEntryPointCommon::getRedactedCopyForLogging(
+                                    invocation->definition(), request.body)),
+                            "error"_attr = redact(rcStatus));
             }
 
             uassertStatusOK(rcStatus);
@@ -120,26 +128,34 @@ public:
         }
 
         // Ensures that if we tried to do a write, we wait for write concern, even if that write was
-        // a noop.
-        //
-        // Transactions do not stash their lockers on commit and abort, so after commit and abort,
-        // wasGlobalLockTakenForWrite will return whether any statement in the transaction as a
-        // whole acquired the global write lock.
-        //
-        // Speculative majority semantics dictate that "abortTransaction" should not wait for write
-        // concern on operations the transaction observed. As a result, "abortTransaction" only ever
-        // waits on an oplog entry it wrote (and has already set lastOp to) or previous writes on
-        // the same client.
-        if (opCtx->lockState()->wasGlobalLockTakenForWrite()) {
-            if (invocation->definition()->getName() != "abortTransaction") {
-                repl::ReplClientInfo::forClient(opCtx->getClient())
-                    .setLastOpToSystemLastOpTime(opCtx);
-                lastOpAfterRun = repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
+        // a noop. We do not need to update this for multi-document transactions as read-only/noop
+        // transactions will do a noop write at commit time, which should have incremented the
+        // lastOp. And speculative majority semantics dictate that "abortTransaction" should not
+        // wait for write concern on operations the transaction observed.
+        if (opCtx->lockState()->wasGlobalLockTakenForWrite() &&
+            !opCtx->inMultiDocumentTransaction()) {
+
+            // Recently stepped down nodes will receive the proper error message because the
+            // rstlKillOpThread would have already interrupted this thread since it took a lock for
+            // a write. We should allow standalone nodes to wait for write concern since they might
+            // be waiting for journaling.
+            auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+            if (!replCoord->canAcceptNonLocalWrites() && replCoord->isReplEnabled()) {
+                return;
             }
+
+            repl::ReplClientInfo::forClient(opCtx->getClient()).setLastOpToSystemLastOpTime(opCtx);
+            lastOpAfterRun = repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
             waitForWriteConcernAndAppendStatus();
             return;
         }
 
+        // Waits for write concern if we tried to explicitly set the lastOp forward but lastOp was
+        // already up to date. We still want to wait for write concern on the lastOp. This is
+        // primarily to make sure back to back retryable write retries still wait for write concern.
+        //
+        // WARNING: Retryable writes that expect to wait for write concern on retries must ensure
+        // this is entered by calling setLastOp() or setLastOpToSystemLastOpTime().
         if (repl::ReplClientInfo::forClient(opCtx->getClient())
                 .lastOpWasSetExplicitlyByClientForCurrentOperation(opCtx)) {
             waitForWriteConcernAndAppendStatus();
@@ -169,30 +185,6 @@ public:
         CurOp::get(opCtx)->debug().errInfo = getStatusFromCommandResult(replyObj);
     }
 
-    void handleException(const DBException& e, OperationContext* opCtx) const override {
-        // If we got a stale config, wait in case the operation is stuck in a critical section
-        if (auto sce = e.extraInfo<StaleConfigInfo>()) {
-            if (!opCtx->getClient()->isInDirectClient()) {
-                // We already have the StaleConfig exception, so just swallow any errors due to
-                // refresh
-                onShardVersionMismatchNoExcept(opCtx, sce->getNss(), sce->getVersionReceived())
-                    .ignore();
-            }
-        } else if (auto sce = e.extraInfo<StaleDbRoutingVersion>()) {
-            if (!opCtx->getClient()->isInDirectClient()) {
-                onDbVersionMismatchNoExcept(
-                    opCtx, sce->getDb(), sce->getVersionReceived(), sce->getVersionWanted())
-                    .ignore();
-            }
-        } else if (auto cannotImplicitCreateCollInfo =
-                       e.extraInfo<CannotImplicitlyCreateCollectionInfo>()) {
-            if (ShardingState::get(opCtx)->enabled()) {
-                onCannotImplicitlyCreateCollection(opCtx, cannotImplicitCreateCollInfo->getNss())
-                    .ignore();
-            }
-        }
-    }
-
     // Called from the error contexts where request may not be available.
     void appendReplyMetadataOnError(OperationContext* opCtx,
                                     BSONObjBuilder* metadataBob) const override {
@@ -218,15 +210,13 @@ public:
             repl::OpTime lastOpTimeFromClient =
                 repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
             replCoord->prepareReplMetadata(request.body, lastOpTimeFromClient, metadataBob);
-            // For commands from mongos, append some info to help getLastError(w) work.
-            // TODO: refactor out of here as part of SERVER-18236
+
             if (isShardingAware || isConfig) {
+                // For commands from mongos, append some info to help getLastError(w) work.
                 rpc::ShardingMetadata(lastOpTimeFromClient, replCoord->getElectionId())
                     .writeToMetadata(metadataBob)
                     .transitional_ignore();
-            }
 
-            if (isShardingAware || isConfig) {
                 auto lastCommittedOpTime = replCoord->getLastCommittedOpTime();
                 metadataBob->append(kLastCommittedOpTimeFieldName,
                                     lastCommittedOpTime.getTimestamp());
@@ -240,6 +230,27 @@ public:
         }
     }
 
+    bool refreshDatabase(OperationContext* opCtx, const StaleDbRoutingVersion& se) const
+        noexcept override {
+        return onDbVersionMismatchNoExcept(
+                   opCtx, se.getDb(), se.getVersionReceived(), se.getVersionWanted())
+            .isOK();
+    }
+
+    bool refreshCollection(OperationContext* opCtx, const StaleConfigInfo& se) const
+        noexcept override {
+        return onShardVersionMismatchNoExcept(opCtx, se.getNss(), se.getVersionReceived()).isOK();
+    }
+
+    bool refreshCatalogCache(OperationContext* opCtx,
+                             const ShardCannotRefreshDueToLocksHeldInfo& refreshInfo) const
+        noexcept override {
+        return Grid::get(opCtx)
+            ->catalogCache()
+            ->getCollectionRoutingInfo(opCtx, refreshInfo.getNss())
+            .isOK();
+    }
+
     void advanceConfigOpTimeFromRequestMetadata(OperationContext* opCtx) const override {
         // Handle config optime information that may have been sent along with the command.
         rpc::advanceConfigOpTimeFromRequestMetadata(opCtx);
@@ -251,8 +262,9 @@ public:
     }
 };
 
-DbResponse ServiceEntryPointMongod::handleRequest(OperationContext* opCtx, const Message& m) {
-    return ServiceEntryPointCommon::handleRequest(opCtx, m, Hooks{});
+Future<DbResponse> ServiceEntryPointMongod::handleRequest(OperationContext* opCtx,
+                                                          const Message& m) noexcept {
+    return ServiceEntryPointCommon::handleRequest(opCtx, m, std::make_unique<Hooks>());
 }
 
 }  // namespace mongo

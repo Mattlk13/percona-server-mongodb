@@ -33,14 +33,9 @@ global:
 
 imports:
     - "mongo/idl/basic_types.idl"
+    - "mongo/db/query/hint.idl"
 
 types:
-    indexHint:
-        bson_serialization_type: any
-        description: "Either a string index name or an object index specification."
-        cpp_type: mongo::BSONObj
-        deserializer: ::mongo::count_request::countParseHint
-
     countLimit:
         bson_serialization_type: any
         description: "The absolute value of an int for limit."
@@ -62,9 +57,11 @@ types:
 commands:
     count:
         description: "Parser for the 'count' command."
-        cpp_name: CountCommand
+        command_name: count
+        cpp_name: CountCommandRequest
         strict: true
         namespace: concatenate_with_db_or_uuid
+        api_version: ""
         fields:
             query:
                 description: "A query that selects which documents to count in the collection or
@@ -87,10 +84,6 @@ commands:
             collation:
                 description: "The collation to use in the count command."
                 type: object
-                optional: true
-            comment:
-                description: "A comment."
-                type: string
                 optional: true
             fields:
                 description: "A BSONObj added by the shell. Left in for backwards compatibility."

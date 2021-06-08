@@ -27,28 +27,34 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kTransaction
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTransaction
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/commands/txn_two_phase_commit_cmds_gen.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/s/transaction_coordinator_service.h"
 #include "mongo/db/session_catalog_mongod.h"
 #include "mongo/db/transaction_participant.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
 
+MONGO_FAIL_POINT_DEFINE(hangAfterStartingCoordinateCommit);
 MONGO_FAIL_POINT_DEFINE(participantReturnNetworkErrorForPrepareAfterExecutingPrepareLogic);
 
 class PrepareTransactionCmd : public TypedCommand<PrepareTransactionCmd> {
 public:
+    bool acceptsAnyApiVersionParameters() const override {
+        return true;
+    }
+
     class PrepareTimestamp {
     public:
         PrepareTimestamp(Timestamp timestamp) : _timestamp(std::move(timestamp)) {}
@@ -73,60 +79,74 @@ public:
                 uassertStatusOK(ShardingState::get(opCtx)->canAcceptShardedCommands());
             }
 
-            // We automatically fail 'prepareTransaction' against a primary that has
-            // 'enableMajorityReadConcern' set to 'false'.
-            uassert(50993,
+            // If a node has majority read concern disabled, replication must use the legacy
+            // 'rollbackViaRefetch' algortithm, which does not support prepareTransaction oplog
+            // entries
+            uassert(ErrorCodes::ReadConcernMajorityNotEnabled,
                     "'prepareTransaction' is not supported with 'enableMajorityReadConcern=false'",
                     serverGlobalParams.enableMajorityReadConcern);
 
-            // We do not allow preparing a transaction if the replica set has any arbiters.
+            // Replica sets with arbiters are able to continually accept majority writes without
+            // actually being able to commit them (e.g. PSA with a downed secondary), which in turn
+            // will impact the liveness of 2PC transactions
             const auto replCoord = repl::ReplicationCoordinator::get(opCtx);
-            uassert(50995,
+            uassert(ErrorCodes::ReadConcernMajorityNotEnabled,
                     "'prepareTransaction' is not supported for replica sets with arbiters",
                     !replCoord->setContainsArbiter());
+
+            // Standalone nodes do not support transactions at all
+            uassert(ErrorCodes::ReadConcernMajorityNotEnabled,
+                    "'prepareTransaction' is not supported on standalone nodes.",
+                    replCoord->isReplEnabled());
 
             auto txnParticipant = TransactionParticipant::get(opCtx);
             uassert(ErrorCodes::CommandFailed,
                     "prepareTransaction must be run within a transaction",
                     txnParticipant);
 
-            LOG(3)
-                << "Participant shard received prepareTransaction for transaction with txnNumber "
-                << opCtx->getTxnNumber() << " on session "
-                << opCtx->getLogicalSessionId()->toBSON();
+            LOGV2_DEBUG(22483,
+                        3,
+                        "{sessionId}:{txnNumber} Participant shard received prepareTransaction",
+                        "Participant shard received prepareTransaction",
+                        "sessionId"_attr = opCtx->getLogicalSessionId()->toBSON(),
+                        "txnNumber"_attr = opCtx->getTxnNumber());
 
-            uassert(ErrorCodes::CommandNotSupported,
-                    "'prepareTransaction' is only supported in feature compatibility version 4.2",
-                    (serverGlobalParams.featureCompatibility.getVersion() ==
-                     ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42));
+            // TODO(SERVER-46105) remove
+            uassert(ErrorCodes::OperationNotSupportedInTransaction,
+                    "Cannot create new collections inside distributed transactions",
+                    UncommittedCollections::get(opCtx).isEmpty());
 
             uassert(ErrorCodes::NoSuchTransaction,
                     "Transaction isn't in progress",
-                    txnParticipant.inMultiDocumentTransaction());
+                    txnParticipant.transactionIsOpen());
 
             if (txnParticipant.transactionIsPrepared()) {
                 auto& replClient = repl::ReplClientInfo::forClient(opCtx->getClient());
                 auto prepareOpTime = txnParticipant.getPrepareOpTime();
 
-                // Ensure waiting for writeConcern of the prepare OpTime.
-                if (prepareOpTime > replClient.getLastOp()) {
-                    // In case this node has failed over, in which case the term will have
-                    // increased, set the Client's last OpTime to the larger of the system last
-                    // OpTime and the prepare OpTime.
-                    const auto systemLastOpTime =
-                        repl::ReplicationCoordinator::get(opCtx)->getMyLastAppliedOpTime();
-                    replClient.setLastOp(opCtx, std::max(prepareOpTime, systemLastOpTime));
-                }
+                // Ensure waiting for writeConcern of the prepare OpTime. If the node has failed
+                // over, then we want to wait on an OpTime in the new term, so we wait on the
+                // lastApplied OpTime. If we've gotten to this point, then we are guaranteed that
+                // the transaction was prepared at this prepareOpTime on this branch of history and
+                // that waiting on this lastApplied OpTime waits on the prepareOpTime as well.
+                // Because lastAppliedOpTime is updated asynchronously with the WUOW that prepares
+                // the transaction, there is a chance that the lastAppliedOpTime is behind the
+                // prepareOpTime. And we also need to be careful not to set lastOp backwards. Thus,
+                // we set the client lastOp to max of prepareOpTime, lastAppliedOpTime, and the
+                // current lastOp.
+                const auto lastAppliedOpTime =
+                    repl::ReplicationCoordinator::get(opCtx)->getMyLastAppliedOpTime();
+                replClient.setLastOp(
+                    opCtx, std::max({prepareOpTime, lastAppliedOpTime, replClient.getLastOp()}));
 
-                invariant(opCtx->recoveryUnit()->getPrepareTimestamp() ==
-                              prepareOpTime.getTimestamp(),
-                          str::stream() << "recovery unit prepareTimestamp: "
-                                        << opCtx->recoveryUnit()->getPrepareTimestamp().toString()
-                                        << " participant prepareOpTime: "
-                                        << prepareOpTime.toString());
+                invariant(
+                    opCtx->recoveryUnit()->getPrepareTimestamp() == prepareOpTime.getTimestamp(),
+                    str::stream() << "recovery unit prepareTimestamp: "
+                                  << opCtx->recoveryUnit()->getPrepareTimestamp().toString()
+                                  << " participant prepareOpTime: " << prepareOpTime.toString());
 
-                if (MONGO_FAIL_POINT(
-                        participantReturnNetworkErrorForPrepareAfterExecutingPrepareLogic)) {
+                if (MONGO_unlikely(participantReturnNetworkErrorForPrepareAfterExecutingPrepareLogic
+                                       .shouldFail())) {
                     uasserted(ErrorCodes::HostUnreachable,
                               "returning network error because failpoint is on");
                 }
@@ -134,8 +154,8 @@ public:
             }
 
             const auto prepareTimestamp = txnParticipant.prepareTransaction(opCtx, {});
-            if (MONGO_FAIL_POINT(
-                    participantReturnNetworkErrorForPrepareAfterExecutingPrepareLogic)) {
+            if (MONGO_unlikely(participantReturnNetworkErrorForPrepareAfterExecutingPrepareLogic
+                                   .shouldFail())) {
                 uasserted(ErrorCodes::HostUnreachable,
                           "returning network error because failpoint is on");
             }
@@ -191,10 +211,15 @@ std::set<ShardId> validateParticipants(OperationContext* opCtx,
     }
     ss << ']';
 
-    LOG(3) << "Coordinator shard received request to coordinate commit with "
-              "participant list "
-           << ss.str() << " for " << opCtx->getLogicalSessionId()->getId() << ':'
-           << opCtx->getTxnNumber();
+    LOGV2_DEBUG(
+        22484,
+        3,
+        "{sessionId}:{txnNumber} Coordinator shard received request to coordinate commit with "
+        "participant list {participantList}",
+        "Coordinator shard received request to coordinate commit",
+        "sessionId"_attr = opCtx->getLogicalSessionId()->getId(),
+        "txnNumber"_attr = opCtx->getTxnNumber(),
+        "participantList"_attr = ss.str());
 
     return participantsSet;
 }
@@ -202,6 +227,10 @@ std::set<ShardId> validateParticipants(OperationContext* opCtx,
 class CoordinateCommitTransactionCmd : public TypedCommand<CoordinateCommitTransactionCmd> {
 public:
     using Request = CoordinateCommitTransaction;
+
+    bool acceptsAnyApiVersionParameters() const override {
+        return true;
+    }
 
     class Invocation final : public InvocationBase {
     public:
@@ -213,26 +242,21 @@ public:
                 uassertStatusOK(ShardingState::get(opCtx)->canAcceptShardedCommands());
             }
 
-            uassert(ErrorCodes::CommandNotSupported,
-                    "'coordinateCommitTransaction' is only supported in feature compatibility "
-                    "version 4.2",
-                    (serverGlobalParams.featureCompatibility.getVersion() ==
-                     ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42));
-
             const auto& cmd = request();
             const auto tcs = TransactionCoordinatorService::get(opCtx);
 
-            boost::optional<Future<txn::CommitDecision>> coordinatorDecisionFuture;
+            // Coordinate the commit, or recover the commit decision from disk if this command was
+            // sent without a participant list.
+            auto coordinatorDecisionFuture = cmd.getParticipants().empty()
+                ? tcs->recoverCommit(opCtx, *opCtx->getLogicalSessionId(), *opCtx->getTxnNumber())
+                : tcs->coordinateCommit(opCtx,
+                                        *opCtx->getLogicalSessionId(),
+                                        *opCtx->getTxnNumber(),
+                                        validateParticipants(opCtx, cmd.getParticipants()));
 
-            if (!cmd.getParticipants().empty()) {
-                coordinatorDecisionFuture =
-                    tcs->coordinateCommit(opCtx,
-                                          *opCtx->getLogicalSessionId(),
-                                          *opCtx->getTxnNumber(),
-                                          validateParticipants(opCtx, cmd.getParticipants()));
-            } else {
-                coordinatorDecisionFuture = tcs->recoverCommit(
-                    opCtx, *opCtx->getLogicalSessionId(), *opCtx->getTxnNumber());
+            if (MONGO_unlikely(hangAfterStartingCoordinateCommit.shouldFail())) {
+                LOGV2(22485, "Hit hangAfterStartingCoordinateCommit failpoint");
+                hangAfterStartingCoordinateCommit.pauseWhileSet(opCtx);
             }
 
             ON_BLOCK_EXIT([opCtx] {
@@ -240,13 +264,15 @@ public:
                 // (in all cases except the one where this command aborts the local participant), so
                 // ensure waiting for the client's writeConcern of the decision.
                 repl::ReplClientInfo::forClient(opCtx->getClient())
-                    .setLastOpToSystemLastOpTime(opCtx);
+                    .setLastOpToSystemLastOpTimeIgnoringInterrupt(opCtx);
             });
 
             if (coordinatorDecisionFuture) {
                 auto swCommitDecision = coordinatorDecisionFuture->getNoThrow(opCtx);
-                // The coordinator can only return NoSuchTransaction if cancelIfCommitNotYetStarted
-                // was called, which can happen in one of 3 cases:
+
+                // The coordinator can throw TransactionCoordinatorCanceled if
+                // cancelIfCommitNotYetStarted was called, which can happen in one of 3 cases:
+                //
                 //  1) The deadline to receive coordinateCommit passed
                 //  2) Transaction with a newer txnNumber started on the session before
                 //     coordinateCommit was received
@@ -256,36 +282,42 @@ public:
                 // Even though only (3) requires recovering the commit decision from the local
                 // participant, since these cases cannot be differentiated currently, we always
                 // recover from the local participant.
-                if (swCommitDecision != ErrorCodes::NoSuchTransaction) {
-                    auto commitDecision = uassertStatusOK(std::move(swCommitDecision));
-                    switch (commitDecision) {
-                        case txn::CommitDecision::kCommit:
-                            return;
-                        case txn::CommitDecision::kAbort:
-                            uasserted(ErrorCodes::NoSuchTransaction, "Transaction was aborted");
+                if (swCommitDecision != ErrorCodes::TransactionCoordinatorCanceled) {
+                    if (swCommitDecision.isOK()) {
+                        invariant(swCommitDecision.getValue() == txn::CommitDecision::kCommit);
+                        return;
                     }
+
+                    invariant(swCommitDecision != ErrorCodes::TransactionCoordinatorSteppingDown);
+                    invariant(swCommitDecision !=
+                              ErrorCodes::TransactionCoordinatorReachedAbortDecision);
+
+                    uassertStatusOKWithContext(swCommitDecision, "Transaction was aborted");
                 }
             }
 
             // No coordinator was found in memory. Recover the decision from the local participant.
 
-            LOG(3) << "Going to recover decision from local participant for "
-                   << opCtx->getLogicalSessionId()->getId() << ':' << opCtx->getTxnNumber();
+            LOGV2_DEBUG(22486,
+                        3,
+                        "{sessionId}:{txnNumber} Going to recover decision from local participant",
+                        "Going to recover decision from local participant",
+                        "sessionId"_attr = opCtx->getLogicalSessionId()->getId(),
+                        "txnNumber"_attr = opCtx->getTxnNumber());
 
             boost::optional<SharedSemiFuture<void>> participantExitPrepareFuture;
             {
                 MongoDOperationContextSession sessionTxnState(opCtx);
                 auto txnParticipant = TransactionParticipant::get(opCtx);
-
                 txnParticipant.beginOrContinue(opCtx,
                                                *opCtx->getTxnNumber(),
                                                false /* autocommit */,
                                                boost::none /* startTransaction */);
 
-                try {
-                    txnParticipant.abortTransactionIfNotPrepared(opCtx);
-                } catch (const ExceptionFor<ErrorCodes::TransactionCommitted>&) {
+                if (txnParticipant.transactionIsCommitted())
                     return;
+                if (txnParticipant.transactionIsInProgress()) {
+                    txnParticipant.abortTransaction(opCtx);
                 }
 
                 participantExitPrepareFuture = txnParticipant.onExitPrepare();
@@ -304,7 +336,7 @@ public:
                                                false /* autocommit */,
                                                boost::none /* startTransaction */);
 
-                invariant(!txnParticipant.inMultiDocumentTransaction(),
+                invariant(!txnParticipant.transactionIsOpen(),
                           "The participant should not be in progress after we waited for the "
                           "participant to complete");
                 uassert(ErrorCodes::NoSuchTransaction,

@@ -47,7 +47,7 @@ public:
     static constexpr StringData kStageName = "$sequentialCache"_sd;
 
     const char* getSourceName() const final {
-        return kStageName.rawData();
+        return DocumentSourceSequentialDocumentCache::kStageName.rawData();
     }
 
     StageConstraints constraints(Pipeline::SplitState pipeState) const {
@@ -58,7 +58,8 @@ public:
                                      DiskUseRequirement::kNoDiskUse,
                                      FacetRequirement::kNotAllowed,
                                      TransactionRequirement::kAllowed,
-                                     LookupRequirement::kAllowed);
+                                     LookupRequirement::kAllowed,
+                                     UnionRequirement::kAllowed);
 
         constraints.requiresInputDocSource = (_cache->isBuilding());
         return constraints;
@@ -67,8 +68,6 @@ public:
     boost::optional<DistributedPlanLogic> distributedPlanLogic() final {
         return boost::none;
     }
-
-    GetNextResult getNext() final;
 
     static boost::intrusive_ptr<DocumentSourceSequentialDocumentCache> create(
         const boost::intrusive_ptr<ExpressionContext>& pExpCtx, SequentialDocumentCache* cache) {
@@ -85,6 +84,7 @@ public:
     }
 
 protected:
+    GetNextResult doGetNext() final;
     Pipeline::SourceContainer::iterator doOptimizeAt(Pipeline::SourceContainer::iterator itr,
                                                      Pipeline::SourceContainer* container) final;
 
@@ -96,7 +96,11 @@ private:
 
     SequentialDocumentCache* _cache;
 
+    // This flag is set to prevent the cache stage from immediately serving from the cache after it
+    // has exhausted input from its source for the first time.
+    bool _cacheIsEOF = false;
+
     bool _hasOptimizedPos = false;
 };
 
-}  // namesace mongo
+}  // namespace mongo

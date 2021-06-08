@@ -27,8 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
-
 #include "mongo/platform/basic.h"
 
 #include "mongo/base/init.h"
@@ -44,7 +42,6 @@ namespace {
 
 ServiceContext::ConstructorActionRegisterer registerEgressTransportLayer{
     "ConfigureEgressTransportLayer", [](ServiceContext* sc) {
-
         invariant(!sc->getTransportLayer());
         transport::TransportLayerASIO::Options opts;
         opts.mode = transport::TransportLayerASIO::Options::kEgress;

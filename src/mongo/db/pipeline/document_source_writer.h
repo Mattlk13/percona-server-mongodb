@@ -53,20 +53,30 @@ class DocumentSourceWriteBlock {
     repl::ReadConcernArgs _originalArgs;
     RecoveryUnit::ReadSource _originalSource;
     EnforcePrepareConflictsBlock _enforcePrepareConflictsBlock;
+    Timestamp _originalTimestamp;
 
 public:
     DocumentSourceWriteBlock(OperationContext* opCtx)
         : _opCtx(opCtx), _enforcePrepareConflictsBlock(opCtx) {
         _originalArgs = repl::ReadConcernArgs::get(_opCtx);
         _originalSource = _opCtx->recoveryUnit()->getTimestampReadSource();
+        if (_originalSource == RecoveryUnit::ReadSource::kProvided) {
+            // Storage engine operations require at least Global IS.
+            Lock::GlobalLock lk(_opCtx, MODE_IS);
+            _originalTimestamp = *_opCtx->recoveryUnit()->getPointInTimeReadTimestamp(_opCtx);
+        }
 
         repl::ReadConcernArgs::get(_opCtx) = repl::ReadConcernArgs();
-        _opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::kUnset);
+        _opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kNoTimestamp);
     }
 
     ~DocumentSourceWriteBlock() {
         repl::ReadConcernArgs::get(_opCtx) = _originalArgs;
-        _opCtx->recoveryUnit()->setTimestampReadSource(_originalSource);
+        if (_originalSource == RecoveryUnit::ReadSource::kProvided) {
+            _opCtx->recoveryUnit()->setTimestampReadSource(_originalSource, _originalTimestamp);
+        } else {
+            _opCtx->recoveryUnit()->setTimestampReadSource(_originalSource);
+        }
     }
 };
 
@@ -89,9 +99,10 @@ public:
     using BatchObject = B;
     using BatchedObjects = std::vector<BatchObject>;
 
-    DocumentSourceWriter(NamespaceString outputNs,
+    DocumentSourceWriter(const char* stageName,
+                         NamespaceString outputNs,
                          const boost::intrusive_ptr<ExpressionContext>& expCtx)
-        : DocumentSource(expCtx),
+        : DocumentSource(stageName, expCtx),
           _outputNs(std::move(outputNs)),
           _writeConcern(expCtx->opCtx->getWriteConcern()) {}
 
@@ -119,9 +130,8 @@ public:
         return _outputNs;
     }
 
-    GetNextResult getNext() final override;
-
 protected:
+    GetNextResult doGetNext() final override;
     /**
      * Prepares the stage to be able to write incoming batches.
      */
@@ -165,61 +175,66 @@ private:
 };
 
 template <typename B>
-DocumentSource::GetNextResult DocumentSourceWriter<B>::getNext() {
-    pExpCtx->checkForInterrupt();
-
+DocumentSource::GetNextResult DocumentSourceWriter<B>::doGetNext() {
     if (_done) {
         return GetNextResult::makeEOF();
     }
 
-    if (!_initialized) {
-        // Explain should never try to actually execute any writes. We only ever expect
-        // getNext() to be called for the 'executionStats' and 'allPlansExecution' explain
-        // modes. This assertion should not be triggered for 'queryPlanner' explain, which
-        // is perfectly legal.
-        uassert(51029,
-                "explain of {} is not allowed with verbosity {}"_format(
-                    getSourceName(), ExplainOptions::verbosityString(*pExpCtx->explain)),
-                !pExpCtx->explain);
-        initialize();
-        _initialized = true;
-    }
+    // Ignore writes and exhaust input if we are in explain mode.
+    if (pExpCtx->explain) {
+        auto nextInput = pSource->getNext();
+        for (; nextInput.isAdvanced(); nextInput = pSource->getNext()) {
+        }
+        _done = nextInput.getStatus() == GetNextResult::ReturnStatus::kEOF;
+        return nextInput;
+    } else {
+        // Ensure that the client's operationTime reflects the latest write even if the command
+        // fails.
+        ON_BLOCK_EXIT(
+            [&] { pExpCtx->mongoProcessInterface->updateClientOperationTime(pExpCtx->opCtx); });
 
-    BatchedObjects batch;
-    int bufferedBytes = 0;
+        if (!_initialized) {
+            initialize();
+            _initialized = true;
+        }
 
-    auto nextInput = pSource->getNext();
-    for (; nextInput.isAdvanced(); nextInput = pSource->getNext()) {
-        waitWhileFailPointEnabled();
+        BatchedObjects batch;
+        int bufferedBytes = 0;
 
-        auto doc = nextInput.releaseDocument();
-        auto[obj, objSize] = makeBatchObject(std::move(doc));
+        auto nextInput = pSource->getNext();
+        for (; nextInput.isAdvanced(); nextInput = pSource->getNext()) {
+            waitWhileFailPointEnabled();
 
-        bufferedBytes += objSize;
-        if (!batch.empty() &&
-            (bufferedBytes > BSONObjMaxUserSize || batch.size() >= write_ops::kMaxWriteBatchSize)) {
+            auto doc = nextInput.releaseDocument();
+            auto [obj, objSize] = makeBatchObject(std::move(doc));
+
+            bufferedBytes += objSize;
+            if (!batch.empty() &&
+                (bufferedBytes > BSONObjMaxUserSize ||
+                 batch.size() >= write_ops::kMaxWriteBatchSize)) {
+                spill(std::move(batch));
+                batch.clear();
+                bufferedBytes = objSize;
+            }
+            batch.push_back(obj);
+        }
+        if (!batch.empty()) {
             spill(std::move(batch));
             batch.clear();
-            bufferedBytes = objSize;
         }
-        batch.push_back(obj);
-    }
-    if (!batch.empty()) {
-        spill(std::move(batch));
-        batch.clear();
-    }
 
-    switch (nextInput.getStatus()) {
-        case GetNextResult::ReturnStatus::kAdvanced: {
-            MONGO_UNREACHABLE;  // We consumed all advances above.
-        }
-        case GetNextResult::ReturnStatus::kPauseExecution: {
-            return nextInput;  // Propagate the pause.
-        }
-        case GetNextResult::ReturnStatus::kEOF: {
-            _done = true;
-            finalize();
-            return nextInput;
+        switch (nextInput.getStatus()) {
+            case GetNextResult::ReturnStatus::kAdvanced: {
+                MONGO_UNREACHABLE;  // We consumed all advances above.
+            }
+            case GetNextResult::ReturnStatus::kPauseExecution: {
+                return nextInput;  // Propagate the pause.
+            }
+            case GetNextResult::ReturnStatus::kEOF: {
+                _done = true;
+                finalize();
+                return nextInput;
+            }
         }
     }
     MONGO_UNREACHABLE;

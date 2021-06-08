@@ -33,6 +33,7 @@
 
 #include <algorithm>
 #include <iterator>
+#include <memory>
 
 #include "mongo/client/mongo_uri.h"
 #include "mongo/scripting/mozjs/implscope.h"
@@ -40,14 +41,14 @@
 #include "mongo/scripting/mozjs/valuereader.h"
 #include "mongo/scripting/mozjs/valuewriter.h"
 #include "mongo/scripting/mozjs/wrapconstrainedmethod.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
 namespace mozjs {
 
 const JSFunctionSpec URIInfo::methods[2] = {
-    MONGO_ATTACH_JS_CONSTRAINED_METHOD(toString, URIInfo), JS_FS_END,
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD(toString, URIInfo),
+    JS_FS_END,
 };
 
 const char* const URIInfo::className = "MongoURI";
@@ -70,7 +71,7 @@ void URIInfo::construct(JSContext* cx, JS::CallArgs args) {
     auto parsed = uassertStatusOK(sw);
 
     BSONArrayBuilder serversBuilder;
-    for (const auto hp : parsed.getServers()) {
+    for (const auto& hp : parsed.getServers()) {
         BSONObjBuilder b;
         b.append("server", hp.toString());
         b.append("host", hp.host());

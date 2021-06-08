@@ -31,12 +31,13 @@
 
 #include "mongo/db/update/update_object_node.h"
 
+#include <memory>
+
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/update/field_checker.h"
 #include "mongo/db/update/modifier_table.h"
 #include "mongo/db/update/update_array_node.h"
 #include "mongo/db/update/update_leaf_node.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -61,8 +62,7 @@ StatusWith<std::string> parseArrayFilterIdentifier(
         return Status(ErrorCodes::BadValue,
                       str::stream() << "Cannot have array filter identifier (i.e. '$[<id>]') "
                                        "element in the first position in path '"
-                                    << fieldRef.dottedField()
-                                    << "'");
+                                    << fieldRef.dottedField() << "'");
     }
 
     auto identifier = field.substr(2, field.size() - 3);
@@ -70,9 +70,7 @@ StatusWith<std::string> parseArrayFilterIdentifier(
     if (!identifier.empty() && arrayFilters.find(identifier) == arrayFilters.end()) {
         return Status(ErrorCodes::BadValue,
                       str::stream() << "No array filter found for identifier '" << identifier
-                                    << "' in path '"
-                                    << fieldRef.dottedField()
-                                    << "'");
+                                    << "' in path '" << fieldRef.dottedField() << "'");
     }
 
     if (!identifier.empty()) {
@@ -110,7 +108,7 @@ void applyChild(const UpdateNode& child,
                 UpdateNode::UpdateNodeApplyParams* updateNodeApplyParams,
                 UpdateExecutor::ApplyResult* applyResult) {
 
-    auto pathTakenSizeBefore = updateNodeApplyParams->pathTaken->numParts();
+    auto pathTakenSizeBefore = updateNodeApplyParams->pathTaken->fieldRef().numParts();
 
     // A non-ok value for childElement will indicate that we need to append 'field' to the
     // 'pathToCreate' FieldRef.
@@ -127,7 +125,11 @@ void applyChild(const UpdateNode& child,
         // The path we've traversed so far already exists in our document, and 'childElement'
         // represents the Element indicated by the 'field' name or index, which we indicate by
         // updating the 'pathTaken' FieldRef.
-        updateNodeApplyParams->pathTaken->appendPart(field);
+        updateNodeApplyParams->pathTaken->append(
+            field,
+            applyParams->element.getType() == BSONType::Array
+                ? RuntimeUpdatePath::ComponentType::kArrayIndex
+                : RuntimeUpdatePath::ComponentType::kFieldName);
     } else {
         // We are traversing path components that do not exist in our document. Any update modifier
         // that creates new path components (i.e., any modifiers that return true for
@@ -145,20 +147,22 @@ void applyChild(const UpdateNode& child,
 
     applyResult->indexesAffected = applyResult->indexesAffected || childApplyResult.indexesAffected;
     applyResult->noop = applyResult->noop && childApplyResult.noop;
+    applyResult->containsDotsAndDollarsField =
+        applyResult->containsDotsAndDollarsField || childApplyResult.containsDotsAndDollarsField;
 
     // Pop 'field' off of 'pathToCreate' or 'pathTaken'.
     if (!updateNodeApplyParams->pathToCreate->empty()) {
         updateNodeApplyParams->pathToCreate->removeLastPart();
     } else {
-        updateNodeApplyParams->pathTaken->removeLastPart();
+        updateNodeApplyParams->pathTaken->popBack();
     }
 
     // If the child is an internal node, it may have created 'pathToCreate' and moved 'pathToCreate'
     // to the end of 'pathTaken'. We should advance 'element' to the end of 'pathTaken'.
-    if (updateNodeApplyParams->pathTaken->numParts() > pathTakenSizeBefore) {
-        for (auto i = pathTakenSizeBefore; i < updateNodeApplyParams->pathTaken->numParts(); ++i) {
-            applyParams->element =
-                getChild(applyParams->element, updateNodeApplyParams->pathTaken->getPart(i));
+    if (updateNodeApplyParams->pathTaken->size() > pathTakenSizeBefore) {
+        for (auto i = pathTakenSizeBefore; i < updateNodeApplyParams->pathTaken->size(); ++i) {
+            applyParams->element = getChild(
+                applyParams->element, updateNodeApplyParams->pathTaken->fieldRef().getPart(i));
             invariant(applyParams->element.ok());
         }
     } else if (!updateNodeApplyParams->pathToCreate->empty()) {
@@ -170,16 +174,22 @@ void applyChild(const UpdateNode& child,
             getChild(applyParams->element, updateNodeApplyParams->pathToCreate->getPart(0));
         if (childElement.ok()) {
             applyParams->element = childElement;
-            updateNodeApplyParams->pathTaken->appendPart(
-                updateNodeApplyParams->pathToCreate->getPart(0));
+            updateNodeApplyParams->pathTaken->append(
+                updateNodeApplyParams->pathToCreate->getPart(0),
+                applyParams->element.getType() == BSONType::Array
+                    ? RuntimeUpdatePath::ComponentType::kArrayIndex
+                    : RuntimeUpdatePath::ComponentType::kFieldName);
 
             // Either the path was fully created or not created at all.
             for (size_t i = 1; i < updateNodeApplyParams->pathToCreate->numParts(); ++i) {
+                const BSONType parentType = applyParams->element.getType();
                 applyParams->element =
                     getChild(applyParams->element, updateNodeApplyParams->pathToCreate->getPart(i));
                 invariant(applyParams->element.ok());
-                updateNodeApplyParams->pathTaken->appendPart(
-                    updateNodeApplyParams->pathToCreate->getPart(i));
+                updateNodeApplyParams->pathTaken->append(
+                    updateNodeApplyParams->pathToCreate->getPart(i),
+                    parentType == BSONType::Array ? RuntimeUpdatePath::ComponentType::kArrayIndex
+                                                  : RuntimeUpdatePath::ComponentType::kFieldName);
             }
 
             updateNodeApplyParams->pathToCreate->clear();
@@ -189,7 +199,7 @@ void applyChild(const UpdateNode& child,
 
 BSONObj makeBSONForOperator(const std::vector<std::pair<std::string, BSONObj>>& updatesForOp) {
     BSONObjBuilder bob;
-    for (const auto & [ path, value ] : updatesForOp)
+    for (const auto& [path, value] : updatesForOp)
         bob << path << value.firstElement();
     return bob.obj();
 }
@@ -227,8 +237,8 @@ StatusWith<bool> UpdateObjectNode::parseAndMerge(
         //    be a string value.
         if (BSONType::String != modExpr.type()) {
             return Status(ErrorCodes::BadValue,
-                          str::stream() << "The 'to' field for $rename must be a string: "
-                                        << modExpr);
+                          str::stream()
+                              << "The 'to' field for $rename must be a string: " << modExpr);
         }
 
         fieldRef.parse(modExpr.valueStringData());
@@ -249,8 +259,7 @@ StatusWith<bool> UpdateObjectNode::parseAndMerge(
     if (positional && positionalCount > 1) {
         return Status(ErrorCodes::BadValue,
                       str::stream() << "Too many positional (i.e. '$') elements found in path '"
-                                    << fieldRef.dottedField()
-                                    << "'");
+                                    << fieldRef.dottedField() << "'");
     }
 
     if (positional && positionalIndex == 0) {
@@ -258,8 +267,7 @@ StatusWith<bool> UpdateObjectNode::parseAndMerge(
             ErrorCodes::BadValue,
             str::stream()
                 << "Cannot have positional (i.e. '$') element in the first position in path '"
-                << fieldRef.dottedField()
-                << "'");
+                << fieldRef.dottedField() << "'");
     }
 
     // Construct and initialize the leaf node.
@@ -272,7 +280,7 @@ StatusWith<bool> UpdateObjectNode::parseAndMerge(
 
     // Create UpdateInternalNodes along the path.
     UpdateInternalNode* current = static_cast<UpdateInternalNode*>(root);
-    for (size_t i = 0; i < fieldRef.numParts() - 1; ++i) {
+    for (FieldIndex i = 0; i < fieldRef.numParts() - 1; ++i) {
         auto fieldIsArrayFilterIdentifier =
             fieldchecker::isArrayFilterIdentifier(fieldRef.getPart(i));
 
@@ -297,15 +305,14 @@ StatusWith<bool> UpdateObjectNode::parseAndMerge(
                 return Status(ErrorCodes::ConflictingUpdateOperators,
                               str::stream() << "Updating the path '" << fieldRef.dottedField()
                                             << "' would create a conflict at '"
-                                            << fieldRef.dottedSubstring(0, i + 1)
-                                            << "'");
+                                            << fieldRef.dottedSubstring(0, i + 1) << "'");
             }
         } else {
             std::unique_ptr<UpdateInternalNode> ownedChild;
             if (childShouldBeArrayNode) {
-                ownedChild = stdx::make_unique<UpdateArrayNode>(arrayFilters);
+                ownedChild = std::make_unique<UpdateArrayNode>(arrayFilters);
             } else {
-                ownedChild = stdx::make_unique<UpdateObjectNode>();
+                ownedChild = std::make_unique<UpdateObjectNode>();
             }
             child = ownedChild.get();
             current->setChild(std::move(childName), std::move(ownedChild));
@@ -334,10 +341,9 @@ StatusWith<bool> UpdateObjectNode::parseAndMerge(
 
     if (current->getChild(childName)) {
         return Status(ErrorCodes::ConflictingUpdateOperators,
-                      str::stream() << "Updating the path '" << fieldRef.dottedField()
-                                    << "' would create a conflict at '"
-                                    << fieldRef.dottedField()
-                                    << "'");
+                      str::stream()
+                          << "Updating the path '" << fieldRef.dottedField()
+                          << "' would create a conflict at '" << fieldRef.dottedField() << "'");
     }
     current->setChild(std::move(childName), std::move(leaf));
 
@@ -347,7 +353,7 @@ StatusWith<bool> UpdateObjectNode::parseAndMerge(
 // static
 std::unique_ptr<UpdateNode> UpdateObjectNode::createUpdateNodeByMerging(
     const UpdateObjectNode& leftNode, const UpdateObjectNode& rightNode, FieldRef* pathTaken) {
-    auto mergedNode = stdx::make_unique<UpdateObjectNode>();
+    auto mergedNode = std::make_unique<UpdateObjectNode>();
 
     mergedNode->_children =
         createUpdateNodeMapByMerging(leftNode._children, rightNode._children, pathTaken);
@@ -388,12 +394,12 @@ BSONObj UpdateObjectNode::serialize() const {
 
     BSONObjBuilder bob;
 
-    for (const auto & [ pathPrefix, child ] : _children) {
+    for (const auto& [pathPrefix, child] : _children) {
         auto path = FieldRef(pathPrefix);
         child->produceSerializationMap(&path, &operatorOrientedUpdates);
     }
 
-    for (const auto & [ op, updates ] : operatorOrientedUpdates)
+    for (const auto& [op, updates] : operatorOrientedUpdates)
         bob << op << makeBSONForOperator(updates);
 
     return bob.obj();
@@ -411,7 +417,6 @@ UpdateExecutor::ApplyResult UpdateObjectNode::apply(
     auto applyResult = ApplyResult::noopResult();
 
     for (const auto& pair : _children) {
-
         // If this child has the same field name as the positional child, they must be merged and
         // applied.
         if (applyPositional && pair.first == applyParams.matchedField) {
@@ -419,19 +424,21 @@ UpdateExecutor::ApplyResult UpdateObjectNode::apply(
             // Check if we have stored the result of merging the positional child with this child.
             auto mergedChild = _mergedChildrenCache.find(pair.first);
             if (mergedChild == _mergedChildrenCache.end()) {
-
-                // The full path to the merged field is required for error reporting.
+                // The full path to the merged field is required for error reporting. In order to
+                // modify the 'pathTaken' FieldRef, we need a (mutable) copy of it.
+                FieldRef pathTakenFieldRefCopy(updateNodeApplyParams.pathTaken->fieldRef());
                 for (size_t i = 0; i < updateNodeApplyParams.pathToCreate->numParts(); ++i) {
-                    updateNodeApplyParams.pathTaken->appendPart(
+                    pathTakenFieldRefCopy.appendPart(
                         updateNodeApplyParams.pathToCreate->getPart(i));
                 }
-                updateNodeApplyParams.pathTaken->appendPart(applyParams.matchedField);
-                auto insertResult = _mergedChildrenCache.emplace(std::make_pair(
-                    pair.first,
-                    UpdateNode::createUpdateNodeByMerging(
-                        *_positionalChild, *pair.second, updateNodeApplyParams.pathTaken.get())));
-                for (size_t i = 0; i < updateNodeApplyParams.pathToCreate->numParts() + 1; ++i) {
-                    updateNodeApplyParams.pathTaken->removeLastPart();
+                pathTakenFieldRefCopy.appendPart(applyParams.matchedField);
+                auto insertResult = _mergedChildrenCache.emplace(
+                    std::make_pair(pair.first,
+                                   UpdateNode::createUpdateNodeByMerging(
+                                       *_positionalChild, *pair.second, &pathTakenFieldRefCopy)));
+                for (FieldIndex i = 0; i < updateNodeApplyParams.pathToCreate->numParts() + 1;
+                     ++i) {
+                    pathTakenFieldRefCopy.removeLastPart();
                 }
                 invariant(insertResult.second);
                 mergedChild = insertResult.first;

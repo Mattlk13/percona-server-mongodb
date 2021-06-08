@@ -35,8 +35,12 @@ namespace mongo {
 constexpr StringData InternalSchemaMatchArrayIndexMatchExpression::kName;
 
 InternalSchemaMatchArrayIndexMatchExpression::InternalSchemaMatchArrayIndexMatchExpression(
-    StringData path, long long index, std::unique_ptr<ExpressionWithPlaceholder> expression)
-    : ArrayMatchingMatchExpression(MatchExpression::INTERNAL_SCHEMA_MATCH_ARRAY_INDEX, path),
+    StringData path,
+    long long index,
+    std::unique_ptr<ExpressionWithPlaceholder> expression,
+    clonable_ptr<ErrorAnnotation> annotation)
+    : ArrayMatchingMatchExpression(
+          MatchExpression::INTERNAL_SCHEMA_MATCH_ARRAY_INDEX, path, std::move(annotation)),
       _index(index),
       _expression(std::move(expression)) {
     invariant(static_cast<bool>(_expression));
@@ -47,7 +51,7 @@ void InternalSchemaMatchArrayIndexMatchExpression::debugString(StringBuilder& de
     _debugAddSpace(debug, indentationLevel);
 
     BSONObjBuilder builder;
-    serialize(&builder);
+    serialize(&builder, true);
     debug << builder.obj().toString() << "\n";
 
     const auto* tag = getTag();
@@ -76,7 +80,7 @@ BSONObj InternalSchemaMatchArrayIndexMatchExpression::getSerializedRightHandSide
         matchArrayElemSubobj.append("namePlaceholder", _expression->getPlaceholder().value_or(""));
         {
             BSONObjBuilder subexprSubObj(matchArrayElemSubobj.subobjStart("expression"));
-            _expression->getFilter()->serialize(&subexprSubObj);
+            _expression->getFilter()->serialize(&subexprSubObj, true);
             subexprSubObj.doneFast();
         }
         matchArrayElemSubobj.doneFast();
@@ -86,12 +90,12 @@ BSONObj InternalSchemaMatchArrayIndexMatchExpression::getSerializedRightHandSide
 
 std::unique_ptr<MatchExpression> InternalSchemaMatchArrayIndexMatchExpression::shallowClone()
     const {
-    auto clone = stdx::make_unique<InternalSchemaMatchArrayIndexMatchExpression>(
-        path(), _index, _expression->shallowClone());
+    auto clone = std::make_unique<InternalSchemaMatchArrayIndexMatchExpression>(
+        path(), _index, _expression->shallowClone(), _errorAnnotation);
     if (getTag()) {
         clone->setTag(getTag()->clone());
     }
-    return std::move(clone);
+    return clone;
 }
 
 MatchExpression::ExpressionOptimizerFunc

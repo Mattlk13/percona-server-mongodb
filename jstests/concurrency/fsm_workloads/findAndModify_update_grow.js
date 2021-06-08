@@ -4,22 +4,18 @@
  * findAndModify_update_grow.js
  *
  * Each thread inserts a single document into a collection, and then
- * repeatedly performs the findAndModify command. Attempts to trigger
- * the same conditions that with MMAPv1 caused a document move,
- * by growing the size of the inserted document using the $set and $mul
- * update operators. Now checks that document moves don't happen and
- * that large changes in document size are handled correctly.
+ * repeatedly performs the findAndModify command. Checks that document
+ * moves don't happen and that large changes in document size are handled
+ * correctly.
  */
 load('jstests/concurrency/fsm_workload_helpers/server_types.js');  // for isMongod
 
 var $config = (function() {
-
     var data = {
         shardKey: {tid: 1},
     };
 
     var states = (function() {
-
         // Use the workload name as the field name (since it is assumed
         // to be unique) to avoid any potential issues with large keys
         // and indexes on the collection.
@@ -43,7 +39,7 @@ var $config = (function() {
             this.bsonsize = Object.bsonsize(doc);
 
             var res = db[collName].insert(doc);
-            assertAlways.writeOK(res);
+            assertAlways.commandWorked(res);
             assertAlways.eq(1, res.nInserted);
         }
 
@@ -109,7 +105,6 @@ var $config = (function() {
             insert: insert,
             findAndModify: findAndModify,
         };
-
     })();
 
     var transitions = {insert: {findAndModify: 1}, findAndModify: {findAndModify: 1}};
@@ -122,5 +117,4 @@ var $config = (function() {
         startState: 'insert',
         transitions: transitions
     };
-
 })();

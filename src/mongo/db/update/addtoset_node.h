@@ -29,12 +29,12 @@
 
 #pragma once
 
+#include <memory>
 #include <vector>
 
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/update/modifier_node.h"
-#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
@@ -46,7 +46,7 @@ public:
     Status init(BSONElement modExpr, const boost::intrusive_ptr<ExpressionContext>& expCtx) final;
 
     std::unique_ptr<UpdateNode> clone() const final {
-        return stdx::make_unique<AddToSetNode>(*this);
+        return std::make_unique<AddToSetNode>(*this);
     }
 
     void setCollator(const CollatorInterface* collator) final;
@@ -57,7 +57,7 @@ public:
 
 protected:
     ModifyResult updateExistingElement(mutablebson::Element* element,
-                                       std::shared_ptr<FieldRef> elementPath) const final;
+                                       const FieldRef& elementPath) const final;
     void setValueForNewElement(mutablebson::Element* element) const final;
 
     bool allowCreation() const final {
@@ -78,7 +78,7 @@ private:
                 BSONObjBuilder subBuilder(bob.subobjStart(""));
                 {
                     BSONObjBuilder eachBuilder(subBuilder.subarrayStart("$each"));
-                    for (const auto element : _elements)
+                    for (const auto& element : _elements)
                         eachBuilder << element;
                 }
             }

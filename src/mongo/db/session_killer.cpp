@@ -48,9 +48,9 @@ SessionKiller::SessionKiller(ServiceContext* sc, KillFunc killer)
     _thread = stdx::thread([this, sc] {
         // This is the background killing thread
 
-        Client::setCurrent(sc->makeClient("SessionKiller"));
+        ThreadClient tc("SessionKiller", sc);
 
-        stdx::unique_lock<stdx::mutex> lk(_mutex);
+        stdx::unique_lock<Latch> lk(_mutex);
 
         // While we're not in shutdown
         while (!_inShutdown) {
@@ -72,7 +72,7 @@ SessionKiller::SessionKiller(ServiceContext* sc, KillFunc killer)
 SessionKiller::~SessionKiller() {
     DESTRUCTOR_GUARD([&] {
         {
-            stdx::lock_guard<stdx::mutex> lk(_mutex);
+            stdx::lock_guard<Latch> lk(_mutex);
             _inShutdown = true;
         }
         _killerCV.notify_one();
@@ -85,18 +85,19 @@ SessionKiller::ReapResult::ReapResult() : result(std::make_shared<boost::optiona
 
 SessionKiller::Matcher::Matcher(KillAllSessionsByPatternSet&& patterns)
     : _patterns(std::move(patterns)) {
-    for (const auto& pattern : _patterns) {
+    for (const auto& item : _patterns) {
+        auto& pattern = item.pattern;
         if (pattern.getUid()) {
             _uids.emplace(pattern.getUid().get(), &pattern);
         } else if (pattern.getLsid()) {
             _lsids.emplace(pattern.getLsid().get(), &pattern);
         } else {
             // If we're killing everything, it's the only pattern we care about.
-            decltype(_patterns) onlyKillAll{{pattern}};
+            decltype(_patterns) onlyKillAll{{item}};
             using std::swap;
             swap(_patterns, onlyKillAll);
 
-            _killAll = &(*_patterns.begin());
+            _killAll = &(_patterns.begin()->pattern);
             break;
         }
     }
@@ -138,7 +139,7 @@ SessionKiller* SessionKiller::get(OperationContext* ctx) {
 
 std::shared_ptr<SessionKiller::Result> SessionKiller::kill(
     OperationContext* opCtx, const KillAllSessionsByPatternSet& toKill) {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    stdx::unique_lock<Latch> lk(_mutex);
 
     // Save a shared_ptr to the current reapResults (I.e. the next thing to get killed).
     auto reapResults = _reapResults;
@@ -164,7 +165,7 @@ std::shared_ptr<SessionKiller::Result> SessionKiller::kill(
     return {reapResults.result, reapResults.result->get_ptr()};
 }
 
-void SessionKiller::_periodicKill(OperationContext* opCtx, stdx::unique_lock<stdx::mutex>& lk) {
+void SessionKiller::_periodicKill(OperationContext* opCtx, stdx::unique_lock<Latch>& lk) {
     // Pull our current workload onto the stack.  Swap it for empties.
     decltype(_nextToReap) nextToReap;
     decltype(_reapResults) reapResults;
@@ -177,24 +178,52 @@ void SessionKiller::_periodicKill(OperationContext* opCtx, stdx::unique_lock<std
     // Drop the lock and run the killer.
     lk.unlock();
 
-    Matcher matcher(std::move(nextToReap));
-    boost::optional<Result> results;
-    try {
-        results.emplace(_killFunc(opCtx, matcher, &_urbg));
-    } catch (...) {
-        results.emplace(exceptionToStatus());
+    // Group patterns with equal API parameters into sets.
+    stdx::unordered_map<APIParameters, KillAllSessionsByPatternSet, APIParameters::Hash> sets;
+    for (auto& item : nextToReap) {
+        sets[item.apiParameters].insert(std::move(item));
     }
-    lk.lock();
 
-    invariant(results);
+    // Use the API parameters included in each KillAllSessionsByPattern struct.
+    IgnoreAPIParametersBlock ignoreApiParametersBlock(opCtx);
+    Result finalResults{std::vector<HostAndPort>{}};
+    for (auto& [apiParameters, items] : sets) {
+        APIParameters::get(opCtx) = apiParameters;
+        Matcher matcher(std::move(items));
+        boost::optional<Result> results;
+        try {
+            results.emplace(_killFunc(opCtx, matcher, &_urbg));
+        } catch (...) {
+            results.emplace(exceptionToStatus());
+        }
+        invariant(results);
+        if (!results->isOK()) {
+            finalResults = *results;
+            break;
+        }
+
+        finalResults.getValue().insert(finalResults.getValue().end(),
+                                       std::make_move_iterator(results->getValue().begin()),
+                                       std::make_move_iterator(results->getValue().end()));
+    }
 
     // Expose the results and notify callers
-    *(reapResults.result) = std::move(results);
+    lk.lock();
+    *(reapResults.result) = std::move(finalResults);
     _callerCV.notify_all();
 };
 
 void SessionKiller::set(ServiceContext* sc, std::shared_ptr<SessionKiller> sk) {
     getSessionKiller(sc) = sk;
+}
+
+
+void SessionKiller::shutdown(ServiceContext* sc) {
+    auto shared = getSessionKiller(sc);
+    getSessionKiller(sc).reset();
+
+    // Nuke
+    shared.reset();
 }
 
 }  // namespace mongo

@@ -29,20 +29,20 @@
 
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
 
-#include "mongo/base/shim.h"
 #include "mongo/base/status.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_manager_impl.h"
+#include "mongo/db/auth/privilege.h"
 #include "mongo/db/auth/privilege_format.h"
 #include "mongo/db/auth/role_name.h"
 #include "mongo/db/auth/user.h"
 #include "mongo/db/auth/user_name.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/stdx/functional.h"
 
 namespace mongo {
 
@@ -59,7 +59,7 @@ class AuthzManagerExternalState {
     AuthzManagerExternalState& operator=(const AuthzManagerExternalState&) = delete;
 
 public:
-    static MONGO_DECLARE_SHIM(()->std::unique_ptr<AuthzManagerExternalState>) create;
+    static std::unique_ptr<AuthzManagerExternalState> create();
 
     virtual ~AuthzManagerExternalState();
 
@@ -68,7 +68,9 @@ public:
      * calling other methods.  Object may not be used after this method returns something other
      * than Status::OK().
      */
-    virtual Status initialize(OperationContext* opCtx) = 0;
+    virtual Status initialize(OperationContext* opCtx) {
+        return Status::OK();
+    }
 
     /**
      * Creates an external state manipulator for an AuthorizationSession whose
@@ -84,58 +86,67 @@ public:
     virtual Status getStoredAuthorizationVersion(OperationContext* opCtx, int* outVersion) = 0;
 
     /**
-     * Writes into "result" a document describing the named user and returns Status::OK().  The
-     * description includes the user credentials and customData, if present, the user's role
-     * membership and delegation information, a full list of the user's privileges, and a full
-     * list of the user's roles, including those roles held implicitly through other roles
-     * (indirect roles). In the event that some of this information is inconsistent, the
-     * document will contain a "warnings" array, with std::string messages describing
-     * inconsistencies.
+     * Writes into "result" a document describing the requested user and returns Status::OK().
+     * The caller is required to provide all information necessary to unique identify the request
+     * for a user, including the user's name and any roles which the user must possess via
+     * out-of-band attestation. The returned description includes the user credentials and
+     * customData, if present, the user's role membership and delegation information, a full
+     * list of the user's privileges, and a full list of the user's roles, including those
+     * roles held implicitly through other roles (indirect roles). In the event that some of this
+     * information is inconsistent, the document will contain a "warnings" array,
+     * with std::string messages describing inconsistencies.
      *
      * If the user does not exist, returns ErrorCodes::UserNotFound.
      */
     virtual Status getUserDescription(OperationContext* opCtx,
-                                      const UserName& userName,
+                                      const UserRequest& user,
                                       BSONObj* result) = 0;
 
     /**
-     * Writes into "result" a document describing the named role and returns Status::OK(). If
-     * showPrivileges is kOmit or kShowPrivileges, the description includes the roles which the
-     * named role is a member of, including those memberships held implicitly through other roles
-     * (indirect roles). If "showPrivileges" is kShowPrivileges, then the description documents
-     * will also include a full list of the role's privileges. If "showPrivileges" is
-     * kShowAsUserFragment, then the description returned will take the form of a partial user
-     * document, describing a hypothetical user which possesses the provided and implicit roles,
-     * and all inherited privileges. In the event that some of this information is inconsistent,
-     * the document will contain a "warnings" array, with std::string messages describing
-     * inconsistencies.
+     * Fetches and/or synthesizes a User object similar to above eliding additional
+     * marshalling of data to BSON and back.
+     */
+    virtual StatusWith<User> getUserObject(OperationContext* opCtx, const UserRequest& userReq) = 0;
+
+    /**
+     * Checks to see if the named roles exist.
+     */
+    virtual Status rolesExist(OperationContext* opCtx, const std::vector<RoleName>& roleNames) = 0;
+
+    using ResolveRoleOption = AuthorizationManager::ResolveRoleOption;
+    using ResolvedRoleData = AuthorizationManager::ResolvedRoleData;
+
+    /**
+     * Collects (in)direct roles, privileges, and restrictions for a set of start roles.
+     */
+    virtual StatusWith<ResolvedRoleData> resolveRoles(OperationContext* opCtx,
+                                                      const std::vector<RoleName>& roleNames,
+                                                      ResolveRoleOption option) = 0;
+
+    /**
+     * Fetches and returns objects representing named roles.
      *
-     * If the role does not exist, returns ErrorCodes::RoleNotFound.
+     * Each BSONObj in the $result vector contains a full role description
+     * as retrieved from admin.system.roles plus inherited role/privilege
+     * information as appropriate.
      */
-    virtual Status getRoleDescription(OperationContext* opCtx,
-                                      const RoleName& roleName,
-                                      PrivilegeFormat showPrivileges,
-                                      AuthenticationRestrictionsFormat,
-                                      BSONObj* result) = 0;
-
-    /**
-     * Writes into "result" a document describing the named role is and returns Status::OK(). If
-     * showPrivileges is kOmit or kShowPrivileges, the description includes the roles which the
-     * named roles are a member of, including those memberships held implicitly through other roles
-     * (indirect roles). If "showPrivileges" is kShowPrivileges, then the description documents
-     * will also include a full list of the roles' privileges. If "showPrivileges" is
-     * kShowAsUserFragment, then the description returned will take the form of a partial user
-     * document, describing a hypothetical user which possesses the provided and implicit roles,
-     * and all inherited privileges. In the event that some of this information is inconsistent,
-     * the document will contain a "warnings" array, with std::string messages describing
-     * inconsistencies.
-     */
-
     virtual Status getRolesDescription(OperationContext* opCtx,
                                        const std::vector<RoleName>& roles,
                                        PrivilegeFormat showPrivileges,
                                        AuthenticationRestrictionsFormat,
-                                       BSONObj* result) = 0;
+                                       std::vector<BSONObj>* result) = 0;
+
+    /**
+     * Fetches named roles and synthesizes them into a fragment of a user document.
+     *
+     * The document synthesized into $result looks like a complete user document
+     * representing the $roles specified and their subordinates, but without
+     * an actual user name or credentials.
+     */
+    virtual Status getRolesAsUserFragment(OperationContext* opCtx,
+                                          const std::vector<RoleName>& roles,
+                                          AuthenticationRestrictionsFormat,
+                                          BSONObj* result) = 0;
 
     /**
      * Writes into "result" documents describing the roles that are defined on the given
@@ -163,7 +174,7 @@ public:
 
     virtual void logOp(OperationContext* opCtx,
                        AuthorizationManagerImpl* authManager,
-                       const char* op,
+                       StringData op,
                        const NamespaceString& ns,
                        const BSONObj& o,
                        const BSONObj* o2) {}
@@ -174,10 +185,9 @@ protected:
     AuthzManagerExternalState();  // This class should never be instantiated directly.
 
     /**
-     * Returns true if roles for this user were provided by the client, and can be obtained from
-     * the connection.
+     * Construct a Status about one or more unknown roles.
      */
-    bool shouldUseRolesFromConnection(OperationContext* opCtx, const UserName& username);
+    static Status makeRoleNotFoundStatus(const stdx::unordered_set<RoleName>&);
 };
 
 }  // namespace mongo

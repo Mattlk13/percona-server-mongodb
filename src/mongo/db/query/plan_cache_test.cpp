@@ -50,6 +50,7 @@
 #include "mongo/db/query/query_planner_test_lib.h"
 #include "mongo/db/query/query_solution.h"
 #include "mongo/db/query/query_test_service_context.h"
+#include "mongo/idl/server_parameter_test_util.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/scopeguard.h"
@@ -74,12 +75,13 @@ unique_ptr<CanonicalQuery> canonicalize(const BSONObj& queryObj) {
     QueryTestServiceContext serviceContext;
     auto opCtx = serviceContext.makeOperationContext();
 
-    auto qr = stdx::make_unique<QueryRequest>(nss);
-    qr->setFilter(queryObj);
+    auto findCommand = std::make_unique<FindCommandRequest>(nss);
+    findCommand->setFilter(queryObj);
     const boost::intrusive_ptr<ExpressionContext> expCtx;
     auto statusWithCQ =
         CanonicalQuery::canonicalize(opCtx.get(),
-                                     std::move(qr),
+                                     std::move(findCommand),
+                                     false,
                                      expCtx,
                                      ExtensionsCallbackNoop(),
                                      MatchExpressionParser::kAllowAllSpecialFeatures);
@@ -87,8 +89,8 @@ unique_ptr<CanonicalQuery> canonicalize(const BSONObj& queryObj) {
     return std::move(statusWithCQ.getValue());
 }
 
-unique_ptr<CanonicalQuery> canonicalize(const char* queryStr) {
-    BSONObj queryObj = fromjson(queryStr);
+unique_ptr<CanonicalQuery> canonicalize(StringData queryStr) {
+    BSONObj queryObj = fromjson(queryStr.toString());
     return canonicalize(queryObj);
 }
 
@@ -99,15 +101,16 @@ unique_ptr<CanonicalQuery> canonicalize(BSONObj query,
     QueryTestServiceContext serviceContext;
     auto opCtx = serviceContext.makeOperationContext();
 
-    auto qr = stdx::make_unique<QueryRequest>(nss);
-    qr->setFilter(query);
-    qr->setSort(sort);
-    qr->setProj(proj);
-    qr->setCollation(collation);
+    auto findCommand = std::make_unique<FindCommandRequest>(nss);
+    findCommand->setFilter(query);
+    findCommand->setSort(sort);
+    findCommand->setProjection(proj);
+    findCommand->setCollation(collation);
     const boost::intrusive_ptr<ExpressionContext> expCtx;
     auto statusWithCQ =
         CanonicalQuery::canonicalize(opCtx.get(),
-                                     std::move(qr),
+                                     std::move(findCommand),
+                                     false,
                                      expCtx,
                                      ExtensionsCallbackNoop(),
                                      MatchExpressionParser::kAllowAllSpecialFeatures);
@@ -134,23 +137,24 @@ unique_ptr<CanonicalQuery> canonicalize(const char* queryStr,
     QueryTestServiceContext serviceContext;
     auto opCtx = serviceContext.makeOperationContext();
 
-    auto qr = stdx::make_unique<QueryRequest>(nss);
-    qr->setFilter(fromjson(queryStr));
-    qr->setSort(fromjson(sortStr));
-    qr->setProj(fromjson(projStr));
+    auto findCommand = std::make_unique<FindCommandRequest>(nss);
+    findCommand->setFilter(fromjson(queryStr));
+    findCommand->setSort(fromjson(sortStr));
+    findCommand->setProjection(fromjson(projStr));
     if (skip) {
-        qr->setSkip(skip);
+        findCommand->setSkip(skip);
     }
     if (limit) {
-        qr->setLimit(limit);
+        findCommand->setLimit(limit);
     }
-    qr->setHint(fromjson(hintStr));
-    qr->setMin(fromjson(minStr));
-    qr->setMax(fromjson(maxStr));
+    findCommand->setHint(fromjson(hintStr));
+    findCommand->setMin(fromjson(minStr));
+    findCommand->setMax(fromjson(maxStr));
     const boost::intrusive_ptr<ExpressionContext> expCtx;
     auto statusWithCQ =
         CanonicalQuery::canonicalize(opCtx.get(),
-                                     std::move(qr),
+                                     std::move(findCommand),
+                                     false,
                                      expCtx,
                                      ExtensionsCallbackNoop(),
                                      MatchExpressionParser::kAllowAllSpecialFeatures);
@@ -170,24 +174,24 @@ unique_ptr<CanonicalQuery> canonicalize(const char* queryStr,
     QueryTestServiceContext serviceContext;
     auto opCtx = serviceContext.makeOperationContext();
 
-    auto qr = stdx::make_unique<QueryRequest>(nss);
-    qr->setFilter(fromjson(queryStr));
-    qr->setSort(fromjson(sortStr));
-    qr->setProj(fromjson(projStr));
+    auto findCommand = std::make_unique<FindCommandRequest>(nss);
+    findCommand->setFilter(fromjson(queryStr));
+    findCommand->setSort(fromjson(sortStr));
+    findCommand->setProjection(fromjson(projStr));
     if (skip) {
-        qr->setSkip(skip);
+        findCommand->setSkip(skip);
     }
     if (limit) {
-        qr->setLimit(limit);
+        findCommand->setLimit(limit);
     }
-    qr->setHint(fromjson(hintStr));
-    qr->setMin(fromjson(minStr));
-    qr->setMax(fromjson(maxStr));
-    qr->setExplain(explain);
+    findCommand->setHint(fromjson(hintStr));
+    findCommand->setMin(fromjson(minStr));
+    findCommand->setMax(fromjson(maxStr));
     const boost::intrusive_ptr<ExpressionContext> expCtx;
     auto statusWithCQ =
         CanonicalQuery::canonicalize(opCtx.get(),
-                                     std::move(qr),
+                                     std::move(findCommand),
+                                     explain,
                                      expCtx,
                                      ExtensionsCallbackNoop(),
                                      MatchExpressionParser::kAllowAllSpecialFeatures);
@@ -196,14 +200,37 @@ unique_ptr<CanonicalQuery> canonicalize(const char* queryStr,
 }
 
 /**
- * Check that the stable keys of 'a' and 'b' are equal, but the unstable parts are not.
+ * Check that the stable keys of 'a' and 'b' are equal, but the index discriminators are not.
  */
 void assertPlanCacheKeysUnequalDueToDiscriminators(const PlanCacheKey& a, const PlanCacheKey& b) {
     ASSERT_EQ(a.getStableKeyStringData(), b.getStableKeyStringData());
-    ASSERT_EQ(a.getUnstablePart().size(), b.getUnstablePart().size());
+    ASSERT_EQ(a.getIndexabilityDiscriminators().size(), b.getIndexabilityDiscriminators().size());
+    ASSERT_NE(a.getIndexabilityDiscriminators(), b.getIndexabilityDiscriminators());
+
     // Should always have the begin and end delimiters.
-    ASSERT_NE(a.getUnstablePart(), b.getUnstablePart());
-    ASSERT_GTE(a.getUnstablePart().size(), 2u);
+    ASSERT_GTE(a.getIndexabilityDiscriminators().size(), 2u);
+}
+
+/**
+ * Check that the stable keys of 'a' and 'b' are equal, but the 'forceClassicEngine' values are not.
+ */
+void assertPlanCacheKeysUnequalDueToForceClassicEngineValue(const PlanCacheKey& a,
+                                                            const PlanCacheKey& b) {
+    ASSERT_EQ(a.getStableKeyStringData(), b.getStableKeyStringData());
+    auto aUnstablePart = a.getUnstablePart();
+    auto bUnstablePart = b.getUnstablePart();
+
+    ASSERT_EQ(aUnstablePart.size(), aUnstablePart.size());
+
+    // Should have at least 1 byte to represent whether we must use the classic engine.
+    ASSERT_GTE(aUnstablePart.size(), 1);
+
+    // The indexability discriminators should match.
+    ASSERT_EQ(a.getIndexabilityDiscriminators(), b.getIndexabilityDiscriminators());
+
+    // The unstable parts should not match because of the last character.
+    ASSERT_NE(aUnstablePart, bUnstablePart);
+    ASSERT_NE(aUnstablePart[aUnstablePart.size() - 1], bUnstablePart[bUnstablePart.size() - 1]);
 }
 
 /**
@@ -239,14 +266,16 @@ void assertEquivalent(const char* queryStr,
     FAIL(ss);
 }
 
-// Helper which constructs a $** IndexEntry and returns it along with an owned ProjectionExecAgg.
-// The latter simulates the ProjectionExecAgg which, during normal operation, is owned and
+// Helper which constructs a $** IndexEntry and returns it along with an owned ProjectionExecutor.
+// The latter simulates the ProjectionExecutor which, during normal operation, is owned and
 // maintained by the $** index's IndexAccessMethod, and is required because the plan cache will
 // obtain unowned pointers to it.
-std::pair<IndexEntry, std::unique_ptr<ProjectionExecAgg>> makeWildcardEntry(BSONObj keyPattern) {
-    auto projExec = WildcardKeyGenerator::createProjectionExec(keyPattern, {});
+std::pair<IndexEntry, std::unique_ptr<WildcardProjection>> makeWildcardEntry(BSONObj keyPattern) {
+    auto wcProj = std::make_unique<WildcardProjection>(
+        WildcardKeyGenerator::createProjectionExecutor(keyPattern, {}));
     return {IndexEntry(keyPattern,
                        IndexNames::nameToType(IndexNames::findPluginName(keyPattern)),
+                       IndexDescriptor::kLatestIndexVersion,
                        false,  // multikey
                        {},
                        {},
@@ -256,22 +285,23 @@ std::pair<IndexEntry, std::unique_ptr<ProjectionExecAgg>> makeWildcardEntry(BSON
                        nullptr,
                        BSONObj(),
                        nullptr,
-                       projExec.get()),
-            std::move(projExec)};
+                       wcProj.get()),
+            std::move(wcProj)};
 }
 
 // A version of the above for CoreIndexInfo, used for plan cache update tests.
-std::pair<CoreIndexInfo, std::unique_ptr<ProjectionExecAgg>> makeWildcardUpdate(
+std::pair<CoreIndexInfo, std::unique_ptr<WildcardProjection>> makeWildcardUpdate(
     BSONObj keyPattern) {
-    auto projExec = WildcardKeyGenerator::createProjectionExec(keyPattern, {});
+    auto wcProj = std::make_unique<WildcardProjection>(
+        WildcardKeyGenerator::createProjectionExecutor(keyPattern, {}));
     return {CoreIndexInfo(keyPattern,
                           IndexNames::nameToType(IndexNames::findPluginName(keyPattern)),
                           false,                                // sparse
                           IndexEntry::Identifier{"indexName"},  // name
                           nullptr,                              // filterExpr
                           nullptr,                              // collation
-                          projExec.get()),                      // wildcard
-            std::move(projExec)};
+                          wcProj.get()),                        // wildcard
+            std::move(wcProj)};
 }
 
 //
@@ -283,7 +313,7 @@ std::pair<CoreIndexInfo, std::unique_ptr<ProjectionExecAgg>> makeWildcardUpdate(
  */
 struct GenerateQuerySolution {
     QuerySolution* operator()() const {
-        unique_ptr<QuerySolution> qs(new QuerySolution());
+        unique_ptr<QuerySolution> qs(new QuerySolution(QueryPlannerParams::Options::DEFAULT));
         qs->cacheData.reset(new SolutionCacheData());
         qs->cacheData->solnType = SolutionCacheData::COLLSCAN_SOLN;
         qs->cacheData->tree.reset(new PlanCacheIndexTree());
@@ -294,17 +324,20 @@ struct GenerateQuerySolution {
 /**
  * Utility function to create a PlanRankingDecision
  */
-std::unique_ptr<PlanRankingDecision> createDecision(size_t numPlans, size_t works = 0) {
-    unique_ptr<PlanRankingDecision> why(new PlanRankingDecision());
+std::unique_ptr<plan_ranker::PlanRankingDecision> createDecision(size_t numPlans,
+                                                                 size_t works = 0) {
+    auto why = std::make_unique<plan_ranker::PlanRankingDecision>();
+    std::vector<std::unique_ptr<PlanStageStats>> stats;
     for (size_t i = 0; i < numPlans; ++i) {
         CommonStats common("COLLSCAN");
-        auto stats = stdx::make_unique<PlanStageStats>(common, STAGE_COLLSCAN);
-        stats->specific.reset(new CollectionScanStats());
-        why->stats.push_back(std::move(stats));
-        why->stats[i]->common.works = works;
+        auto stat = std::make_unique<PlanStageStats>(common, STAGE_COLLSCAN);
+        stat->specific.reset(new CollectionScanStats());
+        stat->common.works = works;
+        stats.push_back(std::move(stat));
         why->scores.push_back(0U);
         why->candidateOrder.push_back(i);
     }
+    why->getStats<PlanStageStats>().candidatePlanStats = std::move(stats);
     return why;
 }
 
@@ -343,9 +376,10 @@ void assertShouldNotCacheQuery(const char* queryStr) {
 }
 
 std::unique_ptr<QuerySolution> getQuerySolutionForCaching() {
-    std::unique_ptr<QuerySolution> qs = std::make_unique<QuerySolution>();
-    qs->cacheData = stdx::make_unique<SolutionCacheData>();
-    qs->cacheData->tree = stdx::make_unique<PlanCacheIndexTree>();
+    std::unique_ptr<QuerySolution> qs =
+        std::make_unique<QuerySolution>(QueryPlannerParams::Options::DEFAULT);
+    qs->cacheData = std::make_unique<SolutionCacheData>();
+    qs->cacheData->tree = std::make_unique<PlanCacheIndexTree>();
     return qs;
 }
 
@@ -480,8 +514,7 @@ TEST(PlanCacheTest, ShouldNotCacheQueryExplain) {
                                                "{}",  // min, max
                                                true   // explain
                                                ));
-    const QueryRequest& qr = cq->getQueryRequest();
-    ASSERT_TRUE(qr.isExplain());
+    ASSERT_TRUE(cq->getExplain());
     assertShouldNotCacheQuery(*cq);
 }
 
@@ -490,7 +523,7 @@ TEST(PlanCacheTest, AddEmptySolutions) {
     PlanCache planCache;
     unique_ptr<CanonicalQuery> cq(canonicalize("{a: 1}"));
     std::vector<QuerySolution*> solns;
-    unique_ptr<PlanRankingDecision> decision(createDecision(1U));
+    unique_ptr<plan_ranker::PlanRankingDecision> decision(createDecision(1U));
     QueryTestServiceContext serviceContext;
     ASSERT_NOT_OK(planCache.set(*cq, solns, std::move(decision), Date_t{}));
 }
@@ -676,7 +709,11 @@ TEST(PlanCacheTest, WorksValueIncreases) {
     ASSERT_EQ(planCache.get(*cq).state, PlanCache::CacheEntryState::kPresentActive);
     entry = assertGet(planCache.getEntry(*cq));
     ASSERT_TRUE(entry->isActive);
-    ASSERT_EQ(entry->decision->stats[0]->common.works, 25U);
+
+    ASSERT(entry->debugInfo);
+    ASSERT(entry->debugInfo->decision);
+    auto&& decision = entry->debugInfo->decision;
+    ASSERT_EQ(decision->getStats<PlanStageStats>().candidatePlanStats[0]->common.works, 25U);
     ASSERT_EQ(entry->works, 25U);
 
     ASSERT_EQUALS(planCache.size(), 1U);
@@ -894,6 +931,7 @@ protected:
         params.indices.push_back(
             IndexEntry(keyPattern,
                        IndexNames::nameToType(IndexNames::findPluginName(keyPattern)),
+                       IndexDescriptor::kLatestIndexVersion,
                        multikey,
                        {},
                        {},
@@ -910,6 +948,7 @@ protected:
         params.indices.push_back(
             IndexEntry(keyPattern,
                        IndexNames::nameToType(IndexNames::findPluginName(keyPattern)),
+                       IndexDescriptor::kLatestIndexVersion,
                        multikey,
                        {},
                        {},
@@ -925,6 +964,7 @@ protected:
     void addIndex(BSONObj keyPattern, const std::string& indexName, CollatorInterface* collator) {
         IndexEntry entry(keyPattern,
                          IndexNames::nameToType(IndexNames::findPluginName(keyPattern)),
+                         IndexDescriptor::kLatestIndexVersion,
                          false,
                          {},
                          {},
@@ -1001,23 +1041,24 @@ protected:
         // Clean up any previous state from a call to runQueryFull or runQueryAsCommand.
         solns.clear();
 
-        auto qr = std::make_unique<QueryRequest>(nss);
-        qr->setFilter(query);
-        qr->setSort(sort);
-        qr->setProj(proj);
+        auto findCommand = std::make_unique<FindCommandRequest>(nss);
+        findCommand->setFilter(query);
+        findCommand->setSort(sort);
+        findCommand->setProjection(proj);
         if (skip) {
-            qr->setSkip(skip);
+            findCommand->setSkip(skip);
         }
         if (limit) {
-            qr->setLimit(limit);
+            findCommand->setLimit(limit);
         }
-        qr->setHint(hint);
-        qr->setMin(minObj);
-        qr->setMax(maxObj);
+        findCommand->setHint(hint);
+        findCommand->setMin(minObj);
+        findCommand->setMax(maxObj);
         const boost::intrusive_ptr<ExpressionContext> expCtx;
         auto statusWithCQ =
             CanonicalQuery::canonicalize(opCtx.get(),
-                                         std::move(qr),
+                                         std::move(findCommand),
+                                         false,
                                          expCtx,
                                          ExtensionsCallbackNoop(),
                                          MatchExpressionParser::kAllowAllSpecialFeatures);
@@ -1035,13 +1076,14 @@ protected:
         solns.clear();
 
         const bool isExplain = false;
-        std::unique_ptr<QueryRequest> qr(
-            assertGet(QueryRequest::makeFromFindCommand(nss, cmdObj, isExplain)));
+        std::unique_ptr<FindCommandRequest> findCommand(
+            query_request_helper::makeFromFindCommandForTests(cmdObj));
 
         const boost::intrusive_ptr<ExpressionContext> expCtx;
         auto statusWithCQ =
             CanonicalQuery::canonicalize(opCtx.get(),
-                                         std::move(qr),
+                                         std::move(findCommand),
+                                         isExplain,
                                          expCtx,
                                          ExtensionsCallbackNoop(),
                                          MatchExpressionParser::kAllowAllSpecialFeatures);
@@ -1068,8 +1110,7 @@ protected:
         BSONObj testSoln = fromjson(solnJson);
         size_t matches = 0;
         for (auto&& soln : solns) {
-            QuerySolutionNode* root = soln->root.get();
-            if (QueryPlannerTestLib::solutionMatches(testSoln, root)) {
+            if (QueryPlannerTestLib::solutionMatches(testSoln, soln->root())) {
                 ++matches;
             }
         }
@@ -1108,15 +1149,16 @@ protected:
         QueryTestServiceContext serviceContext;
         auto opCtx = serviceContext.makeOperationContext();
 
-        auto qr = stdx::make_unique<QueryRequest>(nss);
-        qr->setFilter(query);
-        qr->setSort(sort);
-        qr->setProj(proj);
-        qr->setCollation(collation);
+        auto findCommand = std::make_unique<FindCommandRequest>(nss);
+        findCommand->setFilter(query);
+        findCommand->setSort(sort);
+        findCommand->setProjection(proj);
+        findCommand->setCollation(collation);
         const boost::intrusive_ptr<ExpressionContext> expCtx;
         auto statusWithCQ =
             CanonicalQuery::canonicalize(opCtx.get(),
-                                         std::move(qr),
+                                         std::move(findCommand),
+                                         false,
                                          expCtx,
                                          ExtensionsCallbackNoop(),
                                          MatchExpressionParser::kAllowAllSpecialFeatures);
@@ -1125,15 +1167,16 @@ protected:
 
         // Create a CachedSolution the long way..
         // QuerySolution -> PlanCacheEntry -> CachedSolution
-        QuerySolution qs;
-        qs.cacheData.reset(soln.cacheData->clone());
+        QuerySolution qs{QueryPlannerParams::Options::DEFAULT};
+        qs.cacheData = soln.cacheData->clone();
         std::vector<QuerySolution*> solutions;
         solutions.push_back(&qs);
 
         uint32_t queryHash = canonical_query_encoder::computeHash(ck.stringData());
         uint32_t planCacheKey = queryHash;
-        PlanCacheEntry entry(solutions, createDecision(1U).release(), queryHash, planCacheKey);
-        CachedSolution cachedSoln(ck, entry);
+        auto entry = PlanCacheEntry::create(
+            solutions, createDecision(1U), *scopedCq, queryHash, planCacheKey, Date_t(), false, 0);
+        CachedSolution cachedSoln(*entry);
 
         auto statusWithQs = QueryPlanner::planFromCache(*scopedCq, params, cachedSoln);
         ASSERT_OK(statusWithQs.getStatus());
@@ -1149,8 +1192,7 @@ protected:
     QuerySolution* firstMatchingSolution(const string& solnJson) const {
         BSONObj testSoln = fromjson(solnJson);
         for (auto&& soln : solns) {
-            QuerySolutionNode* root = soln->root.get();
-            if (QueryPlannerTestLib::solutionMatches(testSoln, root)) {
+            if (QueryPlannerTestLib::solutionMatches(testSoln, soln->root())) {
                 return soln.get();
             }
         }
@@ -1161,7 +1203,7 @@ protected:
         dumpSolutions(ss);
         FAIL(ss);
 
-        return NULL;
+        return nullptr;
     }
 
     /**
@@ -1172,7 +1214,7 @@ protected:
      */
     void assertSolutionMatches(QuerySolution* trueSoln, const string& solnJson) const {
         BSONObj testSoln = fromjson(solnJson);
-        if (!QueryPlannerTestLib::solutionMatches(testSoln, trueSoln->root.get())) {
+        if (!QueryPlannerTestLib::solutionMatches(testSoln, trueSoln->root())) {
             str::stream ss;
             ss << "Expected solution " << solnJson
                << " did not match true solution: " << trueSoln->toString() << '\n';
@@ -1216,8 +1258,8 @@ protected:
      */
     void assertNotCached(const string& solnJson) {
         QuerySolution* bestSoln = firstMatchingSolution(solnJson);
-        ASSERT(NULL != bestSoln);
-        ASSERT(NULL == bestSoln->cacheData.get());
+        ASSERT(nullptr != bestSoln);
+        ASSERT(nullptr == bestSoln->cacheData.get());
     }
 
     static const PlanCacheKey ck;
@@ -1228,7 +1270,7 @@ protected:
 };
 
 const std::string mockKey("mock_cache_key");
-const PlanCacheKey CachePlanSelectionTest::ck(mockKey, "");
+const PlanCacheKey CachePlanSelectionTest::ck(mockKey, "", internalQueryForceClassicEngine.load());
 
 //
 // Equality
@@ -1337,8 +1379,7 @@ TEST_F(CachePlanSelectionTest, Or2DSphereNonNear) {
 TEST_F(CachePlanSelectionTest, AndWithinPolygonWithinCenterSphere) {
     addIndex(BSON("a"
                   << "2dsphere"
-                  << "b"
-                  << 1),
+                  << "b" << 1),
              "a_2dsphere_b_2dsphere");
 
     BSONObj query = fromjson(
@@ -1541,8 +1582,8 @@ TEST_F(CachePlanSelectionTest, CollscanMergeSort) {
                                     sort,
                                     BSONObj(),
                                     BSONObj(),
-                                    "{sort: {pattern: {c: 1}, limit: 0, node: {sortKeyGen: "
-                                    "{node: {cscan: {dir: 1}}}}}}");
+                                    "{sort: {pattern: {c: 1}, limit: 0, type: 'simple', node: "
+                                    "{cscan: {dir: 1}}}}");
 }
 
 //
@@ -1680,8 +1721,8 @@ TEST_F(CachePlanSelectionTest, NaturalHintNotCached) {
     addIndex(BSON("b" << 1), "b_1");
     runQuerySortHint(BSON("a" << 1), BSON("b" << 1), BSON("$natural" << 1));
     assertNotCached(
-        "{sort: {pattern: {b: 1}, limit: 0, node: {sortKeyGen: {node: "
-        "{cscan: {filter: {a: 1}, dir: 1}}}}}}");
+        "{sort: {pattern: {b: 1}, limit: 0, type: 'simple', node: "
+        "{cscan: {filter: {a: 1}, dir: 1}}}}");
 }
 
 TEST_F(CachePlanSelectionTest, HintValidNotCached) {
@@ -1747,8 +1788,9 @@ TEST_F(CachePlanSelectionTest, Or2DNonNearNotCached) {
 TEST_F(CachePlanSelectionTest, MatchingCollation) {
     CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kReverseString);
     addIndex(BSON("x" << 1), "x_1", &collator);
-    runQueryAsCommand(fromjson(
-        "{find: 'testns', filter: {x: 'foo'}, collation: {locale: 'mock_reverse_string'}}"));
+    runQueryAsCommand(
+        fromjson("{find: 'testns', filter: {x: 'foo'}, collation: {locale: 'mock_reverse_string'}, "
+                 "'$db': 'test'}"));
 
     assertPlanCacheRecoversSolution(BSON("x"
                                          << "bar"),
@@ -1883,8 +1925,8 @@ TEST(PlanCacheTest, ComputeKeyCollationIndex) {
     // 'noStrings' gets a different key since it is compatible with the index.
     assertPlanCacheKeysUnequalDueToDiscriminators(planCache.computeKey(*containsString),
                                                   planCache.computeKey(*noStrings));
-    ASSERT_EQ(planCache.computeKey(*containsString).getUnstablePart(), "<0>");
-    ASSERT_EQ(planCache.computeKey(*noStrings).getUnstablePart(), "<1>");
+    ASSERT_EQ(planCache.computeKey(*containsString).getIndexabilityDiscriminators(), "<0>");
+    ASSERT_EQ(planCache.computeKey(*noStrings).getIndexabilityDiscriminators(), "<1>");
 
     // 'noStrings' and 'containsStringHasCollation' get different keys, since the collation
     // specified in the query is considered part of its shape. However, they have the same index
@@ -1911,8 +1953,8 @@ TEST(PlanCacheTest, ComputeKeyCollationIndex) {
     // 'inNoStrings' gets a different key since it is compatible with the index.
     assertPlanCacheKeysUnequalDueToDiscriminators(planCache.computeKey(*inContainsString),
                                                   planCache.computeKey(*inNoStrings));
-    ASSERT_EQ(planCache.computeKey(*inContainsString).getUnstablePart(), "<0>");
-    ASSERT_EQ(planCache.computeKey(*inNoStrings).getUnstablePart(), "<1>");
+    ASSERT_EQ(planCache.computeKey(*inContainsString).getIndexabilityDiscriminators(), "<0>");
+    ASSERT_EQ(planCache.computeKey(*inNoStrings).getIndexabilityDiscriminators(), "<1>");
 
     // 'inNoStrings' and 'inContainsStringHasCollation' get the same key since they compatible with
     // the index.
@@ -1952,8 +1994,8 @@ TEST(PlanCacheTest, ComputeKeyWildcardIndex) {
               planCacheWithNoIndexes.computeKey(*usesPathWithObject));
     assertPlanCacheKeysUnequalDueToDiscriminators(planCache.computeKey(*usesPathWithScalar),
                                                   planCache.computeKey(*usesPathWithObject));
-    ASSERT_EQ(planCache.computeKey(*usesPathWithScalar).getUnstablePart(), "<1>");
-    ASSERT_EQ(planCache.computeKey(*usesPathWithObject).getUnstablePart(), "<0>");
+    ASSERT_EQ(planCache.computeKey(*usesPathWithScalar).getIndexabilityDiscriminators(), "<1>");
+    ASSERT_EQ(planCache.computeKey(*usesPathWithObject).getIndexabilityDiscriminators(), "<0>");
 
     ASSERT_EQ(planCache.computeKey(*usesPathWithObject), planCache.computeKey(*usesPathWithArray));
     ASSERT_EQ(planCache.computeKey(*usesPathWithObject),
@@ -1981,8 +2023,10 @@ TEST(PlanCacheTest, ComputeKeyWildcardIndex) {
     assertPlanCacheKeysUnequalDueToDiscriminators(
         planCache.computeKey(*orQueryWithOneBranchAllowed),
         planCache.computeKey(*orQueryWithNoBranchesAllowed));
-    ASSERT_EQ(planCache.computeKey(*orQueryWithOneBranchAllowed).getUnstablePart(), "<1><0>");
-    ASSERT_EQ(planCache.computeKey(*orQueryWithNoBranchesAllowed).getUnstablePart(), "<0><0>");
+    ASSERT_EQ(planCache.computeKey(*orQueryWithOneBranchAllowed).getIndexabilityDiscriminators(),
+              "<1><0>");
+    ASSERT_EQ(planCache.computeKey(*orQueryWithNoBranchesAllowed).getIndexabilityDiscriminators(),
+              "<0><0>");
 }
 
 TEST(PlanCacheTest, ComputeKeyWildcardIndexDiscriminatesEqualityToEmptyObj) {
@@ -1996,16 +2040,174 @@ TEST(PlanCacheTest, ComputeKeyWildcardIndexDiscriminatesEqualityToEmptyObj) {
     std::unique_ptr<CanonicalQuery> equalsNonEmptyObj(canonicalize("{a: {b: 1}}"));
     assertPlanCacheKeysUnequalDueToDiscriminators(planCache.computeKey(*equalsEmptyObj),
                                                   planCache.computeKey(*equalsNonEmptyObj));
-    ASSERT_EQ(planCache.computeKey(*equalsNonEmptyObj).getUnstablePart(), "<0>");
-    ASSERT_EQ(planCache.computeKey(*equalsEmptyObj).getUnstablePart(), "<1>");
+    ASSERT_EQ(planCache.computeKey(*equalsNonEmptyObj).getIndexabilityDiscriminators(), "<0>");
+    ASSERT_EQ(planCache.computeKey(*equalsEmptyObj).getIndexabilityDiscriminators(), "<1>");
 
     // $in with empty obj and $in with non-empty obj have different plan cache keys.
     std::unique_ptr<CanonicalQuery> inWithEmptyObj(canonicalize("{a: {$in: [{}]}}"));
     std::unique_ptr<CanonicalQuery> inWithNonEmptyObj(canonicalize("{a: {$in: [{b: 1}]}}"));
     assertPlanCacheKeysUnequalDueToDiscriminators(planCache.computeKey(*inWithEmptyObj),
                                                   planCache.computeKey(*inWithNonEmptyObj));
-    ASSERT_EQ(planCache.computeKey(*inWithNonEmptyObj).getUnstablePart(), "<0>");
-    ASSERT_EQ(planCache.computeKey(*inWithEmptyObj).getUnstablePart(), "<1>");
+    ASSERT_EQ(planCache.computeKey(*inWithNonEmptyObj).getIndexabilityDiscriminators(), "<0>");
+    ASSERT_EQ(planCache.computeKey(*inWithEmptyObj).getIndexabilityDiscriminators(), "<1>");
+}
+
+TEST(PlanCacheTest, ComputeKeyWildcardDiscriminatesCorrectlyBasedOnPartialFilterExpression) {
+    BSONObj filterObj = BSON("x" << BSON("$gt" << 0));
+    std::unique_ptr<MatchExpression> filterExpr(parseMatchExpression(filterObj));
+
+    auto entryProjUpdatePair = makeWildcardUpdate(BSON("$**" << 1));
+    auto indexInfo = std::move(entryProjUpdatePair.first);
+    indexInfo.filterExpr = filterExpr.get();
+
+    PlanCache planCache;
+    planCache.notifyOfIndexUpdates({indexInfo});
+
+    // Test that queries on field 'x' are discriminated based on their relationship with the partial
+    // filter expression.
+    {
+        auto compatibleWithFilter = canonicalize("{x: {$eq: 5}}");
+        auto incompatibleWithFilter = canonicalize("{x: {$eq: -5}}");
+        auto compatibleKey = planCache.computeKey(*compatibleWithFilter);
+        auto incompatibleKey = planCache.computeKey(*incompatibleWithFilter);
+
+        assertPlanCacheKeysUnequalDueToDiscriminators(compatibleKey, incompatibleKey);
+        // The discriminator strings have the format "<xx>". That is, there are two discriminator
+        // bits for the "x" predicate, the first pertaining to the partialFilterExpression and the
+        // second around applicability to the wildcard index.
+        ASSERT_EQ(compatibleKey.getIndexabilityDiscriminators(), "<11>");
+        ASSERT_EQ(incompatibleKey.getIndexabilityDiscriminators(), "<01>");
+    }
+
+    // The partialFilterExpression should lead to a discriminator over field 'x', but not over 'y'.
+    // (Separately, there are wildcard-related discriminator bits for both 'x' and 'y'.)
+    {
+        auto compatibleWithFilter = canonicalize("{x: {$eq: 5}, y: 1}");
+        auto incompatibleWithFilter = canonicalize("{x: {$eq: -5}, y: 1}");
+        auto compatibleKey = planCache.computeKey(*compatibleWithFilter);
+        auto incompatibleKey = planCache.computeKey(*incompatibleWithFilter);
+
+        assertPlanCacheKeysUnequalDueToDiscriminators(compatibleKey, incompatibleKey);
+        // The discriminator strings have the format "<xx><y>". That is, there are two discriminator
+        // bits for the "x" predicate (the first pertaining to the partialFilterExpression, the
+        // second around applicability to the wildcard index) and one discriminator bit for "y".
+        ASSERT_EQ(compatibleKey.getIndexabilityDiscriminators(), "<11><1>");
+        ASSERT_EQ(incompatibleKey.getIndexabilityDiscriminators(), "<01><1>");
+    }
+
+    // $eq:null predicates cannot be assigned to a wildcard index. Make sure that this is
+    // discrimated correctly. This test is designed to reproduce SERVER-48614.
+    {
+        auto compatibleQuery = canonicalize("{x: {$eq: 5}, y: 1}");
+        auto incompatibleQuery = canonicalize("{x: {$eq: 5}, y: null}");
+        auto compatibleKey = planCache.computeKey(*compatibleQuery);
+        auto incompatibleKey = planCache.computeKey(*incompatibleQuery);
+
+        assertPlanCacheKeysUnequalDueToDiscriminators(compatibleKey, incompatibleKey);
+        // The discriminator strings have the format "<xx><y>". That is, there are two discriminator
+        // bits for the "x" predicate (the first pertaining to the partialFilterExpression, the
+        // second around applicability to the wildcard index) and one discriminator bit for "y".
+        ASSERT_EQ(compatibleKey.getIndexabilityDiscriminators(), "<11><1>");
+        ASSERT_EQ(incompatibleKey.getIndexabilityDiscriminators(), "<11><0>");
+    }
+
+    // Test that the discriminators are correct for an $eq:null predicate on 'x'. This predicate is
+    // imcompatible for two reasons: null equality predicates cannot be answered by wildcard
+    // indexes, and the predicate is not compatible with the partial filter expression. This should
+    // result in two "0" bits inside the discriminator string.
+    {
+        auto key = planCache.computeKey(*canonicalize("{x: {$eq: null}}"));
+        ASSERT_EQ(key.getIndexabilityDiscriminators(), "<00>");
+    }
+}
+
+TEST(PlanCacheTest, ComputeKeyWildcardDiscriminatesCorrectlyWithPartialFilterAndExpression) {
+    // Partial filter is an AND of multiple conditions.
+    BSONObj filterObj = BSON("x" << BSON("$gt" << 0) << "y" << BSON("$gt" << 0));
+    std::unique_ptr<MatchExpression> filterExpr(parseMatchExpression(filterObj));
+
+    auto entryProjUpdatePair = makeWildcardUpdate(BSON("$**" << 1));
+    auto indexInfo = std::move(entryProjUpdatePair.first);
+    indexInfo.filterExpr = filterExpr.get();
+
+    PlanCache planCache;
+    planCache.notifyOfIndexUpdates({indexInfo});
+
+    {
+        // The discriminators should have the format <xx><yy><z>. The 'z' predicate has just one
+        // discriminator because it is not referenced in the partial filter expression.  All
+        // predicates are compatible.
+        auto key = planCache.computeKey(*canonicalize("{x: {$eq: 1}, y: {$eq: 2}, z: {$eq: 3}}"));
+        ASSERT_EQ(key.getIndexabilityDiscriminators(), "<11><11><1>");
+    }
+
+    {
+        // The discriminators should have the format <xx><yy><z>. The 'y' predicate is not
+        // compatible with the partial filter expression, leading to one of the 'y' bits being set
+        // to zero.
+        auto key = planCache.computeKey(*canonicalize("{x: {$eq: 1}, y: {$eq: -2}, z: {$eq: 3}}"));
+        ASSERT_EQ(key.getIndexabilityDiscriminators(), "<11><01><1>");
+    }
+}
+
+TEST(PlanCacheTest, ComputeKeyWildcardDiscriminatesCorrectlyWithPartialFilterOnNestedField) {
+    BSONObj filterObj = BSON("x.y" << BSON("$gt" << 0));
+    std::unique_ptr<MatchExpression> filterExpr(parseMatchExpression(filterObj));
+
+    auto entryProjUpdatePair = makeWildcardUpdate(BSON("$**" << 1));
+    auto indexInfo = std::move(entryProjUpdatePair.first);
+    indexInfo.filterExpr = filterExpr.get();
+
+    PlanCache planCache;
+    planCache.notifyOfIndexUpdates({indexInfo});
+
+    {
+        // The discriminators have the format <x><(x.y)(x.y)<y>. All predicates are compatible
+        auto key =
+            planCache.computeKey(*canonicalize("{x: {$eq: 1}, y: {$eq: 2}, 'x.y': {$eq: 3}}"));
+        ASSERT_EQ(key.getIndexabilityDiscriminators(), "<1><11><1>");
+    }
+
+    {
+        // Here, the predicate on "x.y" is not compatible with the partial filter expression.
+        auto key =
+            planCache.computeKey(*canonicalize("{x: {$eq: 1}, y: {$eq: 2}, 'x.y': {$eq: -3}}"));
+        ASSERT_EQ(key.getIndexabilityDiscriminators(), "<1><01><1>");
+    }
+}
+
+TEST(PlanCacheTest, ComputeKeyDiscriminatesCorrectlyWithPartialFilterAndWildcardProjection) {
+    BSONObj filterObj = BSON("x" << BSON("$gt" << 0));
+    std::unique_ptr<MatchExpression> filterExpr(parseMatchExpression(filterObj));
+
+    auto entryProjUpdatePair = makeWildcardUpdate(BSON("y.$**" << 1));
+    auto indexInfo = std::move(entryProjUpdatePair.first);
+    indexInfo.filterExpr = filterExpr.get();
+
+    PlanCache planCache;
+    planCache.notifyOfIndexUpdates({indexInfo});
+
+    {
+        // The discriminators have the format <x><y>. The discriminator for 'x' indicates whether
+        // the predicate is compatible with the partial filter expression, whereas the disciminator
+        // for 'y' is about compatibility with the wildcard index.
+        auto key = planCache.computeKey(*canonicalize("{x: {$eq: 1}, y: {$eq: 2}, z: {$eq: 3}}"));
+        ASSERT_EQ(key.getIndexabilityDiscriminators(), "<1><1>");
+    }
+
+    {
+        // Similar to the previous case, except with an 'x' predicate that is incompatible with the
+        // partial filter expression.
+        auto key = planCache.computeKey(*canonicalize("{x: {$eq: -1}, y: {$eq: 2}, z: {$eq: 3}}"));
+        ASSERT_EQ(key.getIndexabilityDiscriminators(), "<0><1>");
+    }
+
+    {
+        // Case where the 'y' predicate is not compatible with the wildcard index.
+        auto key =
+            planCache.computeKey(*canonicalize("{x: {$eq: 1}, y: {$eq: null}, z: {$eq: 3}}"));
+        ASSERT_EQ(key.getIndexabilityDiscriminators(), "<1><0>");
+    }
 }
 
 TEST(PlanCacheTest, StableKeyDoesNotChangeAcrossIndexCreation) {
@@ -2013,7 +2215,7 @@ TEST(PlanCacheTest, StableKeyDoesNotChangeAcrossIndexCreation) {
     unique_ptr<CanonicalQuery> cq(canonicalize("{a: 0}}"));
     const PlanCacheKey preIndexKey = planCache.computeKey(*cq);
     const auto preIndexStableKey = preIndexKey.getStableKey();
-    ASSERT_EQ(preIndexKey.getUnstablePart(), "");
+    ASSERT_EQ(preIndexKey.getIndexabilityDiscriminators(), "");
 
     const auto keyPattern = BSON("a" << 1);
     // Create a sparse index (which requires a discriminator).
@@ -2027,7 +2229,7 @@ TEST(PlanCacheTest, StableKeyDoesNotChangeAcrossIndexCreation) {
     const auto postIndexStableKey = postIndexKey.getStableKey();
     ASSERT_NE(preIndexKey, postIndexKey);
     ASSERT_EQ(preIndexStableKey, postIndexStableKey);
-    ASSERT_EQ(postIndexKey.getUnstablePart(), "<1>");
+    ASSERT_EQ(postIndexKey.getIndexabilityDiscriminators(), "<1>");
 }
 
 TEST(PlanCacheTest, ComputeKeyNotEqualsArray) {
@@ -2037,8 +2239,8 @@ TEST(PlanCacheTest, ComputeKeyNotEqualsArray) {
 
     const PlanCacheKey noIndexNeArrayKey = planCache.computeKey(*cqNeArray);
     const PlanCacheKey noIndexNeScalarKey = planCache.computeKey(*cqNeScalar);
-    ASSERT_EQ(noIndexNeArrayKey.getUnstablePart(), "<0>");
-    ASSERT_EQ(noIndexNeScalarKey.getUnstablePart(), "<1>");
+    ASSERT_EQ(noIndexNeArrayKey.getIndexabilityDiscriminators(), "<0>");
+    ASSERT_EQ(noIndexNeScalarKey.getIndexabilityDiscriminators(), "<1>");
     ASSERT_EQ(noIndexNeScalarKey.getStableKey(), noIndexNeArrayKey.getStableKey());
 
     const auto keyPattern = BSON("a" << 1);
@@ -2057,11 +2259,11 @@ TEST(PlanCacheTest, ComputeKeyNotEqualsArray) {
 
     ASSERT_EQ(noIndexNeScalarKey.getStableKey(), withIndexNeScalarKey.getStableKey());
     // There will be one discriminator for the $not and another for the leaf node ({$eq: 123}).
-    ASSERT_EQ(withIndexNeScalarKey.getUnstablePart(), "<1><1>");
+    ASSERT_EQ(withIndexNeScalarKey.getIndexabilityDiscriminators(), "<1><1>");
     // There will be one discriminator for the $not and another for the leaf node ({$eq: [1]}).
     // Since the index can support equality to an array, the second discriminator will have a value
     // of '1'.
-    ASSERT_EQ(withIndexNeArrayKey.getUnstablePart(), "<0><1>");
+    ASSERT_EQ(withIndexNeArrayKey.getIndexabilityDiscriminators(), "<0><1>");
 }
 
 TEST(PlanCacheTest, ComputeKeyNinArray) {
@@ -2071,8 +2273,8 @@ TEST(PlanCacheTest, ComputeKeyNinArray) {
 
     const PlanCacheKey noIndexNinArrayKey = planCache.computeKey(*cqNinArray);
     const PlanCacheKey noIndexNinScalarKey = planCache.computeKey(*cqNinScalar);
-    ASSERT_EQ(noIndexNinArrayKey.getUnstablePart(), "<0>");
-    ASSERT_EQ(noIndexNinScalarKey.getUnstablePart(), "<1>");
+    ASSERT_EQ(noIndexNinArrayKey.getIndexabilityDiscriminators(), "<0>");
+    ASSERT_EQ(noIndexNinScalarKey.getIndexabilityDiscriminators(), "<1>");
     ASSERT_EQ(noIndexNinScalarKey.getStableKey(), noIndexNinArrayKey.getStableKey());
 
     const auto keyPattern = BSON("a" << 1);
@@ -2092,8 +2294,8 @@ TEST(PlanCacheTest, ComputeKeyNinArray) {
     ASSERT_NE(noIndexNinArrayKey.getUnstablePart(), withIndexNinArrayKey.getUnstablePart());
 
     ASSERT_EQ(noIndexNinScalarKey.getStableKey(), withIndexNinScalarKey.getStableKey());
-    ASSERT_EQ(withIndexNinArrayKey.getUnstablePart(), "<0><1>");
-    ASSERT_EQ(withIndexNinScalarKey.getUnstablePart(), "<1><1>");
+    ASSERT_EQ(withIndexNinArrayKey.getIndexabilityDiscriminators(), "<0><1>");
+    ASSERT_EQ(withIndexNinScalarKey.getIndexabilityDiscriminators(), "<1><1>");
 }
 
 // Test for a bug which would be easy to introduce. If we only inserted discriminators for some
@@ -2130,4 +2332,211 @@ TEST(PlanCacheTest, PlanCacheKeyCollision) {
     ASSERT_NE(keyAWithIndex.getUnstablePart(), keyBWithIndex.getUnstablePart());
 }
 
+TEST(PlanCacheTest, PlanCacheSizeWithCRUDOperations) {
+    PlanCache planCache;
+    unique_ptr<CanonicalQuery> cq(canonicalize("{a: 1, b: 1}"));
+    auto qs = getQuerySolutionForCaching();
+    std::vector<QuerySolution*> solns = {qs.get()};
+    long long previousSize, originalSize = PlanCacheEntry::planCacheTotalSizeEstimateBytes.get();
+
+    // Verify that the plan cache size increases after adding new entry to cache.
+    previousSize = PlanCacheEntry::planCacheTotalSizeEstimateBytes.get();
+    ASSERT_OK(planCache.set(*cq, solns, createDecision(1U), Date_t{}));
+    ASSERT_GT(PlanCacheEntry::planCacheTotalSizeEstimateBytes.get(), previousSize);
+
+    // Verify that trying to set the same entry won't change the plan cache size.
+    previousSize = PlanCacheEntry::planCacheTotalSizeEstimateBytes.get();
+    ASSERT_OK(planCache.set(*cq, solns, createDecision(1U), Date_t{}));
+    ASSERT_EQ(PlanCacheEntry::planCacheTotalSizeEstimateBytes.get(), previousSize);
+
+    // Verify that the plan cache size increases after updating the same entry with more solutions.
+    solns.push_back(qs.get());
+    ASSERT_OK(planCache.set(*cq, solns, createDecision(2U), Date_t{}));
+    ASSERT_GT(PlanCacheEntry::planCacheTotalSizeEstimateBytes.get(), previousSize);
+
+    // Verify that the plan cache size decreases after updating the same entry with fewer solutions.
+    solns.erase(solns.end() - 1);
+    previousSize = PlanCacheEntry::planCacheTotalSizeEstimateBytes.get();
+    ASSERT_OK(planCache.set(*cq, solns, createDecision(1U), Date_t{}));
+    ASSERT_LT(PlanCacheEntry::planCacheTotalSizeEstimateBytes.get(), previousSize);
+    ASSERT_GT(PlanCacheEntry::planCacheTotalSizeEstimateBytes.get(), originalSize);
+
+    // Verify that adding multiple entries will increasing the cache size.
+    long long sizeWithOneEntry = PlanCacheEntry::planCacheTotalSizeEstimateBytes.get();
+    std::string queryString = "{a: 1, c: 1}";
+    for (int i = 0; i < 5; ++i) {
+        // Update the field name in the query string so that plan cache creates a new entry.
+        queryString[1] = 'b' + i;
+        unique_ptr<CanonicalQuery> query(canonicalize(queryString));
+        previousSize = PlanCacheEntry::planCacheTotalSizeEstimateBytes.get();
+        ASSERT_OK(planCache.set(*query, solns, createDecision(1U), Date_t{}));
+        ASSERT_GT(PlanCacheEntry::planCacheTotalSizeEstimateBytes.get(), previousSize);
+    }
+
+    // Verify that removing multiple entries will decreasing the cache size.
+    for (int i = 0; i < 5; ++i) {
+        // Update the field name in the query to match the previously created plan cache entry key.
+        queryString[1] = 'b' + i;
+        unique_ptr<CanonicalQuery> query(canonicalize(queryString));
+        previousSize = PlanCacheEntry::planCacheTotalSizeEstimateBytes.get();
+        ASSERT_OK(planCache.remove(*query));
+        ASSERT_LT(PlanCacheEntry::planCacheTotalSizeEstimateBytes.get(), previousSize);
+    }
+    // Verify that size is reset to the size when there is only entry.
+    ASSERT_EQ(PlanCacheEntry::planCacheTotalSizeEstimateBytes.get(), sizeWithOneEntry);
+
+    // Verify that trying to remove a non-existing key won't change the plan cache size.
+    previousSize = PlanCacheEntry::planCacheTotalSizeEstimateBytes.get();
+    unique_ptr<CanonicalQuery> newQuery(canonicalize("{a: 1}"));
+    ASSERT_NOT_OK(planCache.remove(*newQuery));
+    ASSERT_EQ(PlanCacheEntry::planCacheTotalSizeEstimateBytes.get(), previousSize);
+
+    // Verify that the plan cache size goes back to original size when the entry is removed.
+    ASSERT_OK(planCache.remove(*cq));
+    ASSERT_EQ(planCache.size(), 0U);
+    ASSERT_EQ(PlanCacheEntry::planCacheTotalSizeEstimateBytes.get(), originalSize);
+}
+
+TEST(PlanCacheTest, PlanCacheSizeWithEviction) {
+    const size_t kCacheSize = 5;
+    PlanCache planCache(kCacheSize);
+    unique_ptr<CanonicalQuery> cq(canonicalize("{a: 1, b: 1}"));
+    auto qs = getQuerySolutionForCaching();
+    std::vector<QuerySolution*> solns = {qs.get(), qs.get()};
+    long long originalSize = PlanCacheEntry::planCacheTotalSizeEstimateBytes.get();
+    long long previousSize = PlanCacheEntry::planCacheTotalSizeEstimateBytes.get();
+
+    // Add entries until plan cache is full and verify that the size keeps increasing.
+    std::string queryString = "{a: 1, c: 1}";
+    for (size_t i = 0; i < kCacheSize; ++i) {
+        // Update the field name in the query string so that plan cache creates a new entry.
+        queryString[1]++;
+        unique_ptr<CanonicalQuery> query(canonicalize(queryString));
+        previousSize = PlanCacheEntry::planCacheTotalSizeEstimateBytes.get();
+        ASSERT_OK(planCache.set(*query, solns, createDecision(2U), Date_t{}));
+        ASSERT_GT(PlanCacheEntry::planCacheTotalSizeEstimateBytes.get(), previousSize);
+    }
+
+    // Verify that adding entry of same size as evicted entry wouldn't change the plan cache size.
+    queryString = "{k: 1, c: 1}";
+    cq = unique_ptr<CanonicalQuery>(canonicalize(queryString));
+    previousSize = PlanCacheEntry::planCacheTotalSizeEstimateBytes.get();
+    ASSERT_EQ(planCache.size(), kCacheSize);
+    ASSERT_OK(planCache.set(*cq, solns, createDecision(2U), Date_t{}));
+    ASSERT_EQ(planCache.size(), kCacheSize);
+    ASSERT_EQ(PlanCacheEntry::planCacheTotalSizeEstimateBytes.get(), previousSize);
+
+    // Verify that adding entry with query bigger than the evicted entry's key should change the
+    // plan cache size.
+    queryString = "{k: 1, c: 1, extraField: 1}";
+    unique_ptr<CanonicalQuery> queryBiggerKey(canonicalize(queryString));
+    previousSize = PlanCacheEntry::planCacheTotalSizeEstimateBytes.get();
+    ASSERT_OK(planCache.set(*queryBiggerKey, solns, createDecision(2U), Date_t{}));
+    ASSERT_GT(PlanCacheEntry::planCacheTotalSizeEstimateBytes.get(), previousSize);
+
+    // Verify that adding entry with query solutions larger than the evicted entry's query solutions
+    // should increase the plan cache size.
+    queryString = "{l: 1, c: 1}";
+    cq = unique_ptr<CanonicalQuery>(canonicalize(queryString));
+    previousSize = PlanCacheEntry::planCacheTotalSizeEstimateBytes.get();
+    solns.push_back(qs.get());
+    ASSERT_OK(planCache.set(*cq, solns, createDecision(3U), Date_t{}));
+    ASSERT_GT(PlanCacheEntry::planCacheTotalSizeEstimateBytes.get(), previousSize);
+
+    // Verify that adding entry with query solutions smaller than the evicted entry's query
+    // solutions should decrease the plan cache size.
+    queryString = "{m: 1, c: 1}";
+    cq = unique_ptr<CanonicalQuery>(canonicalize(queryString));
+    previousSize = PlanCacheEntry::planCacheTotalSizeEstimateBytes.get();
+    solns = {qs.get()};
+    ASSERT_OK(planCache.set(*cq, solns, createDecision(1U), Date_t{}));
+    ASSERT_LT(PlanCacheEntry::planCacheTotalSizeEstimateBytes.get(), previousSize);
+
+    // clear() should reset the size.
+    planCache.clear();
+    ASSERT_EQ(PlanCacheEntry::planCacheTotalSizeEstimateBytes.get(), originalSize);
+}
+
+TEST(PlanCacheTest, PlanCacheSizeWithMultiplePlanCaches) {
+    PlanCache planCache1;
+    PlanCache planCache2;
+    unique_ptr<CanonicalQuery> cq(canonicalize("{a: 1, b: 1}"));
+    auto qs = getQuerySolutionForCaching();
+    std::vector<QuerySolution*> solns = {qs.get()};
+    long long previousSize, originalSize = PlanCacheEntry::planCacheTotalSizeEstimateBytes.get();
+
+    // Verify that adding entries to both plan caches will keep increasing the cache size.
+    std::string queryString = "{a: 1, c: 1}";
+    for (int i = 0; i < 5; ++i) {
+        // Update the field name in the query string so that plan cache creates a new entry.
+        queryString[1] = 'b' + i;
+        unique_ptr<CanonicalQuery> query(canonicalize(queryString));
+        previousSize = PlanCacheEntry::planCacheTotalSizeEstimateBytes.get();
+        ASSERT_OK(planCache1.set(*query, solns, createDecision(1U), Date_t{}));
+        ASSERT_GT(PlanCacheEntry::planCacheTotalSizeEstimateBytes.get(), previousSize);
+
+        previousSize = PlanCacheEntry::planCacheTotalSizeEstimateBytes.get();
+        ASSERT_OK(planCache2.set(*query, solns, createDecision(1U), Date_t{}));
+        ASSERT_GT(PlanCacheEntry::planCacheTotalSizeEstimateBytes.get(), previousSize);
+    }
+
+    // Verify that removing entries from one plan caches will keep decreasing the cache size.
+    for (int i = 0; i < 5; ++i) {
+        // Update the field name in the query to match the previously created plan cache entry key.
+        queryString[1] = 'b' + i;
+        unique_ptr<CanonicalQuery> query(canonicalize(queryString));
+        previousSize = PlanCacheEntry::planCacheTotalSizeEstimateBytes.get();
+        ASSERT_OK(planCache1.remove(*query));
+        ASSERT_LT(PlanCacheEntry::planCacheTotalSizeEstimateBytes.get(), previousSize);
+    }
+
+    // Verify for scoped PlanCache object.
+    long long sizeBeforeScopedPlanCache = PlanCacheEntry::planCacheTotalSizeEstimateBytes.get();
+    {
+        PlanCache planCache;
+        previousSize = PlanCacheEntry::planCacheTotalSizeEstimateBytes.get();
+        ASSERT_OK(planCache.set(*cq, solns, createDecision(1U), Date_t{}));
+        ASSERT_GT(PlanCacheEntry::planCacheTotalSizeEstimateBytes.get(), previousSize);
+    }
+
+    // Verify that size is reset to 'sizeBeforeScopedPlanCache' after the destructor of 'planCache'
+    // is called.
+    ASSERT_EQ(PlanCacheEntry::planCacheTotalSizeEstimateBytes.get(), sizeBeforeScopedPlanCache);
+
+    // Clear 'planCache2' to remove all entries.
+    previousSize = PlanCacheEntry::planCacheTotalSizeEstimateBytes.get();
+    planCache2.clear();
+    ASSERT_LT(PlanCacheEntry::planCacheTotalSizeEstimateBytes.get(), previousSize);
+
+    // Verify that size is reset to the original size after removing all entries.
+    ASSERT_EQ(PlanCacheEntry::planCacheTotalSizeEstimateBytes.get(), originalSize);
+}
+
+TEST(PlanCacheTest, DifferentQueryEngines) {
+    // Helper to construct a plan cache key given 'forceClassicEngine'.
+    auto constructPlanCacheKey = [](const PlanCache& pc, bool forceClassicEngine) -> PlanCacheKey {
+        RAIIServerParameterControllerForTest controller{"internalQueryForceClassicEngine",
+                                                        forceClassicEngine};
+        const auto queryStr = "{a: 0}";
+        unique_ptr<CanonicalQuery> cq(canonicalize(queryStr));
+        return pc.computeKey(*cq);
+    };
+
+    PlanCache planCache;
+    const auto keyPattern = BSON("a" << 1);
+
+    // Create a normal btree index. It will have a discriminator.
+    planCache.notifyOfIndexUpdates(
+        {CoreIndexInfo(keyPattern,
+                       IndexNames::nameToType(IndexNames::findPluginName(keyPattern)),
+                       false,                          // sparse
+                       IndexEntry::Identifier{""})});  // name
+
+    const auto classicEngineKey = constructPlanCacheKey(planCache, true);
+    const auto noClassicEngineKey = constructPlanCacheKey(planCache, false);
+
+    // Check that the two plan cache keys are not equal because the plans were created under
+    // different engines.
+    assertPlanCacheKeysUnequalDueToForceClassicEngineValue(classicEngineKey, noClassicEngineKey);
+}
 }  // namespace

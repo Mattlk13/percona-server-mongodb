@@ -29,21 +29,56 @@
 
 #include "mongo/platform/basic.h"
 
+#include <sstream>
+
 #include "mongo/db/multi_key_path_tracker.h"
 
 #include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
 const OperationContext::Decoration<MultikeyPathTracker> MultikeyPathTracker::get =
     OperationContext::declareDecoration<MultikeyPathTracker>();
 
+// static
+std::string MultikeyPathTracker::dumpMultikeyPaths(const MultikeyPaths& multikeyPaths) {
+    std::stringstream ss;
+
+    ss << "[ ";
+    for (const auto& multikeyComponents : multikeyPaths) {
+        ss << "[ ";
+        for (const auto& multikeyComponent : multikeyComponents) {
+            ss << multikeyComponent << " ";
+        }
+        ss << "] ";
+    }
+    ss << "]";
+
+    return ss.str();
+}
+
 void MultikeyPathTracker::mergeMultikeyPaths(MultikeyPaths* toMergeInto,
                                              const MultikeyPaths& newPaths) {
-    invariant(toMergeInto->size() == newPaths.size());
+    invariant(toMergeInto->size() == newPaths.size(),
+              str::stream() << "toMergeInto: " << dumpMultikeyPaths(*toMergeInto)
+                            << "; newPaths: " << dumpMultikeyPaths(newPaths));
     for (auto idx = std::size_t(0); idx < toMergeInto->size(); ++idx) {
         toMergeInto->at(idx).insert(newPaths[idx].begin(), newPaths[idx].end());
     }
+}
+
+bool MultikeyPathTracker::covers(const MultikeyPaths& parent, const MultikeyPaths& child) {
+    for (size_t idx = 0; idx < parent.size(); ++idx) {
+        auto& parentPath = parent[idx];
+        auto& childPath = child[idx];
+        for (auto&& item : childPath) {
+            if (parentPath.find(item) == parentPath.end()) {
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 void MultikeyPathTracker::addMultikeyPathInfo(MultikeyPathInfo info) {
@@ -56,6 +91,9 @@ void MultikeyPathTracker::addMultikeyPathInfo(MultikeyPathInfo info) {
         }
 
         mergeMultikeyPaths(&existingChanges.multikeyPaths, info.multikeyPaths);
+        existingChanges.multikeyMetadataKeys.insert(
+            std::make_move_iterator(info.multikeyMetadataKeys.begin()),
+            std::make_move_iterator(info.multikeyMetadataKeys.end()));
         return;
     }
 

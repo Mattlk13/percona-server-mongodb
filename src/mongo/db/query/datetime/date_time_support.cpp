@@ -27,10 +27,11 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
+#include <limits>
 #include <memory>
 #include <timelib.h>
 
@@ -39,10 +40,10 @@
 #include "mongo/base/init.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/db/service_context.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/platform/overflow_arithmetic.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/ctype.h"
 #include "mongo/util/duration.h"
-#include "mongo/util/log.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -59,16 +60,14 @@ std::unique_ptr<_timelib_time, TimeZone::TimelibTimeDeleter> createTimelibTime()
 // Converts a date to a number of seconds, being careful to round appropriately for negative numbers
 // of seconds.
 long long seconds(Date_t date) {
-    auto millis = date.toMillisSinceEpoch();
-    if (millis < 0) {
-        // We want the division below to truncate toward -inf rather than 0
-        // eg Dec 31, 1969 23:59:58.001 should be -2 seconds rather than -1
-        // This is needed to get the correct values from coerceToTM
-        if (-1999 / 1000 != -2) {  // this is implementation defined
-            millis -= 1000 - 1;
-        }
-    }
-    return durationCount<Seconds>(Milliseconds(millis));
+    // We want the division below to truncate toward -inf rather than 0
+    // eg Dec 31, 1969 23:59:58.001 should be -2 seconds rather than -1
+    // This is needed to get the correct values from coerceToTM
+    constexpr auto needsRounding = -1999 / 1000 != -2;  // This is implementaiton defined.
+    if (auto millis = date.toMillisSinceEpoch(); millis < 0 && millis % 1000 != 0 && needsRounding)
+        return durationCount<Seconds>(Milliseconds(millis)) - 1ll;
+    else
+        return durationCount<Seconds>(Milliseconds(millis));
 }
 
 //
@@ -180,12 +179,11 @@ void TimeZoneDatabase::loadTimeZoneInfo(
                 40475,
                 {ErrorCodes::FailedToParse,
                  str::stream() << "failed to parse time zone file for time zone identifier \""
-                               << entry.id
-                               << "\": "
-                               << timelib_get_error_message(errorCode)});
+                               << entry.id << "\": " << timelib_get_error_message(errorCode)});
         }
 
-        invariant(errorCode == TIMELIB_ERROR_NO_ERROR);
+        invariant(errorCode == TIMELIB_ERROR_NO_ERROR ||
+                  errorCode == TIMELIB_ERROR_EMPTY_POSIX_STRING);
         _timeZones[entry.id] = TimeZone{tzInfo};
     }
 }
@@ -194,7 +192,7 @@ TimeZone TimeZoneDatabase::utcZone() {
     return TimeZone{nullptr};
 }
 
-static timelib_tzinfo* timezonedatabase_gettzinfowrapper(char* tz_id,
+static timelib_tzinfo* timezonedatabase_gettzinfowrapper(const char* tz_id,
                                                          const _timelib_tzdb* db,
                                                          int* error) {
     return nullptr;
@@ -276,8 +274,7 @@ Date_t TimeZoneDatabase::fromString(StringData dateString,
         uasserted(ErrorCodes::ConversionFailure,
                   str::stream()
                       << "an incomplete date/time string has been found, with elements missing: \""
-                      << dateString
-                      << "\"");
+                      << dateString << "\"");
     }
 
     if (!tz.isUtcZone()) {
@@ -295,8 +292,7 @@ Date_t TimeZoneDatabase::fromString(StringData dateString,
                     ErrorCodes::ConversionFailure,
                     str::stream()
                         << "you cannot pass in a date/time string with time zone information ('"
-                        << parsedTime.get()->tz_abbr
-                        << "') together with a timezone argument");
+                        << parsedTime.get()->tz_abbr << "') together with a timezone argument");
                 break;
             default:  // should technically not be possible to reach
                 uasserted(ErrorCodes::ConversionFailure,
@@ -319,19 +315,21 @@ boost::optional<Seconds> TimeZoneDatabase::parseUtcOffset(StringData offsetSpec)
         auto bias = offsetSpec[0] == '+' ? 1 : -1;
 
         // ±HH
-        if (offsetSpec.size() == 3 && isdigit(offsetSpec[1]) && isdigit(offsetSpec[2])) {
+        if (offsetSpec.size() == 3 && ctype::isDigit(offsetSpec[1]) &&
+            ctype::isDigit(offsetSpec[2])) {
             int offset;
-            if (parseNumberFromStringWithBase(offsetSpec.substr(1, 2), 10, &offset).isOK()) {
+            if (NumberParser().base(10)(offsetSpec.substr(1, 2), &offset).isOK()) {
                 return duration_cast<Seconds>(Hours(bias * offset));
             }
             return boost::none;
         }
 
         // ±HHMM
-        if (offsetSpec.size() == 5 && isdigit(offsetSpec[1]) && isdigit(offsetSpec[2]) &&
-            isdigit(offsetSpec[3]) && isdigit(offsetSpec[4])) {
+        if (offsetSpec.size() == 5 && ctype::isDigit(offsetSpec[1]) &&
+            ctype::isDigit(offsetSpec[2]) && ctype::isDigit(offsetSpec[3]) &&
+            ctype::isDigit(offsetSpec[4])) {
             int offset;
-            if (parseNumberFromStringWithBase(offsetSpec.substr(1, 4), 10, &offset).isOK()) {
+            if (NumberParser().base(10)(offsetSpec.substr(1, 4), &offset).isOK()) {
                 return duration_cast<Seconds>(Hours(bias * (offset / 100L)) +
                                               Minutes(bias * (offset % 100)));
             }
@@ -339,19 +337,25 @@ boost::optional<Seconds> TimeZoneDatabase::parseUtcOffset(StringData offsetSpec)
         }
 
         // ±HH:MM
-        if (offsetSpec.size() == 6 && isdigit(offsetSpec[1]) && isdigit(offsetSpec[2]) &&
-            offsetSpec[3] == ':' && isdigit(offsetSpec[4]) && isdigit(offsetSpec[5])) {
+        if (offsetSpec.size() == 6 && ctype::isDigit(offsetSpec[1]) &&
+            ctype::isDigit(offsetSpec[2]) && offsetSpec[3] == ':' &&
+            ctype::isDigit(offsetSpec[4]) && ctype::isDigit(offsetSpec[5])) {
             int hourOffset, minuteOffset;
-            if (!parseNumberFromStringWithBase(offsetSpec.substr(1, 2), 10, &hourOffset).isOK()) {
+            if (!NumberParser().base(10)(offsetSpec.substr(1, 2), &hourOffset).isOK()) {
                 return boost::none;
             }
-            if (!parseNumberFromStringWithBase(offsetSpec.substr(4, 2), 10, &minuteOffset).isOK()) {
+            if (!NumberParser().base(10)(offsetSpec.substr(4, 2), &minuteOffset).isOK()) {
                 return boost::none;
             }
             return duration_cast<Seconds>(Hours(bias * hourOffset) + Minutes(bias * minuteOffset));
         }
     }
     return boost::none;
+}
+
+bool TimeZoneDatabase::isTimeZoneIdentifier(StringData timeZoneId) const {
+    return (_timeZones.find(timeZoneId) != _timeZones.end()) ||
+        static_cast<bool>(parseUtcOffset(timeZoneId));
 }
 
 TimeZone TimeZoneDatabase::getTimeZone(StringData timeZoneId) const {
@@ -367,6 +371,16 @@ TimeZone TimeZoneDatabase::getTimeZone(StringData timeZoneId) const {
 
     uasserted(40485,
               str::stream() << "unrecognized time zone identifier: \"" << timeZoneId << "\"");
+}
+
+std::vector<std::string> TimeZoneDatabase::getTimeZoneStrings() const {
+    std::vector<std::string> timeZoneStrings = {};
+
+    for (auto const& timezone : _timeZones) {
+        timeZoneStrings.push_back(timezone.first);
+    }
+
+    return timeZoneStrings;
 }
 
 void TimeZone::adjustTimeZone(timelib_time* timelibTime) const {
@@ -398,8 +412,9 @@ Date_t TimeZone::createFromDateParts(long long year,
 
     adjustTimeZone(newTime.get());
 
-    auto returnValue = Date_t::fromMillisSinceEpoch(
-        durationCount<Milliseconds>(Seconds(newTime->sse) + Microseconds(newTime->us)));
+    auto returnValue =
+        Date_t::fromMillisSinceEpoch(durationCount<Milliseconds>(Seconds(newTime->sse)) +
+                                     durationCount<Milliseconds>(Microseconds(newTime->us)));
 
     return returnValue;
 }
@@ -422,8 +437,9 @@ Date_t TimeZone::createFromIso8601DateParts(long long isoYear,
 
     adjustTimeZone(newTime.get());
 
-    auto returnValue = Date_t::fromMillisSinceEpoch(
-        durationCount<Milliseconds>(Seconds(newTime->sse) + Microseconds(newTime->us)));
+    auto returnValue =
+        Date_t::fromMillisSinceEpoch(durationCount<Milliseconds>(Seconds(newTime->sse)) +
+                                     durationCount<Milliseconds>(Microseconds(newTime->us)));
 
     return returnValue;
 }
@@ -523,6 +539,11 @@ int TimeZone::dayOfYear(Date_t date) const {
     return timelib_day_of_year(time->y, time->m, time->d) + 1;
 }
 
+int TimeZone::dayOfMonth(Date_t date) const {
+    auto time = getTimelibTime(date);
+    return time->d;
+}
+
 int TimeZone::isoDayOfWeek(Date_t date) const {
     auto time = getTimelibTime(date);
     return timelib_iso_day_of_week(time->y, time->m, time->d);
@@ -545,9 +566,15 @@ long long TimeZone::isoYear(Date_t date) const {
 }
 
 Seconds TimeZone::utcOffset(Date_t date) const {
-    auto time = getTimelibTime(date);
-
-    return Seconds(time->z);
+    if (isTimeZoneIDZone()) {
+        auto* offset = timelib_get_time_zone_info(
+            durationCount<Seconds>(date.toDurationSinceEpoch()), _tzInfo.get());
+        auto timezoneOffsetFromUTC = Seconds(offset->offset);
+        timelib_time_offset_dtor(offset);
+        return timezoneOffsetFromUTC;
+    } else {
+        return _utcOffset;
+    }
 }
 
 void TimeZone::validateToStringFormat(StringData format) {
@@ -558,9 +585,645 @@ void TimeZone::validateFromStringFormat(StringData format) {
     return validateFormat(format, kDateFromStringFormatMap);
 }
 
-std::string TimeZone::formatDate(StringData format, Date_t date) const {
+StatusWith<std::string> TimeZone::formatDate(StringData format, Date_t date) const {
     StringBuilder formatted;
-    outputDateWithFormat(formatted, format, date);
-    return formatted.str();
+    if (auto status = outputDateWithFormat(formatted, format, date); status != Status::OK())
+        return status;
+    else
+        return formatted.str();
+}
+
+namespace {
+constexpr auto kMonthsInOneYear = 12LL;
+constexpr auto kDaysInNonLeapYear = 365LL;
+constexpr auto kHoursPerDay = 24LL;
+constexpr auto kMinutesPerHour = 60LL;
+constexpr auto kSecondsPerMinute = 60LL;
+constexpr auto kMillisecondsPerSecond = 1000LL;
+constexpr int kDaysPerWeek = 7;
+constexpr auto kQuartersPerYear = 4LL;
+constexpr auto kQuarterLengthInMonths = 3LL;
+constexpr long kMillisecondsPerDay{kHoursPerDay * kMinutesPerHour * kSecondsPerMinute *
+                                   kMillisecondsPerSecond};
+constexpr long kLeapYearReferencePoint = -1000000000L;
+
+/**
+ * A Date with only year, month and day of month components.
+ */
+struct Date {
+    Date(const timelib_time& timelibTime)
+        : year{timelibTime.y},
+          month{static_cast<int>(timelibTime.m)},
+          dayOfMonth{static_cast<int>(timelibTime.d)} {}
+    Date(long long year, int month, int dayOfMonth)
+        : year{year}, month{month}, dayOfMonth{dayOfMonth} {}
+    long long year;
+    int month;  // January = 1.
+    int dayOfMonth;
+};
+
+/**
+ * Determines a number of leap years in a year range (leap year reference point; 'year'].
+ */
+inline long leapYearsSinceReferencePoint(long year) {
+    // Count a number of leap years that happened since the reference point, where a leap year is
+    // when year%4==0, excluding years when year%100==0, except when year%400==0.
+    auto yearsSinceReferencePoint = year - kLeapYearReferencePoint;
+    return yearsSinceReferencePoint / 4 - yearsSinceReferencePoint / 100 +
+        yearsSinceReferencePoint / 400;
+}
+
+/**
+ * Sums the number of days in the Gregorian calendar in years: 'startYear',
+ * 'startYear'+1, .., 'endYear'-1.
+ */
+inline long long daysBetweenYears(long startYear, long endYear) {
+    return leapYearsSinceReferencePoint(endYear - 1) - leapYearsSinceReferencePoint(startYear - 1) +
+        (endYear - startYear) * kDaysInNonLeapYear;
+}
+
+/**
+ * Determines a correction needed in number of hours when calculating passed hours between two time
+ * instants 'startInstant' and 'endInstant' due to the Daylight Savings Time. Returns 0, if both
+ * time instants 'startInstant' and 'endInstant' are either in Standard Time (ST) or in Daylight
+ * Saving Time (DST); returns 1, if 'endInstant' is in ST and 'startInstant' is in DST and
+ * 'endInstant' > 'startInstant' or 'endInstant' is in DST and 'startInstant' is in ST and
+ * 'endInstant' < 'startInstant'; otherwise returns -1.
+ */
+inline long long dstCorrection(timelib_time* startInstant, timelib_time* endInstant) {
+    return (startInstant->z - endInstant->z) / (kMinutesPerHour * kSecondsPerMinute);
+}
+inline long long dateDiffYear(Date startInstant, Date endInstant) {
+    return endInstant.year - startInstant.year;
+}
+
+/**
+ * Determines which quarter month 'month' belongs to. 'month' value range is 1..12. Returns a number
+ * of a quarter, where 0 corresponds to the first quarter.
+ */
+inline int quarter(int month) {
+    return (month - 1) / kQuarterLengthInMonths;
+}
+inline long long dateDiffQuarter(Date startInstant, Date endInstant) {
+    return quarter(endInstant.month) - quarter(startInstant.month) +
+        dateDiffYear(startInstant, endInstant) * kQuartersPerYear;
+}
+inline long long dateDiffMonth(Date startInstant, Date endInstant) {
+    return endInstant.month - startInstant.month +
+        dateDiffYear(startInstant, endInstant) * kMonthsInOneYear;
+}
+inline long long dateDiffDay(Date startInstant, Date endInstant) {
+    return timelib_day_of_year(endInstant.year, endInstant.month, endInstant.dayOfMonth) -
+        timelib_day_of_year(startInstant.year, startInstant.month, startInstant.dayOfMonth) +
+        daysBetweenYears(startInstant.year, endInstant.year);
+}
+
+/**
+ * Determines which day of the week time instant 'timeInstant' is in given that the week starts on
+ * day 'startOfWeek'. Returns 0 for the first day, and 6 - for the last.
+ */
+inline unsigned int dayOfWeek(Date timeInstant, DayOfWeek startOfWeek) {
+    // We use 'timelib_iso_day_of_week()' since it returns value 1 for Monday.
+    return (timelib_iso_day_of_week(timeInstant.year, timeInstant.month, timeInstant.dayOfMonth) -
+            static_cast<uint8_t>(startOfWeek) + kDaysPerWeek) %
+        kDaysPerWeek;
+}
+
+/**
+ * Determines a number of weeks between time instant 'startInstant' and 'endInstant' when the first
+ * day of the week is 'startOfWeek'.
+ */
+inline long long dateDiffWeek(Date startInstant, Date endInstant, DayOfWeek startOfWeek) {
+    return (dateDiffDay(startInstant, endInstant) + dayOfWeek(startInstant, startOfWeek) -
+            dayOfWeek(endInstant, startOfWeek)) /
+        kDaysPerWeek;
+}
+inline long long dateDiffHour(timelib_time* startInstant, timelib_time* endInstant) {
+    return endInstant->h - startInstant->h +
+        dateDiffDay(*startInstant, *endInstant) * kHoursPerDay +
+        dstCorrection(startInstant, endInstant);
+}
+inline long long dateDiffMinute(timelib_time* startInstant, timelib_time* endInstant) {
+    return endInstant->i - startInstant->i +
+        dateDiffHour(startInstant, endInstant) * kMinutesPerHour;
+}
+inline long long dateDiffSecond(timelib_time* startInstant, timelib_time* endInstant) {
+    return endInstant->s - startInstant->s +
+        dateDiffMinute(startInstant, endInstant) * kSecondsPerMinute;
+}
+inline long long dateDiffMillisecond(Date_t startDate, Date_t endDate) {
+    long long result;
+    uassert(5166308,
+            "dateDiff overflowed",
+            !overflow::sub(endDate.toMillisSinceEpoch(), startDate.toMillisSinceEpoch(), &result));
+    return result;
+}
+
+// A mapping from a string expression of TimeUnit to TimeUnit.
+static const StringMap<TimeUnit> timeUnitNameToTimeUnitMap{
+    {"year", TimeUnit::year},
+    {"quarter", TimeUnit::quarter},
+    {"month", TimeUnit::month},
+    {"week", TimeUnit::week},
+    {"day", TimeUnit::day},
+    {"hour", TimeUnit::hour},
+    {"minute", TimeUnit::minute},
+    {"second", TimeUnit::second},
+    {"millisecond", TimeUnit::millisecond},
+};
+
+// A mapping from string representations of a day of a week to DayOfWeek.
+static const StringMap<DayOfWeek> dayOfWeekNameToDayOfWeekMap{
+    {"monday", DayOfWeek::monday},
+    {"mon", DayOfWeek::monday},
+    {"tuesday", DayOfWeek::tuesday},
+    {"tue", DayOfWeek::tuesday},
+    {"wednesday", DayOfWeek::wednesday},
+    {"wed", DayOfWeek::wednesday},
+    {"thursday", DayOfWeek::thursday},
+    {"thu", DayOfWeek::thursday},
+    {"friday", DayOfWeek::friday},
+    {"fri", DayOfWeek::friday},
+    {"saturday", DayOfWeek::saturday},
+    {"sat", DayOfWeek::saturday},
+    {"sunday", DayOfWeek::sunday},
+    {"sun", DayOfWeek::sunday},
+};
+}  // namespace
+
+long long dateDiff(Date_t startDate,
+                   Date_t endDate,
+                   TimeUnit unit,
+                   const TimeZone& timezone,
+                   DayOfWeek startOfWeek) {
+    if (TimeUnit::millisecond == unit) {
+        return dateDiffMillisecond(startDate, endDate);
+    }
+
+    // Translate the time instants to the given timezone.
+    auto startDateInTimeZone = timezone.getTimelibTime(startDate);
+    auto endDateInTimeZone = timezone.getTimelibTime(endDate);
+    switch (unit) {
+        case TimeUnit::year:
+            return dateDiffYear(*startDateInTimeZone, *endDateInTimeZone);
+        case TimeUnit::quarter:
+            return dateDiffQuarter(*startDateInTimeZone, *endDateInTimeZone);
+        case TimeUnit::month:
+            return dateDiffMonth(*startDateInTimeZone, *endDateInTimeZone);
+        case TimeUnit::week:
+            return dateDiffWeek(*startDateInTimeZone, *endDateInTimeZone, startOfWeek);
+        case TimeUnit::day:
+            return dateDiffDay(*startDateInTimeZone, *endDateInTimeZone);
+        case TimeUnit::hour:
+            return dateDiffHour(startDateInTimeZone.get(), endDateInTimeZone.get());
+        case TimeUnit::minute:
+            return dateDiffMinute(startDateInTimeZone.get(), endDateInTimeZone.get());
+        case TimeUnit::second:
+            return dateDiffSecond(startDateInTimeZone.get(), endDateInTimeZone.get());
+        default:
+            MONGO_UNREACHABLE;
+    }
+}
+
+TimeUnit parseTimeUnit(StringData unitName) {
+    auto iterator = timeUnitNameToTimeUnitMap.find(unitName);
+    uassert(ErrorCodes::FailedToParse,
+            str::stream() << "unknown time unit value: " << unitName,
+            iterator != timeUnitNameToTimeUnitMap.end());
+    return iterator->second;
+}
+
+bool isValidTimeUnit(StringData unitName) {
+    return timeUnitNameToTimeUnitMap.find(unitName) != timeUnitNameToTimeUnitMap.end();
+}
+
+StringData serializeTimeUnit(TimeUnit unit) {
+    switch (unit) {
+        case TimeUnit::year:
+            return "year"_sd;
+        case TimeUnit::quarter:
+            return "quarter"_sd;
+        case TimeUnit::month:
+            return "month"_sd;
+        case TimeUnit::week:
+            return "week"_sd;
+        case TimeUnit::day:
+            return "day"_sd;
+        case TimeUnit::hour:
+            return "hour"_sd;
+        case TimeUnit::minute:
+            return "minute"_sd;
+        case TimeUnit::second:
+            return "second"_sd;
+        case TimeUnit::millisecond:
+            return "millisecond"_sd;
+    }
+    MONGO_UNREACHABLE_TASSERT(5339900);
+}
+
+DayOfWeek parseDayOfWeek(StringData dayOfWeek) {
+    // Perform case-insensitive lookup.
+    auto iterator = dayOfWeekNameToDayOfWeekMap.find(str::toLower(dayOfWeek));
+    uassert(ErrorCodes::FailedToParse,
+            str::stream() << "unknown day of week value: " << dayOfWeek,
+            iterator != dayOfWeekNameToDayOfWeekMap.end());
+    return iterator->second;
+}
+
+bool isValidDayOfWeek(StringData dayOfWeek) {
+    // Perform case-insensitive lookup.
+    return dayOfWeekNameToDayOfWeekMap.find(str::toLower(dayOfWeek)) !=
+        dayOfWeekNameToDayOfWeekMap.end();
+}
+
+void TimelibRelTimeDeleter::operator()(timelib_rel_time* relTime) {
+    timelib_rel_time_dtor(relTime);
+}
+
+std::unique_ptr<_timelib_rel_time, TimelibRelTimeDeleter> createTimelibRelTime() {
+    return std::unique_ptr<_timelib_rel_time, TimelibRelTimeDeleter>(timelib_rel_time_ctor());
+}
+
+std::unique_ptr<timelib_rel_time, TimelibRelTimeDeleter> getTimelibRelTime(TimeUnit unit,
+                                                                           long long amount) {
+    auto relTime = createTimelibRelTime();
+    switch (unit) {
+        case TimeUnit::year:
+            relTime->y = amount;
+            break;
+        case TimeUnit::quarter:
+            relTime->m = amount * kQuarterLengthInMonths;
+            break;
+        case TimeUnit::month:
+            relTime->m = amount;
+            break;
+        case TimeUnit::week:
+            relTime->d = amount * kDaysPerWeek;
+            break;
+        case TimeUnit::day:
+            relTime->d = amount;
+            break;
+        case TimeUnit::hour:
+            relTime->h = amount;
+            break;
+        case TimeUnit::minute:
+            relTime->i = amount;
+            break;
+        case TimeUnit::second:
+            relTime->s = amount;
+            break;
+        case TimeUnit::millisecond:
+            relTime->us = durationCount<Microseconds>(Milliseconds(amount));
+            break;
+        default:
+            MONGO_UNREACHABLE;
+    }
+    return relTime;
+}
+
+namespace {
+/**
+ * A helper function that adds an amount of months to a month given by 'year' and 'month'.
+ * The amount can be a negative number. Returns the new month as a [year, month] pair.
+ */
+std::pair<long long, long long> addMonths(long long year, long long month, long long amount) {
+    auto m = month + amount;
+    auto y = year;
+    if (m > 12) {
+        y += m / 12;
+        m -= 12 * (m / 12);
+    }
+    if (m <= 0) {
+        auto yearsInBetween = (-m) / 12 + 1;
+        m += 12 * yearsInBetween;
+        y -= yearsInBetween;
+    }
+    return {y, m};
+}
+
+/**
+ * A helper function that computes the number of days to add to get an equivalent result as from
+ * adding an 'amount' number of 'unit's in two use cases:
+ * In case the date is in UTC, a last day adjustment is needed if the day is greater than 28th.
+ * In case the date is in a timezone different from UTC, the time interval is always converted into
+ * a number of days to produce correct result in this timezone. This may also include a last day
+ * adjustment.
+ *
+ * The last day adjustment computation makes sure that the day in the result date is not greater
+ * than the last valid day in the respective month. Example: 2020-10-31 + 1 month -> day adjustment
+ * is needed since there is no 31st of November. The function computes adjusted time interval of 30
+ * days. For dates in UTC and day smaller than 29th, the function returns boost::none.
+ *
+ * tm: start date of the operation
+ * unit: the time unit
+ * amount: the amount of time units to be added
+ * returns optional intervalInDays : adjusted time interval in number of days if adjustment is
+ * needed
+ */
+boost::optional<long long> daysToAdd(timelib_time* tm, TimeUnit unit, long long amount) {
+    if (tm->d <= 28 && tm->z == 0) {
+        return boost::none;
+    }
+    if (unit == TimeUnit::year) {
+        unit = TimeUnit::month;
+        amount *= kMonthsInOneYear;
+    }
+    if (unit == TimeUnit::quarter) {
+        unit = TimeUnit::month;
+        amount *= kQuarterLengthInMonths;
+    }
+
+    auto [resYear, resMonth] = addMonths(tm->y, tm->m, amount);
+    auto maxResDay = timelib_days_in_month(resYear, resMonth);
+    auto targetDay = std::min(tm->d, maxResDay);
+    long long intervalInDays = timelib_day_of_year(resYear, resMonth, targetDay) -
+        timelib_day_of_year(tm->y, tm->m, tm->d) + daysBetweenYears(tm->y, resYear);
+    return boost::make_optional(intervalInDays);
+}
+
+/**
+ * A helper function that computes DST correction in seconds for start and end seconds-since-epoch
+ * for the given timezone argument.
+ */
+long long dateAddDSTCorrection(long long startSse, long long endSse, const TimeZone& timezone) {
+    auto tz = timezone.getTzInfo();
+    if (!tz) {
+        return 0;
+    }
+    auto startOffset = timelib_get_time_zone_info(startSse, tz.get());
+    auto endOffset = timelib_get_time_zone_info(endSse, tz.get());
+    long long corr = startOffset->offset - endOffset->offset;
+    // If the result date falls into the missing hour during Standard to DST time
+    // change, forward the clock with 1 hour.
+    if (endOffset->is_dst && endSse - endOffset->transition_time <= 3600) {
+        corr += 3600;
+    }
+    timelib_time_offset_dtor(startOffset);
+    timelib_time_offset_dtor(endOffset);
+    return corr;
+}
+
+/**
+ * Determines a distance of 'value' to the lower bound of a bin 'value' falls into. It assumes that
+ * there is a set of bins with following bounds .., [-'binSize', 0), [0, 'binSize'), ['binSize',
+ * 2*'binSize'), ..
+ *
+ * binSize - bin size. Must be greater than 0.
+ */
+inline long long distanceToBinLowerBound(long long value, long long binSize) {
+    tassert(5439019, "expected binSize > 0", binSize > 0);
+    long long remainder = value % binSize;
+    if (remainder < 0) {
+        remainder += binSize;
+    }
+    return remainder;
+}
+
+/**
+ * An optimized version of date truncation algorithm that works with bins in milliseconds, seconds,
+ * minutes and hours.
+ */
+inline Date_t truncateDateMillis(Date_t date,
+                                 Date_t referencePoint,
+                                 unsigned long long binSizeMillis) {
+    tassert(5439020,
+            "expected binSizeMillis to be convertable to a 64-bit signed integer",
+            binSizeMillis <=
+                static_cast<unsigned long long>(std::numeric_limits<long long>::max()));
+    long long shiftedDate;
+    uassert(5439000,
+            "dateTrunc overflowed",
+            !overflow::sub(
+                date.toMillisSinceEpoch(), referencePoint.toMillisSinceEpoch(), &shiftedDate));
+    long long result;
+    uassert(5439001,
+            "dateTrunc overflowed",
+            !overflow::sub(date.toMillisSinceEpoch(),
+                           distanceToBinLowerBound(shiftedDate, binSizeMillis),
+                           &result));
+    return Date_t::fromMillisSinceEpoch(result);
+}
+
+inline long long binSizeInMillis(unsigned long long binSize, unsigned long millisPerUnit) {
+    long long binSizeInMillis;
+    uassert(
+        5439002, "dateTrunc overflowed", !overflow::mul(binSize, millisPerUnit, &binSizeInMillis));
+    return binSizeInMillis;
+}
+
+/**
+ * The same as 'truncateDate(Date_t, TimeUnit, unsigned long long binSize, const TimeZone&,
+ * DayOfWeek)', but additionally accepts a reference point 'referencePoint', that is expected to be
+ * aligned to the given time unit.
+ *
+ * referencePoint - a reference point for bins. It is a pair of two different representations -
+ * milliseconds since Unix epoch and date component based to avoid the cost of converting from one
+ * representation to another.
+ */
+Date_t truncateDate(Date_t date,
+                    TimeUnit unit,
+                    unsigned long long binSize,
+                    std::pair<Date_t, Date> referencePoint,
+                    const TimeZone& timezone,
+                    DayOfWeek startOfWeek) {
+    switch (unit) {
+        case TimeUnit::millisecond:
+            return truncateDateMillis(date, referencePoint.first, binSize);
+        case TimeUnit::second:
+            return truncateDateMillis(
+                date, referencePoint.first, binSizeInMillis(binSize, kMillisecondsPerSecond));
+        case TimeUnit::minute:
+            return truncateDateMillis(
+                date,
+                referencePoint.first,
+                binSizeInMillis(binSize, kSecondsPerMinute * kMillisecondsPerSecond));
+        case TimeUnit::hour:
+            return truncateDateMillis(
+                date,
+                referencePoint.first,
+                binSizeInMillis(binSize,
+                                kMinutesPerHour * kSecondsPerMinute * kMillisecondsPerSecond));
+        default: {
+            uassert(
+                5439006,
+                "dateTrunc unsupported binSize value",
+                binSize <=
+                    100'000'000'000);  // This is a limit up to which dateAdd() can properly handle.
+            const auto dateInTimeZone = timezone.getTimelibTime(date);
+            long long distanceFromReferencePoint;
+            switch (unit) {
+                case TimeUnit::day:
+                    distanceFromReferencePoint =
+                        dateDiffDay(referencePoint.second, *dateInTimeZone);
+                    break;
+                case TimeUnit::week:
+                    distanceFromReferencePoint =
+                        dateDiffWeek(referencePoint.second, *dateInTimeZone, startOfWeek);
+                    break;
+                case TimeUnit::month:
+                    distanceFromReferencePoint =
+                        dateDiffMonth(referencePoint.second, *dateInTimeZone);
+                    break;
+                case TimeUnit::quarter:
+                    distanceFromReferencePoint =
+                        dateDiffQuarter(referencePoint.second, *dateInTimeZone);
+                    break;
+                case TimeUnit::year:
+                    distanceFromReferencePoint =
+                        dateDiffYear(referencePoint.second, *dateInTimeZone);
+                    break;
+                default:
+                    MONGO_UNREACHABLE_TASSERT(5439021);
+            }
+
+            // Determine a distance of the lower bound of a bin 'date' falls into from the reference
+            // point.
+            long long binLowerBoundFromRefPoint;
+            uassert(5439004,
+                    "dateTrunc overflowed",
+                    !overflow::sub(distanceFromReferencePoint,
+                                   distanceToBinLowerBound(distanceFromReferencePoint, binSize),
+                                   &binLowerBoundFromRefPoint));
+
+            // Determine the lower bound of a bin the 'date' falls into.
+            return dateAdd(referencePoint.first, unit, binLowerBoundFromRefPoint, timezone);
+        }
+    }
+}
+
+/**
+ * Returns the default reference point used in $dateTrunc computation that is tied to 'timezone'. It
+ * must be aligned to time unit 'unit'. This function returns a pair of representations of the
+ * reference point.
+ */
+std::pair<Date_t, Date> defaultReferencePointForDateTrunc(const TimeZone& timezone,
+                                                          TimeUnit unit,
+                                                          DayOfWeek startOfWeek) {
+    // We use a more resource efficient way than 'TimeZone::createFromDateParts()' to get reference
+    // point value in 'timezone'.
+    constexpr long long kReferencePointInUTCMillis = 946684800000LL;  // 2000-01-01T00:00:00.000Z
+    Date referencePoint{2000, 1, 1};
+    long long referencePointMillis = kReferencePointInUTCMillis -
+        durationCount<Milliseconds>(timezone.utcOffset(
+            Date_t::fromMillisSinceEpoch(kReferencePointInUTCMillis)));
+    dassert(timezone.createFromDateParts(2000, 1, 1, 0, 0, 0, 0).toMillisSinceEpoch() ==
+            referencePointMillis);
+
+    if (TimeUnit::week == unit) {
+        // Find the nearest to 'referencePoint' first day of the week that is in the future.
+        constexpr DayOfWeek kReferencePointDayOfWeek{
+            DayOfWeek::saturday};  // 2000-01-01 is Saturday.
+        int referencePointDayOfWeek = (static_cast<uint8_t>(kReferencePointDayOfWeek) -
+                                       static_cast<uint8_t>(startOfWeek) + kDaysPerWeek) %
+            kDaysPerWeek;
+        int daysToAdjustBy = (kDaysPerWeek - referencePointDayOfWeek) % kDaysPerWeek;
+
+        // If the reference point was an arbitrary value, we would need to use 'dateAdd()' function
+        // to correctly add a number of days to account for Daylight Saving Time (DST) transitions
+        // that may happen between the initial reference point and the resulting date (DST has a
+        // different offset from UTC than Standard Time). However, since the reference point is the
+        // first of January, 2000 and Daylight Saving Time transitions did not happen in the first
+        // half of January in year 2000, it is correct to just add a number of milliseconds in
+        // 'daysToAdjustBy' days.
+        referencePointMillis += daysToAdjustBy * kMillisecondsPerDay;
+        referencePoint.dayOfMonth += daysToAdjustBy;
+    }
+    return {Date_t::fromMillisSinceEpoch(referencePointMillis), referencePoint};
+}
+}  // namespace
+
+Date_t dateAdd(Date_t date, TimeUnit unit, long long amount, const TimeZone& timezone) {
+    if (unit == TimeUnit::millisecond) {
+        return date + Milliseconds(amount);
+    }
+
+    auto utcTime = createTimelibTime();
+    timelib_unixtime2gmt(utcTime.get(), seconds(date));
+    utcTime.get()->us = durationCount<Microseconds>(Milliseconds(date.toMillisSinceEpoch() % 1000));
+
+    // Check if an adjustment for the last day of month is necessary.
+    if (unit == TimeUnit::year || unit == TimeUnit::quarter || unit == TimeUnit::month) {
+        auto intervalInDays = [&]() {
+            if (timezone.isUtcZone()) {
+                return daysToAdd(utcTime.get(), unit, amount);
+            }
+            // If a timezone is provided, the last day adjustment is computed in this timezone.
+            auto localTime = timezone.getTimelibTime(date);
+            return daysToAdd(localTime.get(), unit, amount);
+        }();
+        if (intervalInDays) {
+            unit = TimeUnit::day;
+            amount = intervalInDays.get();
+        }
+    }
+
+    auto interval = getTimelibRelTime(unit, amount);
+
+    // Compute the result date in UTC and if needed later perform a DST correction for a timezone.
+    // The alternative computation in the associated timezone gives incorrect results when the
+    // computed date falls into the missing hour during the standard time-to-DST transition or
+    // falls into the repeated hour during the DST-to-standard time transition.
+    auto newTime = timelib_add(utcTime.get(), interval.get());
+
+    // Check the DST offsets in the given timezone and compute a correction if the time unit is
+    // a day or a larger unit. UTC and offset-based timezones do not have DST and do not need
+    // this correction.
+    if ((interval->d || interval->m || interval->y) && timezone.isTimeZoneIDZone()) {
+        newTime->sse += dateAddDSTCorrection(utcTime->sse, newTime->sse, timezone);
+    }
+
+    long long res;
+    if (overflow::mul(newTime->sse, 1000L, &res)) {
+        timelib_time_dtor(newTime);
+        uasserted(5166406, "dateAdd overflowed");
+    }
+
+    auto returnDate =
+        Date_t::fromMillisSinceEpoch(durationCount<Milliseconds>(Seconds(newTime->sse)) +
+                                     durationCount<Milliseconds>(Microseconds(newTime->us)));
+    timelib_time_dtor(newTime);
+    return returnDate;
+}
+
+StatusWith<long long> timeUnitTypicalMilliseconds(TimeUnit unit) {
+    auto constexpr millisecond = 1;
+    auto constexpr second = millisecond * kMillisecondsPerSecond;
+    auto constexpr minute = second * kSecondsPerMinute;
+    auto constexpr hour = minute * kMinutesPerHour;
+    auto constexpr day = hour * kHoursPerDay;
+    auto constexpr week = day * kDaysPerWeek;
+
+    switch (unit) {
+        case TimeUnit::millisecond:
+            return millisecond;
+        case TimeUnit::second:
+            return second;
+        case TimeUnit::minute:
+            return minute;
+        case TimeUnit::hour:
+            return hour;
+        case TimeUnit::day:
+            return day;
+        case TimeUnit::week:
+            return week;
+        case TimeUnit::month:
+        case TimeUnit::quarter:
+        case TimeUnit::year:
+            return Status(ErrorCodes::BadValue,
+                          str::stream() << "TimeUnit is too big: " << serializeTimeUnit(unit));
+    }
+    MONGO_UNREACHABLE_TASSERT(5423303);
+}
+
+Date_t truncateDate(Date_t date,
+                    TimeUnit unit,
+                    unsigned long long binSize,
+                    const TimeZone& timezone,
+                    DayOfWeek startOfWeek) {
+    uassert(5439005, "expected binSize > 0", binSize > 0);
+
+    // Determine a reference point aligned to the natural boundaries of time unit 'unit'.
+    const auto referencePoint{defaultReferencePointForDateTrunc(timezone, unit, startOfWeek)};
+    return truncateDate(date, unit, binSize, referencePoint, timezone, startOfWeek);
 }
 }  // namespace mongo

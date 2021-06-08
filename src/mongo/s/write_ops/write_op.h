@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include <absl/container/flat_hash_set.h>
 #include <vector>
 
 #include "mongo/s/ns_targeter.h"
@@ -118,9 +119,9 @@ public:
      * Returns !OK if the targeting process itself fails
      *             (no TargetedWrites will be added, state unchanged)
      */
-    Status targetWrites(OperationContext* opCtx,
-                        const NSTargeter& targeter,
-                        std::vector<TargetedWrite*>* targetedWrites);
+    void targetWrites(OperationContext* opCtx,
+                      const NSTargeter& targeter,
+                      std::vector<TargetedWrite*>* targetedWrites);
 
     /**
      * Returns the number of child writes that were last targeted.
@@ -179,8 +180,10 @@ private:
 
     // Whether this write is part of a transaction.
     const bool _inTxn;
-};
 
+    // stores the shards where this write operation succeeded
+    absl::flat_hash_set<ShardId> _successfulShardSet;
+};
 /**
  * State of a write in-progress (to a single shard) which is one part of a larger write
  * operation.

@@ -34,7 +34,7 @@
 #include "mongo/idl/idl_parser.h"
 
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/db/command_generic_argument.h"
+#include "mongo/idl/command_generic_argument.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -63,6 +63,7 @@ std::string toCommaDelimitedList(const std::vector<BSONType>& types) {
 
 constexpr StringData IDLParserErrorContext::kOpMsgDollarDBDefault;
 constexpr StringData IDLParserErrorContext::kOpMsgDollarDB;
+constexpr auto collectionlessAggregateCursorCol = "$cmd.aggregate"_sd;
 
 bool IDLParserErrorContext::checkAndAssertTypeSlowPath(const BSONElement& element,
                                                        BSONType type) const {
@@ -76,9 +77,7 @@ bool IDLParserErrorContext::checkAndAssertTypeSlowPath(const BSONElement& elemen
     std::string path = getElementPath(element);
     uasserted(ErrorCodes::TypeMismatch,
               str::stream() << "BSON field '" << path << "' is the wrong type '"
-                            << typeName(elementType)
-                            << "', expected type '"
-                            << typeName(type)
+                            << typeName(elementType) << "', expected type '" << typeName(type)
                             << "'");
 }
 
@@ -93,10 +92,8 @@ bool IDLParserErrorContext::checkAndAssertBinDataTypeSlowPath(const BSONElement&
         std::string path = getElementPath(element);
         uasserted(ErrorCodes::TypeMismatch,
                   str::stream() << "BSON field '" << path << "' is the wrong bindData type '"
-                                << typeName(element.binDataType())
-                                << "', expected type '"
-                                << typeName(type)
-                                << "'");
+                                << typeName(element.binDataType()) << "', expected type '"
+                                << typeName(type) << "'");
     }
 
     return true;
@@ -113,14 +110,7 @@ bool IDLParserErrorContext::checkAndAssertTypes(const BSONElement& element,
             return false;
         }
 
-        std::string path = getElementPath(element);
-        std::string type_str = toCommaDelimitedList(types);
-        uasserted(ErrorCodes::TypeMismatch,
-                  str::stream() << "BSON field '" << path << "' is the wrong type '"
-                                << typeName(element.type())
-                                << "', expected types '["
-                                << type_str
-                                << "']");
+        throwBadType(element, types);
     }
 
     return true;
@@ -189,6 +179,14 @@ void IDLParserErrorContext::throwMissingField(StringData fieldName) const {
 
 void IDLParserErrorContext::throwUnknownField(StringData fieldName) const {
     std::string path = getElementPath(fieldName);
+    if (isMongocryptdArgument(fieldName)) {
+        uasserted(
+            4662500,
+            str::stream()
+                << "BSON field '" << path
+                << "' is an unknown field. This command may be meant for a mongocryptd process.");
+    }
+
     uasserted(40415, str::stream() << "BSON field '" << path << "' is an unknown field.");
 }
 
@@ -204,10 +202,8 @@ void IDLParserErrorContext::throwBadArrayFieldNumberSequence(std::uint32_t actua
     std::string path = getElementPath(StringData());
     uasserted(40423,
               str::stream() << "BSON array field '" << path << "' has a non-sequential value '"
-                            << actualValue
-                            << "' for an array field name, expected value '"
-                            << expectedValue
-                            << "'.");
+                            << actualValue << "' for an array field name, expected value '"
+                            << expectedValue << "'.");
 }
 
 void IDLParserErrorContext::throwBadEnumValue(int enumValue) const {
@@ -224,14 +220,45 @@ void IDLParserErrorContext::throwBadEnumValue(StringData enumValue) const {
                             << "' is not a valid value.");
 }
 
+void IDLParserErrorContext::throwBadType(const BSONElement& element,
+                                         const std::vector<BSONType>& types) const {
+    std::string path = getElementPath(element);
+    std::string type_str = toCommaDelimitedList(types);
+    uasserted(ErrorCodes::TypeMismatch,
+              str::stream() << "BSON field '" << path << "' is the wrong type '"
+                            << typeName(element.type()) << "', expected types '[" << type_str
+                            << "']");
+}
+
+void IDLParserErrorContext::throwAPIStrictErrorIfApplicable(BSONElement field) const {
+    throwAPIStrictErrorIfApplicable(field.fieldNameStringData());
+}
+
+void IDLParserErrorContext::throwAPIStrictErrorIfApplicable(StringData fieldName) const {
+    uassert(ErrorCodes::APIStrictError,
+            str::stream() << "BSON field '" << getElementPath(fieldName)
+                          << "' is not allowed with apiStrict:true.",
+            !_apiStrict);
+}
+
 NamespaceString IDLParserErrorContext::parseNSCollectionRequired(StringData dbName,
-                                                                 const BSONElement& element) {
+                                                                 const BSONElement& element,
+                                                                 bool allowGlobalCollectionName) {
     const bool isUUID = (element.canonicalType() == canonicalizeBSONType(mongo::BinData) &&
                          element.binDataType() == BinDataType::newUUID);
     uassert(ErrorCodes::BadValue,
             str::stream() << "Collection name must be provided. UUID is not valid in this "
                           << "context",
             !isUUID);
+
+    if (allowGlobalCollectionName && element.isNumber()) {
+        uassert(ErrorCodes::BadValue,
+                str::stream() << "Invalid command format: the '" << element.fieldNameStringData()
+                              << "' field must specify a collection name or 1",
+                element.number() == 1);
+        return NamespaceString(dbName, collectionlessAggregateCursorCol);
+    }
+
     uassert(ErrorCodes::BadValue,
             str::stream() << "collection name has invalid type " << typeName(element.type()),
             element.canonicalType() == canonicalizeBSONType(mongo::String));
@@ -251,10 +278,7 @@ NamespaceStringOrUUID IDLParserErrorContext::parseNsOrUUID(StringData dbname,
         return {dbname.toString(), uassertStatusOK(UUID::parse(element))};
     } else {
         // Ensure collection identifier is not a Command
-        const NamespaceString nss(parseNSCollectionRequired(dbname, element));
-        uassert(ErrorCodes::InvalidNamespace,
-                str::stream() << "Invalid collection name specified '" << nss.ns() << "'",
-                nss.isNormal());
+        const NamespaceString nss(parseNSCollectionRequired(dbname, element, false));
         return nss;
     }
 }
@@ -316,4 +340,45 @@ std::vector<std::vector<std::uint8_t>> transformVector(const std::vector<ConstDa
 
     return output;
 }
+
+/**
+ * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+ * break because of it.
+ */
+void noOpSerializer(bool, StringData fieldName, BSONObjBuilder* bob) {}
+
+/**
+ * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+ * break because of it.
+ */
+void serializeBSONWhenNotEmpty(BSONObj obj, StringData fieldName, BSONObjBuilder* bob) {
+    if (!obj.isEmpty()) {
+        bob->append(fieldName, obj);
+    }
+}
+
+/**
+ * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+ * break because of it.
+ */
+BSONObj parseOwnedBSON(BSONElement element) {
+    uassert(ErrorCodes::TypeMismatch,
+            str::stream() << "Expected field " << element.fieldNameStringData()
+                          << "to be of type object",
+            element.type() == BSONType::Object);
+    return element.Obj().getOwned();
+}
+
+/**
+ * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+ * break because of it.
+ */
+bool parseBoolean(BSONElement element) {
+    uassert(ErrorCodes::TypeMismatch,
+            str::stream() << "Expected field " << element.fieldNameStringData()
+                          << "to be of type object",
+            element.type() == BSONType::Bool);
+    return element.boolean();
+}
+
 }  // namespace mongo

@@ -31,6 +31,7 @@
 #include "mongo/unittest/unittest.h"
 
 #include "mongo/client/connection_string.h"
+#include "mongo/executor/connection_pool.h"
 #include "mongo/executor/network_connection_hook.h"
 #include "mongo/executor/network_interface.h"
 #include "mongo/executor/task_executor.h"
@@ -59,10 +60,12 @@ inline TaskExecutor::CallbackHandle makeCallbackHandle() {
     return TaskExecutor::CallbackHandle(std::make_shared<MockCallbackState>());
 }
 
-using StartCommandCB = stdx::function<void(const RemoteCommandResponse&)>;
+using StartCommandCB = std::function<void(const RemoteCommandResponse&)>;
 
 class NetworkInterfaceIntegrationFixture : public mongo::unittest::Test {
 public:
+    void createNet(std::unique_ptr<NetworkConnectionHook> connectHook = nullptr,
+                   ConnectionPool::Options options = {});
     void startNet(std::unique_ptr<NetworkConnectionHook> connectHook = nullptr);
     void tearDown() override;
 
@@ -71,6 +74,8 @@ public:
     ConnectionString fixture();
 
     void setRandomNumberGenerator(PseudoRandom* generator);
+
+    void resetIsInternalClient(bool isInternalClient);
 
     PseudoRandom* getRandomNumberGenerator();
 
@@ -81,11 +86,21 @@ public:
     Future<RemoteCommandResponse> runCommand(const TaskExecutor::CallbackHandle& cbHandle,
                                              RemoteCommandRequest request);
 
+    Future<RemoteCommandOnAnyResponse> runCommandOnAny(const TaskExecutor::CallbackHandle& cbHandle,
+                                                       RemoteCommandRequestOnAny request);
+
+    Future<void> startExhaustCommand(
+        const TaskExecutor::CallbackHandle& cbHandle,
+        RemoteCommandRequest request,
+        std::function<void(const RemoteCommandResponse&)> exhaustUtilCB,
+        const BatonHandle& baton = nullptr);
+
     RemoteCommandResponse runCommandSync(RemoteCommandRequest& request);
 
     void assertCommandOK(StringData db,
                          const BSONObj& cmd,
-                         Milliseconds timeoutMillis = Minutes(5));
+                         Milliseconds timeoutMillis = Minutes(5),
+                         transport::ConnectSSLMode sslMode = transport::kGlobalSSLMode);
     void assertCommandFailsOnClient(StringData db,
                                     const BSONObj& cmd,
                                     ErrorCodes::Error reason,

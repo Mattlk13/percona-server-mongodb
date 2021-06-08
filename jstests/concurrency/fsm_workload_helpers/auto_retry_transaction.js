@@ -1,7 +1,6 @@
 'use strict';
 
-var {withTxnAndAutoRetry} = (function() {
-
+var {withTxnAndAutoRetry, isKilledSessionCode} = (function() {
     /**
      * Calls 'func' with the print() function overridden to be a no-op.
      *
@@ -71,9 +70,9 @@ var {withTxnAndAutoRetry} = (function() {
             // is a retryable write.
             if (!commitRes.ok && retryOnKilledSession && isKilledSessionCode(commitRes.code)) {
                 print("-=-=-=- Retrying commit after killed session code, sessionId: " +
-                      tojsononeline(session.getSessionId()) + ", txnNumber: " +
-                      tojsononeline(session.getTxnNumber_forTesting()) + ", res: " +
-                      tojsononeline(commitRes));
+                      tojsononeline(session.getSessionId()) +
+                      ", txnNumber: " + tojsononeline(session.getTxnNumber_forTesting()) +
+                      ", res: " + tojsononeline(commitRes));
                 continue;
             }
 
@@ -121,12 +120,16 @@ var {withTxnAndAutoRetry} = (function() {
                "retrying on killed session error codes isn't supported with prepareProbability");
 
         let hasTransientError;
-
+        let iterations = 0;
         do {
             session.startTransaction_forTesting(txnOptions, {ignoreActiveTxn: true});
             let hasCommitTxnError = false;
             hasTransientError = false;
 
+            iterations += 1;
+            if (iterations % 10 === 0) {
+                print("withTxnAndAutoRetry has iterated " + iterations + " times.");
+            }
             try {
                 func();
 
@@ -145,17 +148,19 @@ var {withTxnAndAutoRetry} = (function() {
 
             } catch (e) {
                 if (!hasCommitTxnError) {
-                    // Use the version of abortTransaction() that ignores errors. We ignore the
-                    // error from abortTransaction because the transaction may have implicitly
-                    // been aborted by the server already and will therefore return a
-                    // NoSuchTransaction error response.
-                    // We need to call abortTransaction() in order to update the mongo shell's
-                    // state such that it agrees no transaction is currently in progress on this
-                    // session.
-                    session.abortTransaction();
+                    // We need to call abortTransaction_forTesting() in order to update the mongo
+                    // shell's state such that it agrees no transaction is currently in progress on
+                    // this session.
+                    // The transaction may have implicitly been aborted by the server or killed by
+                    // the kill_session helper and will therefore return a
+                    // NoSuchTransaction/Interrupted error code.
+                    assert.commandWorkedOrFailedWithCode(
+                        session.abortTransaction_forTesting(),
+                        [ErrorCodes.NoSuchTransaction, ErrorCodes.Interrupted]);
                 }
 
                 if (shouldRetryEntireTxnOnError(e, hasCommitTxnError, retryOnKilledSession)) {
+                    print("Retrying transaction due to transient error.");
                     hasTransientError = true;
                     continue;
                 }

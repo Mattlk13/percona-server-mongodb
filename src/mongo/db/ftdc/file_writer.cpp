@@ -27,8 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kFTDC
-
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/ftdc/file_writer.h"
@@ -43,7 +41,6 @@
 #include "mongo/db/ftdc/util.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -205,7 +202,13 @@ Status FTDCFileWriter::flush(const boost::optional<ConstDataRange>& range, Date_
         }
     }
 
-    boost::filesystem::remove(_interimFile);
+    boost::system::error_code ec;
+    boost::filesystem::remove(_interimFile, ec);
+    if (ec) {
+        return {ErrorCodes::NonExistentPath,
+                str::stream() << "\"" << _interimFile.generic_string()
+                              << "\" could not be removed during flush: " << ec.message()};
+    }
 
     return Status::OK();
 }

@@ -35,18 +35,18 @@
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/op_observer_registry.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
-#include "mongo/db/s/config_server_op_observer.h"
+#include "mongo/db/s/collection_sharding_state_factory_shard.h"
+#include "mongo/db/s/collection_sharding_state_factory_standalone.h"
 #include "mongo/db/s/op_observer_sharding_impl.h"
 #include "mongo/db/s/shard_server_catalog_cache_loader.h"
 #include "mongo/db/s/shard_server_op_observer.h"
+#include "mongo/db/s/shard_server_test_fixture.h"
 #include "mongo/db/s/sharding_initialization_mongod.h"
 #include "mongo/db/s/type_shard_identity.h"
 #include "mongo/db/server_options.h"
-#include "mongo/s/catalog/dist_lock_manager_mock.h"
 #include "mongo/s/catalog/sharding_catalog_client_impl.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/config_server_catalog_cache_loader.h"
-#include "mongo/s/shard_server_test_fixture.h"
 
 namespace mongo {
 namespace {
@@ -59,9 +59,6 @@ const std::string kShardName("TestShard");
  */
 class ShardingInitializationMongoDTest : public ShardingMongodTestFixture {
 protected:
-    // Used to write to set up local collections before exercising server logic.
-    std::unique_ptr<DBDirectClient> _dbDirectClient;
-
     void setUp() override {
         serverGlobalParams.clusterRole = ClusterRole::None;
         ShardingMongodTestFixture::setUp();
@@ -70,29 +67,27 @@ protected:
         serverGlobalParams.clusterRole = ClusterRole::ShardServer;
 
         CatalogCacheLoader::set(getServiceContext(),
-                                stdx::make_unique<ShardServerCatalogCacheLoader>(
-                                    stdx::make_unique<ConfigServerCatalogCacheLoader>()));
+                                std::make_unique<ShardServerCatalogCacheLoader>(
+                                    std::make_unique<ConfigServerCatalogCacheLoader>()));
 
         ShardingInitializationMongoD::get(getServiceContext())
-            ->setGlobalInitMethodForTest([&](OperationContext* opCtx,
-                                             const ShardIdentity& shardIdentity,
-                                             StringData distLockProcessId) {
-                const auto& configConnStr = shardIdentity.getConfigsvrConnectionString();
+            ->setGlobalInitMethodForTest(
+                [&](OperationContext* opCtx, const ShardIdentity& shardIdentity) {
+                    const auto& configConnStr = shardIdentity.getConfigsvrConnectionString();
 
-                uassertStatusOK(initializeGlobalShardingStateForMongodForTest(configConnStr));
+                    uassertStatusOK(initializeGlobalShardingStateForMongodForTest(configConnStr));
 
-                // Set the ConnectionString return value on the mock targeter so that later calls to
-                // the
-                // targeter's getConnString() return the appropriate value
-                auto configTargeter = RemoteCommandTargeterMock::get(
-                    shardRegistry()->getConfigShard()->getTargeter());
-                configTargeter->setConnectionStringReturnValue(configConnStr);
-                configTargeter->setFindHostReturnValue(configConnStr.getServers()[0]);
+                    // Set the ConnectionString return value on the mock targeter so that later
+                    // calls to the targeter's getConnString() return the appropriate value
+                    auto configTargeter = RemoteCommandTargeterMock::get(
+                        shardRegistry()->getConfigShard()->getTargeter());
+                    configTargeter->setConnectionStringReturnValue(configConnStr);
+                    configTargeter->setFindHostReturnValue(configConnStr.getServers()[0]);
 
-                return Status::OK();
-            });
+                    return Status::OK();
+                });
 
-        _dbDirectClient = stdx::make_unique<DBDirectClient>(operationContext());
+        _dbDirectClient = std::make_unique<DBDirectClient>(operationContext());
     }
 
     void tearDown() override {
@@ -108,15 +103,8 @@ protected:
         ShardingMongodTestFixture::tearDown();
     }
 
-    std::unique_ptr<DistLockManager> makeDistLockManager(
-        std::unique_ptr<DistLockCatalog> distLockCatalog) override {
-        return stdx::make_unique<DistLockManagerMock>(nullptr);
-    }
-
-    std::unique_ptr<ShardingCatalogClient> makeShardingCatalogClient(
-        std::unique_ptr<DistLockManager> distLockManager) override {
-        invariant(distLockManager);
-        return stdx::make_unique<ShardingCatalogClientImpl>(std::move(distLockManager));
+    std::unique_ptr<ShardingCatalogClient> makeShardingCatalogClient() override {
+        return std::make_unique<ShardingCatalogClientImpl>();
     }
 
     auto* shardingInitialization() {
@@ -126,6 +114,9 @@ protected:
     auto* shardingState() {
         return ShardingState::get(getServiceContext());
     }
+
+    // Used to write to set up local collections before exercising server logic.
+    std::unique_ptr<DBDirectClient> _dbDirectClient;
 };
 
 /**
@@ -135,21 +126,30 @@ protected:
 class ScopedSetStandaloneMode {
 public:
     ScopedSetStandaloneMode(ServiceContext* serviceContext) : _serviceContext(serviceContext) {
+        CollectionShardingStateFactory::clear(serviceContext);
+
+        CollectionShardingStateFactory::set(
+            serviceContext,
+            std::make_unique<CollectionShardingStateFactoryStandalone>(serviceContext));
+
         serverGlobalParams.clusterRole = ClusterRole::None;
-        _serviceContext->setOpObserver(stdx::make_unique<OpObserverRegistry>());
+        _serviceContext->setOpObserver(std::make_unique<OpObserverRegistry>());
     }
 
     ~ScopedSetStandaloneMode() {
-        serverGlobalParams.clusterRole = ClusterRole::ShardServer;
-        auto makeOpObserver = [&] {
-            auto opObserver = stdx::make_unique<OpObserverRegistry>();
-            opObserver->addObserver(stdx::make_unique<OpObserverShardingImpl>());
-            opObserver->addObserver(stdx::make_unique<ConfigServerOpObserver>());
-            opObserver->addObserver(stdx::make_unique<ShardServerOpObserver>());
-            return opObserver;
-        };
+        CollectionShardingStateFactory::clear(_serviceContext);
 
-        _serviceContext->setOpObserver(makeOpObserver());
+        CollectionShardingStateFactory::set(
+            _serviceContext,
+            std::make_unique<CollectionShardingStateFactoryShard>(_serviceContext));
+
+        serverGlobalParams.clusterRole = ClusterRole::ShardServer;
+        _serviceContext->setOpObserver([&] {
+            auto opObserver = std::make_unique<OpObserverRegistry>();
+            opObserver->addObserver(std::make_unique<OpObserverShardingImpl>());
+            opObserver->addObserver(std::make_unique<ShardServerOpObserver>());
+            return opObserver;
+        }());
     }
 
 private:
@@ -162,7 +162,7 @@ TEST_F(ShardingInitializationMongoDTest, ValidShardIdentitySucceeds) {
 
     ShardIdentityType shardIdentity;
     shardIdentity.setConfigsvrConnectionString(
-        ConnectionString(ConnectionString::SET, "a:1,b:2", "config"));
+        ConnectionString(ConnectionString::ConnectionType::kReplicaSet, "a:1,b:2", "config"));
     shardIdentity.setShardName(kShardName);
     shardIdentity.setClusterId(OID::gen());
 
@@ -179,22 +179,22 @@ TEST_F(ShardingInitializationMongoDTest, InitWhilePreviouslyInErrorStateWillStay
 
     ShardIdentityType shardIdentity;
     shardIdentity.setConfigsvrConnectionString(
-        ConnectionString(ConnectionString::SET, "a:1,b:2", "config"));
+        ConnectionString(ConnectionString::ConnectionType::kReplicaSet, "a:1,b:2", "config"));
     shardIdentity.setShardName(kShardName);
     shardIdentity.setClusterId(OID::gen());
 
-    shardingInitialization()->setGlobalInitMethodForTest([](
-        OperationContext* opCtx, const ShardIdentity& shardIdentity, StringData distLockProcessId) {
-        uasserted(ErrorCodes::ShutdownInProgress, "Not an actual shutdown");
-    });
+    shardingInitialization()->setGlobalInitMethodForTest(
+        [](OperationContext* opCtx, const ShardIdentity& shardIdentity) {
+            uasserted(ErrorCodes::ShutdownInProgress, "Not an actual shutdown");
+        });
 
     shardingInitialization()->initializeFromShardIdentity(operationContext(), shardIdentity);
 
     // ShardingState is now in error state, attempting to call it again will still result in error.
-    shardingInitialization()->setGlobalInitMethodForTest([](
-        OperationContext* opCtx, const ShardIdentity& shardIdentity, StringData distLockProcessId) {
-        FAIL("Should not be invoked!");
-    });
+    shardingInitialization()->setGlobalInitMethodForTest(
+        [](OperationContext* opCtx, const ShardIdentity& shardIdentity) {
+            FAIL("Should not be invoked!");
+        });
 
     ASSERT_THROWS_CODE(
         shardingInitialization()->initializeFromShardIdentity(operationContext(), shardIdentity),
@@ -211,7 +211,7 @@ TEST_F(ShardingInitializationMongoDTest, InitializeAgainWithMatchingShardIdentit
     auto clusterID = OID::gen();
     ShardIdentityType shardIdentity;
     shardIdentity.setConfigsvrConnectionString(
-        ConnectionString(ConnectionString::SET, "a:1,b:2", "config"));
+        ConnectionString(ConnectionString::ConnectionType::kReplicaSet, "a:1,b:2", "config"));
     shardIdentity.setShardName(kShardName);
     shardIdentity.setClusterId(clusterID);
 
@@ -219,14 +219,14 @@ TEST_F(ShardingInitializationMongoDTest, InitializeAgainWithMatchingShardIdentit
 
     ShardIdentityType shardIdentity2;
     shardIdentity2.setConfigsvrConnectionString(
-        ConnectionString(ConnectionString::SET, "a:1,b:2", "config"));
+        ConnectionString(ConnectionString::ConnectionType::kReplicaSet, "a:1,b:2", "config"));
     shardIdentity2.setShardName(kShardName);
     shardIdentity2.setClusterId(clusterID);
 
-    shardingInitialization()->setGlobalInitMethodForTest([](
-        OperationContext* opCtx, const ShardIdentity& shardIdentity, StringData distLockProcessId) {
-        FAIL("Should not be invoked!");
-    });
+    shardingInitialization()->setGlobalInitMethodForTest(
+        [](OperationContext* opCtx, const ShardIdentity& shardIdentity) {
+            FAIL("Should not be invoked!");
+        });
 
     shardingInitialization()->initializeFromShardIdentity(operationContext(), shardIdentity2);
 
@@ -244,7 +244,7 @@ TEST_F(ShardingInitializationMongoDTest, InitializeAgainWithMatchingReplSetNameS
     auto clusterID = OID::gen();
     ShardIdentityType shardIdentity;
     shardIdentity.setConfigsvrConnectionString(
-        ConnectionString(ConnectionString::SET, "a:1,b:2", "config"));
+        ConnectionString(ConnectionString::ConnectionType::kReplicaSet, "a:1,b:2", "config"));
     shardIdentity.setShardName(kShardName);
     shardIdentity.setClusterId(clusterID);
 
@@ -252,14 +252,14 @@ TEST_F(ShardingInitializationMongoDTest, InitializeAgainWithMatchingReplSetNameS
 
     ShardIdentityType shardIdentity2;
     shardIdentity2.setConfigsvrConnectionString(
-        ConnectionString(ConnectionString::SET, "b:2,c:3", "config"));
+        ConnectionString(ConnectionString::ConnectionType::kReplicaSet, "b:2,c:3", "config"));
     shardIdentity2.setShardName(kShardName);
     shardIdentity2.setClusterId(clusterID);
 
-    shardingInitialization()->setGlobalInitMethodForTest([](
-        OperationContext* opCtx, const ShardIdentity& shardIdentity, StringData distLockProcessId) {
-        FAIL("Should not be invoked!");
-    });
+    shardingInitialization()->setGlobalInitMethodForTest(
+        [](OperationContext* opCtx, const ShardIdentity& shardIdentity) {
+            FAIL("Should not be invoked!");
+        });
 
     shardingInitialization()->initializeFromShardIdentity(operationContext(), shardIdentity2);
 
@@ -291,13 +291,9 @@ TEST_F(ShardingInitializationMongoDTest,
     storageGlobalParams.readOnly = true;
     serverGlobalParams.overrideShardIdentity =
         BSON("_id"
-             << "shardIdentity"
-             << ShardIdentity::kShardNameFieldName
-             << kShardName
-             << ShardIdentity::kClusterIdFieldName
-             << OID::gen()
-             << ShardIdentity::kConfigsvrConnectionStringFieldName
-             << "invalid");
+             << "shardIdentity" << ShardIdentity::kShardNameFieldName << kShardName
+             << ShardIdentity::kClusterIdFieldName << OID::gen()
+             << ShardIdentity::kConfigsvrConnectionStringFieldName << "invalid");
 
     ASSERT_THROWS_CODE(
         shardingInitialization()->initializeShardingAwarenessIfNeeded(operationContext()),
@@ -312,7 +308,7 @@ TEST_F(ShardingInitializationMongoDTest,
     serverGlobalParams.overrideShardIdentity = [] {
         ShardIdentityType shardIdentity;
         shardIdentity.setConfigsvrConnectionString(
-            ConnectionString(ConnectionString::SET, "a:1,b:2", "config"));
+            ConnectionString(ConnectionString::ConnectionType::kReplicaSet, "a:1,b:2", "config"));
         shardIdentity.setShardName(kShardName);
         shardIdentity.setClusterId(OID::gen());
         ASSERT_OK(shardIdentity.validate());
@@ -356,7 +352,7 @@ TEST_F(ShardingInitializationMongoDTest,
     serverGlobalParams.overrideShardIdentity = [] {
         ShardIdentityType shardIdentity;
         shardIdentity.setConfigsvrConnectionString(
-            ConnectionString(ConnectionString::SET, "a:1,b:2", "config"));
+            ConnectionString(ConnectionString::ConnectionType::kReplicaSet, "a:1,b:2", "config"));
         shardIdentity.setShardName(kShardName);
         shardIdentity.setClusterId(OID::gen());
         ASSERT_OK(shardIdentity.validate());
@@ -399,7 +395,7 @@ TEST_F(ShardingInitializationMongoDTest,
     serverGlobalParams.overrideShardIdentity = [] {
         ShardIdentityType shardIdentity;
         shardIdentity.setConfigsvrConnectionString(
-            ConnectionString(ConnectionString::SET, "a:1,b:2", "config"));
+            ConnectionString(ConnectionString::ConnectionType::kReplicaSet, "a:1,b:2", "config"));
         shardIdentity.setShardName(kShardName);
         shardIdentity.setClusterId(OID::gen());
         ASSERT_OK(shardIdentity.validate());
@@ -436,10 +432,8 @@ TEST_F(ShardingInitializationMongoDTest,
         ScopedSetStandaloneMode standalone(getServiceContext());
 
         BSONObj invalidShardIdentity = BSON("_id"
-                                            << "shardIdentity"
-                                            << ShardIdentity::kShardNameFieldName
-                                            << kShardName
-                                            << ShardIdentity::kClusterIdFieldName
+                                            << "shardIdentity" << ShardIdentity::kShardNameFieldName
+                                            << kShardName << ShardIdentity::kClusterIdFieldName
                                             << OID::gen()
                                             << ShardIdentity::kConfigsvrConnectionStringFieldName
                                             << "invalid");
@@ -464,8 +458,8 @@ TEST_F(ShardingInitializationMongoDTest,
 
         BSONObj validShardIdentity = [&] {
             ShardIdentityType shardIdentity;
-            shardIdentity.setConfigsvrConnectionString(
-                ConnectionString(ConnectionString::SET, "a:1,b:2", "config"));
+            shardIdentity.setConfigsvrConnectionString(ConnectionString(
+                ConnectionString::ConnectionType::kReplicaSet, "a:1,b:2", "config"));
             shardIdentity.setShardName(kShardName);
             shardIdentity.setClusterId(OID::gen());
             ASSERT_OK(shardIdentity.validate());
@@ -511,7 +505,7 @@ TEST_F(ShardingInitializationMongoDTest,
     BSONObj validShardIdentity = [&] {
         ShardIdentityType shardIdentity;
         shardIdentity.setConfigsvrConnectionString(
-            ConnectionString(ConnectionString::SET, "a:1,b:2", "config"));
+            ConnectionString(ConnectionString::ConnectionType::kReplicaSet, "a:1,b:2", "config"));
         shardIdentity.setShardName(kShardName);
         shardIdentity.setClusterId(OID::gen());
         ASSERT_OK(shardIdentity.validate());

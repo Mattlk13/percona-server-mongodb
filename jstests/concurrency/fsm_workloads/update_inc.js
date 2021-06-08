@@ -9,11 +9,10 @@
  * of increments performed.
  */
 
-// For isMongod and supportsDocumentLevelConcurrency.
+// For isMongod.
 load('jstests/concurrency/fsm_workload_helpers/server_types.js');
 
 var $config = (function() {
-
     var data = {
         // uses the workload name as _id on the document.
         // assumes this name will be unique.
@@ -37,10 +36,9 @@ var $config = (function() {
             var res = db[collName].update({_id: this.id}, updateDoc);
             assertAlways.eq(0, res.nUpserted, tojson(res));
 
-            if (isMongod(db) && supportsDocumentLevelConcurrency(db)) {
-                // Storage engines which support document-level concurrency will automatically retry
-                // any operations when there are conflicts, so we should always see a matching
-                // document.
+            if (isMongod(db)) {
+                // Storage engines will automatically retry any operations when there are conflicts,
+                // so we should always see a matching document.
                 assertWhenOwnColl.eq(res.nMatched, 1, tojson(res));
                 if (db.getMongo().writeMode() === 'commands') {
                     assertWhenOwnColl.eq(res.nModified, 1, tojson(res));
@@ -96,5 +94,4 @@ var $config = (function() {
         transitions: transitions,
         setup: setup
     };
-
 })();

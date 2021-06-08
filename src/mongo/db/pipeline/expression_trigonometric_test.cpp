@@ -31,7 +31,7 @@
 
 #include "mongo/db/pipeline/expression_trigonometric.h"
 
-#include "mongo/db/pipeline/document_value_test_util.h"
+#include "mongo/db/exec/document_value/document_value_test_util.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
 #include "mongo/unittest/unittest.h"
 
@@ -54,11 +54,11 @@ static void assertApproxEq(const Value& evaluated, const Value& expected) {
 
 // A testing class for testing approximately equal results for one argument numeric expressions.
 static void assertEvaluates(const std::string& expressionName, Value input, Value output) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto expCtx = ExpressionContextForTest{};
     auto obj = BSON(expressionName << BSON_ARRAY(input));
-    auto vps = expCtx->variablesParseState;
-    auto expression = Expression::parseExpression(expCtx, obj, vps);
-    Value result = expression->evaluate(Document());
+    auto vps = expCtx.variablesParseState;
+    auto expression = Expression::parseExpression(&expCtx, obj, vps);
+    Value result = expression->evaluate({}, &expCtx.variables);
     ASSERT_EQUALS(result.getType(), output.getType());
     assertApproxEq(result, output);
 }
@@ -69,11 +69,11 @@ static void assertEvaluates(const std::string& expressionName,
                             Value input1,
                             Value input2,
                             Value output) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto expCtx = ExpressionContextForTest{};
     auto obj = BSON(expressionName << BSON_ARRAY(input1 << input2));
-    auto vps = expCtx->variablesParseState;
-    auto expression = Expression::parseExpression(expCtx, obj, vps);
-    Value result = expression->evaluate(Document());
+    auto vps = expCtx.variablesParseState;
+    auto expression = Expression::parseExpression(&expCtx, obj, vps);
+    Value result = expression->evaluate({}, &expCtx.variables);
     ASSERT_EQUALS(result.getType(), output.getType());
     assertApproxEq(result, output);
 }
@@ -1403,4 +1403,4 @@ TEST(ExpressionDegreesToRadiansTest, DecimalArg) {
 TEST(ExpressionDegreesToRadiansTest, NullArg) {
     assertEvaluates("$degreesToRadians", Value(BSONNULL), Value(BSONNULL));
 }
-}  // namespace expression_trigonometric_test
+}  // namespace expression_tests

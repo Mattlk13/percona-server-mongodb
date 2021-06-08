@@ -41,22 +41,26 @@ public:
     using SessionMode = MongoProcessInterface::CurrentOpSessionsMode;
     using UserMode = MongoProcessInterface::CurrentOpUserMode;
     using CursorMode = MongoProcessInterface::CurrentOpCursorMode;
+    using BacktraceMode = MongoProcessInterface::CurrentOpBacktraceMode;
 
     static constexpr StringData kStageName = "$currentOp"_sd;
 
     class LiteParsed final : public LiteParsedDocumentSource {
     public:
-        static std::unique_ptr<LiteParsed> parse(const AggregationRequest& request,
+        static std::unique_ptr<LiteParsed> parse(const NamespaceString& nss,
                                                  const BSONElement& spec);
 
-        LiteParsed(UserMode allUsers, LocalOpsMode localOps)
-            : _allUsers(allUsers), _localOps(localOps) {}
+        LiteParsed(std::string parseTimeName, UserMode allUsers, LocalOpsMode localOps)
+            : LiteParsedDocumentSource(std::move(parseTimeName)),
+              _allUsers(allUsers),
+              _localOps(localOps) {}
 
         stdx::unordered_set<NamespaceString> getInvolvedNamespaces() const final {
             return stdx::unordered_set<NamespaceString>();
         }
 
-        PrivilegeVector requiredPrivileges(bool isMongos) const final {
+        PrivilegeVector requiredPrivileges(bool isMongos,
+                                           bool bypassDocumentValidation) const final {
             PrivilegeVector privileges;
 
             // In a sharded cluster, we always need the inprog privilege to run $currentOp on the
@@ -70,10 +74,6 @@ public:
             return privileges;
         }
 
-        bool allowedToForwardFromMongos() const final {
-            return _localOps == LocalOpsMode::kRemoteShardOps;
-        }
-
         bool allowedToPassthroughFromMongos() const final {
             return _localOps == LocalOpsMode::kRemoteShardOps;
         }
@@ -82,13 +82,12 @@ public:
             return true;
         }
 
-        void assertSupportsReadConcern(const repl::ReadConcernArgs& readConcern) const {
-            uassert(ErrorCodes::InvalidOptions,
-                    str::stream() << "Aggregation stage " << kStageName << " cannot run with a "
-                                  << "readConcern other than 'local', or in a multi-document "
-                                  << "transaction. Current readConcern: "
-                                  << readConcern.toString(),
-                    readConcern.getLevel() == repl::ReadConcernLevel::kLocalReadConcern);
+        ReadConcernSupportResult supportsReadConcern(repl::ReadConcernLevel level) const {
+            return onlyReadConcernLocalSupported(kStageName, level);
+        }
+
+        void assertSupportsMultiDocumentTransaction() const {
+            transactionNotSupported(kStageName);
         }
 
     private:
@@ -103,9 +102,8 @@ public:
         UserMode includeOpsFromAllUsers = UserMode::kExcludeOthers,
         LocalOpsMode showLocalOpsOnMongoS = LocalOpsMode::kRemoteShardOps,
         TruncationMode truncateOps = TruncationMode::kNoTruncation,
-        CursorMode idleCursors = CursorMode::kExcludeCursors);
-
-    GetNextResult getNext() final;
+        CursorMode idleCursors = CursorMode::kExcludeCursors,
+        BacktraceMode backtrace = BacktraceMode::kExcludeBacktrace);
 
     const char* getSourceName() const final;
 
@@ -118,7 +116,10 @@ public:
                                      DiskUseRequirement::kNoDiskUse,
                                      FacetRequirement::kNotAllowed,
                                      TransactionRequirement::kNotAllowed,
-                                     LookupRequirement::kAllowed);
+                                     LookupRequirement::kAllowed,
+                                     (_showLocalOpsOnMongoS == LocalOpsMode::kLocalMongosOps
+                                          ? UnionRequirement::kNotAllowed
+                                          : UnionRequirement::kAllowed));
 
         constraints.isIndependentOfAnyCollection = true;
         constraints.requiresInputDocSource = false;
@@ -141,14 +142,18 @@ private:
                             UserMode includeOpsFromAllUsers,
                             LocalOpsMode showLocalOpsOnMongoS,
                             TruncationMode truncateOps,
-                            CursorMode idleCursors)
-        : DocumentSource(pExpCtx),
+                            CursorMode idleCursors,
+                            BacktraceMode backtrace)
+        : DocumentSource(kStageName, pExpCtx),
           _includeIdleConnections(includeIdleConnections),
           _includeIdleSessions(includeIdleSessions),
           _includeOpsFromAllUsers(includeOpsFromAllUsers),
           _showLocalOpsOnMongoS(showLocalOpsOnMongoS),
           _truncateOps(truncateOps),
-          _idleCursors(idleCursors) {}
+          _idleCursors(idleCursors),
+          _backtrace(backtrace) {}
+
+    GetNextResult doGetNext() final;
 
     ConnMode _includeIdleConnections = ConnMode::kExcludeIdle;
     SessionMode _includeIdleSessions = SessionMode::kIncludeIdle;
@@ -156,6 +161,7 @@ private:
     LocalOpsMode _showLocalOpsOnMongoS = LocalOpsMode::kRemoteShardOps;
     TruncationMode _truncateOps = TruncationMode::kNoTruncation;
     CursorMode _idleCursors = CursorMode::kExcludeCursors;
+    BacktraceMode _backtrace = BacktraceMode::kExcludeBacktrace;
 
     std::string _shardName;
 

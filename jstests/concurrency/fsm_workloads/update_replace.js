@@ -7,19 +7,17 @@
  * The collection has indexes on some but not all fields.
  */
 
-// For isMongod and supportsDocumentLevelConcurrency.
+// For isMongod.
 load('jstests/concurrency/fsm_workload_helpers/server_types.js');
 
 var $config = (function() {
-
     // explicitly pass db to avoid accidentally using the global `db`
     function assertResult(db, res) {
         assertAlways.eq(0, res.nUpserted, tojson(res));
 
-        if (isMongod(db) && supportsDocumentLevelConcurrency(db)) {
-            // Storage engines which support document-level concurrency will automatically retry
-            // any operations when there are conflicts, so we should always see a matching
-            // document.
+        if (isMongod(db)) {
+            // Storage engines will automatically retry any operations when there are conflicts, so
+            // we should always see a matching document.
             assertWhenOwnColl.eq(res.nMatched, 1, tojson(res));
         } else {
             // On storage engines that do not support document-level concurrency, it is possible
@@ -59,12 +57,12 @@ var $config = (function() {
     var transitions = {update: {update: 1}};
 
     function setup(db, collName, cluster) {
-        assertAlways.commandWorked(db[collName].ensureIndex({a: 1}));
-        assertAlways.commandWorked(db[collName].ensureIndex({b: 1}));
+        assertAlways.commandWorked(db[collName].createIndex({a: 1}));
+        assertAlways.commandWorked(db[collName].createIndex({b: 1}));
         // no index on c
 
-        assertAlways.commandWorked(db[collName].ensureIndex({x: 1}));
-        assertAlways.commandWorked(db[collName].ensureIndex({y: 1}));
+        assertAlways.commandWorked(db[collName].createIndex({x: 1}));
+        assertAlways.commandWorked(db[collName].createIndex({y: 1}));
         // no index on z
 
         // numDocs should be much less than threadCount, to make more threads use the same docs.
@@ -73,7 +71,7 @@ var $config = (function() {
 
         for (var i = 0; i < this.numDocs; ++i) {
             var res = db[collName].insert({_id: i});
-            assertWhenOwnColl.writeOK(res);
+            assertWhenOwnColl.commandWorked(res);
             assertWhenOwnColl.eq(1, res.nInserted);
         }
 
@@ -88,5 +86,4 @@ var $config = (function() {
         transitions: transitions,
         setup: setup
     };
-
 })();

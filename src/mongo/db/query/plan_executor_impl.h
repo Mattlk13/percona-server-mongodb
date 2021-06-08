@@ -32,9 +32,16 @@
 #include <boost/optional.hpp>
 #include <queue>
 
+#include "mongo/db/exec/multi_plan.h"
+#include "mongo/db/exec/working_set.h"
 #include "mongo/db/query/plan_executor.h"
+#include "mongo/db/query/query_solution.h"
 
 namespace mongo {
+
+class CappedInsertNotifier;
+class CollectionScan;
+struct CappedInsertNotifierData;
 
 class PlanExecutorImpl : public PlanExecutor {
     PlanExecutorImpl(const PlanExecutorImpl&) = delete;
@@ -42,62 +49,74 @@ class PlanExecutorImpl : public PlanExecutor {
 
 public:
     /**
-     * Public factory methods delegate to this impl factory to do their work.
-     */
-    static StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> make(
-        OperationContext* opCtx,
-        std::unique_ptr<WorkingSet> ws,
-        std::unique_ptr<PlanStage> rt,
-        std::unique_ptr<QuerySolution> qs,
-        std::unique_ptr<CanonicalQuery> cq,
-        const Collection* collection,
-        NamespaceString nss,
-        YieldPolicy yieldPolicy);
-
-    virtual ~PlanExecutorImpl();
-    WorkingSet* getWorkingSet() const final;
-    PlanStage* getRootStage() const final;
-    CanonicalQuery* getCanonicalQuery() const final;
-    const NamespaceString& nss() const final;
-    OperationContext* getOpCtx() const final;
-    void saveState() final;
-    void restoreState() final;
-    void detachFromOperationContext() final;
-    void reattachToOperationContext(OperationContext* opCtx) final;
-    void restoreStateWithoutRetrying() final;
-    ExecState getNextSnapshotted(Snapshotted<BSONObj>* objOut, RecordId* dlOut) final;
-    ExecState getNext(BSONObj* objOut, RecordId* dlOut) final;
-    bool isEOF() final;
-    Status executePlan() final;
-    void markAsKilled(Status killStatus) final;
-    void dispose(OperationContext* opCtx) final;
-    void enqueue(const BSONObj& obj) final;
-    bool isMarkedAsKilled() const final;
-    Status getKillStatus() final;
-    bool isDisposed() const final;
-    bool isDetached() const final;
-    Timestamp getLatestOplogTimestamp() const final;
-    BSONObj getPostBatchResumeToken() const final;
-    Status getMemberObjectStatus(const BSONObj& memberObj) const final;
-
-private:
-    /**
-     * New PlanExecutor instances are created with the static make() method above.
+     * Callers should obtain PlanExecutorImpl instances uses the 'plan_executor_factory' methods, in
+     * order to avoid depending directly on this concrete implementation of the PlanExecutor
+     * interface.
      */
     PlanExecutorImpl(OperationContext* opCtx,
                      std::unique_ptr<WorkingSet> ws,
                      std::unique_ptr<PlanStage> rt,
                      std::unique_ptr<QuerySolution> qs,
                      std::unique_ptr<CanonicalQuery> cq,
-                     const Collection* collection,
+                     const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                     const CollectionPtr& collection,
+                     bool returnOwnedBson,
                      NamespaceString nss,
-                     YieldPolicy yieldPolicy);
+                     PlanYieldPolicy::YieldPolicy yieldPolicy);
+
+    virtual ~PlanExecutorImpl();
+    CanonicalQuery* getCanonicalQuery() const final;
+    const NamespaceString& nss() const final;
+    OperationContext* getOpCtx() const final;
+    void saveState() final;
+    void restoreState(const RestoreContext& context) final;
+    void detachFromOperationContext() final;
+    void reattachToOperationContext(OperationContext* opCtx) final;
+    ExecState getNextDocument(Document* objOut, RecordId* dlOut) final;
+    ExecState getNext(BSONObj* out, RecordId* dlOut) final;
+    bool isEOF() final;
+    long long executeCount() override;
+    UpdateResult executeUpdate() override;
+    UpdateResult getUpdateResult() const override;
+    long long executeDelete() override;
+    void markAsKilled(Status killStatus) final;
+    void dispose(OperationContext* opCtx) final;
+    void enqueue(const BSONObj& obj) final;
+    bool isMarkedAsKilled() const final;
+    Status getKillStatus() final;
+    bool isDisposed() const final;
+    Timestamp getLatestOplogTimestamp() const final;
+    BSONObj getPostBatchResumeToken() const final;
+    LockPolicy lockPolicy() const final;
+    const PlanExplainer& getPlanExplainer() const final;
 
     /**
-     * Clients of PlanExecutor expect that on receiving a new instance from one of the make()
-     * factory methods, plan selection has already been completed. In order to enforce this
-     * property, this function is called to do plan selection prior to returning the new
-     * PlanExecutor.
+     * Same as restoreState() but without the logic to retry if a WriteConflictException is thrown.
+     *
+     * This is only public for PlanYieldPolicy. DO NOT CALL ANYWHERE ELSE.
+     */
+    void restoreStateWithoutRetrying(const RestoreContext& context, const Yieldable* yieldable);
+
+    /**
+     * Return a pointer to this executor's MultiPlanStage, or nullptr if it does not have one.
+     */
+    MultiPlanStage* getMultiPlanStage() const;
+
+    PlanStage* getRootStage() const;
+
+private:
+    /**
+     *  Executes the underlying PlanStage tree until it indicates EOF. Throws an exception if the
+     *  plan results in an error.
+     *
+     *  Useful for cases where the caller wishes to execute the plan and extract stats from it (e.g.
+     *  the result of a count or update) rather than returning a set of resulting documents.
+     */
+    void _executePlan();
+
+    /**
+     * Called on construction in order to ensure that when callers receive a new instance of a
+     * 'PlanExecutorImpl', plan selection has already been completed.
      *
      * If the tree contains plan selection stages, such as MultiPlanStage or SubplanStage,
      * this calls into their underlying plan selection facilities. Otherwise, does nothing.
@@ -110,72 +129,55 @@ private:
      */
     Status _pickBestPlan();
 
-    /**
-     * Returns true if the PlanExecutor should listen for inserts, which is when a getMore is called
-     * on a tailable and awaitData cursor that still has time left and hasn't been interrupted.
-     */
-    bool _shouldListenForInserts();
-
-    /**
-     * Returns true if the PlanExecutor should wait for data to be inserted, which is when a getMore
-     * is called on a tailable and awaitData cursor on a capped collection.  Returns false if an EOF
-     * should be returned immediately.
-     */
-    bool _shouldWaitForInserts();
-
-    /**
-     * Gets the CappedInsertNotifier for a capped collection.  Returns nullptr if this plan executor
-     * is not capable of yielding based on a notifier.
-     */
-    std::shared_ptr<CappedInsertNotifier> _getCappedInsertNotifier();
-
-    /**
-     * Yields locks and waits for inserts to the collection. Returns ADVANCED if there has been an
-     * insertion and there may be new results. Returns FAILURE if the PlanExecutor was killed during
-     * a yield. This method is only to be used for tailable and awaitData cursors, so rather than
-     * returning FAILURE if the operation has exceeded its time limit, we return IS_EOF to preserve
-     * this PlanExecutor for future use.
-     *
-     * If an error is encountered and 'errorObj' is provided, it is populated with an object
-     * describing the error.
-     */
-    ExecState _waitForInserts(CappedInsertNotifierData* notifierData,
-                              Snapshotted<BSONObj>* errorObj);
-
-    /**
-     * Common implementation for getNext() and getNextSnapshotted().
-     */
-    ExecState _getNextImpl(Snapshotted<BSONObj>* objOut, RecordId* dlOut);
+    ExecState _getNextImpl(Snapshotted<Document>* objOut, RecordId* dlOut);
 
     // The OperationContext that we're executing within. This can be updated if necessary by using
     // detachFromOperationContext() and reattachToOperationContext().
     OperationContext* _opCtx;
 
+    // Note, this can be null. Some queries don't need a CanonicalQuery for planning. For example,
+    // aggregation queries create a PlanExecutor with no CanonicalQuery.
     std::unique_ptr<CanonicalQuery> _cq;
+
+    // When '_cq' is not null, this will point to the same ExpressionContext that is in the '_cq'
+    // object. Note that this pointer can also be null when '_cq' is null. For example a "list
+    // collections" query does not need a CanonicalQuery or ExpressionContext.
+    boost::intrusive_ptr<ExpressionContext> _expCtx;
+
     std::unique_ptr<WorkingSet> _workingSet;
     std::unique_ptr<QuerySolution> _qs;
     std::unique_ptr<PlanStage> _root;
+    std::unique_ptr<PlanExplainer> _planExplainer;
 
     // If _killStatus has a non-OK value, then we have been killed and the value represents the
     // reason for the kill.
     Status _killStatus = Status::OK();
 
+    // Whether the executor must return owned BSON.
+    const bool _mustReturnOwnedBson;
+
     // What namespace are we operating over?
     NamespaceString _nss;
 
-    // This is used to handle automatic yielding when allowed by the YieldPolicy. Never NULL.
-    // TODO make this a non-pointer member. This requires some header shuffling so that this
-    // file includes plan_yield_policy.h rather than the other way around.
-    const std::unique_ptr<PlanYieldPolicy> _yieldPolicy;
+    // This is used to handle automatic yielding when allowed by the YieldPolicy. Never nullptr.
+    std::unique_ptr<PlanYieldPolicy> _yieldPolicy;
 
     // A stash of results generated by this plan that the user of the PlanExecutor didn't want
     // to consume yet. We empty the queue before retrieving further results from the plan
     // stages.
-    std::queue<BSONObj> _stash;
+    std::queue<Document> _stash;
+
+    // The output document that is used by getNext BSON API. This allows us to avoid constantly
+    // allocating and freeing DocumentStorage.
+    Document _docOutput;
 
     enum { kUsable, kSaved, kDetached, kDisposed } _currentState = kUsable;
 
-    bool _everDetachedFromOperationContext = false;
+    // A pointer either to a CollectionScan stage, if present in the execution tree, or nullptr
+    // otherwise. We cache it to avoid the need to traverse the execution tree in runtime when the
+    // executor is requested to return the oplog tracking info. Since this info is provided by
+    // either of these stages, the executor will simply delegate the request to the cached stage.
+    const CollectionScan* _collScanStage{nullptr};
 };
 
 }  // namespace mongo

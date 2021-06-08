@@ -34,12 +34,13 @@
 #include "api_common.h"
 #include "mongo/base/initializer.h"
 #include "mongo/bson/bsonobj.h"
-#include "mongo/db/client.h"
-#include "mongo/db/exec/projection_exec.h"
+#include "mongo/db/exec/projection_executor.h"
+#include "mongo/db/exec/projection_executor_builder.h"
 #include "mongo/db/matcher/matcher.h"
-#include "mongo/db/ops/parsed_update.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/ops/parsed_update_array_filters.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
-#include "mongo/db/query/parsed_projection.h"
+#include "mongo/db/query/projection_parser.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/update/update_driver.h"
 #include "mongo/util/assert_util.h"
@@ -57,6 +58,8 @@
 namespace mongo {
 
 using StitchSupportStatusImpl = StatusForAPI<stitch_support_v1_error>;
+
+const NamespaceString kDummyNamespaceStr = NamespaceString("");
 
 /**
  * C interfaces that use enterCXX() must provide a translateException() function that converts any
@@ -117,12 +120,12 @@ ServiceContext* initialize() {
     // The global initializers can take arguments, which would normally be supplied on the command
     // line, but we assume that clients of this library will never want anything other than the
     // defaults for all configuration that would be controlled by these parameters.
-    Status status =
-        mongo::runGlobalInitializers(0 /* argc */, nullptr /* argv */, nullptr /* envp */);
+    Status status = mongo::runGlobalInitializers(std::vector<std::string>{});
     uassertStatusOKWithContext(status, "Global initialization failed");
     setGlobalServiceContext(ServiceContext::make());
+    auto serviceContext = getGlobalServiceContext();
 
-    return getGlobalServiceContext();
+    return serviceContext;
 }
 
 struct ServiceContextDestructor {
@@ -139,21 +142,6 @@ struct ServiceContextDestructor {
 };
 
 using EmbeddedServiceContextPtr = std::unique_ptr<mongo::ServiceContext, ServiceContextDestructor>;
-
-ProjectionExec makeProjectionExecChecked(OperationContext* opCtx,
-                                         const BSONObj& spec,
-                                         const MatchExpression* queryExpression,
-                                         const CollatorInterface* collator) {
-    /**
-     * ParsedProjction::make performs necessary checks to ensure a projection spec is valid however
-     * we are not interested in the ParsedProjection object it produces.
-     */
-    ParsedProjection* dummy;
-    uassertStatusOK(ParsedProjection::make(opCtx, spec, queryExpression, &dummy));
-    delete dummy;
-    return ProjectionExec(opCtx, spec, queryExpression, collator);
-}
-
 }  // namespace
 }  // namespace mongo
 
@@ -178,12 +166,14 @@ struct stitch_support_v1_matcher {
                               stitch_support_v1_collator* collator)
         : client(std::move(client)),
           opCtx(this->client->makeOperationContext()),
-          matcher(filterBSON.getOwned(),
-                  new mongo::ExpressionContext(opCtx.get(),
-                                               collator ? collator->collator.get() : nullptr)){};
+          expCtx(new mongo::ExpressionContext(opCtx.get(),
+                                              collator ? collator->collator->clone() : nullptr,
+                                              mongo::kDummyNamespaceStr)),
+          matcher(filterBSON.getOwned(), expCtx){};
 
     mongo::ServiceContext::UniqueClient client;
     mongo::ServiceContext::UniqueOperationContext opCtx;
+    boost::intrusive_ptr<mongo::ExpressionContext> expCtx;
     mongo::Matcher matcher;
 };
 
@@ -192,27 +182,35 @@ struct stitch_support_v1_projection {
                                  const mongo::BSONObj& pattern,
                                  stitch_support_v1_matcher* matcher,
                                  stitch_support_v1_collator* collator)
-        : client(std::move(client)),
-          opCtx(this->client->makeOperationContext()),
-          projectionExec(mongo::makeProjectionExecChecked(
-              opCtx.get(),
-              pattern.getOwned(),
-              matcher ? matcher->matcher.getMatchExpression() : nullptr,
-              collator ? collator->collator.get() : nullptr)),
-          matcher(matcher) {
-        uassert(51050,
-                "Projections with a positional operator require a matcher",
-                matcher || !projectionExec.projectRequiresQueryExpression());
+        : client(std::move(client)), opCtx(this->client->makeOperationContext()), matcher(matcher) {
+
+        auto expCtx = mongo::make_intrusive<mongo::ExpressionContext>(
+            opCtx.get(),
+            collator ? collator->collator->clone() : nullptr,
+            mongo::kDummyNamespaceStr);
+        const auto policies = mongo::ProjectionPolicies::findProjectionPolicies();
+        auto proj =
+            mongo::projection_ast::parse(expCtx,
+                                         pattern,
+                                         matcher ? matcher->matcher.getMatchExpression() : nullptr,
+                                         matcher ? *matcher->matcher.getQuery() : mongo::BSONObj(),
+                                         policies);
+
         uassert(51051,
-                "$textScore, $sortKey, $recordId, $geoNear and $returnKey are not allowed in this "
+                "$textScore, $sortKey, $recordId and $geoNear are not allowed in this "
                 "context",
-                !projectionExec.hasMetaFields() && !projectionExec.returnKey());
+                !proj.metadataDeps().any());
+
+        this->requiresMatch = proj.requiresMatchDetails();
+        this->projectionExec = mongo::projection_executor::buildProjectionExecutor(
+            expCtx, &proj, policies, mongo::projection_executor::kDefaultBuilderParams);
     }
 
     mongo::ServiceContext::UniqueClient client;
     mongo::ServiceContext::UniqueOperationContext opCtx;
-    mongo::ProjectionExec projectionExec;
+    std::unique_ptr<mongo::projection_executor::ProjectionExecutor> projectionExec;
 
+    bool requiresMatch = false;
     stitch_support_v1_matcher* matcher;
 };
 
@@ -228,19 +226,23 @@ struct stitch_support_v1_update {
                              stitch_support_v1_collator* collator)
         : client(std::move(client)),
           opCtx(this->client->makeOperationContext()),
+          expCtx(new mongo::ExpressionContext(opCtx.get(),
+                                              collator ? collator->collator->clone() : nullptr,
+                                              mongo::kDummyNamespaceStr)),
           updateExpr(updateExpr.getOwned()),
           arrayFilters(arrayFilters.getOwned()),
           matcher(matcher),
-          updateDriver(new mongo::ExpressionContext(
-              opCtx.get(), collator ? collator->collator.get() : nullptr)) {
+          updateDriver(expCtx) {
         std::vector<mongo::BSONObj> arrayFilterVector;
         for (auto&& filter : this->arrayFilters) {
             arrayFilterVector.push_back(filter.embeddedObject());
         }
-        this->parsedFilters = uassertStatusOK(mongo::ParsedUpdate::parseArrayFilters(
-            arrayFilterVector, this->opCtx.get(), collator ? collator->collator.get() : nullptr));
+        this->parsedFilters = uassertStatusOK(
+            mongo::parsedUpdateArrayFilters(expCtx, arrayFilterVector, mongo::kDummyNamespaceStr));
 
-        updateDriver.parse(this->updateExpr, parsedFilters);
+        updateDriver.parse(
+            mongo::write_ops::UpdateModification::parseFromClassicUpdate(this->updateExpr),
+            parsedFilters);
 
         uassert(51037,
                 "Updates with a positional operator require a matcher object.",
@@ -249,6 +251,7 @@ struct stitch_support_v1_update {
 
     mongo::ServiceContext::UniqueClient client;
     mongo::ServiceContext::UniqueOperationContext opCtx;
+    boost::intrusive_ptr<mongo::ExpressionContext> expCtx;
     mongo::BSONObj updateExpr;
     mongo::BSONArray arrayFilters;
 
@@ -513,8 +516,8 @@ stitch_support_v1_projection_apply(stitch_support_v1_projection* const projectio
     return enterCXX(mongo::getStatusImpl(status), [&]() {
         mongo::BSONObj document(mongo::fromInterfaceType(documentBSON));
 
-        auto outputResult = projection->projectionExec.project(document);
-        auto outputObj = uassertStatusOK(outputResult);
+        auto outputObj =
+            projection->projectionExec->applyTransformation(mongo::Document{document}).toBson();
         auto outputSize = static_cast<size_t>(outputObj.objsize());
         auto output = new (std::nothrow) char[outputSize];
 
@@ -530,7 +533,7 @@ stitch_support_v1_projection_apply(stitch_support_v1_projection* const projectio
 bool MONGO_API_CALL
 stitch_support_v1_projection_requires_match(stitch_support_v1_projection* const projection) {
     return [projection]() noexcept {
-        return projection->projectionExec.projectRequiresQueryExpression();
+        return projection->requiresMatch;
     }
     ();
 }
@@ -587,7 +590,8 @@ stitch_support_v1_update_apply(stitch_support_v1_update* const update,
 
         mongo::FieldRefSetWithStorage modifiedPaths;
 
-        uassertStatusOK(update->updateDriver.update(matchedField,
+        uassertStatusOK(update->updateDriver.update(update->opCtx.get(),
+                                                    matchedField,
                                                     &mutableDoc,
                                                     false /* validateForStorage */,
                                                     immutablePaths,
@@ -633,7 +637,8 @@ uint8_t* MONGO_API_CALL stitch_support_v1_update_upsert(stitch_support_v1_update
                 mutableDoc));
         }
 
-        uassertStatusOK(update->updateDriver.update(mongo::StringData() /* matchedField */,
+        uassertStatusOK(update->updateDriver.update(update->opCtx.get(),
+                                                    mongo::StringData() /* matchedField */,
                                                     &mutableDoc,
                                                     false /* validateForStorage */,
                                                     immutablePaths,

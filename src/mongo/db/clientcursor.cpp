@@ -65,6 +65,8 @@ static Counter64 cursorStatsOpen;           // gauge
 static Counter64 cursorStatsOpenPinned;     // gauge
 static Counter64 cursorStatsOpenNoTimeout;  // gauge
 static Counter64 cursorStatsTimedOut;
+static Counter64 cursorStatsTotalOpened;
+static Counter64 cursorStatsMoreThanOneBatch;
 
 static ServerStatusMetricField<Counter64> dCursorStatsOpen("cursor.open.total", &cursorStatsOpen);
 static ServerStatusMetricField<Counter64> dCursorStatsOpenPinned("cursor.open.pinned",
@@ -73,10 +75,10 @@ static ServerStatusMetricField<Counter64> dCursorStatsOpenNoTimeout("cursor.open
                                                                     &cursorStatsOpenNoTimeout);
 static ServerStatusMetricField<Counter64> dCursorStatusTimedout("cursor.timedOut",
                                                                 &cursorStatsTimedOut);
-
-long long ClientCursor::totalOpen() {
-    return cursorStatsOpen.get();
-}
+static ServerStatusMetricField<Counter64> dCursorStatsTotalOpened("cursor.totalOpened",
+                                                                  &cursorStatsTotalOpened);
+static ServerStatusMetricField<Counter64> dCursorStatsMoreThanOneBatch(
+    "cursor.moreThanOneBatch", &cursorStatsMoreThanOneBatch);
 
 ClientCursor::ClientCursor(ClientCursorParams params,
                            CursorId cursorId,
@@ -87,21 +89,23 @@ ClientCursor::ClientCursor(ClientCursorParams params,
       _authenticatedUsers(std::move(params.authenticatedUsers)),
       _lsid(operationUsingCursor->getLogicalSessionId()),
       _txnNumber(operationUsingCursor->getTxnNumber()),
+      _apiParameters(std::move(params.apiParameters)),
       _writeConcernOptions(std::move(params.writeConcernOptions)),
       _readConcernArgs(std::move(params.readConcernArgs)),
       _originatingCommand(params.originatingCommandObj),
       _originatingPrivileges(std::move(params.originatingPrivileges)),
       _queryOptions(params.queryOptions),
-      _lockPolicy(params.lockPolicy),
       _exec(std::move(params.exec)),
       _operationUsingCursor(operationUsingCursor),
       _lastUseDate(now),
       _createdDate(now),
-      _planSummary(Explain::getPlanSummary(_exec.get())) {
+      _planSummary(_exec->getPlanExplainer().getPlanSummary()),
+      _opKey(operationUsingCursor->getOperationKey()) {
     invariant(_exec);
     invariant(_operationUsingCursor);
 
     cursorStatsOpen.increment();
+    cursorStatsTotalOpened.increment();
 
     if (isNoTimeout()) {
         // cursors normally timeout after an inactivity period to prevent excess memory use
@@ -119,6 +123,9 @@ ClientCursor::~ClientCursor() {
     if (isNoTimeout()) {
         cursorStatsOpenNoTimeout.decrement();
     }
+
+    if (_nBatchesReturned > 1)
+        cursorStatsMoreThanOneBatch.increment();
 }
 
 void ClientCursor::markAsKilled(Status killStatus) {
@@ -151,6 +158,7 @@ GenericCursor ClientCursor::toGenericCursor() const {
     if (auto opCtx = _operationUsingCursor) {
         gc.setOperationUsingCursorId(opCtx->getOpID());
     }
+    gc.setLastKnownCommittedOpTime(_lastKnownCommittedOpTime);
     return gc;
 }
 
@@ -288,8 +296,7 @@ public:
     }
 };
 
-// Only one instance of the ClientCursorMonitor exists
-ClientCursorMonitor clientCursorMonitor;
+auto getClientCursorMonitor = ServiceContext::declareDecoration<ClientCursorMonitor>();
 
 void _appendCursorStats(BSONObjBuilder& b) {
     b.append("note", "deprecated, use server status metrics");
@@ -299,10 +306,10 @@ void _appendCursorStats(BSONObjBuilder& b) {
     b.appendNumber("totalNoTimeout", cursorStatsOpenNoTimeout.get());
     b.appendNumber("timedOut", cursorStatsTimedOut.get());
 }
-}
+}  // namespace
 
 void startClientCursorMonitor() {
-    clientCursorMonitor.go();
+    getClientCursorMonitor(getGlobalServiceContext()).go();
 }
 
 }  // namespace mongo

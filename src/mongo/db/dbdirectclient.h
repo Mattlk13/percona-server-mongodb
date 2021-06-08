@@ -30,8 +30,10 @@
 #pragma once
 
 #include "mongo/client/dbclient_base.h"
+#include "mongo/config.h"
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/lasterror.h"
+#include "mongo/db/ops/write_ops.h"
 #include "mongo/util/net/hostandport.h"
 
 namespace mongo {
@@ -45,9 +47,7 @@ class OperationContext;
  *
  * All operations are performed within the scope of a passed-in OperationContext (except when
  * using the deprecated constructor). You must ensure that the OperationContext is valid when
- * calling into any function. If you ever need to change the OperationContext, that can be done
- * without the overhead of creating a new DBDirectClient by calling setOpCtx(), after which all
- * operations will use the new OperationContext.
+ * calling into any function.
  */
 class DBDirectClient : public DBClientBase {
 public:
@@ -55,16 +55,18 @@ public:
 
     using DBClientBase::query;
 
-    // XXX: is this valid or useful?
-    void setOpCtx(OperationContext* opCtx);
+    virtual std::unique_ptr<DBClientCursor> query(
+        const NamespaceStringOrUUID& nsOrUuid,
+        Query query,
+        int nToReturn = 0,
+        int nToSkip = 0,
+        const BSONObj* fieldsToReturn = nullptr,
+        int queryOptions = 0,
+        int batchSize = 0,
+        boost::optional<BSONObj> readConcernObj = boost::none);
 
-    virtual std::unique_ptr<DBClientCursor> query(const NamespaceStringOrUUID& nsOrUuid,
-                                                  Query query,
-                                                  int nToReturn = 0,
-                                                  int nToSkip = 0,
-                                                  const BSONObj* fieldsToReturn = 0,
-                                                  int queryOptions = 0,
-                                                  int batchSize = 0);
+    write_ops::FindAndModifyCommandReply findAndModify(
+        const write_ops::FindAndModifyCommandRequest& findAndModify);
 
     virtual bool isFailed() const;
 
@@ -77,15 +79,16 @@ public:
     virtual bool call(Message& toSend,
                       Message& response,
                       bool assertOk = true,
-                      std::string* actualServer = 0);
+                      std::string* actualServer = nullptr);
 
-    virtual void say(Message& toSend, bool isRetry = false, std::string* actualServer = 0);
+    virtual void say(Message& toSend, bool isRetry = false, std::string* actualServer = nullptr);
 
-    virtual unsigned long long count(const std::string& ns,
-                                     const BSONObj& query = BSONObj(),
-                                     int options = 0,
-                                     int limit = 0,
-                                     int skip = 0);
+    virtual long long count(const NamespaceStringOrUUID nsOrUuid,
+                            const BSONObj& query = BSONObj(),
+                            int options = 0,
+                            int limit = 0,
+                            int skip = 0,
+                            boost::optional<BSONObj> readConcernObj = boost::none);
 
     virtual ConnectionString::ConnectionType type() const;
 
@@ -103,6 +106,20 @@ public:
     bool isMongos() const final {
         return false;
     }
+
+    bool isTLS() final {
+        return false;
+    }
+
+#ifdef MONGO_CONFIG_SSL
+    const SSLConfiguration* getSSLConfiguration() override {
+        invariant(false);
+        return nullptr;
+    }
+#endif
+
+protected:
+    void _auth(const BSONObj& params) override;
 
 private:
     OperationContext* _opCtx;

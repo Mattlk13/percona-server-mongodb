@@ -41,6 +41,11 @@ public:
         return nullptr;
     }
 
+    std::shared_ptr<const ViewCatalog> getViewCatalog(OperationContext* const opCtx,
+                                                      StringData dbName) const override {
+        return nullptr;
+    }
+
     Database* openDb(OperationContext* opCtx, StringData ns, bool* justCreated = nullptr) override {
         return nullptr;
     }
@@ -55,11 +60,7 @@ public:
         return std::set<std::string>();
     }
 
-    std::unique_ptr<Collection> makeCollection(OperationContext* const opCtx,
-                                               const StringData fullNS,
-                                               OptionalCollectionUUID uuid,
-                                               CollectionCatalogEntry* const details,
-                                               RecordStore* const recordStore) override {
+    std::vector<std::string> getNames() override {
         return {};
     }
 };

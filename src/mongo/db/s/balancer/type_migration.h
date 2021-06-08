@@ -48,13 +48,13 @@ public:
     static const NamespaceString ConfigNS;
 
     // Field names and types in the migrations collection type.
-    static const BSONField<std::string> name;
     static const BSONField<std::string> ns;
     static const BSONField<BSONObj> min;
     static const BSONField<BSONObj> max;
     static const BSONField<std::string> fromShard;
     static const BSONField<std::string> toShard;
     static const BSONField<bool> waitForDelete;
+    static const BSONField<std::string> forceJumbo;
 
     /**
      * The Balancer encapsulates migration information in MigrateInfo objects, so this facilitates
@@ -78,17 +78,16 @@ public:
      */
     MigrateInfo toMigrateInfo() const;
 
-    /**
-     * Uniquely identifies a chunk by collection and min key.
-     */
-    std::string getName() const;
-
     const NamespaceString& getNss() const {
         return _nss;
     }
 
     bool getWaitForDelete() const {
         return _waitForDelete;
+    }
+
+    MoveChunkRequest::ForceJumbo getForceJumbo() const {
+        return MoveChunkRequest::parseForceJumbo(_forceJumbo);
     }
 
 private:
@@ -102,6 +101,7 @@ private:
     ShardId _toShard;
     ChunkVersion _chunkVersion;
     bool _waitForDelete{false};
+    std::string _forceJumbo{0};
 };
 
 }  // namespace mongo

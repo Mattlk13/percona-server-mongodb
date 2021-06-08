@@ -12,7 +12,7 @@ t.save({loc: q});
 
 var indexname = "2dsphere";
 
-t.ensureIndex({loc: indexname});
+t.createIndex({loc: indexname});
 
 assert.eq(1, t.find({loc: p}).itcount(), indexname);
 
@@ -42,10 +42,10 @@ assert.eq(
          $or: [
              {loc: {$geoIntersects: {$geometry: {type: 'LineString', coordinates: [p, q]}}}},
              {
-               loc: {
-                   $geoIntersects:
-                       {$geometry: {type: 'LineString', coordinates: [[0, 0], [1, 1]]}}
-               }
+                 loc: {
+                     $geoIntersects:
+                         {$geometry: {type: 'LineString', coordinates: [[0, 0], [1, 1]]}}
+                 }
              }
          ]
      }).itcount(),
@@ -63,18 +63,18 @@ assert.eq(
     t.find({
          $or: [
              {
-               loc: {
-                   $geoIntersects:
-                       {$geometry: {type: 'Polygon', coordinates: [[[0, 0], p, q, [0, 0]]]}}
-               }
+                 loc: {
+                     $geoIntersects:
+                         {$geometry: {type: 'Polygon', coordinates: [[[0, 0], p, q, [0, 0]]]}}
+                 }
              },
              {
-               loc: {
-                   $geoIntersects: {
-                       $geometry:
-                           {type: 'Polygon', coordinates: [[[0, 0], [1, 1], [0, 1], [0, 0]]]}
-                   }
-               }
+                 loc: {
+                     $geoIntersects: {
+                         $geometry:
+                             {type: 'Polygon', coordinates: [[[0, 0], [1, 1], [0, 1], [0, 0]]]}
+                     }
+                 }
              }
          ]
      }).itcount(),
@@ -84,7 +84,7 @@ t.dropIndexes();
 
 var indexname = "2d";
 
-t.ensureIndex({loc: indexname});
+t.createIndex({loc: indexname});
 
 assert.eq(2,
           t.find({

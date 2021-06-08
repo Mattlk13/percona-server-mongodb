@@ -2,7 +2,6 @@
 // Scope for the function
 //
 var _bulk_api_module = (function() {
-
     // Batch types
     var NONE = 0;
     var INSERT = 1;
@@ -37,7 +36,6 @@ var _bulk_api_module = (function() {
      * Accepts { w : x, j : x, wtimeout : x, fsync: x } or w, wtimeout, j
      */
     var WriteConcern = function(wValue, wTimeout, jValue) {
-
         if (!(this instanceof WriteConcern)) {
             var writeConcern = Object.create(WriteConcern.prototype);
             WriteConcern.apply(writeConcern, arguments);
@@ -97,7 +95,6 @@ var _bulk_api_module = (function() {
         this.shellPrint = function() {
             return this.toString();
         };
-
     };
 
     /**
@@ -107,7 +104,6 @@ var _bulk_api_module = (function() {
      * are used to filter the WriteResult to only include relevant result fields.
      */
     var WriteResult = function(bulkResult, singleBatchType, writeConcern) {
-
         if (!(this instanceof WriteResult))
             return new WriteResult(bulkResult, singleBatchType, writeConcern);
 
@@ -191,6 +187,10 @@ var _bulk_api_module = (function() {
                 result.writeError = {};
                 result.writeError.code = this.getWriteError().code;
                 result.writeError.errmsg = this.getWriteError().errmsg;
+                let errInfo = this.getWriteError().errInfo;
+                if (errInfo) {
+                    result.writeError.errInfo = errInfo;
+                }
             }
 
             if (this.getWriteConcernError() != null) {
@@ -217,7 +217,6 @@ var _bulk_api_module = (function() {
      * Wraps the result for the commands
      */
     var BulkWriteResult = function(bulkResult, singleBatchType, writeConcern) {
-
         if (!(this instanceof BulkWriteResult) && !(this instanceof BulkWriteError))
             return new BulkWriteResult(bulkResult, singleBatchType, writeConcern);
 
@@ -354,7 +353,6 @@ var _bulk_api_module = (function() {
      * Represents a bulk write error, identical to a BulkWriteResult but thrown
      */
     var BulkWriteError = function(bulkResult, singleBatchType, writeConcern, message) {
-
         if (!(this instanceof BulkWriteError))
             return new BulkWriteError(bulkResult, singleBatchType, writeConcern, message);
 
@@ -397,7 +395,6 @@ var _bulk_api_module = (function() {
      * Wraps a command error
      */
     var WriteCommandError = function(commandError) {
-
         if (!(this instanceof WriteCommandError))
             return new WriteCommandError(commandError);
 
@@ -445,6 +442,9 @@ var _bulk_api_module = (function() {
         defineReadOnlyProperty(this, "code", err.code);
         defineReadOnlyProperty(this, "index", err.index);
         defineReadOnlyProperty(this, "errmsg", err.errmsg);
+        // errInfo field is optional.
+        if (err.hasOwnProperty("errInfo"))
+            defineReadOnlyProperty(this, "errInfo", err.errInfo);
 
         //
         // Define access methods
@@ -536,8 +536,9 @@ var _bulk_api_module = (function() {
 
         // Set max byte size
         var maxBatchSizeBytes = 1024 * 1024 * 16;
-        var maxNumberOfDocsInBatch = 1000;
+        var maxNumberOfDocsInBatch = (TestData && TestData.disableBatchWrites) ? 1 : 1000;
         var writeConcern = null;
+        var letParams = null;
         var currentOp;
 
         // Final results
@@ -607,7 +608,6 @@ var _bulk_api_module = (function() {
 
         // Add to internal list of documents
         var addToOperationsList = function(docType, document) {
-
             if (Array.isArray(document))
                 throw Error("operation passed in cannot be an Array");
 
@@ -638,7 +638,7 @@ var _bulk_api_module = (function() {
          *     Otherwise, returns the same object passed.
          */
         var addIdIfNeeded = function(obj) {
-            if (typeof(obj._id) == "undefined" && !Array.isArray(obj)) {
+            if (typeof (obj._id) == "undefined" && !Array.isArray(obj)) {
                 var tmp = obj;  // don't want to modify input
                 obj = {_id: new ObjectId()};
                 for (var key in tmp) {
@@ -668,6 +668,11 @@ var _bulk_api_module = (function() {
                 var document =
                     {q: currentOp.selector, u: updateDocument, multi: true, upsert: upsert};
 
+                // Copy over the hint, if we have one.
+                if (currentOp.hasOwnProperty('hint')) {
+                    document.hint = currentOp.hint;
+                }
+
                 // Copy over the collation, if we have one.
                 if (currentOp.hasOwnProperty('collation')) {
                     document.collation = currentOp.collation;
@@ -690,6 +695,11 @@ var _bulk_api_module = (function() {
                 // Establish the update command
                 var document =
                     {q: currentOp.selector, u: updateDocument, multi: false, upsert: upsert};
+
+                // Copy over the hint, if we have one.
+                if (currentOp.hasOwnProperty('hint')) {
+                    document.hint = currentOp.hint;
+                }
 
                 // Copy over the collation, if we have one.
                 if (currentOp.hasOwnProperty('collation')) {
@@ -718,6 +728,11 @@ var _bulk_api_module = (function() {
             upsert: function() {
                 currentOp.upsert = true;
                 // Return the findOperations
+                return findOperations;
+            },
+
+            hint: function(hint) {
+                currentOp.hint = hint;
                 return findOperations;
             },
 
@@ -794,10 +809,13 @@ var _bulk_api_module = (function() {
             return findOperations;
         };
 
+        this.setLetParams = function(userLet) {
+            letParams = userLet;
+        };
+
         //
         // Merge write command result into aggregated results object
         var mergeBatchResults = function(batch, bulkResult, result) {
-
             // If we have an insert Batch type
             if (batch.batchType == INSERT) {
                 bulkResult.nInserted = bulkResult.nInserted + result.n;
@@ -845,6 +863,10 @@ var _bulk_api_module = (function() {
                         errmsg: result.writeErrors[i].errmsg,
                         op: batch.operations[result.writeErrors[i].index]
                     };
+                    var errInfo = result.writeErrors[i].errInfo;
+                    if (errInfo) {
+                        writeError['errInfo'] = errInfo;
+                    }
 
                     bulkResult.writeErrors.push(new WriteError(writeError));
                 }
@@ -878,6 +900,11 @@ var _bulk_api_module = (function() {
             // If we have a write concern
             if (writeConcern) {
                 cmd.writeConcern = writeConcern;
+            }
+
+            // If we have let parameters, add them to the command.
+            if (letParams) {
+                cmd.let = letParams;
             }
 
             {
@@ -994,8 +1021,8 @@ var _bulk_api_module = (function() {
             } else if (code == 19900 ||  // No longer primary
                        code == 16805 ||  // replicatedToNum no longer primary
                        code == 14330 ||  // gle wmode changed; invalid
-                       code == NOT_MASTER ||
-                       code == UNKNOWN_REPL_WRITE_CONCERN || code == WRITE_CONCERN_FAILED) {
+                       code == NOT_MASTER || code == UNKNOWN_REPL_WRITE_CONCERN ||
+                       code == WRITE_CONCERN_FAILED) {
                 extractedErr.wcError = {code: code, errmsg: errMsg};
             } else if (!isOK) {
                 // This is a GLE failure we don't understand
@@ -1022,7 +1049,6 @@ var _bulk_api_module = (function() {
 
         // Execute the operations, serially
         var executeBatchWithLegacyOps = function(batch) {
-
             var batchResult = {n: 0, writeErrors: [], upserted: []};
 
             var extractedErr = null;
@@ -1098,25 +1124,24 @@ var _bulk_api_module = (function() {
                 bsonWoCompare(writeConcern, {w: 0}) != 0;
 
             extractedErr = null;
-            if (needToEnforceWC && (batchResult.writeErrors.length == 0 ||
-                                    (!ordered &&
-                                     // not all errored.
-                                     batchResult.writeErrors.length < batch.operations.length))) {
-                // if last write errored
-                if (batchResult.writeErrors.length > 0 &&
-                    batchResult.writeErrors[batchResult.writeErrors.length - 1].index ==
-                        (batch.operations.length - 1)) {
-                    // Reset previous errors so we can apply the write concern no matter what
-                    // as long as it is valid.
-                    collection.getDB().runCommand({resetError: 1});
-                }
+            if (needToEnforceWC &&
+                (batchResult.writeErrors.length == 0 ||
+                 (!ordered &&
+                  // not all errored.
+                  batchResult.writeErrors.length < batch.operations.length))) {
+                var hadError = batchResult.writeErrors.length > 0;
+                var lastErrorIndex = batchResult.writeErrors.length - 1;
+                var didAllOperationsFail = hadError &&
+                    batchResult.writeErrors[lastErrorIndex].index == (batch.operations.length - 1);
 
-                result = executeGetLastError(collection.getDB(), writeConcern);
-                extractedErr = extractGLEErrors(result);
+                if (!didAllOperationsFail) {
+                    result = executeGetLastError(collection.getDB(), writeConcern);
+                    extractedErr = extractGLEErrors(result);
 
-                if (extractedErr.unknownError) {
-                    // Report as a wc failure
-                    extractedErr.wcError = extractedErr.unknownError;
+                    if (extractedErr.unknownError) {
+                        // Report as a wc failure
+                        extractedErr.wcError = extractedErr.unknownError;
+                    }
                 }
             }
 
@@ -1222,7 +1247,6 @@ var _bulk_api_module = (function() {
     };
 
     return module;
-
 })();
 
 // Globals

@@ -27,6 +27,8 @@
  *    it in the license file.
  */
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
+
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/ttl_collection_cache.h"
@@ -34,8 +36,12 @@
 #include <algorithm>
 
 #include "mongo/db/service_context.h"
+#include "mongo/logv2/log.h"
+#include "mongo/util/fail_point.h"
 
 namespace mongo {
+
+MONGO_FAIL_POINT_DEFINE(hangTTLCollectionCacheAfterRegisteringInfo);
 
 namespace {
 const auto getTTLCollectionCache = ServiceContext::declareDecoration<TTLCollectionCache>();
@@ -45,20 +51,34 @@ TTLCollectionCache& TTLCollectionCache::get(ServiceContext* ctx) {
     return getTTLCollectionCache(ctx);
 }
 
-void TTLCollectionCache::registerCollection(const NamespaceString& collectionNS) {
-    stdx::lock_guard<stdx::mutex> lock(_ttlCollectionsLock);
-    _ttlCollections.push_back(collectionNS.ns());
+void TTLCollectionCache::registerTTLInfo(UUID uuid, const Info& info) {
+    {
+        stdx::lock_guard<Latch> lock(_ttlInfosLock);
+        _ttlInfos[uuid].push_back(info);
+    }
+
+    if (MONGO_unlikely(hangTTLCollectionCacheAfterRegisteringInfo.shouldFail())) {
+        LOGV2(4664000, "Hanging due to hangTTLCollectionCacheAfterRegisteringInfo fail point");
+        hangTTLCollectionCacheAfterRegisteringInfo.pauseWhileSet();
+    }
 }
 
-void TTLCollectionCache::unregisterCollection(const NamespaceString& collectionNS) {
-    stdx::lock_guard<stdx::mutex> lock(_ttlCollectionsLock);
-    auto collIter = std::find(_ttlCollections.begin(), _ttlCollections.end(), collectionNS.ns());
-    fassert(40220, collIter != _ttlCollections.end());
-    _ttlCollections.erase(collIter);
+void TTLCollectionCache::deregisterTTLInfo(UUID uuid, const Info& info) {
+    stdx::lock_guard<Latch> lock(_ttlInfosLock);
+    auto infoIt = _ttlInfos.find(uuid);
+    fassert(5400705, infoIt != _ttlInfos.end());
+    auto& [_, infoVec] = *infoIt;
+
+    auto iter = std::find(infoVec.begin(), infoVec.end(), info);
+    fassert(40220, iter != infoVec.end());
+    infoVec.erase(iter);
+    if (infoVec.empty()) {
+        _ttlInfos.erase(infoIt);
+    }
 }
 
-std::vector<std::string> TTLCollectionCache::getCollections() {
-    stdx::lock_guard<stdx::mutex> lock(_ttlCollectionsLock);
-    return _ttlCollections;
+TTLCollectionCache::InfoMap TTLCollectionCache::getTTLInfos() {
+    stdx::lock_guard<Latch> lock(_ttlInfosLock);
+    return _ttlInfos;
 }
 };  // namespace mongo

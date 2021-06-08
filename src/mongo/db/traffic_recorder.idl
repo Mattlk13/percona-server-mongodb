@@ -59,7 +59,9 @@ structs:
 commands:
     startRecordingTraffic:
         description: "start recording Command"
+        command_name: startRecordingTraffic
         namespace: ignored
+        api_version: ""
         fields:
             filename:
                 description: "output file name"
@@ -75,7 +77,9 @@ commands:
 
     stopRecordingTraffic:
         description: "stop recording Command"
+        command_name: stopRecordingTraffic
         namespace: ignored
+        api_version: ""
 
 server_parameters:
     trafficRecordingDirectory:

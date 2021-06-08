@@ -27,10 +27,13 @@
  *    it in the license file.
  */
 
-#include "mongo/db/s/config_server_op_observer.h"
+#include "mongo/platform/basic.h"
+
+#include "mongo/db/s/config/config_server_test_fixture.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
+#include "mongo/db/s/config_server_op_observer.h"
+#include "mongo/db/vector_clock_mutable.h"
 #include "mongo/s/cluster_identity_loader.h"
-#include "mongo/s/config_server_test_fixture.h"
 #include "mongo/unittest/death_test.h"
 
 namespace mongo {
@@ -39,10 +42,7 @@ namespace {
 class ConfigServerOpObserverTest : public ConfigServerTestFixture {
 protected:
     void setUp() override {
-        ConfigServerTestFixture::setUp();
-
-        ASSERT_OK(ShardingCatalogManager::get(operationContext())
-                      ->initializeConfigDatabaseIfNeeded(operationContext()));
+        setUpAndInitializeConfigDb();
 
         auto clusterIdLoader = ClusterIdentityLoader::get(operationContext());
         ASSERT_OK(clusterIdLoader->loadClusterId(operationContext(),
@@ -96,6 +96,21 @@ TEST_F(ConfigServerOpObserverTest, NodeDoesNotClearClusterIDWhenConfigVersionNot
     opObserver.onReplicationRollback(operationContext(), rbInfo);
 
     ASSERT_EQ(ClusterIdentityLoader::get(operationContext())->getClusterId(), _clusterId);
+}
+
+TEST_F(ConfigServerOpObserverTest, ConfigOpTimeAdvancedWhenMajorityCommitPointAdvanced) {
+    ConfigServerOpObserver opObserver;
+
+    repl::OpTime a(Timestamp(1, 1), 1);
+    repl::OpTime b(Timestamp(1, 2), 1);
+
+    opObserver.onMajorityCommitPointUpdate(getServiceContext(), a);
+    const auto aTime = VectorClock::get(getServiceContext())->getTime();
+    ASSERT_EQ(a.getTimestamp(), aTime.configTime().asTimestamp());
+
+    opObserver.onMajorityCommitPointUpdate(getServiceContext(), b);
+    const auto bTime = VectorClock::get(getServiceContext())->getTime();
+    ASSERT_EQ(b.getTimestamp(), bTime.configTime().asTimestamp());
 }
 
 }  // namespace

@@ -15,6 +15,12 @@ var $config = (function() {
     const states = {
         init: function init(db, collName) {
             let session = db.getMongo().startSession({causalConsistency: true});
+            // The default WC is majority and this test can't satisfy majority writes.
+            assert.commandWorked(db.adminCommand({
+                setDefaultRWConcern: 1,
+                defaultWriteConcern: {w: 1},
+                writeConcern: {w: "majority"}
+            }));
             // Store the session ID in the database so any unterminated transactions can be aborted
             // at teardown.
             insertSessionDoc(db, collName, this.tid, session.getSessionId().id);
@@ -38,18 +44,18 @@ var $config = (function() {
             doSnapshotGetMore(collName,
                               this,
                               [
-                                ErrorCodes.CursorKilled,
-                                ErrorCodes.CursorNotFound,
-                                ErrorCodes.Interrupted,
-                                ErrorCodes.LockTimeout,
-                                ErrorCodes.NoSuchTransaction,
+                                  ErrorCodes.CursorKilled,
+                                  ErrorCodes.CursorNotFound,
+                                  ErrorCodes.Interrupted,
+                                  ErrorCodes.LockTimeout,
+                                  ErrorCodes.NoSuchTransaction,
                               ],
                               [
-                                ErrorCodes.NoSuchTransaction,
-                                ErrorCodes.Interrupted,
-                                // Anonymous code for when user tries to send commit as the first
-                                // operation in a transaction without sending a recovery token
-                                50940
+                                  ErrorCodes.NoSuchTransaction,
+                                  ErrorCodes.Interrupted,
+                                  // Anonymous code for when user tries to send commit as the first
+                                  // operation in a transaction without sending a recovery token
+                                  50940
                               ]);
         },
 
@@ -131,7 +137,7 @@ var $config = (function() {
         assertWhenOwnColl.commandWorked(db.runCommand({create: collName}));
         for (let i = 0; i < this.numIds; ++i) {
             const res = db[collName].insert({_id: i, value: i});
-            assert.writeOK(res);
+            assert.commandWorked(res);
             assert.eq(1, res.nInserted);
         }
     }
@@ -151,5 +157,4 @@ var $config = (function() {
         teardown: teardown,
         data: data,
     };
-
 })();

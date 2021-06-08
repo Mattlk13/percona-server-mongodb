@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include "mongo/s/sharding_task_executor_pool_controller.h"
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/util/net/hostandport.h"
 
@@ -66,11 +67,17 @@ struct ConnectionPoolStats {
     size_t totalAvailable = 0u;
     size_t totalCreated = 0u;
     size_t totalRefreshing = 0u;
+    boost::optional<ShardingTaskExecutorPoolController::MatchingStrategy> strategy;
 
-    stdx::unordered_map<std::string, ConnectionStatsPer> statsByPool;
-    stdx::unordered_map<HostAndPort, ConnectionStatsPer> statsByHost;
-    stdx::unordered_map<std::string, stdx::unordered_map<HostAndPort, ConnectionStatsPer>>
-        statsByPoolHost;
+    using StatsByHost = std::map<HostAndPort, ConnectionStatsPer>;
+
+    struct PoolStats final : public ConnectionStatsPer {
+        StatsByHost statsByHost;
+    };
+    using StatsByPool = std::map<std::string, PoolStats>;
+
+    StatsByHost statsByHost;
+    StatsByPool statsByPool;
 };
 
 }  // namespace executor

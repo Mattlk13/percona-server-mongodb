@@ -29,6 +29,8 @@
 
 #pragma once
 
+#include <memory>
+
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/index_bounds_builder.h"
 #include "mongo/db/query/query_planner_params.h"
@@ -138,15 +140,17 @@ private:
      */
     struct ScanBuildingState {
         ScanBuildingState(MatchExpression* theRoot,
+                          const std::vector<IndexEntry>& indexList,
                           bool inArrayOp,
-                          const std::vector<IndexEntry>& indexList)
+                          bool isCoveredNull = false)
             : root(theRoot),
               inArrayOperator(inArrayOp),
+              isCoveredNullQuery(isCoveredNull),
               indices(indexList),
               currentScan(nullptr),
               curChild(0),
               currentIndexNumber(IndexTag::kNoIndex),
-              ixtag(NULL),
+              ixtag(nullptr),
               tightness(IndexBoundsBuilder::INEXACT_FETCH),
               curOr(nullptr),
               loosestBounds(IndexBoundsBuilder::EXACT) {}
@@ -157,13 +161,13 @@ private:
          * This always should be called prior to allocating a new 'currentScan'.
          */
         void resetForNextScan(IndexTag* newTag) {
-            currentScan.reset(NULL);
+            currentScan.reset(nullptr);
             currentIndexNumber = newTag->index;
             tightness = IndexBoundsBuilder::INEXACT_FETCH;
             loosestBounds = IndexBoundsBuilder::EXACT;
 
             if (MatchExpression::OR == root->matchType()) {
-                curOr = stdx::make_unique<OrMatchExpression>();
+                curOr = std::make_unique<OrMatchExpression>();
             }
         }
 
@@ -173,6 +177,9 @@ private:
 
         // Are we inside an array operator such as $elemMatch or $all?
         bool inArrayOperator;
+
+        // Is this a covered null query?
+        bool isCoveredNullQuery;
 
         // A list of relevant indices which 'root' may be tagged to use.
         const std::vector<IndexEntry>& indices;
@@ -397,7 +404,7 @@ private:
      * AND or an OR match expression.
      */
     static void addFilterToSolutionNode(QuerySolutionNode* node,
-                                        MatchExpression* match,
+                                        std::unique_ptr<MatchExpression> match,
                                         MatchExpression::MatchType type);
 
     /**

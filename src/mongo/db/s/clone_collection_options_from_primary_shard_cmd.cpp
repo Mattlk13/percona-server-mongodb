@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -37,7 +37,6 @@
 #include "mongo/db/s/shard_filtering_metadata_refresh.h"
 #include "mongo/s/request_types/clone_collection_options_from_primary_shard_gen.h"
 #include "mongo/s/shard_id.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
@@ -52,8 +51,15 @@ public:
 
         void typedRun(OperationContext* opCtx) {
             auto primaryShardId = ShardId(request().getPrimaryShard().toString());
+            auto collectionOptionsAndIndexes = [&]() -> CollectionOptionsAndIndexes {
+                auto [collOptions, uuid] = MigrationDestinationManager::getCollectionOptions(
+                    opCtx, ns(), primaryShardId, boost::none, boost::none);
+                auto [indexes, idIndex] = MigrationDestinationManager::getCollectionIndexes(
+                    opCtx, ns(), primaryShardId, boost::none, boost::none);
+                return {uuid, indexes, idIndex, collOptions};
+            }();
             MigrationDestinationManager::cloneCollectionIndexesAndOptions(
-                opCtx, ns(), primaryShardId);
+                opCtx, ns(), collectionOptionsAndIndexes);
 
             // At the time this command is invoked, the config server primary has already written
             // the collection's routing metadata, so sync from the config server

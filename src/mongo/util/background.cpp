@@ -27,23 +27,25 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/util/background.h"
 
+#include <functional>
+
 #include "mongo/config.h"
+#include "mongo/logv2/log.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/concurrency/idle_thread_block.h"
 #include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/concurrency/spin_lock.h"
 #include "mongo/util/concurrency/thread_name.h"
 #include "mongo/util/debug_util.h"
-#include "mongo/util/log.h"
+#include "mongo/util/hierarchical_acquisition.h"
 #include "mongo/util/str.h"
 #include "mongo/util/timer.h"
 
@@ -53,6 +55,10 @@ namespace {
 
 class PeriodicTaskRunner : public BackgroundJob {
 public:
+    // Tasks are expected to finish reasonably quickly, so when a task run takes longer
+    // than `kMinLog`, the verbosity of its summary log statement is upgraded from 3 to 0.
+    static constexpr auto kMinLog = Milliseconds(100);
+
     PeriodicTaskRunner() : _shutdownRequested(false) {}
 
     void add(PeriodicTask* task);
@@ -79,7 +85,9 @@ private:
     void _runTask(PeriodicTask* task);
 
     // _mutex protects the _shutdownRequested flag and the _tasks vector.
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH(
+        // This mutex is held around task execution HierarchicalAcquisitionLevel(0),
+        "PeriodicTaskRunner::_mutex");
 
     // The condition variable is used to sleep for the interval between task
     // executions, and is notified when the _shutdownRequested flag is toggled.
@@ -128,7 +136,7 @@ bool runnerDestroyed = false;
 struct BackgroundJob::JobStatus {
     JobStatus() : state(NotStarted) {}
 
-    stdx::mutex mutex;
+    Mutex mutex = MONGO_MAKE_LATCH("JobStatus::mutex");
     stdx::condition_variable done;
     State state;
 };
@@ -143,7 +151,11 @@ void BackgroundJob::jobBody() {
         setThreadName(threadName);
     }
 
-    LOG(1) << "BackgroundJob starting: " << threadName;
+    LOGV2_DEBUG(23098,
+                1,
+                "BackgroundJob starting: {threadName}",
+                "BackgroundJob starting",
+                "threadName"_attr = threadName);
 
     run();
 
@@ -153,7 +165,7 @@ void BackgroundJob::jobBody() {
     {
         // It is illegal to access any state owned by this BackgroundJob after leaving this
         // scope, with the exception of the call to 'delete this' below.
-        stdx::unique_lock<stdx::mutex> l(_status->mutex);
+        stdx::unique_lock<Latch> l(_status->mutex);
         _status->state = Done;
         _status->done.notify_all();
     }
@@ -163,7 +175,7 @@ void BackgroundJob::jobBody() {
 }
 
 void BackgroundJob::go() {
-    stdx::unique_lock<stdx::mutex> l(_status->mutex);
+    stdx::unique_lock<Latch> l(_status->mutex);
     massert(17234,
             str::stream() << "backgroundJob already running: " << name(),
             _status->state != Running);
@@ -177,7 +189,7 @@ void BackgroundJob::go() {
 }
 
 Status BackgroundJob::cancel() {
-    stdx::unique_lock<stdx::mutex> l(_status->mutex);
+    stdx::unique_lock<Latch> l(_status->mutex);
 
     if (_status->state == Running)
         return Status(ErrorCodes::IllegalOperation, "Cannot cancel a running BackgroundJob");
@@ -193,7 +205,7 @@ Status BackgroundJob::cancel() {
 bool BackgroundJob::wait(unsigned msTimeOut) {
     verify(!_selfDelete);  // you cannot call wait on a self-deleting job
     const auto deadline = Date_t::now() + Milliseconds(msTimeOut);
-    stdx::unique_lock<stdx::mutex> l(_status->mutex);
+    stdx::unique_lock<Latch> l(_status->mutex);
     while (_status->state != Done) {
         if (msTimeOut) {
             if (stdx::cv_status::timeout ==
@@ -207,12 +219,12 @@ bool BackgroundJob::wait(unsigned msTimeOut) {
 }
 
 BackgroundJob::State BackgroundJob::getState() const {
-    stdx::unique_lock<stdx::mutex> l(_status->mutex);
+    stdx::unique_lock<Latch> l(_status->mutex);
     return _status->state;
 }
 
 bool BackgroundJob::running() const {
-    stdx::unique_lock<stdx::mutex> l(_status->mutex);
+    stdx::unique_lock<Latch> l(_status->mutex);
     return _status->state == Running;
 }
 
@@ -267,15 +279,15 @@ Status PeriodicTask::stopRunningPeriodicTasks(int gracePeriodMillis) {
 }
 
 void PeriodicTaskRunner::add(PeriodicTask* task) {
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    stdx::lock_guard<Latch> lock(_mutex);
     _tasks.push_back(task);
 }
 
 void PeriodicTaskRunner::remove(PeriodicTask* task) {
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    stdx::lock_guard<Latch> lock(_mutex);
     for (size_t i = 0; i != _tasks.size(); i++) {
         if (_tasks[i] == task) {
-            _tasks[i] = NULL;
+            _tasks[i] = nullptr;
             break;
         }
     }
@@ -283,7 +295,7 @@ void PeriodicTaskRunner::remove(PeriodicTask* task) {
 
 Status PeriodicTaskRunner::stop(int gracePeriodMillis) {
     {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        stdx::lock_guard<Latch> lock(_mutex);
         _shutdownRequested = true;
         _cond.notify_one();
     }
@@ -299,7 +311,7 @@ void PeriodicTaskRunner::run() {
     // Use a shorter cycle time in debug mode to help catch race conditions.
     const Seconds waitTime(kDebugBuild ? 5 : 60);
 
-    stdx::unique_lock<stdx::mutex> lock(_mutex);
+    stdx::unique_lock<Latch> lock(_mutex);
     while (!_shutdownRequested) {
         {
             MONGO_IDLE_THREAD_BLOCK;
@@ -329,14 +341,26 @@ void PeriodicTaskRunner::_runTask(PeriodicTask* const task) {
     try {
         task->taskDoWork();
     } catch (const std::exception& e) {
-        error() << "task: " << taskName << " failed: " << redact(e.what());
+        LOGV2_ERROR(23100,
+                    "Task: {taskName} failed: {error}",
+                    "Task failed",
+                    "taskName"_attr = taskName,
+                    "error"_attr = redact(e.what()));
     } catch (...) {
-        error() << "task: " << taskName << " failed with unknown error";
+        LOGV2_ERROR(23101,
+                    "Task: {taskName} failed with unknown error",
+                    "Task failed with unknown error",
+                    "taskName"_attr = taskName);
     }
 
-    const int ms = timer.millis();
-    const int kMinLogMs = 100;
-    LOG(ms <= kMinLogMs ? 3 : 0) << "task: " << taskName << " took: " << ms << "ms";
+    const auto duration = timer.elapsed();
+
+    LOGV2_DEBUG(23099,
+                duration <= kMinLog ? 3 : 0,
+                "Task: {taskName} took: {duration}",
+                "Task finished",
+                "taskName"_attr = taskName,
+                "duration"_attr = duration_cast<Milliseconds>(duration));
 }
 
 }  // namespace mongo

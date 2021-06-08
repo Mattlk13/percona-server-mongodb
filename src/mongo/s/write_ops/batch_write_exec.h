@@ -86,13 +86,19 @@ typedef std::map<ConnectionString, HostOpTime> HostOpTimeMap;
 class BatchWriteExecStats {
 public:
     BatchWriteExecStats()
-        : numRounds(0), numTargetErrors(0), numResolveErrors(0), numStaleBatches(0) {}
+        : numRounds(0),
+          numTargetErrors(0),
+          numResolveErrors(0),
+          numStaleShardBatches(0),
+          numStaleDbBatches(0) {}
 
     void noteWriteAt(const HostAndPort& host, repl::OpTime opTime, const OID& electionId);
     void noteTargetedShard(const ShardId& shardId);
+    void noteNumShardsOwningChunks(const int nShardsOwningChunks);
 
     const std::set<ShardId>& getTargetedShards() const;
     const HostOpTimeMap& getWriteOpTimes() const;
+    const boost::optional<int> getNumShardsOwningChunks() const;
 
     // Expose via helpers if this gets more complex
 
@@ -102,12 +108,15 @@ public:
     int numTargetErrors;
     // Number of times host resolution failed
     int numResolveErrors;
-    // Number of stale batches
-    int numStaleBatches;
+    // Number of stale batches due to StaleShardVersion
+    int numStaleShardBatches;
+    // Number of stale batches due to StaleDbVersion
+    int numStaleDbBatches;
 
 private:
     std::set<ShardId> _targetedShards;
     HostOpTimeMap _writeOpTimes;
+    boost::optional<int> _numShardsOwningChunks;
 };
 
 }  // namespace mongo

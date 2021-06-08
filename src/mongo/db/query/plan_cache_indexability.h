@@ -29,21 +29,22 @@
 
 #pragma once
 
+#include <functional>
 #include <vector>
 
-#include "mongo/db/exec/projection_exec_agg.h"
-#include "mongo/stdx/functional.h"
 #include "mongo/util/string_map.h"
 
 namespace mongo {
-
 class BSONObj;
 class CollatorInterface;
 class CompositeIndexabilityDiscriminator;
 class MatchExpression;
 struct CoreIndexInfo;
+namespace projection_executor {
+class ProjectionExecutor;
+}
 
-using IndexabilityDiscriminator = stdx::function<bool(const MatchExpression* me)>;
+using IndexabilityDiscriminator = std::function<bool(const MatchExpression* me)>;
 using IndexabilityDiscriminators = std::vector<IndexabilityDiscriminator>;
 using IndexToDiscriminatorMap = StringMap<CompositeIndexabilityDiscriminator>;
 
@@ -116,18 +117,13 @@ private:
      * index.
      */
     struct WildcardIndexDiscriminatorContext {
-        WildcardIndexDiscriminatorContext(const ProjectionExecAgg* proj,
+        WildcardIndexDiscriminatorContext(projection_executor::ProjectionExecutor* proj,
                                           std::string name,
-                                          const MatchExpression* filter,
                                           const CollatorInterface* coll)
-            : projectionExec(proj),
-              filterExpr(filter),
-              collator(coll),
-              catalogName(std::move(name)) {}
+            : projectionExec(proj), collator(coll), catalogName(std::move(name)) {}
 
         // These are owned by the catalog.
-        const ProjectionExecAgg* projectionExec;
-        const MatchExpression* filterExpr;  // For partial indexes.
+        projection_executor::ProjectionExecutor* projectionExec;
         const CollatorInterface* collator;
 
         std::string catalogName;

@@ -29,13 +29,15 @@
 
 #pragma once
 
+#include <functional>
+
 #include "mongo/db/repl/optime.h"
+#include "mongo/executor/task_executor_pool.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/util/hierarchical_acquisition.h"
 
 namespace mongo {
 
@@ -45,9 +47,7 @@ class OperationContext;
 class ServiceContext;
 
 namespace executor {
-struct ConnectionPoolStats;
 class NetworkInterface;
-class TaskExecutorPool;
 }  // namespace executor
 
 /**
@@ -58,7 +58,7 @@ public:
     Grid();
     ~Grid();
 
-    using CustomConnectionPoolStatsFn = stdx::function<void(executor::ConnectionPoolStats* stats)>;
+    using CustomConnectionPoolStatsFn = std::function<void(executor::ConnectionPoolStats* stats)>;
 
     /**
      * Retrieves the instance of Grid associated with the current service/operation context.
@@ -144,6 +144,18 @@ public:
     }
 
     /**
+     * Returns a readConcern at the specified level for reading after the current ConfigTime.
+     */
+    repl::ReadConcernArgs readConcernWithConfigTime(repl::ReadConcernLevel readConcernLevel) const;
+
+    /**
+     * Returns a readPreference (based on the given one) for targeting a config server that is at or
+     * after the current ConfigTime.
+     */
+    ReadPreferenceSetting readPreferenceWithConfigTime(
+        const ReadPreferenceSetting& readPreference) const;
+
+    /**
      * Returns the the last optime that a shard or config server has reported as the current
      * committed optime on the config server.
      * NOTE: This is not valid to call on a config server instance.
@@ -191,7 +203,7 @@ private:
     AtomicWord<bool> _shardingInitialized{false};
 
     // Protects _configOpTime.
-    mutable stdx::mutex _mutex;
+    mutable Mutex _mutex = MONGO_MAKE_LATCH(HierarchicalAcquisitionLevel(0), "Grid::_mutex");
 
     // Last known highest opTime from the config server that should be used when doing reads.
     // This value is updated any time a shard or mongos talks to a config server or a shard.

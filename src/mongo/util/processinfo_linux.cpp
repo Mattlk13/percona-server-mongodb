@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 #include "mongo/platform/basic.h"
 
@@ -35,6 +35,7 @@
 
 #include <iostream>
 #include <malloc.h>
+#include <pcrecpp.h>
 #include <sched.h>
 #include <stdio.h>
 #include <sys/mman.h>
@@ -53,27 +54,28 @@
 #include <boost/filesystem.hpp>
 #include <boost/none.hpp>
 #include <boost/optional.hpp>
+#include <fmt/format.h>
+#include <pcrecpp.h>
 
+#include "mongo/logv2/log.h"
+#include "mongo/util/ctype.h"
 #include "mongo/util/file.h"
-#include "mongo/util/log.h"
 
 #define KLONG long
 #define KLF "l"
 
 namespace mongo {
 
+using namespace fmt::literals;
+
 class LinuxProc {
 public:
     LinuxProc(ProcessId pid) {
-        char name[128];
-        sprintf(name, "/proc/%d/stat", pid.asUInt32());
-
-        FILE* f = fopen(name, "r");
+        auto name = "/proc/{}/stat"_format(pid.asUInt32());
+        FILE* f = fopen(name.c_str(), "r");
         if (!f) {
-            std::stringstream ss;
-            ss << "couldn't open [" << name << "] " << errnoWithDescription();
-            std::string s = ss.str();
-            msgasserted(13538, s.c_str());
+            auto e = errno;
+            msgasserted(13538, "couldn't open [{}] {}"_format(name, errnoWithDescription(e)));
         }
         int found = fscanf(f,
                            "%d %127s %c "
@@ -132,10 +134,8 @@ public:
                              &_exit_signal, &_processor,
                              &_rtprio, &_sched
                            */
-                           );
-        if (found == 0) {
-            std::cout << "system error: reading proc info" << std::endl;
-        }
+        );
+        massert(13539, "couldn't parse [{}]"_format(name).c_str(), found != 0);
         fclose(f);
     }
 
@@ -244,54 +244,193 @@ public:
     // The current EIP (instruction pointer).
 };
 
+namespace {
+
+// As described in the /proc/[pid]/mountinfo section of `man 5 proc`:
+//
+// 36 35 98:0 /mnt1 /mnt2 rw,noatime master:1 - ext3 /dev/root rw,errors=continue
+// |  |  |    |     |     |          |          |      |     |
+// (1)(2)(3:4)(5)   (6)   (7)        (8)        (9)   (10)   (11)
+struct MountRecord {
+    bool parseLine(const std::string& line) {
+        static const pcrecpp::RE kRe{
+            //   (1)   (2)   (3)   (4)   (5)   (6)   (7)   (8)                (9)   (10)  (11)
+            R"re((\d+) (\d+) (\d+):(\d+) (\S+) (\S+) (\S+) ((?:\S+:\S+ ?)*) - (\S+) (\S+) (\S+))re"};
+        return kRe.FullMatch(line,
+                             &mountId,
+                             &parentId,
+                             &major,
+                             &minor,
+                             &root,
+                             &mountPoint,
+                             &options,
+                             &fields,
+                             &type,
+                             &source,
+                             &superOpt);
+    }
+
+    void appendBSON(BSONObjBuilder& bob) const {
+        bob.append("mountId", mountId)
+            .append("parentId", parentId)
+            .append("major", major)
+            .append("minor", minor)
+            .append("root", root)
+            .append("mountPoint", mountPoint)
+            .append("options", options)
+            .append("fields", fields)
+            .append("type", type)
+            .append("source", source)
+            .append("superOpt", superOpt);
+    }
+
+    int mountId;             //  (1) unique ID for the mount
+    int parentId;            //  (2) the ID of the parent mount (self for the root mount)
+    int major;               //  (3) major block device number (see stat(2))
+    int minor;               //  (4) minor block device number
+    std::string root;        //  (5) path in filesystem forming the root
+    std::string mountPoint;  //  (6) the mount point relative to the process's root
+    std::string options;     //  (7) per-mount options (see mount(2)).
+    std::string fields;      //  (8) zero or more: "tag[:value]" fields
+    std::string type;        //  (9) filesystem type: "type[.subtype]"
+    std::string source;      //  (10) fs-specific information or "none"
+    std::string superOpt;    //  (11) per-superblock options (see mount(2))
+};
+
+void appendMountInfo(BSONObjBuilder& bob) {
+    std::ifstream ifs("/proc/self/mountinfo");
+    if (!ifs)
+        return;
+    BSONArrayBuilder arr = bob.subarrayStart("mountInfo");
+    std::string line;
+    MountRecord rec;
+    while (ifs && getline(ifs, line)) {
+        if (rec.parseLine(line)) {
+            auto bob = BSONObjBuilder(arr.subobjStart());
+            rec.appendBSON(bob);
+        }
+    }
+}
+
+class CpuInfoParser {
+public:
+    struct LineProcessor {
+        pcrecpp::RE regex;
+        std::function<void(const std::string&)> f;
+    };
+    std::vector<LineProcessor> lineProcessors;
+    std::function<void()> recordProcessor;
+    void run() {
+        std::ifstream f("/proc/cpuinfo");
+        if (!f)
+            return;
+
+        bool readSuccess;
+        bool unprocessed = false;
+        static StaticImmortal<pcrecpp::RE> lineRegex(R"re((.*?)\s*:\s*(.*))re");
+        do {
+            std::string fstr;
+            readSuccess = f && std::getline(f, fstr);
+            if (readSuccess && !fstr.empty()) {
+                std::string key;
+                std::string value;
+                if (!lineRegex->FullMatch(fstr, &key, &value))
+                    continue;
+                for (auto&& [lpr, lpf] : lineProcessors) {
+                    if (lpr.FullMatch(key))
+                        lpf(value);
+                }
+                unprocessed = true;
+            } else if (unprocessed) {
+                recordProcessor();
+                unprocessed = false;
+            }
+        } while (readSuccess);
+    }
+};
+
+}  // namespace
 
 class LinuxSysHelper {
 public:
     /**
-    * Read the first 1023 bytes from a file
-    */
+     * Read the first 1023 bytes from a file
+     */
     static std::string readLineFromFile(const char* fname) {
         FILE* f;
         char fstr[1024] = {0};
 
         f = fopen(fname, "r");
-        if (f != NULL) {
-            if (fgets(fstr, 1023, f) != NULL)
+        if (f != nullptr) {
+            if (fgets(fstr, 1023, f) != nullptr)
                 fstr[strlen(fstr) < 1 ? 0 : strlen(fstr) - 1] = '\0';
             fclose(f);
         }
         return fstr;
     }
 
+
     /**
-    * Get some details about the CPU
-    */
-    static void getCpuInfo(int& procCount, std::string& freq, std::string& features) {
-        FILE* f;
-        char fstr[1024] = {0};
-        procCount = 0;
+     * count the number of physical cores
+     */
+    static void getNumPhysicalCores(int& physicalCores) {
 
-        f = fopen("/proc/cpuinfo", "r");
-        if (f == NULL)
-            return;
+        /* In /proc/cpuinfo core ids are only unique within a particular physical unit, AKA a cpu
+         * package, so to count the total cores we need to count the unique pairs of core id and
+         * physical id*/
+        struct CpuId {
+            std::string core;
+            std::string physical;
+        };
 
-        while (fgets(fstr, 1023, f) != NULL && !feof(f)) {
-            // until the end of the file
-            fstr[strlen(fstr) < 1 ? 0 : strlen(fstr) - 1] = '\0';
-            if (strncmp(fstr, "processor ", 10) == 0 || strncmp(fstr, "processor\t:", 11) == 0)
-                ++procCount;
-            if (strncmp(fstr, "cpu MHz\t\t:", 10) == 0)
-                freq = fstr + 11;
-            if (strncmp(fstr, "flags\t\t:", 8) == 0)
-                features = fstr + 9;
-        }
+        CpuId parsedCpuId;
 
-        fclose(f);
+        auto cmp = [](auto&& a, auto&& b) {
+            auto tupLens = [](auto&& o) { return std::tie(o.core, o.physical); };
+            return tupLens(a) < tupLens(b);
+        };
+        std::set<CpuId, decltype(cmp)> cpuIds(cmp);
+
+        CpuInfoParser cpuInfoParser{
+            {
+                {"physical id", [&](const std::string& value) { parsedCpuId.physical = value; }},
+                {"core id", [&](const std::string& value) { parsedCpuId.core = value; }},
+            },
+            [&]() {
+                cpuIds.insert(parsedCpuId);
+                parsedCpuId = CpuId{};
+            }};
+        cpuInfoParser.run();
+
+        physicalCores = cpuIds.size();
     }
 
     /**
-    * Determine linux distro and version
-    */
+     * Get some details about the CPU
+     */
+    static void getCpuInfo(int& procCount, std::string& freq, std::string& features) {
+
+        procCount = 0;
+
+        CpuInfoParser cpuInfoParser{
+            {
+#ifdef __s390x__
+                {R"re(processor\s+\d+)re", [&](const std::string& value) { procCount++; }},
+                {"cpu MHz static", [&](const std::string& value) { freq = value; }},
+                {"features", [&](const std::string& value) { features = value; }},
+#else
+                {"processor", [&](const std::string& value) { procCount++; }},
+                {"cpu MHz", [&](const std::string& value) { freq = value; }},
+                {"flags", [&](const std::string& value) { features = value; }},
+#endif
+            },
+            []() {}};
+        cpuInfoParser.run();
+    }
+
+    /**
+     * Determine linux distro and version
+     */
     static void getLinuxDistro(std::string& name, std::string& version) {
         char buf[4096] = {0};
 
@@ -322,7 +461,7 @@ public:
                     if (std::string(key).compare("DISTRIB_RELEASE") == 0)
                         version = val;
                 }
-            } catch (const std::out_of_range& e) {
+            } catch (const std::out_of_range&) {
                 // attempted to get invalid substr
             }
             // return with lsb-release data if we found both the name and version
@@ -387,8 +526,8 @@ public:
     }
 
     /**
-    * Get system memory total
-    */
+     * Get system memory total
+     */
     static unsigned long long getSystemMemorySize() {
         std::string meminfo = readLineFromFile("/proc/meminfo");
         size_t lineOff = 0;
@@ -399,31 +538,30 @@ public:
             lineOff = 0;
 
             // trim whitespace and append 000 to replace kB.
-            while (isspace(meminfo.at(lineOff)))
+            while (ctype::isSpace(meminfo.at(lineOff)))
                 lineOff++;
             meminfo = meminfo.substr(lineOff);
 
             unsigned long long systemMem = 0;
-            if (mongo::parseNumberFromString(meminfo, &systemMem).isOK()) {
+            if (mongo::NumberParser{}(meminfo, &systemMem).isOK()) {
                 return systemMem * 1024;  // convert from kB to bytes
             } else
-                log() << "Unable to collect system memory information";
+                LOGV2(23338, "Unable to collect system memory information");
         }
         return 0;
     }
 
     /**
-    * Get memory limit for the process.
-    * If memory is being limited by the applied control group and it's less
-    * than the OS system memory (default cgroup limit is ulonglong max) let's
-    * return the actual memory we'll have available to the process.
-    */
+     * Get memory limit for the process.
+     * If memory is being limited by the applied control group and it's less
+     * than the OS system memory (default cgroup limit is ulonglong max) let's
+     * return the actual memory we'll have available to the process.
+     */
     static unsigned long long getMemorySizeLimit() {
         unsigned long long systemMemBytes = getSystemMemorySize();
         unsigned long long cgroupMemBytes = 0;
         std::string cgmemlimit = readLineFromFile("/sys/fs/cgroup/memory/memory.limit_in_bytes");
-        if (!cgmemlimit.empty() &&
-            mongo::parseNumberFromString(cgmemlimit, &cgroupMemBytes).isOK()) {
+        if (!cgmemlimit.empty() && mongo::NumberParser{}(cgmemlimit, &cgroupMemBytes).isOK()) {
             return std::min(systemMemBytes, cgroupMemBytes);
         }
         return systemMemBytes;
@@ -469,10 +607,6 @@ int ProcessInfo::getResidentSize() {
     return (int)((p.getResidentSizeInPages() * getPageSize()) / (1024.0 * 1024));
 }
 
-double ProcessInfo::getSystemMemoryPressurePercentage() {
-    return 0.0;
-}
-
 void ProcessInfo::getExtraInfo(BSONObjBuilder& info) {
     struct rusage ru;
     getrusage(RUSAGE_SELF, &ru);
@@ -509,20 +643,25 @@ void ProcessInfo::getExtraInfo(BSONObjBuilder& info) {
 }
 
 /**
-* Save a BSON obj representing the host system's details
-*/
+ * Save a BSON obj representing the host system's details
+ */
 void ProcessInfo::SystemInfo::collectSystemInfo() {
     utsname unameData;
     std::string distroName, distroVersion;
     std::string cpuFreq, cpuFeatures;
     int cpuCount;
+    int physicalCores;
 
     std::string verSig = LinuxSysHelper::readLineFromFile("/proc/version_signature");
     LinuxSysHelper::getCpuInfo(cpuCount, cpuFreq, cpuFeatures);
+    LinuxSysHelper::getNumPhysicalCores(physicalCores);
     LinuxSysHelper::getLinuxDistro(distroName, distroVersion);
 
     if (uname(&unameData) == -1) {
-        log() << "Unable to collect detailed system information: " << strerror(errno);
+        auto e = errno;
+        LOGV2(23339,
+              "Unable to collect detailed system information",
+              "error"_attr = errnoWithDescription(e));
     }
 
     osType = "Linux";
@@ -559,13 +698,16 @@ void ProcessInfo::SystemInfo::collectSystemInfo() {
     bExtra.append("pageSize", static_cast<long long>(pageSize));
     bExtra.append("numPages", static_cast<int>(sysconf(_SC_PHYS_PAGES)));
     bExtra.append("maxOpenFiles", static_cast<int>(sysconf(_SC_OPEN_MAX)));
+    bExtra.append("physicalCores", physicalCores);
+
+    appendMountInfo(bExtra);
 
     _extraStats = bExtra.obj();
 }
 
 /**
-* Determine if the process is running with (cc)NUMA
-*/
+ * Determine if the process is running with (cc)NUMA
+ */
 bool ProcessInfo::checkNumaEnabled() {
     bool hasMultipleNodes = false;
     bool hasNumaMaps = false;
@@ -574,8 +716,10 @@ bool ProcessInfo::checkNumaEnabled() {
         hasMultipleNodes = boost::filesystem::exists("/sys/devices/system/node/node1");
         hasNumaMaps = boost::filesystem::exists("/proc/self/numa_maps");
     } catch (boost::filesystem::filesystem_error& e) {
-        log() << "WARNING: Cannot detect if NUMA interleaving is enabled. "
-              << "Failed to probe \"" << e.path1().string() << "\": " << e.code().message();
+        LOGV2(23340,
+              "WARNING: Cannot detect if NUMA interleaving is enabled. Failed to probe",
+              "path"_attr = e.path1().string(),
+              "reason"_attr = e.code().message());
         return false;
     }
 
@@ -594,30 +738,4 @@ bool ProcessInfo::checkNumaEnabled() {
     return false;
 }
 
-bool ProcessInfo::blockCheckSupported() {
-    return true;
-}
-
-bool ProcessInfo::blockInMemory(const void* start) {
-    unsigned char x = 0;
-    if (mincore(const_cast<void*>(alignToStartOfPage(start)), getPageSize(), &x)) {
-        log() << "mincore failed: " << errnoWithDescription();
-        return 1;
-    }
-    return x & 0x1;
-}
-
-bool ProcessInfo::pagesInMemory(const void* start, size_t numPages, std::vector<char>* out) {
-    out->resize(numPages);
-    if (mincore(const_cast<void*>(alignToStartOfPage(start)),
-                numPages * getPageSize(),
-                reinterpret_cast<unsigned char*>(&out->front()))) {
-        log() << "mincore failed: " << errnoWithDescription();
-        return false;
-    }
-    for (size_t i = 0; i < numPages; ++i) {
-        (*out)[i] &= 0x1;
-    }
-    return true;
-}
-}
+}  // namespace mongo

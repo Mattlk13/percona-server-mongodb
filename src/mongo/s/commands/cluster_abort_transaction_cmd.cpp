@@ -27,23 +27,46 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/txn_cmds_gen.h"
+#include "mongo/db/transaction_validation.h"
+#include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/transaction_router.h"
 
 namespace mongo {
 namespace {
 
+static const Status kOnlyTransactionsReadConcernsSupported{
+    ErrorCodes::InvalidOptions, "only read concerns valid in transactions are supported"};
+static const Status kDefaultReadConcernNotPermitted{ErrorCodes::InvalidOptions,
+                                                    "default read concern not permitted"};
+
 /**
  * Implements the abortTransaction command on mongos.
  */
-class ClusterAbortTransactionCmd : public BasicCommand {
+class ClusterAbortTransactionCmd
+    : public BasicCommandWithRequestParser<ClusterAbortTransactionCmd> {
 public:
-    ClusterAbortTransactionCmd() : BasicCommand("abortTransaction") {}
+    using BasicCommandWithRequestParser::BasicCommandWithRequestParser;
+    using Request = AbortTransaction;
+    using Reply = OkReply;
+
+    void validateResult(const BSONObj& resultObj) final {
+        auto ctx = IDLParserErrorContext("AbortReply");
+        if (!checkIsErrorStatus(resultObj, ctx)) {
+            // Will throw if the result doesn't match the abortReply.
+            Reply::parse(ctx, resultObj);
+        }
+    }
+
+    const std::set<std::string>& apiVersions() const {
+        return kApiVersions1;
+    }
 
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kAlways;
@@ -57,6 +80,18 @@ public:
         return true;
     }
 
+    ReadConcernSupportResult supportsReadConcern(const BSONObj& cmdObj,
+                                                 repl::ReadConcernLevel level) const override {
+        // abortTransaction commences running inside a transaction (even though the transaction will
+        // be ended by the time it completes).  Therefore it needs to accept any readConcern which
+        // is valid within a transaction.  However it is not appropriate to apply the default
+        // readConcern, since the readConcern of the transaction (set by the first operation) is
+        // what must apply.
+        return {{!isReadConcernLevelAllowedInTransaction(level),
+                 kOnlyTransactionsReadConcernsSupported},
+                {kDefaultReadConcernNotPermitted}};
+    }
+
     std::string help() const override {
         return "Aborts a transaction";
     }
@@ -67,18 +102,23 @@ public:
         return Status::OK();
     }
 
-    bool run(OperationContext* opCtx,
-             const std::string& dbName,
-             const BSONObj& cmdObj,
-             BSONObjBuilder& result) override {
+    bool runWithRequestParser(OperationContext* opCtx,
+                              const std::string& dbName,
+                              const BSONObj& cmdObj,
+                              const RequestParser& requestParser,
+                              BSONObjBuilder& result) final {
         auto txnRouter = TransactionRouter::get(opCtx);
         uassert(ErrorCodes::InvalidOptions,
                 "abortTransaction can only be run within a session",
                 txnRouter);
 
-        auto abortRes = txnRouter->abortTransaction(opCtx);
+        auto abortRes = txnRouter.abortTransaction(opCtx);
         CommandHelpers::filterCommandReplyForPassthrough(abortRes, &result);
         return true;
+    }
+
+    const AuthorizationContract* getAuthorizationContract() const final {
+        return &::mongo::AbortTransaction::kAuthorizationContract;
     }
 
 } clusterAbortTransactionCmd;

@@ -26,11 +26,14 @@ env.Library(
         'view_graph.cpp',
     ],
     LIBDEPS=[
-        'resolved_view',
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/pipeline/aggregation',
-        '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
         '$BUILD_DIR/mongo/db/query/collation/collator_factory_interface',
+        '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
+        'resolved_view',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/audit',
     ]
 )
 
@@ -41,11 +44,12 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/pipeline/aggregation_request_helper',
     ]
 )
 
 env.CppUnitTest(
-    target='views_test',
+    target='db_views_test',
     source=[
         'resolved_view_test.cpp',
         'view_catalog_test.cpp',
@@ -53,12 +57,14 @@ env.CppUnitTest(
         'view_graph_test.cpp',
     ],
     LIBDEPS=[
-        'views',
         '$BUILD_DIR/mongo/db/auth/authmocks',
+        '$BUILD_DIR/mongo/db/catalog/catalog_test_fixture',
         '$BUILD_DIR/mongo/db/query/collation/collator_interface_mock',
         '$BUILD_DIR/mongo/db/query/query_test_service_context',
         '$BUILD_DIR/mongo/db/repl/replmocks',
         '$BUILD_DIR/mongo/s/is_mongos',
         '$BUILD_DIR/mongo/unittest/unittest',
+        'views',
+        'views_mongod',
     ],
 )

@@ -2,19 +2,19 @@
 //
 // @tags: [
 //   # This test attempts to enable profiling on a server and then get profiling data by reading
-//   # from the "system.profile" collection. The former operation must be routed to the primary in
+//   # nodes the "system.profile" collection. The former operation must be routed to the primary in
 //   # a replica set, whereas the latter may be routed to a secondary.
 //   assumes_read_preference_unchanged,
 //   does_not_support_stepdowns,
-//   requires_getmore,
 //   requires_capped,
+//   requires_getmore,
 //   requires_profiling,
 // ]
 
 var testDB = db.getSiblingDB("geo_s2cursorlimitskip");
 var t = testDB.geo_s2getmmm;
 t.drop();
-t.ensureIndex({geo: "2dsphere"});
+t.createIndex({geo: "2dsphere"});
 
 Random.setRandomSeed();
 var random = Random.rand;
@@ -35,7 +35,7 @@ function insertRandomPoints(num, minDist, maxDist) {
         var lat = sign() * (minDist + random() * (maxDist - minDist));
         var lng = sign() * (minDist + random() * (maxDist - minDist));
         var point = {geo: {type: "Point", coordinates: [lng, lat]}};
-        assert.writeOK(t.insert(point));
+        assert.commandWorked(t.insert(point));
     }
 }
 
@@ -53,7 +53,7 @@ assert.eq(cursor.count(), totalPointCount);
 
 // Disable profiling in order to drop the system.profile collection.
 // Then enable profiling for all operations. This is acceptable because
-// our test is blacklisted from the parallel suite.
+// our test is denylisted from the parallel suite.
 testDB.setProfilingLevel(0);
 testDB.system.profile.drop();
 // Create 4MB system.profile collection to prevent the 'getmore' operations from overwriting the

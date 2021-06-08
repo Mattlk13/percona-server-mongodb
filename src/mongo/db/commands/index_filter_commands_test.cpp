@@ -33,13 +33,14 @@
 
 #include "mongo/db/commands/index_filter_commands.h"
 
+#include <memory>
+
 #include "mongo/db/json.h"
 #include "mongo/db/operation_context_noop.h"
 #include "mongo/db/query/collation/collator_interface_mock.h"
 #include "mongo/db/query/plan_ranker.h"
 #include "mongo/db/query/query_solution.h"
 #include "mongo/db/query/query_test_service_context.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/unittest.h"
 
 using namespace mongo;
@@ -104,16 +105,18 @@ vector<BSONObj> getFilters(const QuerySettings& querySettings) {
 /**
  * Utility function to create a PlanRankingDecision
  */
-std::unique_ptr<PlanRankingDecision> createDecision(size_t numPlans) {
-    unique_ptr<PlanRankingDecision> why(new PlanRankingDecision());
+std::unique_ptr<plan_ranker::PlanRankingDecision> createDecision(size_t numPlans) {
+    auto why = std::make_unique<plan_ranker::PlanRankingDecision>();
+    std::vector<std::unique_ptr<PlanStageStats>> stats;
     for (size_t i = 0; i < numPlans; ++i) {
         CommonStats common("COLLSCAN");
-        auto stats = stdx::make_unique<PlanStageStats>(common, STAGE_COLLSCAN);
-        stats->specific.reset(new CollectionScanStats());
-        why->stats.push_back(std::move(stats));
+        auto stat = std::make_unique<PlanStageStats>(common, STAGE_COLLSCAN);
+        stat->specific.reset(new CollectionScanStats());
+        stats.push_back(std::move(stat));
         why->scores.push_back(0U);
         why->candidateOrder.push_back(i);
     }
+    why->getStats<PlanStageStats>().candidatePlanStats = std::move(stats);
     return why;
 }
 
@@ -127,16 +130,16 @@ void addQueryShapeToPlanCache(OperationContext* opCtx,
                               const char* projectionStr,
                               const char* collationStr) {
     // Create canonical query.
-    auto qr = stdx::make_unique<QueryRequest>(nss);
-    qr->setFilter(fromjson(queryStr));
-    qr->setSort(fromjson(sortStr));
-    qr->setProj(fromjson(projectionStr));
-    qr->setCollation(fromjson(collationStr));
-    auto statusWithCQ = CanonicalQuery::canonicalize(opCtx, std::move(qr));
+    auto findCommand = std::make_unique<FindCommandRequest>(nss);
+    findCommand->setFilter(fromjson(queryStr));
+    findCommand->setSort(fromjson(sortStr));
+    findCommand->setProjection(fromjson(projectionStr));
+    findCommand->setCollation(fromjson(collationStr));
+    auto statusWithCQ = CanonicalQuery::canonicalize(opCtx, std::move(findCommand));
     ASSERT_OK(statusWithCQ.getStatus());
     std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
-    QuerySolution qs;
+    QuerySolution qs{QueryPlannerParams::Options::DEFAULT};
     qs.cacheData.reset(new SolutionCacheData());
     qs.cacheData->tree.reset(new PlanCacheIndexTree());
     std::vector<QuerySolution*> solns;
@@ -158,12 +161,12 @@ bool planCacheContains(OperationContext* opCtx,
                        const char* collationStr) {
 
     // Create canonical query.
-    auto qr = stdx::make_unique<QueryRequest>(nss);
-    qr->setFilter(fromjson(queryStr));
-    qr->setSort(fromjson(sortStr));
-    qr->setProj(fromjson(projectionStr));
-    qr->setCollation(fromjson(collationStr));
-    auto statusWithInputQuery = CanonicalQuery::canonicalize(opCtx, std::move(qr));
+    auto findCommand = std::make_unique<FindCommandRequest>(nss);
+    findCommand->setFilter(fromjson(queryStr));
+    findCommand->setSort(fromjson(sortStr));
+    findCommand->setProjection(fromjson(projectionStr));
+    findCommand->setCollation(fromjson(collationStr));
+    auto statusWithInputQuery = CanonicalQuery::canonicalize(opCtx, std::move(findCommand));
     ASSERT_OK(statusWithInputQuery.getStatus());
     unique_ptr<CanonicalQuery> inputQuery = std::move(statusWithInputQuery.getValue());
 
@@ -173,15 +176,17 @@ bool planCacheContains(OperationContext* opCtx,
     // Search keys.
     bool found = false;
     for (auto&& entry : entries) {
-        // Canonicalizing query shape in cache entry to get cache key.
-        // Alternatively, we could add key to PlanCacheEntry but that would be used in one place
-        // only.
-        auto qr = stdx::make_unique<QueryRequest>(nss);
-        qr->setFilter(entry->query);
-        qr->setSort(entry->sort);
-        qr->setProj(entry->projection);
-        qr->setCollation(entry->collation);
-        auto statusWithCurrentQuery = CanonicalQuery::canonicalize(opCtx, std::move(qr));
+        ASSERT(entry->debugInfo);
+        const auto& createdFromQuery = entry->debugInfo->createdFromQuery;
+
+        // Canonicalize the query shape stored in the cache entry in order to get the plan cache
+        // key.
+        auto findCommand = std::make_unique<FindCommandRequest>(nss);
+        findCommand->setFilter(createdFromQuery.filter);
+        findCommand->setSort(createdFromQuery.sort);
+        findCommand->setProjection(createdFromQuery.projection);
+        findCommand->setCollation(createdFromQuery.collation);
+        auto statusWithCurrentQuery = CanonicalQuery::canonicalize(opCtx, std::move(findCommand));
         ASSERT_OK(statusWithCurrentQuery.getStatus());
         unique_ptr<CanonicalQuery> currentQuery = std::move(statusWithCurrentQuery.getValue());
 

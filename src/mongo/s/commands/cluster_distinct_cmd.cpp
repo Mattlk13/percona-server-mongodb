@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -36,6 +36,7 @@
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/query/parsed_distinct.h"
 #include "mongo/db/query/view_response_formatter.h"
+#include "mongo/db/repl/read_concern_level.h"
 #include "mongo/db/views/resolved_view.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/cluster_commands_helpers.h"
@@ -43,6 +44,7 @@
 #include "mongo/s/grid.h"
 #include "mongo/s/query/cluster_aggregate.h"
 #include "mongo/s/transaction_router.h"
+#include "mongo/util/decimal_counter.h"
 
 namespace mongo {
 namespace {
@@ -63,6 +65,10 @@ public:
         return AllowedOnSecondary::kAlways;
     }
 
+    bool maintenanceOk() const override {
+        return false;
+    }
+
     bool adminOnly() const override {
         return false;
     }
@@ -71,10 +77,9 @@ public:
         return false;
     }
 
-    bool supportsReadConcern(const std::string& dbName,
-                             const BSONObj& cmdObj,
-                             repl::ReadConcernLevel level) const final {
-        return true;
+    ReadConcernSupportResult supportsReadConcern(const BSONObj& cmdObj,
+                                                 repl::ReadConcernLevel level) const final {
+        return ReadConcernSupportResult::allSupportedAndDefaultPermitted();
     }
 
     void addRequiredPrivileges(const std::string& dbname,
@@ -127,17 +132,19 @@ public:
                 return aggCmdOnView.getStatus();
             }
 
-            auto aggRequestOnView =
-                AggregationRequest::parseFromBSON(nss, aggCmdOnView.getValue(), verbosity);
-            if (!aggRequestOnView.isOK()) {
-                return aggRequestOnView.getStatus();
-            }
+            auto viewAggCmd = OpMsgRequest::fromDBAndBody(nss.db(), aggCmdOnView.getValue()).body;
+            auto aggRequestOnView = aggregation_request_helper::parseFromBSON(
+                nss,
+                viewAggCmd,
+                verbosity,
+                APIParameters::get(opCtx).getAPIStrict().value_or(false));
+
 
             auto bodyBuilder = result->getBodyBuilder();
             // An empty PrivilegeVector is acceptable because these privileges are only checked on
             // getMore and explain will not open a cursor.
             return ClusterAggregate::retryOnViewError(opCtx,
-                                                      aggRequestOnView.getValue(),
+                                                      aggRequestOnView,
                                                       *ex.extraInfo<ResolvedView>(),
                                                       nss,
                                                       PrivilegeVector(),
@@ -151,11 +158,7 @@ public:
 
         auto bodyBuilder = result->getBodyBuilder();
         return ClusterExplain::buildExplainResult(
-            opCtx,
-            ClusterExplain::downconvert(opCtx, shardResponses),
-            mongosStageName,
-            millisElapsed,
-            &bodyBuilder);
+            opCtx, shardResponses, mongosStageName, millisElapsed, cmdObj, &bodyBuilder);
     }
 
     bool run(OperationContext* opCtx,
@@ -175,7 +178,14 @@ public:
                 CollatorFactoryInterface::get(opCtx->getServiceContext())->makeFromBSON(collation));
         }
 
-        const auto routingInfo = uassertStatusOK(getCollectionRoutingInfoForTxnCmd(opCtx, nss));
+        const auto cm = uassertStatusOK(getCollectionRoutingInfoForTxnCmd(opCtx, nss));
+        if (repl::ReadConcernArgs::get(opCtx).getLevel() ==
+                repl::ReadConcernLevel::kSnapshotReadConcern &&
+            !opCtx->inMultiDocumentTransaction() && cm.isSharded()) {
+            uasserted(ErrorCodes::InvalidOptions,
+                      "readConcern level \"snapshot\" prohibited for \"distinct\" command on"
+                      " sharded collection");
+        }
 
         std::vector<AsyncRequestsSender::Response> shardResponses;
         try {
@@ -183,8 +193,9 @@ public:
                 opCtx,
                 nss.db(),
                 nss,
-                routingInfo,
-                CommandHelpers::filterCommandRequestForPassthrough(cmdObj),
+                cm,
+                applyReadWriteConcern(
+                    opCtx, this, CommandHelpers::filterCommandRequestForPassthrough(cmdObj)),
                 ReadPreferenceSetting::get(opCtx),
                 Shard::RetryPolicy::kIdempotent,
                 query,
@@ -197,14 +208,19 @@ public:
             auto aggCmdOnView = parsedDistinct.getValue().asAggregationCommand();
             uassertStatusOK(aggCmdOnView.getStatus());
 
-            auto aggRequestOnView = AggregationRequest::parseFromBSON(nss, aggCmdOnView.getValue());
-            uassertStatusOK(aggRequestOnView.getStatus());
+            auto viewAggCmd = OpMsgRequest::fromDBAndBody(nss.db(), aggCmdOnView.getValue()).body;
+            auto aggRequestOnView = aggregation_request_helper::parseFromBSON(
+                nss,
+                viewAggCmd,
+                boost::none,
+                APIParameters::get(opCtx).getAPIStrict().value_or(false));
 
-            auto resolvedAggRequest = ex->asExpandedViewAggregation(aggRequestOnView.getValue());
-            auto resolvedAggCmd = resolvedAggRequest.serializeToCommandObj().toBson();
+            auto resolvedAggRequest = ex->asExpandedViewAggregation(aggRequestOnView);
+            auto resolvedAggCmd =
+                aggregation_request_helper::serializeToCommandObj(resolvedAggRequest);
 
             if (auto txnRouter = TransactionRouter::get(opCtx)) {
-                txnRouter->onViewResolutionError(opCtx, nss);
+                txnRouter.onViewResolutionError(opCtx, nss);
             }
 
             BSONObj aggResult = CommandHelpers::runCommandDirectly(
@@ -217,12 +233,11 @@ public:
             return true;
         }
 
-        BSONObjComparator bsonCmp(
-            BSONObj(),
-            BSONObjComparator::FieldNamesMode::kConsider,
-            !collation.isEmpty()
-                ? collator.get()
-                : (routingInfo.cm() ? routingInfo.cm()->getDefaultCollator() : nullptr));
+        BSONObjComparator bsonCmp(BSONObj(),
+                                  BSONObjComparator::FieldNamesMode::kConsider,
+                                  !collation.isEmpty()
+                                      ? collator.get()
+                                      : (cm.isSharded() ? cm.getDefaultCollator() : nullptr));
         BSONObjSet all = bsonCmp.makeBSONObjSet();
 
         for (const auto& response : shardResponses) {
@@ -242,12 +257,19 @@ public:
         }
 
         BSONObjBuilder b(32);
-        int n = 0;
+        DecimalCounter<unsigned> n;
         for (auto&& obj : all) {
-            b.appendAs(obj.firstElement(), b.numStr(n++));
+            b.appendAs(obj.firstElement(), StringData{n});
+            ++n;
         }
 
         result.appendArray("values", b.obj());
+        // If mongos selected atClusterTime or received it from client, transmit it back.
+        if (!opCtx->inMultiDocumentTransaction() &&
+            repl::ReadConcernArgs::get(opCtx).getArgsAtClusterTime()) {
+            result.append("atClusterTime"_sd,
+                          repl::ReadConcernArgs::get(opCtx).getArgsAtClusterTime()->asTimestamp());
+        }
         return true;
     }
 

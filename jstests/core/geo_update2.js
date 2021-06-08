@@ -1,4 +1,6 @@
-// @tags: [requires_non_retryable_writes]
+// @tags: [
+//   requires_non_retryable_writes,
+// ]
 
 t = db.geo_update2;
 t.drop();
@@ -9,7 +11,7 @@ for (var x = 0; x < 10; x++) {
     }
 }
 
-t.ensureIndex({loc: "2d"});
+t.createIndex({loc: "2d"});
 
 function p() {
     print("--------------");
@@ -25,13 +27,13 @@ function p() {
 
 p();
 
-assert.writeOK(
+assert.commandWorked(
     t.update({"loc": {"$within": {"$center": [[5, 5], 2]}}}, {'$inc': {'z': 1}}, false, true));
 p();
 
-assert.writeOK(t.update({}, {'$inc': {'z': 1}}, false, true));
+assert.commandWorked(t.update({}, {'$inc': {'z': 1}}, false, true));
 p();
 
-assert.writeOK(
+assert.commandWorked(
     t.update({"loc": {"$within": {"$center": [[5, 5], 2]}}}, {'$inc': {'z': 1}}, false, true));
 p();

@@ -46,7 +46,6 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_context_d_test_fixture.h"
 #include "mongo/db/transaction_history_iterator.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -61,7 +60,7 @@ namespace {
 repl::OplogEntry makeOplogEntry(repl::OpTime opTime,
                                 BSONObj docToInsert,
                                 boost::optional<repl::OpTime> prevWriteOpTimeInTransaction) {
-    return repl::OplogEntry(
+    return {repl::DurableOplogEntry(
         opTime,                           // optime
         0,                                // hash
         repl::OpTypeEnum::kInsert,        // opType
@@ -73,11 +72,13 @@ repl::OplogEntry makeOplogEntry(repl::OpTime opTime,
         boost::none,                      // o2
         {},                               // sessionInfo
         boost::none,                      // upsert
-        boost::none,                      // wall clock time
-        boost::none,                      // statement id
+        Date_t(),                         // wall clock time
+        {},                               // statement ids
         prevWriteOpTimeInTransaction,     // optime of previous write within same transaction
         boost::none,                      // pre-image optime
-        boost::none);                     // post-image optime
+        boost::none,                      // post-image optime
+        boost::none,                      // ShardId of resharding recipient
+        boost::none)};                    // _id
 }
 
 }  // namespace

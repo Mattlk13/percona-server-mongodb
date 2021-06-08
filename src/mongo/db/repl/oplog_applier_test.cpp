@@ -36,6 +36,7 @@
 #include "mongo/db/commands/txn_cmds_gen.h"
 #include "mongo/db/operation_context_noop.h"
 #include "mongo/db/repl/oplog_applier.h"
+#include "mongo/db/repl/oplog_batcher_test_fixture.h"
 #include "mongo/db/repl/oplog_buffer_blocking_queue.h"
 #include "mongo/unittest/unittest.h"
 
@@ -55,18 +56,19 @@ public:
     explicit OplogApplierMock(OplogBuffer* oplogBuffer);
 
     void _run(OplogBuffer* oplogBuffer) final;
-    void _shutdown() final;
-    StatusWith<OpTime> _multiApply(OperationContext* opCtx, Operations ops) final;
+    StatusWith<OpTime> _applyOplogBatch(OperationContext* opCtx, std::vector<OplogEntry> ops) final;
 };
 
 OplogApplierMock::OplogApplierMock(OplogBuffer* oplogBuffer)
-    : OplogApplier(nullptr, oplogBuffer, nullptr) {}
+    : OplogApplier(nullptr,
+                   oplogBuffer,
+                   nullptr,
+                   OplogApplier::Options(OplogApplication::Mode::kSecondary)) {}
 
 void OplogApplierMock::_run(OplogBuffer* oplogBuffer) {}
 
-void OplogApplierMock::_shutdown() {}
-
-StatusWith<OpTime> OplogApplierMock::_multiApply(OperationContext* opCtx, Operations ops) {
+StatusWith<OpTime> OplogApplierMock::_applyOplogBatch(OperationContext* opCtx,
+                                                      std::vector<OplogEntry> ops) {
     return OpTime();
 }
 
@@ -101,106 +103,10 @@ void OplogApplierTest::tearDown() {
     _buffer = {};
 }
 
-/**
- * Generates an insert oplog entry with the given number used for the timestamp.
- */
-OplogEntry makeInsertOplogEntry(int t, const NamespaceString& nss) {
-    BSONObj oField = BSON("_id" << t << "a" << t);
-    return OplogEntry(OpTime(Timestamp(t, 1), 1),  // optime
-                      boost::none,                 // hash
-                      OpTypeEnum::kInsert,         // op type
-                      nss,                         // namespace
-                      boost::none,                 // uuid
-                      boost::none,                 // fromMigrate
-                      OplogEntry::kOplogVersion,   // version
-                      oField,                      // o
-                      boost::none,                 // o2
-                      {},                          // sessionInfo
-                      boost::none,                 // upsert
-                      Date_t::min() + Seconds(t),  // wall clock time
-                      boost::none,                 // statement id
-                      boost::none,   // optime of previous write within same transaction
-                      boost::none,   // pre-image optime
-                      boost::none);  // post-image optime
-}
-
-/**
- * Generates an applyOps oplog entry with the given number used for the timestamp.
- */
-OplogEntry makeApplyOpsOplogEntry(int t, bool prepare) {
-    auto nss = NamespaceString(NamespaceString::kAdminDb).getCommandNS();
-    BSONObjBuilder oField;
-    oField.append("applyOps", BSONArray());
-    if (prepare) {
-        oField.append("prepare", true);
-    }
-    return OplogEntry(OpTime(Timestamp(t, 1), 1),  // optime
-                      boost::none,                 // hash
-                      OpTypeEnum::kCommand,        // op type
-                      nss,                         // namespace
-                      boost::none,                 // uuid
-                      boost::none,                 // fromMigrate
-                      OplogEntry::kOplogVersion,   // version
-                      oField.obj(),                // o
-                      boost::none,                 // o2
-                      {},                          // sessionInfo
-                      boost::none,                 // upsert
-                      Date_t::min() + Seconds(t),  // wall clock time
-                      boost::none,                 // statement id
-                      boost::none,   // optime of previous write within same transaction
-                      boost::none,   // pre-image optime
-                      boost::none);  // post-image optime
-}
-
-/**
- * Generates a commitTransaction/applyOps oplog entry, depending on whether this is for a prepared
- * transaction, with the given number used for the timestamp.
- */
-OplogEntry makeCommitTransactionOplogEntry(int t, StringData dbName, bool prepared, int count) {
-    auto nss = NamespaceString(dbName).getCommandNS();
-    BSONObj oField;
-    if (prepared) {
-        CommitTransactionOplogObject cmdObj;
-        cmdObj.setCount(count);
-        oField = cmdObj.toBSON();
-    } else {
-        oField = BSON("applyOps" << BSONArray() << "count" << count);
-    }
-    return OplogEntry(OpTime(Timestamp(t, 1), 1),  // optime
-                      boost::none,                 // hash
-                      OpTypeEnum::kCommand,        // op type
-                      nss,                         // namespace
-                      boost::none,                 // uuid
-                      boost::none,                 // fromMigrate
-                      OplogEntry::kOplogVersion,   // version
-                      oField,                      // o
-                      boost::none,                 // o2
-                      {},                          // sessionInfo
-                      boost::none,                 // upsert
-                      Date_t::min() + Seconds(t),  // wall clock time
-                      boost::none,                 // statement id
-                      boost::none,   // optime of previous write within same transaction
-                      boost::none,   // pre-image optime
-                      boost::none);  // post-image optime
-}
-
-/**
- * Returns string representation of OplogApplier::Operations.
- */
-std::string toString(const OplogApplier::Operations& ops) {
-    StringBuilder sb;
-    sb << "[";
-    for (const auto& op : ops) {
-        sb << " " << op.toString();
-    }
-    sb << " ]";
-    return sb.str();
-}
-
 constexpr auto dbName = "test"_sd;
 
 TEST_F(OplogApplierTest, GetNextApplierBatchGroupsCrudOps) {
-    OplogApplier::Operations srcOps;
+    std::vector<OplogEntry> srcOps;
     srcOps.push_back(makeInsertOplogEntry(1, NamespaceString(dbName, "foo")));
     srcOps.push_back(makeInsertOplogEntry(2, NamespaceString(dbName, "bar")));
     _applier->enqueue(_opCtx.get(), srcOps.cbegin(), srcOps.cend());
@@ -212,7 +118,7 @@ TEST_F(OplogApplierTest, GetNextApplierBatchGroupsCrudOps) {
 }
 
 TEST_F(OplogApplierTest, GetNextApplierBatchReturnsPreparedApplyOpsOpInOwnBatch) {
-    OplogApplier::Operations srcOps;
+    std::vector<OplogEntry> srcOps;
     srcOps.push_back(makeApplyOpsOplogEntry(1, true));
     srcOps.push_back(makeInsertOplogEntry(2, NamespaceString(dbName, "bar")));
     _applier->enqueue(_opCtx.get(), srcOps.cbegin(), srcOps.cend());
@@ -223,7 +129,7 @@ TEST_F(OplogApplierTest, GetNextApplierBatchReturnsPreparedApplyOpsOpInOwnBatch)
 }
 
 TEST_F(OplogApplierTest, GetNextApplierBatchGroupsUnpreparedApplyOpsOpWithOtherOps) {
-    OplogApplier::Operations srcOps;
+    std::vector<OplogEntry> srcOps;
     srcOps.push_back(makeApplyOpsOplogEntry(1, false));
     srcOps.push_back(makeInsertOplogEntry(2, NamespaceString(dbName, "bar")));
     _applier->enqueue(_opCtx.get(), srcOps.cbegin(), srcOps.cend());
@@ -235,7 +141,7 @@ TEST_F(OplogApplierTest, GetNextApplierBatchGroupsUnpreparedApplyOpsOpWithOtherO
 }
 
 TEST_F(OplogApplierTest, GetNextApplierBatchReturnsSystemDotViewsOpInOwnBatch) {
-    OplogApplier::Operations srcOps;
+    std::vector<OplogEntry> srcOps;
     srcOps.push_back(makeInsertOplogEntry(
         1, NamespaceString(dbName, NamespaceString::kSystemDotViewsCollectionName)));
     srcOps.push_back(makeInsertOplogEntry(2, NamespaceString(dbName, "bar")));
@@ -247,7 +153,7 @@ TEST_F(OplogApplierTest, GetNextApplierBatchReturnsSystemDotViewsOpInOwnBatch) {
 }
 
 TEST_F(OplogApplierTest, GetNextApplierBatchReturnsServerConfigurationOpInOwnBatch) {
-    OplogApplier::Operations srcOps;
+    std::vector<OplogEntry> srcOps;
     srcOps.push_back(makeInsertOplogEntry(1, NamespaceString::kServerConfigurationNamespace));
     srcOps.push_back(makeInsertOplogEntry(2, NamespaceString(dbName, "bar")));
     _applier->enqueue(_opCtx.get(), srcOps.cbegin(), srcOps.cend());
@@ -257,8 +163,19 @@ TEST_F(OplogApplierTest, GetNextApplierBatchReturnsServerConfigurationOpInOwnBat
     ASSERT_EQUALS(srcOps[0], batch[0]);
 }
 
+TEST_F(OplogApplierTest, GetNextApplierBatchReturnsConfigReshardingDonorOpInOwnBatch) {
+    std::vector<OplogEntry> srcOps;
+    srcOps.push_back(makeInsertOplogEntry(1, NamespaceString::kDonorReshardingOperationsNamespace));
+    srcOps.push_back(makeInsertOplogEntry(2, NamespaceString(dbName, "bar")));
+    _applier->enqueue(_opCtx.get(), srcOps.cbegin(), srcOps.cend());
+
+    auto batch = unittest::assertGet(_applier->getNextApplierBatch(_opCtx.get(), _limits));
+    ASSERT_EQUALS(1U, batch.size()) << toString(batch);
+    ASSERT_EQUALS(srcOps[0], batch[0]);
+}
+
 TEST_F(OplogApplierTest, GetNextApplierBatchReturnsPreparedCommitTransactionOpInOwnBatch) {
-    OplogApplier::Operations srcOps;
+    std::vector<OplogEntry> srcOps;
     srcOps.push_back(makeCommitTransactionOplogEntry(1, dbName, true, 3));
     srcOps.push_back(makeInsertOplogEntry(2, NamespaceString(dbName, "bar")));
     _applier->enqueue(_opCtx.get(), srcOps.cbegin(), srcOps.cend());
@@ -269,7 +186,7 @@ TEST_F(OplogApplierTest, GetNextApplierBatchReturnsPreparedCommitTransactionOpIn
 }
 
 TEST_F(OplogApplierTest, GetNextApplierBatchGroupsUnpreparedCommitTransactionOpWithOtherOps) {
-    OplogApplier::Operations srcOps;
+    std::vector<OplogEntry> srcOps;
     srcOps.push_back(makeCommitTransactionOplogEntry(1, dbName, false, 3));
     srcOps.push_back(makeInsertOplogEntry(2, NamespaceString(dbName, "bar")));
     _applier->enqueue(_opCtx.get(), srcOps.cbegin(), srcOps.cend());
@@ -281,7 +198,7 @@ TEST_F(OplogApplierTest, GetNextApplierBatchGroupsUnpreparedCommitTransactionOpW
 }
 
 TEST_F(OplogApplierTest, GetNextApplierBatchChecksBatchLimitsForNumberOfOperations) {
-    OplogApplier::Operations srcOps;
+    std::vector<OplogEntry> srcOps;
     srcOps.push_back(makeInsertOplogEntry(1, NamespaceString(dbName, "bar")));
     srcOps.push_back(makeInsertOplogEntry(2, NamespaceString(dbName, "bar")));
     srcOps.push_back(makeInsertOplogEntry(3, NamespaceString(dbName, "bar")));
@@ -307,7 +224,7 @@ TEST_F(OplogApplierTest, GetNextApplierBatchChecksBatchLimitsForNumberOfOperatio
 }
 
 TEST_F(OplogApplierTest, GetNextApplierBatchChecksBatchLimitsForSizeOfOperations) {
-    OplogApplier::Operations srcOps;
+    std::vector<OplogEntry> srcOps;
     srcOps.push_back(makeInsertOplogEntry(1, NamespaceString(dbName, "bar")));
     srcOps.push_back(makeInsertOplogEntry(2, NamespaceString(dbName, "bar")));
     srcOps.push_back(makeInsertOplogEntry(3, NamespaceString(dbName, "bar")));
@@ -330,7 +247,7 @@ TEST_F(OplogApplierTest, GetNextApplierBatchChecksBatchLimitsForSizeOfOperations
 
 TEST_F(OplogApplierTest,
        GetNextApplierBatchChecksBatchLimitsUsingEmbededCountInUnpreparedCommitTransactionOp1) {
-    OplogApplier::Operations srcOps;
+    std::vector<OplogEntry> srcOps;
     srcOps.push_back(makeInsertOplogEntry(1, NamespaceString(dbName, "bar")));
     srcOps.push_back(makeCommitTransactionOplogEntry(2, dbName, false, 3));
     srcOps.push_back(makeInsertOplogEntry(3, NamespaceString(dbName, "bar")));
@@ -353,7 +270,7 @@ TEST_F(OplogApplierTest,
 
 TEST_F(OplogApplierTest,
        GetNextApplierBatchChecksBatchLimitsUsingEmbededCountInUnpreparedCommitTransactionOp2) {
-    OplogApplier::Operations srcOps;
+    std::vector<OplogEntry> srcOps;
     srcOps.push_back(makeInsertOplogEntry(1, NamespaceString(dbName, "bar")));
     srcOps.push_back(makeInsertOplogEntry(2, NamespaceString(dbName, "bar")));
     srcOps.push_back(makeCommitTransactionOplogEntry(3, dbName, false, 3));
@@ -379,7 +296,7 @@ TEST_F(OplogApplierTest,
 
 TEST_F(OplogApplierTest,
        GetNextApplierBatchChecksBatchLimitsUsingEmbededCountInUnpreparedCommitTransactionOp3) {
-    OplogApplier::Operations srcOps;
+    std::vector<OplogEntry> srcOps;
     srcOps.push_back(makeInsertOplogEntry(1, NamespaceString(dbName, "bar")));
     srcOps.push_back(makeCommitTransactionOplogEntry(2, dbName, false, 5));
     srcOps.push_back(makeInsertOplogEntry(3, NamespaceString(dbName, "bar")));
@@ -398,6 +315,47 @@ TEST_F(OplogApplierTest,
     batch = unittest::assertGet(_applier->getNextApplierBatch(_opCtx.get(), _limits));
     ASSERT_EQUALS(1U, batch.size()) << toString(batch);
     ASSERT_EQUALS(srcOps[1], batch[0]);
+}
+
+TEST_F(OplogApplierTest, LastOpInLargeTransactionIsProcessedIndividually) {
+    std::vector<OplogEntry> srcOps;
+    srcOps.push_back(makeInsertOplogEntry(1, NamespaceString(dbName, "bar")));
+
+    // Makes entries with ts from range [2, 5).
+    std::vector<OplogEntry> multiEntryTransaction =
+        makeMultiEntryTransactionOplogEntries(2, dbName, /* prepared */ false, /* num entries*/ 3);
+    for (auto entry : multiEntryTransaction) {
+        srcOps.push_back(entry);
+    }
+
+    // Push one extra operation to ensure that the last oplog entry of a large transaction
+    // is processed by itself.
+    srcOps.push_back(makeInsertOplogEntry(5, NamespaceString(dbName, "bar")));
+
+    _applier->enqueue(_opCtx.get(), srcOps.cbegin(), srcOps.cend());
+
+    // Set large enough batch limit to ensure that batcher is not batching because of limit, but
+    // rather because it encountered the final oplog entry of a large transaction.
+    _limits.ops = 10U;
+
+    // First batch: [insert, applyOps, applyOps]
+    auto batch = unittest::assertGet(_applier->getNextApplierBatch(_opCtx.get(), _limits));
+    ASSERT_EQUALS(3U, batch.size()) << toString(batch);
+    ASSERT_EQUALS(srcOps[0], batch[0]);
+    ASSERT_EQUALS(srcOps[1], batch[1]);
+    ASSERT_EQUALS(srcOps[2], batch[2]);
+
+    // Second batch: [applyOps]. The last oplog entry of a large transaction must be processed by
+    // itself.
+    batch = unittest::assertGet(_applier->getNextApplierBatch(_opCtx.get(), _limits));
+    ASSERT_EQUALS(1U, batch.size()) << toString(batch);
+    ASSERT_EQUALS(srcOps[3], batch[0]);
+
+    // Third batch: [insert]. The this confirms that the last oplog entry of a large txn will be
+    // batched individually.
+    batch = unittest::assertGet(_applier->getNextApplierBatch(_opCtx.get(), _limits));
+    ASSERT_EQUALS(1U, batch.size()) << toString(batch);
+    ASSERT_EQUALS(srcOps[4], batch[0]);
 }
 
 }  // namespace

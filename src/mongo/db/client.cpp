@@ -41,6 +41,8 @@
 
 #include "mongo/base/status.h"
 #include "mongo/db/lasterror.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/operation_cpu_timer.h"
 #include "mongo/db/service_context.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/concurrency/thread_name.h"
@@ -55,9 +57,7 @@ thread_local ServiceContext::UniqueClient currentClient;
 void invariantNoCurrentClient() {
     invariant(!haveClient(),
               str::stream() << "Already have client on this thread: "  //
-                            << '"'
-                            << Client::getCurrent()->desc()
-                            << '"');
+                            << '"' << Client::getCurrent()->desc() << '"');
 }
 }  // namespace
 
@@ -97,7 +97,8 @@ Client::Client(std::string desc, ServiceContext* serviceContext, transport::Sess
       _session(std::move(session)),
       _desc(std::move(desc)),
       _connectionId(_session ? _session->id() : 0),
-      _prng(generateSeed(_desc)) {}
+      _prng(generateSeed(_desc)),
+      _uuid(UUID::gen()) {}
 
 void Client::reportState(BSONObjBuilder& builder) {
     builder.append("desc", desc());
@@ -115,17 +116,6 @@ ServiceContext::UniqueOperationContext Client::makeOperationContext() {
     return getServiceContext()->makeOperationContext(this);
 }
 
-void Client::setOperationContext(OperationContext* opCtx) {
-    // We can only set the OperationContext once before resetting it.
-    invariant(opCtx != NULL && _opCtx == NULL);
-    _opCtx = opCtx;
-}
-
-void Client::resetOperationContext() {
-    invariant(_opCtx != NULL);
-    _opCtx = NULL;
-}
-
 std::string Client::clientAddress(bool includePort) const {
     if (!hasRemote()) {
         return "";
@@ -140,6 +130,12 @@ Client* Client::getCurrent() {
     return currentClient.get();
 }
 
+std::unique_ptr<Locker> Client::swapLockState(std::unique_ptr<Locker> locker) {
+    scoped_spinlock scopedLock(_lock);
+    invariant(_opCtx);
+    return _opCtx->swapLockState(std::move(locker), scopedLock);
+}
+
 Client& cc() {
     invariant(haveClient());
     return *Client::getCurrent();
@@ -150,13 +146,39 @@ bool haveClient() {
 }
 
 ServiceContext::UniqueClient Client::releaseCurrent() {
-    invariant(haveClient());
+    invariant(haveClient(), "No client to release");
+    if (auto opCtx = currentClient->_opCtx)
+        if (auto timer = OperationCPUTimer::get(opCtx))
+            timer->onThreadDetach();
     return std::move(currentClient);
 }
 
 void Client::setCurrent(ServiceContext::UniqueClient client) {
     invariantNoCurrentClient();
     currentClient = std::move(client);
+    if (auto opCtx = currentClient->_opCtx)
+        if (auto timer = OperationCPUTimer::get(opCtx))
+            timer->onThreadAttach();
+}
+
+/**
+ * User connections are listed active so long as they are associated with an opCtx.
+ * Non-user connections are listed active if they have an opCtx and not waiting on a condvar.
+ */
+bool Client::hasAnyActiveCurrentOp() const {
+    if (!_opCtx)
+        return false;
+    if (isFromUserConnection() || !_opCtx->isWaitingForConditionOrInterrupt())
+        return true;
+    return false;
+}
+
+void Client::setKilled() noexcept {
+    stdx::lock_guard<Client> lk(*this);
+    _killed.store(true);
+    if (_opCtx) {
+        _serviceContext->killOperation(lk, _opCtx, ErrorCodes::ClientMarkedKilled);
+    }
 }
 
 ThreadClient::ThreadClient(ServiceContext* serviceContext)

@@ -38,7 +38,7 @@
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/client/remote_command_targeter_mock.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/query/query_request.h"
+#include "mongo/db/query/query_request_helper.h"
 #include "mongo/executor/remote_command_request.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
 #include "mongo/rpc/metadata/tracking_metadata.h"
@@ -79,13 +79,11 @@ protected:
             ASSERT_BSONOBJ_EQ(getReplSecondaryOkMetadata(),
                               rpc::TrackingMetadata::removeTrackingData(request.metadata));
 
-            const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
-            ASSERT_EQ(nss.ns(), "config.settings");
+            auto opMsg = OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj);
+            auto findCommand = query_request_helper::makeFromFindCommandForTests(opMsg.body);
 
-            auto query = assertGet(QueryRequest::makeFromFindCommand(nss, request.cmdObj, false));
-
-            ASSERT_EQ(query->nss().ns(), "config.settings");
-            ASSERT_BSONOBJ_EQ(query->getFilter(), BSON("_id" << key));
+            ASSERT_EQ(findCommand->getNamespaceOrUUID().nss()->ns(), "config.settings");
+            ASSERT_BSONOBJ_EQ(findCommand->getFilter(), BSON("_id" << key));
 
             checkReadConcern(request.cmdObj, Timestamp(0, 0), repl::OpTime::kUninitializedTerm);
 
@@ -310,8 +308,7 @@ TEST(BalancerSettingsType, InvalidBalancingWindowTimeFormat) {
 
     ASSERT_NOT_OK(BalancerSettingsType::fromBSON(BSON("activeWindow" << BSON("start"
                                                                              << "23:00"
-                                                                             << "stop"
-                                                                             << 6LL)))
+                                                                             << "stop" << 6LL)))
                       .getStatus());
 }
 

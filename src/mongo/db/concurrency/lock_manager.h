@@ -40,12 +40,14 @@
 #include "mongo/db/concurrency/lock_request_list.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/compiler.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/util/concurrency/mutex.h"
 
 namespace mongo {
+
+class ServiceContext;
 
 /**
  * Entry point for the lock manager scheduling functionality. Don't use it directly, but
@@ -56,36 +58,42 @@ class LockManager {
     LockManager& operator=(const LockManager&) = delete;
 
 public:
+    /**
+     * Gets a mapping of lock to client info.
+     * Used by dump() and the lockInfo command.
+     */
+    static std::map<LockerId, BSONObj> getLockToClientMap(ServiceContext* serviceContext);
+
     LockManager();
     ~LockManager();
 
     /**
-      * Acquires lock on the specified resource in the specified mode and returns the outcome
-      * of the operation. See the details for LockResult for more information on what the
-      * different results mean.
-      *
-      * Locking the same resource twice increments the reference count of the lock so each call
-      * to lock must be matched with a call to unlock with the same resource.
-      *
-      * @param resId Id of the resource to be locked.
-      * @param request LockRequest structure on which the state of the request will be tracked.
-      *                 This value cannot be NULL and the notify value must be set. If the
-      *                 return value is not LOCK_WAITING, this pointer can be freed and will
-      *                 not be used any more.
-      *
-      *                 If the return value is LOCK_WAITING, the notification method will be called
-      *                 at some point into the future, when the lock becomes granted. If unlock is
-      *                 called before the lock becomes granted, the notification will not be
-      *                 invoked.
-      *
-      *                 If the return value is LOCK_WAITING, the notification object *must*
-      *                 live at least until the notify method has been invoked or unlock has
-      *                 been called for the resource it was assigned to. Failure to do so will
-      *                 cause the lock manager to call into an invalid memory location.
-      * @param mode Mode in which the resource should be locked. Lock upgrades are allowed.
-      *
-      * @return See comments for LockResult.
-      */
+     * Acquires lock on the specified resource in the specified mode and returns the outcome
+     * of the operation. See the details for LockResult for more information on what the
+     * different results mean.
+     *
+     * Locking the same resource twice increments the reference count of the lock so each call
+     * to lock must be matched with a call to unlock with the same resource.
+     *
+     * @param resId Id of the resource to be locked.
+     * @param request LockRequest structure on which the state of the request will be tracked.
+     *                 This value cannot be NULL and the notify value must be set. If the
+     *                 return value is not LOCK_WAITING, this pointer can be freed and will
+     *                 not be used any more.
+     *
+     *                 If the return value is LOCK_WAITING, the notification method will be called
+     *                 at some point into the future, when the lock becomes granted. If unlock is
+     *                 called before the lock becomes granted, the notification will not be
+     *                 invoked.
+     *
+     *                 If the return value is LOCK_WAITING, the notification object *must*
+     *                 live at least until the notify method has been invoked or unlock has
+     *                 been called for the resource it was assigned to. Failure to do so will
+     *                 cause the lock manager to call into an invalid memory location.
+     * @param mode Mode in which the resource should be locked. Lock upgrades are allowed.
+     *
+     * @return See comments for LockResult.
+     */
     LockResult lock(ResourceId resId, LockRequest* request, LockMode mode);
     LockResult convert(ResourceId resId, LockRequest* request, LockMode newMode);
 
@@ -129,6 +137,16 @@ public:
     /**
      * Dumps the contents of all locks into a BSON object
      * to be used in lockInfo command in the shell.
+     * Adds a "lockInfo" element to the `result` object:
+     *     "lockInfo": [
+     *         // object for each lock in the LockManager (in any bucket),
+     *         {
+     *             "resourceId": <string>,
+     *             "granted": [ {...}, ... ],  // array of lock requests
+     *             "pending": [ {...}, ... ],  // array of lock requests
+     *         },
+     *         ...
+     *     ]
      */
     void getLockInfoBSON(const std::map<LockerId, BSONObj>& lockToClientMap,
                          BSONObjBuilder* result);
@@ -170,26 +188,14 @@ private:
     Partition* _getPartition(LockRequest* request) const;
 
     /**
-     * Prints the contents of a bucket to the log.
+     * The backend of `dump` and `getLockInfoBSON`.
+     * If `mutableThis`, then we also clean the unused locks in the buckets while iterating.
+     * @param `mutableThis` is a nonconst `this`, but it is null if caller is const.
      */
-    void _dumpBucket(const LockBucket* bucket) const;
-
-    /**
-     * Dump the contents of a bucket to the BSON.
-     */
-    void _dumpBucketToBSON(const std::map<LockerId, BSONObj>& lockToClientMap,
-                           const LockBucket* bucket,
-                           BSONObjBuilder* result);
-
-    /**
-     * Build the BSON object containing the lock info for a particular
-     * bucket. The lockToClientMap is used to map the lockerId to
-     * more useful client information.
-     */
-    void _buildBucketBSON(const LockRequest* iter,
-                          const std::map<LockerId, BSONObj>& lockToClientMap,
-                          const LockBucket* bucket,
-                          BSONArrayBuilder* locks);
+    void _buildLocksArray(const std::map<LockerId, BSONObj>& lockToClientMap,
+                          bool forLogging,
+                          LockManager* mutableThis,
+                          BSONArrayBuilder* buckets) const;
 
     /**
      * Should be invoked when the state of a lock changes in a way, which could potentially

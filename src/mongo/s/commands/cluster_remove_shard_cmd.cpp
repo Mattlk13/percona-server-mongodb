@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -37,7 +37,6 @@
 #include "mongo/s/client/shard.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
@@ -85,8 +84,10 @@ public:
             opCtx,
             ReadPreferenceSetting(ReadPreference::PrimaryOnly),
             "admin",
-            CommandHelpers::appendMajorityWriteConcern(CommandHelpers::appendPassthroughFields(
-                cmdObj, BSON("_configsvrRemoveShard" << target))),
+            CommandHelpers::appendMajorityWriteConcern(
+                CommandHelpers::appendGenericCommandArgs(cmdObj,
+                                                         BSON("_configsvrRemoveShard" << target)),
+                opCtx->getWriteConcern()),
             Shard::RetryPolicy::kIdempotent));
         uassertStatusOK(cmdResponseStatus.commandStatus);
 

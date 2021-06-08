@@ -66,27 +66,29 @@ void MultiApplierTest::setUp() {
  * Generates oplog entries with the given number used for the timestamp.
  */
 OplogEntry makeOplogEntry(int ts) {
-    return OplogEntry(OpTime(Timestamp(ts, 1), 1),  // optime
-                      boost::none,                  // hash
-                      OpTypeEnum::kNoop,            // op type
-                      NamespaceString("a.a"),       // namespace
-                      boost::none,                  // uuid
-                      boost::none,                  // fromMigrate
-                      OplogEntry::kOplogVersion,    // version
-                      BSONObj(),                    // o
-                      boost::none,                  // o2
-                      {},                           // sessionInfo
-                      boost::none,                  // upsert
-                      boost::none,                  // wall clock time
-                      boost::none,                  // statement id
-                      boost::none,   // optime of previous write within same transaction
-                      boost::none,   // pre-image optime
-                      boost::none);  // post-image optime
+    return {DurableOplogEntry(OpTime(Timestamp(ts, 1), 1),  // optime
+                              boost::none,                  // hash
+                              OpTypeEnum::kNoop,            // op type
+                              NamespaceString("a.a"),       // namespace
+                              boost::none,                  // uuid
+                              boost::none,                  // fromMigrate
+                              OplogEntry::kOplogVersion,    // version
+                              BSONObj(),                    // o
+                              boost::none,                  // o2
+                              {},                           // sessionInfo
+                              boost::none,                  // upsert
+                              Date_t(),                     // wall clock time
+                              {},                           // statement ids
+                              boost::none,    // optime of previous write within same transaction
+                              boost::none,    // pre-image optime
+                              boost::none,    // post-image optime
+                              boost::none,    // ShardId of resharding recipient
+                              boost::none)};  // _id
 }
 
 TEST_F(MultiApplierTest, InvalidConstruction) {
-    const MultiApplier::Operations operations{makeOplogEntry(123)};
-    auto multiApply = [](OperationContext*, MultiApplier::Operations) -> StatusWith<OpTime> {
+    const std::vector<OplogEntry> operations{makeOplogEntry(123)};
+    auto multiApply = [](OperationContext*, std::vector<OplogEntry>) -> StatusWith<OpTime> {
         return Status(ErrorCodes::InternalError, "not implemented");
     };
     auto callback = [](const Status&) {};
@@ -99,7 +101,7 @@ TEST_F(MultiApplierTest, InvalidConstruction) {
 
     // Empty list of operations.
     ASSERT_THROWS_CODE_AND_WHAT(
-        MultiApplier(&getExecutor(), MultiApplier::Operations(), multiApply, callback),
+        MultiApplier(&getExecutor(), std::vector<OplogEntry>(), multiApply, callback),
         AssertionException,
         ErrorCodes::BadValue,
         "empty list of operations");
@@ -120,9 +122,9 @@ TEST_F(MultiApplierTest, InvalidConstruction) {
 }
 
 TEST_F(MultiApplierTest, MultiApplierTransitionsDirectlyToCompleteIfShutdownBeforeStarting) {
-    const MultiApplier::Operations operations{makeOplogEntry(123)};
+    const std::vector<OplogEntry> operations{makeOplogEntry(123)};
 
-    auto multiApply = [](OperationContext*, MultiApplier::Operations) -> StatusWith<OpTime> {
+    auto multiApply = [](OperationContext*, std::vector<OplogEntry>) -> StatusWith<OpTime> {
         return OpTime();
     };
     auto callback = [](const Status&) {};
@@ -135,11 +137,11 @@ TEST_F(MultiApplierTest, MultiApplierTransitionsDirectlyToCompleteIfShutdownBefo
 }
 
 TEST_F(MultiApplierTest, MultiApplierInvokesCallbackWithCallbackCanceledStatusUponCancellation) {
-    const MultiApplier::Operations operations{makeOplogEntry(123)};
+    const std::vector<OplogEntry> operations{makeOplogEntry(123)};
 
     bool multiApplyInvoked = false;
     auto multiApply = [&](OperationContext* opCtx,
-                          MultiApplier::Operations operations) -> StatusWith<OpTime> {
+                          std::vector<OplogEntry> operations) -> StatusWith<OpTime> {
         multiApplyInvoked = true;
         return operations.back().getOpTime();
     };
@@ -171,11 +173,11 @@ TEST_F(MultiApplierTest, MultiApplierInvokesCallbackWithCallbackCanceledStatusUp
 }
 
 TEST_F(MultiApplierTest, MultiApplierPassesMultiApplyErrorToCallback) {
-    const MultiApplier::Operations operations{makeOplogEntry(123)};
+    const std::vector<OplogEntry> operations{makeOplogEntry(123)};
 
     bool multiApplyInvoked = false;
     Status multiApplyError(ErrorCodes::OperationFailed, "multi apply failed");
-    auto multiApply = [&](OperationContext*, MultiApplier::Operations) -> StatusWith<OpTime> {
+    auto multiApply = [&](OperationContext*, std::vector<OplogEntry>) -> StatusWith<OpTime> {
         multiApplyInvoked = true;
         return multiApplyError;
     };
@@ -198,12 +200,12 @@ TEST_F(MultiApplierTest, MultiApplierPassesMultiApplyErrorToCallback) {
 }
 
 TEST_F(MultiApplierTest, MultiApplierCatchesMultiApplyExceptionAndConvertsToCallbackStatus) {
-    const MultiApplier::Operations operations{makeOplogEntry(123)};
+    const std::vector<OplogEntry> operations{makeOplogEntry(123)};
 
     bool multiApplyInvoked = false;
     Status multiApplyError(ErrorCodes::OperationFailed, "multi apply failed");
     auto multiApply = [&](OperationContext* opCtx,
-                          MultiApplier::Operations operations) -> StatusWith<OpTime> {
+                          std::vector<OplogEntry> operations) -> StatusWith<OpTime> {
         multiApplyInvoked = true;
         uassertStatusOK(multiApplyError);
         return operations.back().getOpTime();
@@ -229,12 +231,12 @@ TEST_F(MultiApplierTest, MultiApplierCatchesMultiApplyExceptionAndConvertsToCall
 TEST_F(
     MultiApplierTest,
     MultiApplierProvidesOperationContextToMultiApplyFunctionButDisposesBeforeInvokingFinishCallback) {
-    const MultiApplier::Operations operations{makeOplogEntry(123)};
+    const std::vector<OplogEntry> operations{makeOplogEntry(123)};
 
     OperationContext* multiApplyTxn = nullptr;
-    MultiApplier::Operations operationsToApply;
+    std::vector<OplogEntry> operationsToApply;
     auto multiApply = [&](OperationContext* opCtx,
-                          MultiApplier::Operations operations) -> StatusWith<OpTime> {
+                          std::vector<OplogEntry> operations) -> StatusWith<OpTime> {
         multiApplyTxn = opCtx;
         operationsToApply = operations;
         return operationsToApply.back().getOpTime();
@@ -258,7 +260,7 @@ TEST_F(
 
     ASSERT_TRUE(multiApplyTxn);
     ASSERT_EQUALS(1U, operationsToApply.size());
-    ASSERT_BSONOBJ_EQ(operations[0].raw, operationsToApply[0].raw);
+    ASSERT_BSONOBJ_EQ(operations[0].getEntry().toBSON(), operationsToApply[0].getEntry().toBSON());
 
     ASSERT_OK(callbackResult);
     ASSERT_FALSE(callbackTxn);
@@ -283,10 +285,10 @@ TEST_F(MultiApplierTest, MultiApplierResetsOnCompletionCallbackFunctionPointerUp
     bool sharedCallbackStateDestroyed = false;
     auto sharedCallbackData = std::make_shared<SharedCallbackState>(&sharedCallbackStateDestroyed);
 
-    const MultiApplier::Operations operations{makeOplogEntry(123)};
+    const std::vector<OplogEntry> operations{makeOplogEntry(123)};
 
     auto multiApply = [&](OperationContext*,
-                          MultiApplier::Operations operations) -> StatusWith<OpTime> {
+                          std::vector<OplogEntry> operations) -> StatusWith<OpTime> {
         return operations.back().getOpTime();
     };
 

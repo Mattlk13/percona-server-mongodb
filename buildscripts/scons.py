@@ -4,7 +4,7 @@
 import os
 import sys
 
-SCONS_VERSION = os.environ.get('SCONS_VERSION', "3.0.4")
+SCONS_VERSION = os.environ.get('SCONS_VERSION', "3.1.2")
 
 MONGODB_ROOT = os.path.abspath(os.path.dirname(os.path.dirname(__file__)))
 SCONS_DIR = os.path.join(MONGODB_ROOT, 'src', 'third_party', 'scons-' + SCONS_VERSION,
@@ -14,12 +14,25 @@ if not os.path.exists(SCONS_DIR):
     print("Could not find SCons in '%s'" % (SCONS_DIR))
     sys.exit(1)
 
-sys.path = [SCONS_DIR] + sys.path
+SITE_TOOLS_DIR = os.path.join(MONGODB_ROOT, 'site_scons')
+
+sys.path = [SCONS_DIR, SITE_TOOLS_DIR] + sys.path
+
+# pylint: disable=C0413
+from mongo.pip_requirements import verify_requirements, MissingRequirements
+
+try:
+    verify_requirements('etc/pip/compile-requirements.txt')
+except MissingRequirements as ex:
+    print(ex)
+    sys.exit(1)
 
 try:
     import SCons.Script
-except ImportError:
-    print("Could not find SCons in '%s'" % (SCONS_DIR))
+except ImportError as import_err:
+    print("Could not import SCons from '%s'" % (SCONS_DIR))
+    print("ImportError:", import_err)
     sys.exit(1)
 
-SCons.Script.main()
+if __name__ == '__main__':
+    SCons.Script.main()

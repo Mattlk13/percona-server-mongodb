@@ -1,4 +1,3 @@
-
 t = db.regex_embed1;
 
 t.drop();
@@ -18,5 +17,5 @@ function test(m) {
 
 test("A");
 
-t.ensureIndex({"a.x": 1});
+t.createIndex({"a.x": 1});
 test("B");

@@ -31,7 +31,8 @@
 
 #include "mongo/executor/connection_pool_test_fixture.h"
 
-#include "mongo/stdx/memory.h"
+#include <memory>
+
 
 namespace mongo {
 namespace executor {
@@ -64,25 +65,21 @@ void TimerImpl::clear() {
     }
 }
 
-void TimerImpl::fireIfNecessary() {
-    auto now = PoolImpl().now();
+Date_t TimerImpl::now() {
+    return _global->now();
+}
 
+void TimerImpl::fireIfNecessary() {
     auto timers = _timers;
 
     for (auto&& x : timers) {
-        if (_timers.count(x) && (x->_expiration <= now)) {
-            auto execCB = [cb = std::move(x->_cb)](auto&&) mutable {
-                std::move(cb)();
-            };
+        if (_timers.count(x) && (x->_expiration <= x->now())) {
+            auto execCB = [cb = std::move(x->_cb)](auto&&) mutable { std::move(cb)(); };
             auto global = x->_global;
             _timers.erase(x);
             global->_executor->schedule(std::move(execCB));
         }
     }
-}
-
-Date_t TimerImpl::now() {
-    return _global->now();
 }
 
 std::set<TimerImpl*> TimerImpl::_timers;
@@ -123,7 +120,7 @@ void ConnectionImpl::processSetup() {
     _setupQueue.pop_front();
     _pushSetupQueue.pop_front();
 
-    connPtr->_global->_executor->schedule([ connPtr, callback = std::move(callback) ](auto&&) {
+    connPtr->_global->_executor->schedule([connPtr, callback = std::move(callback)](auto&&) {
         auto cb = std::move(connPtr->_setupCallback);
         connPtr->indicateUsed();
         cb(connPtr, callback());
@@ -153,7 +150,7 @@ void ConnectionImpl::processRefresh() {
     _refreshQueue.pop_front();
     _pushRefreshQueue.pop_front();
 
-    connPtr->_global->_executor->schedule([ connPtr, callback = std::move(callback) ](auto&&) {
+    connPtr->_global->_executor->schedule([connPtr, callback = std::move(callback)](auto&&) {
         auto cb = std::move(connPtr->_refreshCallback);
         connPtr->indicateUsed();
         cb(connPtr, callback());
@@ -226,7 +223,7 @@ std::shared_ptr<ConnectionPool::ConnectionInterface> PoolImpl::makeConnection(
 }
 
 std::shared_ptr<ConnectionPool::TimerInterface> PoolImpl::makeTimer() {
-    return stdx::make_unique<TimerImpl>(this);
+    return std::make_unique<TimerImpl>(this);
 }
 
 const std::shared_ptr<OutOfLineExecutor>& PoolImpl::getExecutor() {

@@ -29,12 +29,12 @@
 
 #pragma once
 
+#include <functional>
 #include <map>
 #include <string>
 #include <vector>
 
 #include "mongo/base/status.h"
-#include "mongo/stdx/functional.h"
 #include "mongo/util/duration.h"
 
 namespace mongo {
@@ -95,7 +95,7 @@ public:
      *  true - unknown config options will generate an error during parsing.
      *  false - unknow config options will be ignored during parsing.
      */
-    static stdx::function<bool()> useStrict;
+    static std::function<bool()> useStrict;
 
     OptionsParser() {}
     virtual ~OptionsParser() {}
@@ -110,19 +110,15 @@ public:
      *  file.  For binaries that do not support config files, the "config" option should not be
      *  registered in the OptionSection.
      */
-    Status run(const OptionSection&,
+    Status run(const OptionSection& options,
                const std::vector<std::string>& argv,
-               const std::map<std::string, std::string>& env,
-               Environment*);
+               Environment* env);
 
     /** Handles parsing of a YAML or INI formatted string. The
      *  OptionSection be a description of the allowed options.  This function populates the
      *  given Environment with the results but does not call validate on the Environment.
      */
-    Status runConfigFile(const OptionSection&,
-                         const std::string& config,
-                         const std::map<std::string, std::string>& env,
-                         Environment*);
+    Status runConfigFile(const OptionSection& options, const std::string& config, Environment* env);
 
     /**
      * Flags controlling whether or not __rest and/or __exec directives in a

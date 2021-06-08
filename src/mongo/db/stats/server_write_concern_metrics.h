@@ -32,6 +32,7 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/write_concern_options.h"
+#include "mongo/util/string_map.h"
 
 namespace mongo {
 
@@ -96,7 +97,7 @@ private:
         StringMap<std::uint64_t> wTagCounts;
     };
 
-    mutable stdx::mutex _mutex;
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("ServerWriteConcernMetrics::_mutex");
     WriteConcernMetricsForOperationType _insertMetrics;
     WriteConcernMetricsForOperationType _updateMetrics;
     WriteConcernMetricsForOperationType _deleteMetrics;

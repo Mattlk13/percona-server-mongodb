@@ -1,6 +1,5 @@
 artifacts_tarball = 'artifacts.tgz'
-user = node['current_user']
-homedir = node['etc']['passwd'][user]['dir']
+homedir = "/tmp"
 
 ruby_block 'allow sudo over tty' do
   block do
@@ -12,7 +11,7 @@ ruby_block 'allow sudo over tty' do
 end
 
 # This file limits processes to 1024. It therefore interfereres with `ulimit -u` when present.
-if platform_family? 'rhel'
+if platform_family? 'rhel' or platform_family? 'amazon'
   file '/etc/security/limits.d/90-nproc.conf' do
     action :delete
   end
@@ -24,6 +23,7 @@ end
 
 execute 'extract artifacts' do
   command "tar xzvf #{artifacts_tarball}"
+  live_stream true
   cwd homedir
 end
 
@@ -42,21 +42,25 @@ if platform_family? 'debian'
 
   execute 'apt-get update' do
     command 'apt-get update'
+    live_stream true
   end
 
+  ENV['DEBIAN_FRONTEND'] = 'noninteractive'
   package 'openssl'
 
   # dpkg returns 1 if dependencies are not satisfied, which they will not be
   # for enterprise builds. We install dependencies in the next block.
   execute 'install mongod' do
     command 'dpkg -i `find . -name "*server*.deb"`'
+    live_stream true
     cwd homedir
     returns [0, 1]
   end
 
   # install the tools so we can test install_compass
   execute 'install mongo tools' do
-    command 'dpkg -i `find . -name "*tools*.deb"`'
+    command 'dpkg -i `find . -name "*tools-extra*.deb"`'
+    live_stream true
     cwd homedir
     returns [0, 1]
   end
@@ -66,34 +70,45 @@ if platform_family? 'debian'
   # to install dependencies after the fact.
   execute 'install dependencies' do
     command 'apt-get update && apt-get -y -f install'
+    live_stream true
   end
 
   # the ubuntu 16.04 image does not have python installed by default
   # and it is required for the install_compass script
   execute 'install python' do
     command 'apt-get install -y python'
+    live_stream true
   end
 
   execute 'install mongo shell' do
     command 'dpkg -i `find . -name "*shell*.deb"`'
+    live_stream true
     cwd homedir
   end
 end
 
-if platform_family? 'rhel'
+if platform_family? 'rhel' or platform_family? 'amazon'
+  bash 'wait for yum updates if they are running' do
+    code <<-EOH
+      sleep 120
+    EOH
+  end
   execute 'install mongod' do
     command 'yum install -y `find . -name "*server*.rpm"`'
+    live_stream true
     cwd homedir
   end
 
   # install the tools so we can test install_compass
   execute 'install mongo tools' do
-    command 'yum install -y `find . -name "*tools*.rpm"`'
+    command 'yum install -y `find . -name "*tools-extra*.rpm"`'
+    live_stream true
     cwd homedir
   end
 
   execute 'install mongo shell' do
     command 'yum install -y `find . -name "*shell*.rpm"`'
+    live_stream true
     cwd homedir
   end
 end
@@ -113,31 +128,30 @@ if platform_family? 'suse'
     done
     exit 1
   EOD
-  end
-
-  %w(
-     SLES12-Pool
-     SLES12-Updates
-  ).each do |repo|
-    execute "add #{repo}" do
-      command "zypper addrepo --check --refresh --name \"#{repo}\" http://smt-ec2.susecloud.net/repo/SUSE/Products/SLE-SERVER/12/x86_64/product?credentials=SMT-http_smt-ec2_susecloud_net 'SMT-http_smt-ec2_susecloud_net:#{repo}'"
-      not_if "zypper lr | grep #{repo}"
-    end
+  flags "-x"
   end
 
   execute 'install mongod' do
-    command 'zypper -n install `find . -name "*server*.rpm"`'
+    command 'zypper --no-gpg-checks -n install `find . -name "*server*.rpm"`'
+    live_stream true
+    cwd homedir
+  end
+
+  execute 'install mongo tools' do
+    command 'zypper --no-gpg-checks -n install `find . -name "*tools-extra*.rpm"`'
+    live_stream true
     cwd homedir
   end
 
   execute 'install mongo' do
-    command 'zypper -n install `find . -name "*shell*.rpm"`'
+    command 'zypper --no-gpg-checks -n install `find . -name "*shell*.rpm"`'
+    live_stream true
     cwd homedir
   end
 end
 
 inspec_wait = <<HEREDOC
-#!/bin/bash
+#!/bin/bash -x
 ulimit -v unlimited
 for i in {1..60}
 do

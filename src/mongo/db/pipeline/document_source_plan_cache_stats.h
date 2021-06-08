@@ -36,23 +36,25 @@ namespace mongo {
 
 class DocumentSourcePlanCacheStats final : public DocumentSource {
 public:
-    static const char* kStageName;
+    static constexpr StringData kStageName = "$planCacheStats"_sd;
 
     class LiteParsed final : public LiteParsedDocumentSource {
     public:
-        static std::unique_ptr<LiteParsed> parse(const AggregationRequest& request,
+        static std::unique_ptr<LiteParsed> parse(const NamespaceString& nss,
                                                  const BSONElement& spec) {
-            return stdx::make_unique<LiteParsed>(request.getNamespaceString());
+            return std::make_unique<LiteParsed>(spec.fieldName(), nss);
         }
 
-        explicit LiteParsed(NamespaceString nss) : _nss(std::move(nss)) {}
+        explicit LiteParsed(std::string parseTimeName, NamespaceString nss)
+            : LiteParsedDocumentSource(std::move(parseTimeName)), _nss(std::move(nss)) {}
 
         stdx::unordered_set<NamespaceString> getInvolvedNamespaces() const override {
             // There are no foreign collections.
             return stdx::unordered_set<NamespaceString>();
         }
 
-        PrivilegeVector requiredPrivileges(bool isMongos) const override {
+        PrivilegeVector requiredPrivileges(bool isMongos,
+                                           bool bypassDocumentValidation) const override {
             return {Privilege(ResourcePattern::forExactNamespace(_nss), ActionType::planCacheRead)};
         }
 
@@ -60,22 +62,17 @@ public:
             return true;
         }
 
-        bool allowedToForwardFromMongos() const override {
-            // $planCacheStats must be run locally on a mongod.
-            return false;
-        }
-
         bool allowedToPassthroughFromMongos() const override {
             // $planCacheStats must be run locally on a mongod.
             return false;
         }
 
-        void assertSupportsReadConcern(const repl::ReadConcernArgs& readConcern) const {
-            uassert(ErrorCodes::InvalidOptions,
-                    str::stream() << "Aggregation stage " << kStageName
-                                  << " requires read concern local but found "
-                                  << readConcern.toString(),
-                    readConcern.getLevel() == repl::ReadConcernLevel::kLocalReadConcern);
+        ReadConcernSupportResult supportsReadConcern(repl::ReadConcernLevel level) const {
+            return onlyReadConcernLocalSupported(kStageName, level);
+        }
+
+        void assertSupportsMultiDocumentTransaction() const {
+            transactionNotSupported(DocumentSourcePlanCacheStats::kStageName);
         }
 
     private:
@@ -87,19 +84,16 @@ public:
 
     virtual ~DocumentSourcePlanCacheStats() = default;
 
-    GetNextResult getNext() override;
-
     StageConstraints constraints(
         Pipeline::SplitState = Pipeline::SplitState::kUnsplit) const override {
         StageConstraints constraints{StreamType::kStreaming,
                                      PositionRequirement::kFirst,
-                                     // This stage must run on a mongod, and will fail at parse time
-                                     // if an attempt is made to run it on mongos.
                                      HostTypeRequirement::kAnyShard,
                                      DiskUseRequirement::kNoDiskUse,
                                      FacetRequirement::kNotAllowed,
                                      TransactionRequirement::kNotAllowed,
-                                     LookupRequirement::kAllowed};
+                                     LookupRequirement::kAllowed,
+                                     UnionRequirement::kAllowed};
 
         constraints.requiresInputDocSource = false;
         return constraints;
@@ -110,7 +104,7 @@ public:
     }
 
     const char* getSourceName() const override {
-        return kStageName;
+        return DocumentSourcePlanCacheStats::kStageName.rawData();
     }
 
     /**
@@ -127,10 +121,20 @@ public:
 private:
     DocumentSourcePlanCacheStats(const boost::intrusive_ptr<ExpressionContext>& expCtx);
 
+    GetNextResult doGetNext() final;
+
     Value serialize(
         boost::optional<ExplainOptions::Verbosity> explain = boost::none) const override {
         MONGO_UNREACHABLE;  // Should call serializeToArray instead.
     }
+
+    // If running through mongos in a sharded cluster, stores the shard name so that it can be
+    // appended to each plan cache entry document.
+    std::string _shardName;
+
+    // If running through mongos in a sharded cluster, stores the "host:port" string so that it can
+    // be appended to each plan cache entry document.
+    std::string _hostAndPort;
 
     // The result set for this change is produced through the mongo process interface on the first
     // call to getNext(), and then held by this data member.

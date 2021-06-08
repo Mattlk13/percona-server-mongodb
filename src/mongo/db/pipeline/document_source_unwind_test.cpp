@@ -38,17 +38,17 @@
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/json.h"
+#include "mongo/db/exec/document_value/document_value_test_util.h"
+#include "mongo/db/exec/document_value/value_comparator.h"
+#include "mongo/db/pipeline/aggregate_command_gen.h"
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
 #include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/document_source_mock.h"
 #include "mongo/db/pipeline/document_source_unwind.h"
-#include "mongo/db/pipeline/document_value_test_util.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
-#include "mongo/db/pipeline/value_comparator.h"
 #include "mongo/db/query/query_test_service_context.h"
 #include "mongo/db/service_context.h"
 #include "mongo/dbtests/dbtests.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -69,10 +69,10 @@ static const char* const ns = "unittests.document_source_group_tests";
 class CheckResultsBase {
 public:
     CheckResultsBase()
-        : _queryServiceContext(stdx::make_unique<QueryTestServiceContext>()),
+        : _queryServiceContext(std::make_unique<QueryTestServiceContext>()),
           _opCtx(_queryServiceContext->makeOperationContext()),
           _ctx(new ExpressionContextForTest(_opCtx.get(),
-                                            AggregationRequest(NamespaceString(ns), {}))) {}
+                                            AggregateCommandRequest(NamespaceString(ns), {}))) {}
 
     virtual ~CheckResultsBase() {}
 
@@ -164,8 +164,7 @@ private:
     void createUnwind(bool preserveNullAndEmptyArrays, bool includeArrayIndex) {
         auto specObj =
             DOC("$unwind" << DOC("path" << unwindFieldPath() << "preserveNullAndEmptyArrays"
-                                        << preserveNullAndEmptyArrays
-                                        << "includeArrayIndex"
+                                        << preserveNullAndEmptyArrays << "includeArrayIndex"
                                         << (includeArrayIndex ? Value(indexPath()) : Value())));
         _unwind = static_cast<DocumentSourceUnwind*>(
             DocumentSourceUnwind::createFromBson(specObj.toBson().firstElement(), ctx()).get());
@@ -179,7 +178,7 @@ private:
      * '_unwind' must be initialized before calling this method.
      */
     void assertResultsMatch(BSONObj expectedResults) {
-        auto source = DocumentSourceMock::createForTest(inputData());
+        auto source = DocumentSourceMock::createForTest(inputData(), ctx());
         _unwind->setSource(source.get());
         // Load the results from the DocumentSourceUnwind.
         vector<Document> resultSet;
@@ -475,8 +474,9 @@ class SeveralMoreDocuments : public CheckResultsBase {
     deque<DocumentSource::GetNextResult> inputData() override {
         return {DOC("_id" << 0 << "a" << BSONNULL),
                 DOC("_id" << 1),
-                DOC("_id" << 2 << "a" << DOC_ARRAY("a"_sd
-                                                   << "b"_sd)),
+                DOC("_id" << 2 << "a"
+                          << DOC_ARRAY("a"_sd
+                                       << "b"_sd)),
                 DOC("_id" << 3),
                 DOC("_id" << 4 << "a" << DOC_ARRAY(1 << 2 << 3)),
                 DOC("_id" << 5 << "a" << DOC_ARRAY(4 << 5 << 6)),
@@ -681,7 +681,7 @@ TEST_F(UnwindStageTest, AddsUnwoundPathToDependencies) {
     ASSERT_EQUALS(1U, dependencies.fields.size());
     ASSERT_EQUALS(1U, dependencies.fields.count("x.y.z"));
     ASSERT_EQUALS(false, dependencies.needWholeDocument);
-    ASSERT_EQUALS(false, dependencies.getNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE));
+    ASSERT_EQUALS(false, dependencies.getNeedsMetadata(DocumentMetadataFields::kTextScore));
 }
 
 TEST_F(UnwindStageTest, ShouldPropagatePauses) {
@@ -692,7 +692,8 @@ TEST_F(UnwindStageTest, ShouldPropagatePauses) {
     auto source =
         DocumentSourceMock::createForTest({Document{{"array", vector<Value>{Value(1), Value(2)}}},
                                            DocumentSource::GetNextResult::makePauseExecution(),
-                                           Document{{"array", vector<Value>{Value(1), Value(2)}}}});
+                                           Document{{"array", vector<Value>{Value(1), Value(2)}}}},
+                                          getExpCtx());
 
     unwind->setSource(source.get());
 
@@ -764,8 +765,7 @@ TEST_F(UnwindStageTest, ShouldRejectNonDollarPrefixedPath) {
 TEST_F(UnwindStageTest, ShouldRejectNonBoolPreserveNullAndEmptyArrays) {
     ASSERT_THROWS_CODE(createUnwind(BSON("$unwind" << BSON("path"
                                                            << "$x"
-                                                           << "preserveNullAndEmptyArrays"
-                                                           << 2))),
+                                                           << "preserveNullAndEmptyArrays" << 2))),
                        AssertionException,
                        28809);
 }
@@ -773,8 +773,7 @@ TEST_F(UnwindStageTest, ShouldRejectNonBoolPreserveNullAndEmptyArrays) {
 TEST_F(UnwindStageTest, ShouldRejectNonStringIncludeArrayIndex) {
     ASSERT_THROWS_CODE(createUnwind(BSON("$unwind" << BSON("path"
                                                            << "$x"
-                                                           << "includeArrayIndex"
-                                                           << 2))),
+                                                           << "includeArrayIndex" << 2))),
                        AssertionException,
                        28810);
 }
@@ -806,23 +805,21 @@ TEST_F(UnwindStageTest, ShoudlRejectDollarPrefixedIncludeArrayIndex) {
 TEST_F(UnwindStageTest, ShouldRejectUnrecognizedOption) {
     ASSERT_THROWS_CODE(createUnwind(BSON("$unwind" << BSON("path"
                                                            << "$x"
-                                                           << "preserveNullAndEmptyArrays"
-                                                           << true
-                                                           << "foo"
-                                                           << 3))),
+                                                           << "preserveNullAndEmptyArrays" << true
+                                                           << "foo" << 3))),
                        AssertionException,
                        28811);
     ASSERT_THROWS_CODE(createUnwind(BSON("$unwind" << BSON("path"
                                                            << "$x"
-                                                           << "foo"
-                                                           << 3))),
+                                                           << "foo" << 3))),
                        AssertionException,
                        28811);
 }
 
-class All : public Suite {
+class All : public OldStyleSuiteSpecification {
 public:
-    All() : Suite("DocumentSourceUnwindTests") {}
+    All() : OldStyleSuiteSpecification("DocumentSourceUnwindTests") {}
+
     void setupTests() {
         add<Empty>();
         add<EmptyArray>();
@@ -846,7 +843,7 @@ public:
     }
 };
 
-SuiteInstance<All> myall;
+OldStyleSuiteInitializer<All> myall;
 
 }  // namespace
 }  // namespace mongo

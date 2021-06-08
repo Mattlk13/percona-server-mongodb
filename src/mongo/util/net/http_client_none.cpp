@@ -27,17 +27,34 @@
  *    it in the license file.
  */
 
-#include "mongo/util/net/http_client.h"
 #include "mongo/base/status.h"
+#include "mongo/util/net/http_client.h"
 
 namespace mongo {
 
-std::unique_ptr<HttpClient> HttpClient::create() {
-    return nullptr;
-}
+namespace {
 
-BSONObj HttpClient::getServerStatus() {
-    return BSONObj();
-}
+class HttpClientProviderImpl : public HttpClientProvider {
+public:
+    HttpClientProviderImpl() {
+        registerHTTPClientProvider(this);
+    }
 
+    std::unique_ptr<HttpClient> create() final {
+        return nullptr;
+    }
+
+    std::unique_ptr<HttpClient> createWithoutConnectionPool() final {
+        return nullptr;
+    }
+
+    /**
+     * Content for ServerStatus http_client section.
+     */
+    BSONObj getServerStatus() final {
+        return BSONObj();
+    }
+} provider;
+
+}  // namespace
 }  // namespace mongo

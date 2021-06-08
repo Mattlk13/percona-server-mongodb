@@ -35,6 +35,7 @@
 #include "mongo/db/s/active_migrations_registry.h"
 #include "mongo/db/service_context_d_test_fixture.h"
 #include "mongo/s/request_types/move_chunk_request.h"
+#include "mongo/stdx/future.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -43,12 +44,22 @@ namespace {
 using unittest::assertGet;
 
 class MoveChunkRegistration : public ServiceContextMongoDTest {
+public:
+    void setUp() override {
+        _opCtx = getClient()->makeOperationContext();
+    }
+
+    OperationContext* operationContext() {
+        return _opCtx.get();
+    }
+
 protected:
     ActiveMigrationsRegistry _registry;
+    ServiceContext::UniqueOperationContext _opCtx;
 };
 
 MoveChunkRequest createMoveChunkRequest(const NamespaceString& nss) {
-    const ChunkVersion chunkVersion(1, 2, OID::gen());
+    const ChunkVersion chunkVersion(1, 2, OID::gen(), boost::none /* timestamp */);
 
     BSONObjBuilder builder;
     MoveChunkRequest::appendAsCommand(
@@ -61,13 +72,14 @@ MoveChunkRequest createMoveChunkRequest(const NamespaceString& nss) {
         ChunkRange(BSON("Key" << -100), BSON("Key" << 100)),
         1024,
         MigrationSecondaryThrottleOptions::create(MigrationSecondaryThrottleOptions::kOff),
-        true);
+        true,
+        MoveChunkRequest::ForceJumbo::kDoNotForce);
     return assertGet(MoveChunkRequest::createFromCommand(nss, builder.obj()));
 }
 
 TEST_F(MoveChunkRegistration, ScopedDonateChunkMoveConstructorAndAssignment) {
     auto originalScopedDonateChunk = assertGet(_registry.registerDonateChunk(
-        createMoveChunkRequest(NamespaceString("TestDB", "TestColl"))));
+        operationContext(), createMoveChunkRequest(NamespaceString("TestDB", "TestColl"))));
     ASSERT(originalScopedDonateChunk.mustExecute());
 
     ScopedDonateChunk movedScopedDonateChunk(std::move(originalScopedDonateChunk));
@@ -86,7 +98,7 @@ TEST_F(MoveChunkRegistration, GetActiveMigrationNamespace) {
     const NamespaceString nss("TestDB", "TestColl");
 
     auto originalScopedDonateChunk =
-        assertGet(_registry.registerDonateChunk(createMoveChunkRequest(nss)));
+        assertGet(_registry.registerDonateChunk(operationContext(), createMoveChunkRequest(nss)));
 
     ASSERT_EQ(nss.ns(), _registry.getActiveDonateChunkNss()->ns());
 
@@ -96,10 +108,10 @@ TEST_F(MoveChunkRegistration, GetActiveMigrationNamespace) {
 
 TEST_F(MoveChunkRegistration, SecondMigrationReturnsConflictingOperationInProgress) {
     auto originalScopedDonateChunk = assertGet(_registry.registerDonateChunk(
-        createMoveChunkRequest(NamespaceString("TestDB", "TestColl1"))));
+        operationContext(), createMoveChunkRequest(NamespaceString("TestDB", "TestColl1"))));
 
     auto secondScopedDonateChunkStatus = _registry.registerDonateChunk(
-        createMoveChunkRequest(NamespaceString("TestDB", "TestColl2")));
+        operationContext(), createMoveChunkRequest(NamespaceString("TestDB", "TestColl2")));
     ASSERT_EQ(ErrorCodes::ConflictingOperationInProgress,
               secondScopedDonateChunkStatus.getStatus());
 
@@ -108,17 +120,258 @@ TEST_F(MoveChunkRegistration, SecondMigrationReturnsConflictingOperationInProgre
 
 TEST_F(MoveChunkRegistration, SecondMigrationWithSameArgumentsJoinsFirst) {
     auto originalScopedDonateChunk = assertGet(_registry.registerDonateChunk(
-        createMoveChunkRequest(NamespaceString("TestDB", "TestColl"))));
+        operationContext(), createMoveChunkRequest(NamespaceString("TestDB", "TestColl"))));
     ASSERT(originalScopedDonateChunk.mustExecute());
 
     auto secondScopedDonateChunk = assertGet(_registry.registerDonateChunk(
-        createMoveChunkRequest(NamespaceString("TestDB", "TestColl"))));
+        operationContext(), createMoveChunkRequest(NamespaceString("TestDB", "TestColl"))));
     ASSERT(!secondScopedDonateChunk.mustExecute());
 
     originalScopedDonateChunk.signalComplete({ErrorCodes::InternalError, "Test error"});
-    auto opCtx = makeOperationContext();
+    auto opCtx = operationContext();
     ASSERT_EQ(Status(ErrorCodes::InternalError, "Test error"),
-              secondScopedDonateChunk.waitForCompletion(opCtx.get()));
+              secondScopedDonateChunk.waitForCompletion(opCtx));
+}
+
+TEST_F(MoveChunkRegistration, TestBlockingDonateChunk) {
+    stdx::promise<void> blockDonate;
+    stdx::promise<void> readyToLock;
+    stdx::promise<void> inLock;
+
+    // Registry thread.
+    auto result = stdx::async(stdx::launch::async, [&] {
+        // 2. Lock the registry so that starting to donate will block.
+        _registry.lock(operationContext(), "dummy");
+
+        // 3. Signal the donate thread that the donate is ready to be started.
+        readyToLock.set_value();
+
+        // 4. Wait for the donate thread to start blocking because the registry is locked.
+        blockDonate.get_future().wait();
+
+        // 9. Unlock the registry to signal the donate thread.
+        _registry.unlock("dummy");
+    });
+
+    // Donate thread.
+    auto lockReleased = stdx::async(stdx::launch::async, [&] {
+        ThreadClient tc("donate thread", getGlobalServiceContext());
+        auto opCtx = tc->makeOperationContext();
+
+        auto baton = opCtx->getBaton();
+        baton->schedule([&inLock](Status) {
+            // 7. This is called when the donate is blocking. We let the test method know
+            // that we're blocked on the donate so that it can tell the registry thread to unlock
+            // the registry.
+            inLock.set_value();
+        });
+
+        // 5. This is woken up by the registry thread.
+        readyToLock.get_future().wait();
+
+        // 6. Now that we're woken up by the registry thread, let's attempt to start to donate.
+        // This will block and call the lambda set on the baton above.
+        auto scopedDonateChunk = _registry.registerDonateChunk(
+            opCtx.get(), createMoveChunkRequest(NamespaceString("TestDB", "TestColl")));
+
+        ASSERT_OK(scopedDonateChunk.getStatus());
+        scopedDonateChunk.getValue().signalComplete(Status::OK());
+
+        // 10. Destroy the ScopedDonateChunk and return.
+    });
+
+    // 1. Wait for the donate thread to start blocking.
+    inLock.get_future().wait();
+
+    // 8. Tell the registry thread to unlock the registry. That will signal the donate thread to
+    // continue.
+    blockDonate.set_value();
+
+    // 11. The donate thread has returned and this future is set.
+    lockReleased.wait();
+}
+
+TEST_F(MoveChunkRegistration, TestBlockingReceiveChunk) {
+    stdx::promise<void> blockReceive;
+    stdx::promise<void> readyToLock;
+    stdx::promise<void> inLock;
+
+    // Registry thread.
+    auto result = stdx::async(stdx::launch::async, [&] {
+        // 2. Lock the registry so that starting to receive will block.
+        _registry.lock(operationContext(), "dummy");
+
+        // 3. Signal the receive thread that the receive is ready to be started.
+        readyToLock.set_value();
+
+        // 4. Wait for the receive thread to start blocking because the registry is locked.
+        blockReceive.get_future().wait();
+
+        // 9. Unlock the registry to signal the receive thread.
+        _registry.unlock("dummy");
+    });
+
+    // Receive thread.
+    auto lockReleased = stdx::async(stdx::launch::async, [&] {
+        ThreadClient tc("receive thread", getGlobalServiceContext());
+        auto opCtx = tc->makeOperationContext();
+
+        auto baton = opCtx->getBaton();
+        baton->schedule([&inLock](Status) {
+            // 7. This is called when the receive is blocking. We let the test method know
+            // that we're blocked on the receive so that it can tell the registry thread to unlock
+            // the registry.
+            inLock.set_value();
+        });
+
+        // 5. This is woken up by the registry thread.
+        readyToLock.get_future().wait();
+
+        // 6. Now that we're woken up by the registry thread, let's attempt to start to receive.
+        // This will block and call the lambda set on the baton above.
+        auto scopedReceiveChunk =
+            _registry.registerReceiveChunk(opCtx.get(),
+                                           NamespaceString("TestDB", "TestColl"),
+                                           ChunkRange(BSON("Key" << -100), BSON("Key" << 100)),
+                                           ShardId("shard0001"));
+
+        ASSERT_OK(scopedReceiveChunk.getStatus());
+
+        // 10. Destroy the ScopedReceiveChunk and return.
+    });
+
+    // 1. Wait for the receive thread to start blocking.
+    inLock.get_future().wait();
+
+    // 8. Tell the registry thread to unlock the registry. That will signal the receive thread to
+    // continue.
+    blockReceive.set_value();
+
+    // 11. The receive thread has returned and this future is set.
+    lockReleased.wait();
+}
+
+// This test validates that the ActiveMigrationsRegistry lock will block while there is a donation
+// in progress. The test will fail if any of the futures are not signalled indicating that some part
+// of the sequence is not working correctly.
+TEST_F(MoveChunkRegistration, TestBlockingWhileDonateInProgress) {
+    stdx::promise<void> blockDonate;
+    stdx::promise<void> readyToLock;
+    stdx::promise<void> inLock;
+
+    // Migration thread.
+    auto result = stdx::async(stdx::launch::async, [&] {
+        // 2. Start a migration so that the registry lock will block when acquired.
+        auto scopedDonateChunk = _registry.registerDonateChunk(
+            operationContext(), createMoveChunkRequest(NamespaceString("TestDB", "TestColl")));
+        ASSERT_OK(scopedDonateChunk.getStatus());
+
+        // 3. Signal the registry locking thread that the registry is ready to be locked.
+        readyToLock.set_value();
+
+        // 4. Wait for the registry thread to start blocking because there is an active donate.
+        blockDonate.get_future().wait();
+
+        scopedDonateChunk.getValue().signalComplete(Status::OK());
+
+        // 9. Destroy the ScopedDonateChunk to signal the registy lock.
+    });
+
+    // Registry locking thread.
+    auto lockReleased = stdx::async(stdx::launch::async, [&] {
+        ThreadClient tc("ActiveMigrationsRegistryTest", getGlobalServiceContext());
+        auto opCtx = tc->makeOperationContext();
+
+        auto baton = opCtx->getBaton();
+        baton->schedule([&inLock](Status) {
+            // 7. This is called when the registry lock is blocking. We let the test method know
+            // that we're blocked on the registry lock so that it tell the migration thread to let
+            // the donate operation complete.
+            inLock.set_value();
+        });
+
+        // 5. This is woken up by the migration thread.
+        readyToLock.get_future().wait();
+
+        // 6. Now that we're woken up by the migration thread, let's attempt to lock the registry.
+        // This will block and call the lambda set on the baton above.
+        _registry.lock(opCtx.get(), "dummy");
+
+        // 10. Unlock the registry and return.
+        _registry.unlock("dummy");
+    });
+
+    // 1. Wait for registry lock to be acquired.
+    inLock.get_future().wait();
+
+    // 8. Let the donate operation complete so that the ScopedDonateChunk is destroyed. That will
+    // signal the registry lock.
+    blockDonate.set_value();
+
+    // 11. The registy locking thread has returned and this future is set.
+    lockReleased.wait();
+}
+
+// This test validates that the ActiveMigrationsRegistry lock will block while there is a receive
+// in progress. The test will fail if any of the futures are not signalled indicating that some part
+// of the sequence is not working correctly.
+TEST_F(MoveChunkRegistration, TestBlockingWhileReceiveInProgress) {
+    stdx::promise<void> blockReceive;
+    stdx::promise<void> readyToLock;
+    stdx::promise<void> inLock;
+
+    // Migration thread.
+    auto result = stdx::async(stdx::launch::async, [&] {
+        // 2. Start a migration so that the registry lock will block when acquired.
+        auto scopedReceiveChunk =
+            _registry.registerReceiveChunk(operationContext(),
+                                           NamespaceString("TestDB", "TestColl"),
+                                           ChunkRange(BSON("Key" << -100), BSON("Key" << 100)),
+                                           ShardId("shard0001"));
+        ASSERT_OK(scopedReceiveChunk.getStatus());
+
+        // 3. Signal the registry locking thread that the registry is ready to be locked.
+        readyToLock.set_value();
+
+        // 4. Wait for the registry thread to start blocking because there is an active receive.
+        blockReceive.get_future().wait();
+
+        // 9. Destroy the scopedReceiveChunk to signal the registy lock.
+    });
+
+    // Registry locking thread.
+    auto lockReleased = stdx::async(stdx::launch::async, [&] {
+        ThreadClient tc("ActiveMigrationsRegistryTest", getGlobalServiceContext());
+        auto opCtx = tc->makeOperationContext();
+
+        auto baton = opCtx->getBaton();
+        baton->schedule([&inLock](Status) {
+            // 7. This is called when the registry lock is blocking. We let the test method know
+            // that we're blocked on the registry lock so that it tell the migration thread to let
+            // the receive operation complete.
+            inLock.set_value();
+        });
+
+        // 5. This is woken up by the migration thread.
+        readyToLock.get_future().wait();
+
+        // 6. Now that we're woken up by the migration thread, let's attempt to lock the registry.
+        // This will block and call the lambda set on the baton above.
+        _registry.lock(opCtx.get(), "dummy");
+
+        // 10. Unlock the registry and return.
+        _registry.unlock("dummy");
+    });
+
+    // 1. Wait for registry lock to be acquired.
+    inLock.get_future().wait();
+
+    // 8. Let the receive operation complete so that the scopedReceiveChunk is destroyed. That will
+    // signal the registry lock.
+    blockReceive.set_value();
+
+    // 11. The registy locking thread has returned and this future is set.
+    lockReleased.wait();
 }
 
 }  // namespace

@@ -33,8 +33,8 @@
 
 #include "mongo/db/storage/wiredtiger/wiredtiger_record_store.h"
 #include "mongo/platform/atomic_word.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/mutex.h"
 
 namespace mongo {
 
@@ -49,6 +49,10 @@ public:
         int64_t records;      // Approximate number of records in a chunk of the oplog.
         int64_t bytes;        // Approximate size of records in a chunk of the oplog.
         RecordId lastRecord;  // RecordId of the last record in a chunk of the oplog.
+        Date_t wallTime;      // Walltime of when this chunk of the oplog was created.
+
+        Stone(int64_t records, int64_t bytes, RecordId lastRecord, Date_t wallTime)
+            : records(records), bytes(bytes), lastRecord(lastRecord), wallTime(wallTime) {}
     };
 
     OplogStones(OperationContext* opCtx, WiredTigerRecordStore* rs);
@@ -57,27 +61,27 @@ public:
 
     void kill();
 
-    bool hasExcessStones_inlock() const {
-        int64_t total_bytes = 0;
-        for (std::deque<OplogStones::Stone>::const_iterator it = _stones.begin();
-             it != _stones.end();
-             ++it) {
-            total_bytes += it->bytes;
-        }
-        return total_bytes > _rs->cappedMaxSize();
-    }
+    bool hasExcessStones_inlock() const;
 
     void awaitHasExcessStonesOrDead();
+
+    void getOplogStonesStats(BSONObjBuilder& builder) const {
+        builder.append("totalTimeProcessingMicros", _totalTimeProcessing.load());
+        builder.append("processingMethod", _processBySampling.load() ? "sampling" : "scanning");
+        if (auto oplogMinRetentionHours = storageGlobalParams.oplogMinRetentionHours.load()) {
+            builder.append("oplogMinRetentionHours", oplogMinRetentionHours);
+        }
+    }
 
     boost::optional<OplogStones::Stone> peekOldestStoneIfNeeded() const;
 
     void popOldestStone();
 
-    void createNewStoneIfNeeded(RecordId lastRecord);
+    void createNewStoneIfNeeded(OperationContext* opCtx, RecordId lastRecord, Date_t wallTime);
 
     void updateCurrentStoneAfterInsertOnCommit(OperationContext* opCtx,
                                                int64_t bytesInserted,
-                                               RecordId highestInserted,
+                                               const Record& highestInsertedRecord,
                                                int64_t countInserted);
 
     void clearStonesOnCommit(OperationContext* opCtx);
@@ -99,7 +103,7 @@ public:
     //
 
     size_t numStones() const {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        stdx::lock_guard<Latch> lk(_mutex);
         return _stones.size();
     }
 
@@ -112,6 +116,10 @@ public:
     }
 
     void setMinBytesPerStone(int64_t size);
+
+    bool processedBySampling() const {
+        return _processBySampling.load();
+    }
 
 private:
     class InsertChange;
@@ -129,7 +137,7 @@ private:
 
     WiredTigerRecordStore* _rs;
 
-    stdx::mutex _oplogReclaimMutex;
+    Mutex _oplogReclaimMutex;
     stdx::condition_variable _oplogReclaimCv;
 
     // True if '_rs' has been destroyed, e.g. due to repairDatabase being called on the "local"
@@ -140,10 +148,14 @@ private:
     // deque of oplog stones.
     int64_t _minBytesPerStone;
 
-    AtomicWord<long long> _currentRecords;  // Number of records in the stone being filled.
-    AtomicWord<long long> _currentBytes;    // Number of bytes in the stone being filled.
+    AtomicWord<long long> _currentRecords;     // Number of records in the stone being filled.
+    AtomicWord<long long> _currentBytes;       // Number of bytes in the stone being filled.
+    AtomicWord<int64_t> _totalTimeProcessing;  // Amount of time spent scanning and/or sampling the
+                                               // oplog during start up, if any.
+    AtomicWord<bool> _processBySampling;       // Whether the oplog was sampled or scanned.
 
-    mutable stdx::mutex _mutex;  // Protects against concurrent access to the deque of oplog stones.
+    // Protects against concurrent access to the deque of oplog stones.
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("OplogStones::_mutex");
     std::deque<OplogStones::Stone> _stones;  // front = oldest, back = newest.
 };
 

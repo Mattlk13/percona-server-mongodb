@@ -27,12 +27,15 @@
  *    it in the license file.
  */
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/storage/kv/kv_engine_test_harness.h"
 
 #include <boost/filesystem.hpp>
 #include <boost/filesystem/path.hpp>
+#include <memory>
 
 #include "mongo/base/init.h"
 #include "mongo/db/operation_context_noop.h"
@@ -40,11 +43,11 @@
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_context_test_fixture.h"
-#include "mongo/db/storage/wiredtiger/wiredtiger_global_options.h"
+#include "mongo/db/storage/checkpointer.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_kv_engine.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_record_store.h"
-#include "mongo/logger/logger.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/logv2/log.h"
+#include "mongo/unittest/log_test.h"
 #include "mongo/unittest/temp_dir.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/clock_source_mock.h"
@@ -52,21 +55,20 @@
 namespace mongo {
 namespace {
 
-class WiredTigerKVHarnessHelper : public KVHarnessHelper, public ScopedGlobalServiceContextForTest {
+class WiredTigerKVHarnessHelper : public KVHarnessHelper {
 public:
-    WiredTigerKVHarnessHelper(bool forRepair = false)
-        : _dbpath("wt-kv-harness"), _forRepair(forRepair) {
-        invariant(hasGlobalServiceContext());
-        _engine.reset(makeEngine());
+    WiredTigerKVHarnessHelper(ServiceContext* svcCtx, bool forRepair = false)
+        : _dbpath("wt-kv-harness"), _forRepair(forRepair), _engine(makeEngine()) {
         repl::ReplicationCoordinator::set(
-            getGlobalServiceContext(),
-            std::unique_ptr<repl::ReplicationCoordinator>(new repl::ReplicationCoordinatorMock(
-                getGlobalServiceContext(), repl::ReplSettings())));
+            svcCtx,
+            std::make_unique<repl::ReplicationCoordinatorMock>(svcCtx, repl::ReplSettings()));
+        _engine->notifyStartupComplete();
     }
 
     virtual KVEngine* restartEngine() override {
         _engine.reset(nullptr);
-        _engine.reset(makeEngine());
+        _engine = makeEngine();
+        _engine->notifyStartupComplete();
         return _engine.get();
     }
 
@@ -79,34 +81,40 @@ public:
     }
 
 private:
-    WiredTigerKVEngine* makeEngine() {
-        return new WiredTigerKVEngine(kWiredTigerEngineName,
-                                      _dbpath.path(),
-                                      _cs.get(),
-                                      "",
-                                      1,
-                                      false,
-                                      false,
-                                      _forRepair,
-                                      false);
+    std::unique_ptr<WiredTigerKVEngine> makeEngine() {
+        return std::make_unique<WiredTigerKVEngine>(kWiredTigerEngineName,
+                                                    _dbpath.path(),
+                                                    _cs.get(),
+                                                    "",
+                                                    1,
+                                                    0,
+                                                    false,
+                                                    false,
+                                                    _forRepair,
+                                                    false);
     }
 
-    const std::unique_ptr<ClockSource> _cs = stdx::make_unique<ClockSourceMock>();
+    const std::unique_ptr<ClockSource> _cs = std::make_unique<ClockSourceMock>();
     unittest::TempDir _dbpath;
-    std::unique_ptr<WiredTigerKVEngine> _engine;
     bool _forRepair;
+    std::unique_ptr<WiredTigerKVEngine> _engine;
 };
 
-class WiredTigerKVEngineTest : public unittest::Test, public ScopedGlobalServiceContextForTest {
+class WiredTigerKVEngineTest : public ServiceContextTest {
 public:
     WiredTigerKVEngineTest(bool repair = false)
-        : _helper(repair), _engine(_helper.getWiredTigerKVEngine()) {}
-
-    std::unique_ptr<OperationContext> makeOperationContext() {
-        return std::make_unique<OperationContextNoop>(_engine->newRecoveryUnit());
-    }
+        : _helper(getServiceContext(), repair), _engine(_helper.getWiredTigerKVEngine()) {}
 
 protected:
+    ServiceContext::UniqueOperationContext _makeOperationContext() {
+        auto opCtx = makeOperationContext();
+        opCtx->setRecoveryUnit(
+            std::unique_ptr<RecoveryUnit>(_helper.getEngine()->newRecoveryUnit()),
+            WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
+        opCtx->swapLockState(std::make_unique<LockerNoop>(), WithLock::withoutLock());
+        return opCtx;
+    }
+
     WiredTigerKVHarnessHelper _helper;
     WiredTigerKVEngine* _engine;
 };
@@ -117,16 +125,17 @@ public:
 };
 
 TEST_F(WiredTigerKVEngineRepairTest, OrphanedDataFilesCanBeRecovered) {
-    auto opCtxPtr = makeOperationContext();
+    auto opCtxPtr = _makeOperationContext();
 
     NamespaceString nss("a.b");
     std::string ident = "collection-1234";
     std::string record = "abcd";
-    CollectionOptions options;
+    CollectionOptions defaultCollectionOptions;
 
     std::unique_ptr<RecordStore> rs;
-    ASSERT_OK(_engine->createRecordStore(opCtxPtr.get(), nss.ns(), ident, options));
-    rs = _engine->getRecordStore(opCtxPtr.get(), nss.ns(), ident, options);
+    ASSERT_OK(
+        _engine->createRecordStore(opCtxPtr.get(), nss.ns(), ident, defaultCollectionOptions));
+    rs = _engine->getRecordStore(opCtxPtr.get(), nss.ns(), ident, defaultCollectionOptions);
     ASSERT(rs);
 
     RecordId loc;
@@ -149,7 +158,8 @@ TEST_F(WiredTigerKVEngineRepairTest, OrphanedDataFilesCanBeRecovered) {
     ASSERT(!boost::filesystem::exists(tmpFile));
 
 #ifdef _WIN32
-    auto status = _engine->recoverOrphanedIdent(opCtxPtr.get(), nss, ident, options);
+    auto status =
+        _engine->recoverOrphanedIdent(opCtxPtr.get(), nss, ident, defaultCollectionOptions);
     ASSERT_EQ(ErrorCodes::CommandNotSupported, status.code());
 #else
     // Move the data file out of the way so the ident can be dropped. This not permitted on Windows
@@ -159,29 +169,31 @@ TEST_F(WiredTigerKVEngineRepairTest, OrphanedDataFilesCanBeRecovered) {
     boost::filesystem::rename(*dataFilePath, tmpFile, err);
     ASSERT(!err) << err.message();
 
-    ASSERT_OK(_engine->dropIdent(opCtxPtr.get(), ident));
+    ASSERT_OK(_engine->dropIdent(opCtxPtr.get()->recoveryUnit(), ident));
 
     // The data file is moved back in place so that it becomes an "orphan" of the storage
     // engine and the restoration process can be tested.
     boost::filesystem::rename(tmpFile, *dataFilePath, err);
     ASSERT(!err) << err.message();
 
-    auto status = _engine->recoverOrphanedIdent(opCtxPtr.get(), nss, ident, options);
+    auto status =
+        _engine->recoverOrphanedIdent(opCtxPtr.get(), nss, ident, defaultCollectionOptions);
     ASSERT_EQ(ErrorCodes::DataModifiedByRepair, status.code());
 #endif
 }
 
 TEST_F(WiredTigerKVEngineRepairTest, UnrecoverableOrphanedDataFilesAreRebuilt) {
-    auto opCtxPtr = makeOperationContext();
+    auto opCtxPtr = _makeOperationContext();
 
     NamespaceString nss("a.b");
     std::string ident = "collection-1234";
     std::string record = "abcd";
-    CollectionOptions options;
+    CollectionOptions defaultCollectionOptions;
 
     std::unique_ptr<RecordStore> rs;
-    ASSERT_OK(_engine->createRecordStore(opCtxPtr.get(), nss.ns(), ident, options));
-    rs = _engine->getRecordStore(opCtxPtr.get(), nss.ns(), ident, options);
+    ASSERT_OK(
+        _engine->createRecordStore(opCtxPtr.get(), nss.ns(), ident, defaultCollectionOptions));
+    rs = _engine->getRecordStore(opCtxPtr.get(), nss.ns(), ident, defaultCollectionOptions);
     ASSERT(rs);
 
     RecordId loc;
@@ -200,10 +212,11 @@ TEST_F(WiredTigerKVEngineRepairTest, UnrecoverableOrphanedDataFilesAreRebuilt) {
 
     ASSERT(boost::filesystem::exists(*dataFilePath));
 
-    ASSERT_OK(_engine->dropIdent(opCtxPtr.get(), ident));
+    ASSERT_OK(_engine->dropIdent(opCtxPtr.get()->recoveryUnit(), ident));
 
 #ifdef _WIN32
-    auto status = _engine->recoverOrphanedIdent(opCtxPtr.get(), nss, ident, options);
+    auto status =
+        _engine->recoverOrphanedIdent(opCtxPtr.get(), nss, ident, defaultCollectionOptions);
     ASSERT_EQ(ErrorCodes::CommandNotSupported, status.code());
 #else
     // The ident may not get immediately dropped, so ensure it is completely gone.
@@ -221,33 +234,47 @@ TEST_F(WiredTigerKVEngineRepairTest, UnrecoverableOrphanedDataFilesAreRebuilt) {
 
     // This should recreate an empty data file successfully and move the old one to a name that ends
     // in ".corrupt".
-    auto status = _engine->recoverOrphanedIdent(opCtxPtr.get(), nss, ident, options);
+    auto status =
+        _engine->recoverOrphanedIdent(opCtxPtr.get(), nss, ident, defaultCollectionOptions);
     ASSERT_EQ(ErrorCodes::DataModifiedByRepair, status.code()) << status.reason();
 
     boost::filesystem::path corruptFile = (dataFilePath->string() + ".corrupt");
     ASSERT(boost::filesystem::exists(corruptFile));
 
-    rs = _engine->getRecordStore(opCtxPtr.get(), nss.ns(), ident, options);
+    rs = _engine->getRecordStore(opCtxPtr.get(), nss.ns(), ident, defaultCollectionOptions);
     RecordData data;
     ASSERT_FALSE(rs->findRecord(opCtxPtr.get(), loc, &data));
 #endif
 }
 
 TEST_F(WiredTigerKVEngineTest, TestOplogTruncation) {
-    auto opCtxPtr = makeOperationContext();
+    std::unique_ptr<Checkpointer> checkpointer = std::make_unique<Checkpointer>(_engine);
+    checkpointer->go();
+
+    auto opCtxPtr = _makeOperationContext();
     // The initial data timestamp has to be set to take stable checkpoints. The first stable
     // timestamp greater than this will also trigger a checkpoint. The following loop of the
     // CheckpointThread will observe the new `checkpointDelaySecs` value.
     _engine->setInitialDataTimestamp(Timestamp(1, 1));
-    wiredTigerGlobalOptions.checkpointDelaySecs = 1;
+
+
+    // Ignore data race on this variable when running with TSAN, this is only an issue in this
+    // unittest and not in mongod
+    []()
+#if defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+        __attribute__((no_sanitize("thread")))
+#endif
+#endif
+    {
+        storageGlobalParams.checkpointDelaySecs = 1;
+    }
+    ();
+
 
     // To diagnose any intermittent failures, maximize logging from WiredTigerKVEngine and friends.
-    const auto kStorage = logger::LogComponent::kStorage;
-    auto originalVerbosity = logger::globalLogDomain()->getMinimumLogSeverity(kStorage);
-    logger::globalLogDomain()->setMinimumLoggedSeverity(kStorage, logger::LogSeverity::Debug(3));
-    ON_BLOCK_EXIT([&]() {
-        logger::globalLogDomain()->setMinimumLoggedSeverity(kStorage, originalVerbosity);
-    });
+    auto severityGuard = unittest::MinimumLoggedSeverityGuard{logv2::LogComponent::kStorage,
+                                                              logv2::LogSeverity::Debug(3)};
 
     // Simulate the callback that queries config.transactions for the oldest active transaction.
     boost::optional<Timestamp> oldestActiveTxnTimestamp;
@@ -285,8 +312,12 @@ TEST_F(WiredTigerKVEngineTest, TestOplogTruncation) {
             sleepmillis(100);
         }
 
-        unittest::log() << "Expected the pinned oplog to advance. Expected value: " << newPinned
-                        << " Published value: " << _engine->getOplogNeededForCrashRecovery();
+        LOGV2(22367,
+              "Expected the pinned oplog to advance. Expected value: {newPinned} Published value: "
+              "{engine_getOplogNeededForCrashRecovery}",
+              "newPinned"_attr = newPinned,
+              "engine_getOplogNeededForCrashRecovery"_attr =
+                  _engine->getOplogNeededForCrashRecovery());
         FAIL("");
     };
 
@@ -315,15 +346,168 @@ TEST_F(WiredTigerKVEngineTest, TestOplogTruncation) {
     _engine->setStableTimestamp(Timestamp(30, 1), false);
     callbackShouldFail.store(false);
     assertPinnedMovesSoon(Timestamp(40, 1));
+
+    checkpointer->shutdown({ErrorCodes::ShutdownInProgress, "Test finished"});
 }
 
-std::unique_ptr<KVHarnessHelper> makeHelper() {
-    return stdx::make_unique<WiredTigerKVHarnessHelper>();
+TEST_F(WiredTigerKVEngineTest, IdentDrop) {
+#ifdef _WIN32
+    // TODO SERVER-51595: to re-enable this test on Windows.
+    return;
+#endif
+
+    auto opCtxPtr = _makeOperationContext();
+
+    NamespaceString nss("a.b");
+    std::string ident = "collection-1234";
+    CollectionOptions defaultCollectionOptions;
+
+    std::unique_ptr<RecordStore> rs;
+    ASSERT_OK(
+        _engine->createRecordStore(opCtxPtr.get(), nss.ns(), ident, defaultCollectionOptions));
+
+    const boost::optional<boost::filesystem::path> dataFilePath =
+        _engine->getDataFilePathForIdent(ident);
+    ASSERT(dataFilePath);
+    ASSERT(boost::filesystem::exists(*dataFilePath));
+
+    _engine->dropIdentForImport(opCtxPtr.get(), ident);
+    ASSERT(boost::filesystem::exists(*dataFilePath));
+
+    // Because the underlying file was not removed, it will be renamed out of the way by WiredTiger
+    // when creating a new table with the same ident.
+    ASSERT_OK(
+        _engine->createRecordStore(opCtxPtr.get(), nss.ns(), ident, defaultCollectionOptions));
+
+    const boost::filesystem::path renamedFilePath = dataFilePath->generic_string() + ".1";
+    ASSERT(boost::filesystem::exists(*dataFilePath));
+    ASSERT(boost::filesystem::exists(renamedFilePath));
+
+    ASSERT_OK(_engine->dropIdent(opCtxPtr.get()->recoveryUnit(), ident));
+
+    // WiredTiger drops files asynchronously.
+    for (size_t check = 0; check < 30; check++) {
+        if (!boost::filesystem::exists(*dataFilePath))
+            break;
+        sleepsecs(1);
+    }
+
+    ASSERT(!boost::filesystem::exists(*dataFilePath));
+    ASSERT(boost::filesystem::exists(renamedFilePath));
+}
+
+TEST_F(WiredTigerKVEngineTest, TestBasicPinOldestTimestamp) {
+    auto opCtxRaii = _makeOperationContext();
+    const Timestamp initTs = Timestamp(1, 0);
+
+    // Initialize the oldest timestamp.
+    _engine->setOldestTimestamp(initTs, false);
+    ASSERT_EQ(initTs, _engine->getOldestTimestamp());
+
+    // Assert that advancing the oldest timestamp still succeeds.
+    _engine->setOldestTimestamp(initTs + 1, false);
+    ASSERT_EQ(initTs + 1, _engine->getOldestTimestamp());
+
+    // Error if there's a request to pin the oldest timestamp earlier than what it is already set
+    // as. This error case is not exercised in this test.
+    const bool roundUpIfTooOld = false;
+    // Pin the oldest timestamp to "3".
+    auto pinnedTs = unittest::assertGet(
+        _engine->pinOldestTimestamp(opCtxRaii.get(), "A", initTs + 3, roundUpIfTooOld));
+    // Assert that the pinning method returns the same timestamp as was requested.
+    ASSERT_EQ(initTs + 3, pinnedTs);
+    // Assert that pinning the oldest timestamp does not advance it.
+    ASSERT_EQ(initTs + 1, _engine->getOldestTimestamp());
+
+    // Attempt to advance the oldest timestamp to "5".
+    _engine->setOldestTimestamp(initTs + 5, false);
+    // Observe the oldest timestamp was pinned at the requested "3".
+    ASSERT_EQ(initTs + 3, _engine->getOldestTimestamp());
+
+    // Unpin the oldest timestamp. Assert that unpinning does not advance the oldest timestamp.
+    _engine->unpinOldestTimestamp("A");
+    ASSERT_EQ(initTs + 3, _engine->getOldestTimestamp());
+
+    // Now advancing the oldest timestamp to "5" succeeds.
+    _engine->setOldestTimestamp(initTs + 5, false);
+    ASSERT_EQ(initTs + 5, _engine->getOldestTimestamp());
+}
+
+/**
+ * Demonstrate that multiple actors can request different pins of the oldest timestamp. The minimum
+ * of all active requests will be obeyed.
+ */
+TEST_F(WiredTigerKVEngineTest, TestMultiPinOldestTimestamp) {
+    auto opCtxRaii = _makeOperationContext();
+    const Timestamp initTs = Timestamp(1, 0);
+
+    _engine->setOldestTimestamp(initTs, false);
+    ASSERT_EQ(initTs, _engine->getOldestTimestamp());
+
+    // Error if there's a request to pin the oldest timestamp earlier than what it is already set
+    // as. This error case is not exercised in this test.
+    const bool roundUpIfTooOld = false;
+    // Have "A" pin the timestamp to "1".
+    auto pinnedTs = unittest::assertGet(
+        _engine->pinOldestTimestamp(opCtxRaii.get(), "A", initTs + 1, roundUpIfTooOld));
+    ASSERT_EQ(initTs + 1, pinnedTs);
+    ASSERT_EQ(initTs, _engine->getOldestTimestamp());
+
+    // Have "B" pin the timestamp to "2".
+    pinnedTs = unittest::assertGet(
+        _engine->pinOldestTimestamp(opCtxRaii.get(), "B", initTs + 2, roundUpIfTooOld));
+    ASSERT_EQ(initTs + 2, pinnedTs);
+    ASSERT_EQ(initTs, _engine->getOldestTimestamp());
+
+    // Advancing the oldest timestamp to "5" will only succeed in advancing it to "1".
+    _engine->setOldestTimestamp(initTs + 5, false);
+    ASSERT_EQ(initTs + 1, _engine->getOldestTimestamp());
+
+    // After unpinning "A" at "1", advancing the oldest timestamp will be pinned to "2".
+    _engine->unpinOldestTimestamp("A");
+    _engine->setOldestTimestamp(initTs + 5, false);
+    ASSERT_EQ(initTs + 2, _engine->getOldestTimestamp());
+
+    // Unpinning "B" at "2" allows the oldest timestamp to advance freely.
+    _engine->unpinOldestTimestamp("B");
+    _engine->setOldestTimestamp(initTs + 5, false);
+    ASSERT_EQ(initTs + 5, _engine->getOldestTimestamp());
+}
+
+/**
+ * Test error cases where a request to pin the oldest timestamp uses a value that's too early
+ * relative to the current oldest timestamp.
+ */
+TEST_F(WiredTigerKVEngineTest, TestPinOldestTimestampErrors) {
+    auto opCtxRaii = _makeOperationContext();
+    const Timestamp initTs = Timestamp(10, 0);
+
+    _engine->setOldestTimestamp(initTs, false);
+    ASSERT_EQ(initTs, _engine->getOldestTimestamp());
+
+    const bool roundUpIfTooOld = true;
+    // The false value means using this variable will cause the method to fail on error.
+    const bool failOnError = false;
+
+    // When rounding on error, the pin will succeed, but the return value will be the current oldest
+    // timestamp instead of the requested value.
+    auto pinnedTs = unittest::assertGet(
+        _engine->pinOldestTimestamp(opCtxRaii.get(), "A", initTs - 1, roundUpIfTooOld));
+    ASSERT_EQ(initTs, pinnedTs);
+    ASSERT_EQ(initTs, _engine->getOldestTimestamp());
+
+    // Using "fail on error" will result in a not-OK return value.
+    ASSERT_NOT_OK(_engine->pinOldestTimestamp(opCtxRaii.get(), "B", initTs - 1, failOnError));
+    ASSERT_EQ(initTs, _engine->getOldestTimestamp());
+}
+
+
+std::unique_ptr<KVHarnessHelper> makeHelper(ServiceContext* svcCtx) {
+    return std::make_unique<WiredTigerKVHarnessHelper>(svcCtx);
 }
 
 MONGO_INITIALIZER(RegisterKVHarnessFactory)(InitializerContext*) {
     KVHarnessHelper::registerFactory(makeHelper);
-    return Status::OK();
 }
 
 }  // namespace

@@ -29,20 +29,20 @@
 
 #pragma once
 
-#include "third_party/variant-1.3.0/include/mpark/variant.hpp"
+#include "mpark/variant.hpp"
 
 namespace mongo::stdx {
 
-using ::mpark::variant;
-using ::mpark::visit;
-using ::mpark::holds_alternative;
 using ::mpark::get;
 using ::mpark::get_if;
+using ::mpark::holds_alternative;
+using ::mpark::variant;
+using ::mpark::visit;
 
-using ::mpark::variant_size;
-using ::mpark::variant_size_v;
 using ::mpark::variant_alternative;
 using ::mpark::variant_alternative_t;
+using ::mpark::variant_size;
+using ::mpark::variant_size_v;
 
 constexpr auto variant_npos = ::mpark::variant_npos;
 
@@ -53,7 +53,7 @@ using ::mpark::operator>;
 using ::mpark::operator<=;
 using ::mpark::operator>=;
 
-using ::mpark::monostate;
 using ::mpark::bad_variant_access;
+using ::mpark::monostate;
 
 }  // namespace mongo::stdx

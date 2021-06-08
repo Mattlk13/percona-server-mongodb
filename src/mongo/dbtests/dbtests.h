@@ -63,10 +63,10 @@ Status createIndex(OperationContext* opCtx,
 Status createIndexFromSpec(OperationContext* opCtx, StringData ns, const BSONObj& spec);
 
 /**
- * Combines AutoGetOrCreateDb and OldClientContext. If the requested 'ns' exists, the constructed
+ * Combines AutoGetDb and OldClientContext. If the requested 'ns' exists, the constructed
  * object will have both the database and the collection locked in MODE_IX. Otherwise, the database
- * will be locked in MODE_X and will be created (note, only the database will be created, but not
- * the collection).
+ * will be locked in MODE_IX and will be created, while the collection will be locked in MODE_X, but
+ * not created.
  */
 class WriteContextForTests {
     WriteContextForTests(const WriteContextForTests&) = delete;
@@ -79,15 +79,15 @@ public:
         return _clientContext->db();
     }
 
-    Collection* getCollection() const {
-        return db()->getCollection(_opCtx, _nss);
+    CollectionPtr getCollection() const {
+        return CollectionCatalog::get(_opCtx)->lookupCollectionByNamespace(_opCtx, _nss);
     }
 
 private:
     OperationContext* const _opCtx;
     const NamespaceString _nss;
 
-    boost::optional<AutoGetOrCreateDb> _autoCreateDb;
+    boost::optional<AutoGetDb> _autoDb;
     boost::optional<Lock::CollectionLock> _collLock;
     boost::optional<OldClientContext> _clientContext;
 };

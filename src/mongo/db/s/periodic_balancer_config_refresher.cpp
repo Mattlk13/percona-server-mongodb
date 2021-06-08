@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -35,9 +35,9 @@
 
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/balancer_configuration.h"
 #include "mongo/s/grid.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -46,8 +46,7 @@ namespace {
 const auto getPeriodicBalancerConfigRefresher =
     ServiceContext::declareDecoration<PeriodicBalancerConfigRefresher>();
 
-std::unique_ptr<PeriodicRunner::PeriodicJobHandle> launchBalancerConfigRefresher(
-    ServiceContext* serviceContext) {
+PeriodicJobAnchor launchBalancerConfigRefresher(ServiceContext* serviceContext) {
     auto periodicRunner = serviceContext->getPeriodicRunner();
     invariant(periodicRunner);
 
@@ -61,12 +60,15 @@ std::unique_ptr<PeriodicRunner::PeriodicJobHandle> launchBalancerConfigRefresher
 
             Status status = balancerConfig->refreshAndCheck(opCtx.get());
             if (!status.isOK()) {
-                log() << "Failed to refresh balancer configuration" << causedBy(status);
+                LOGV2(22048,
+                      "Failed to refresh balancer configuration: {error}",
+                      "Failed to refresh balancer configuration",
+                      "error"_attr = redact(status));
             }
         },
         Seconds(30));
     auto balancerConfigRefresher = periodicRunner->makeJob(std::move(job));
-    balancerConfigRefresher->start();
+    balancerConfigRefresher.start();
     return balancerConfigRefresher;
 }
 
@@ -86,7 +88,7 @@ void PeriodicBalancerConfigRefresher::onShardingInitialization(ServiceContext* s
     _isPrimary = isPrimary;
     // This function is called on sharding state initialization, so go ahead
     // and start up the balancer config refresher task if we're a primary.
-    if (isPrimary && !_balancerConfigRefresher) {
+    if (isPrimary && !_balancerConfigRefresher.isValid()) {
         _balancerConfigRefresher = launchBalancerConfigRefresher(serviceContext);
     }
 }
@@ -95,12 +97,12 @@ void PeriodicBalancerConfigRefresher::onStepUp(ServiceContext* serviceContext) {
         _isPrimary = true;
         // If this is the first time we're stepping up, start a thread to periodically refresh the
         // balancer configuration.
-        if (!_balancerConfigRefresher) {
+        if (!_balancerConfigRefresher.isValid()) {
             _balancerConfigRefresher = launchBalancerConfigRefresher(serviceContext);
         } else {
             // If we're stepping up again after having stepped down, just resume
             // the existing task.
-            _balancerConfigRefresher->resume();
+            _balancerConfigRefresher.resume();
         }
     }
 }
@@ -108,9 +110,9 @@ void PeriodicBalancerConfigRefresher::onStepUp(ServiceContext* serviceContext) {
 void PeriodicBalancerConfigRefresher::onStepDown() {
     if (_isPrimary) {
         _isPrimary = false;
-        invariant(_balancerConfigRefresher);
+        invariant(_balancerConfigRefresher.isValid());
         // We don't need to be refreshing the balancer configuration unless we're primary.
-        _balancerConfigRefresher->pause();
+        _balancerConfigRefresher.pause();
     }
 }
 

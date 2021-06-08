@@ -8,27 +8,22 @@ selector:
   # These tests already run with transactions.
   - jstests/core/txns/*.js
 
-  # These tests are not expected to pass with replica-sets:
-  - jstests/core/capped_update.js
-  - jstests/core/dbadmin.js
-  - jstests/core/opcounters_write_cmd.js
-  - jstests/core/read_after_optime.js
-
   ##
   ## Limitations with the way the runner file injects transactions.
   ##
 
   # These tests expects some statements to error, which will cause txns to abort entirely.
+  - jstests/core/api_params_getmore.js
   - jstests/core/bulk_api_ordered.js
   - jstests/core/bulk_api_unordered.js
   - jstests/core/bulk_legacy_enforce_gle.js
-  - jstests/core/capped5.js
   - jstests/core/commands_with_uuid.js
   - jstests/core/dbcase.js
   - jstests/core/dbcase2.js
   - jstests/core/explain_execution_error.js
   - jstests/core/expr.js
   - jstests/core/find9.js
+  - jstests/core/find_and_modify_invalid_query_params.js
   - jstests/core/find_getmore_bsonsize.js
   - jstests/core/find_getmore_cmd.js
   - jstests/core/geo_allowedcomparisons.js
@@ -37,6 +32,7 @@ selector:
   - jstests/core/in.js
   - jstests/core/index8.js # No explicit check for failed command.
   - jstests/core/index_decimal.js
+  - jstests/core/index_large_and_small_dates.js
   - jstests/core/index_multiple_compatibility.js
   - jstests/core/index_partial_write_ops.js
   - jstests/core/indexa.js # No explicit check for failed command.
@@ -50,7 +46,9 @@ selector:
   - jstests/core/or1.js
   - jstests/core/or2.js
   - jstests/core/or3.js
+  - jstests/core/ord.js
   - jstests/core/orj.js
+  - jstests/core/projection_expr_mod.js
   - jstests/core/ref.js
   - jstests/core/ref4.js
   - jstests/core/regex_limit.js
@@ -60,7 +58,9 @@ selector:
   - jstests/core/sortf.js
   - jstests/core/sortg.js
   - jstests/core/sortj.js
+  - jstests/core/sort_with_meta_operator.js
   - jstests/core/tailable_skip_limit.js
+  - jstests/core/timeseries/timeseries_special_indexes.js
   - jstests/core/type_array.js
   - jstests/core/uniqueness.js
   - jstests/core/unset2.js
@@ -84,16 +84,14 @@ selector:
   - jstests/core/and.js
   - jstests/core/collation.js
   - jstests/core/distinct_multikey_dotted_path.js
+  - jstests/core/distinct_with_hashed_index.js
   - jstests/core/explain_shell_helpers.js
   - jstests/core/index_partial_read_ops.js
   - jstests/core/optimized_match_explain.js
   - jstests/core/sort_array.js
   - jstests/core/views/views_collation.js
   - jstests/core/wildcard_index_count.js
-
-  # $out
-  - jstests/core/bypass_doc_validation.js
-  - jstests/core/views/views_aggregation.js
+  - jstests/core/explain_server_params.js
 
   # $listSessions
   - jstests/core/list_all_local_sessions.js
@@ -103,59 +101,33 @@ selector:
 
   # $indexStats
   - jstests/core/index_stats.js
+  - jstests/core/timeseries/timeseries_index_stats.js
 
   # $collStats
   - jstests/core/operation_latency_histogram.js
   - jstests/core/views/views_coll_stats.js
   - jstests/core/views/views_stats.js
 
-  ##
-  ## SERVER-39175 WriteErrors get converted to WriteCommandErrors if part of a txn.
-  ##
-
-  # The same error code, but with ok:0.
-  - jstests/core/json_schema/additional_items.js
-  - jstests/core/json_schema/additional_properties.js
-  - jstests/core/json_schema/bsontype.js
-  - jstests/core/json_schema/dependencies.js
-  - jstests/core/json_schema/encrypt.js
-  - jstests/core/json_schema/items.js
-  - jstests/core/json_schema/logical_keywords.js
-  - jstests/core/json_schema/min_max_items.js
-  - jstests/core/json_schema/min_max_properties.js
-  - jstests/core/json_schema/pattern_properties.js
-  - jstests/core/json_schema/required.js
-  - jstests/core/json_schema/unique_items.js
-
-  - jstests/core/field_name_validation.js
-  - jstests/core/fts_array.js
-  - jstests/core/inc-SERVER-7446.js
-  - jstests/core/invalid_db_name.js
-  - jstests/core/push_sort.js
-
-  # Checks for "WriteErrors" explicitly from the response of db.runCommand()
-  - jstests/core/max_doc_size.js
-
-  # Calls res.getWriteError() or res.hasWriteError().
+  # Errors expected to happen in tests, which can cause transactions to get aborted.
+  # So when the test tries to inspect the documents it can be out of sync (relative
+  # to test run without multi statement transactions).
   - jstests/core/bulk_api_ordered.js
   - jstests/core/bulk_api_unordered.js
   - jstests/core/bulk_legacy_enforce_gle.js
-  - jstests/core/cappeda.js
   - jstests/core/doc_validation.js
   - jstests/core/doc_validation_options.js
-  - jstests/core/geo_multinest0.js
+  - jstests/core/field_name_validation.js
   - jstests/core/insert_illegal_doc.js
-  - jstests/core/ns_length.js
-  - jstests/core/push2.js
-  - jstests/core/remove6.js
-  - jstests/core/removeb.js
-  - jstests/core/rename4.js
-  - jstests/core/shell_writeconcern.js
-  - jstests/core/storefunc.js
+  - jstests/core/push_sort.js
   - jstests/core/update_arrayFilters.js
   - jstests/core/update_dbref.js
   - jstests/core/updatel.js
   - jstests/core/write_result.js
+  - jstests/core/positional_projection.js
+
+  # Trick for bypassing mongo shell validation in the test doesn't work because txn_override
+  # retry logic will hit the shell validation.
+  - jstests/core/invalid_db_name.js
 
   # Multiple writes in a txn, some of which fail because the collection doesn't exist.
   # We create the collection and retry the last write, but previous writes would have
@@ -164,7 +136,6 @@ selector:
   - jstests/core/dbref2.js
   - jstests/core/ref3.js
   - jstests/core/update3.js
-  - jstests/core/rename3.js
 
   ##
   ## Error: Unable to acquire lock within a max lock request timeout of '0ms' milliseconds
@@ -184,17 +155,9 @@ selector:
   # SERVER-34772 Tailable Cursors are not allowed with snapshot readconcern.
   - jstests/core/awaitdata_getmore_cmd.js
   - jstests/core/getmore_cmd_maxtimems.js
+  - jstests/core/invalidated_legacy_cursors.js
   - jstests/core/tailable_cursor_invalidation.js
   - jstests/core/tailable_getmore_batch_size.js
-
-  # SERVER-34918 The "max" option of a capped collection can be exceeded until the next insert.
-  # The reason is that we don't update the count of a collection until a transaction commits,
-  # by which point it is too late to complain that "max" has been exceeded.
-  - jstests/core/capped_max1.js
-
-  # The "max" option of a capped collection can be temporarily exceeded before a
-  # txn is committed.
-  - jstests/core/bulk_insert_capped.js
 
   # Wrong count for top info (WriteLock)
   - jstests/core/top.js
@@ -206,9 +169,6 @@ selector:
   # using a single txnNumber.
   - jstests/core/json_schema/misc_validation.js
   - jstests/core/views/views_all_commands.js
-
-  # Fails with implicit sessions because it will use multiple sessions on the same Mongo connection.
-  - jstests/core/dropdb.js
 
   # Committing a transaction when the server is fsync locked fails.
   - jstests/core/fsync.js
@@ -226,11 +186,9 @@ selector:
   - jstests/core/kill_cursors.js
   - jstests/core/list_collections1.js
   - jstests/core/list_indexes.js
-  - jstests/core/max_time_ms.js
+  - jstests/core/list_indexes_invalidation.js
+  - jstests/core/list_namespaces_invalidation.js
   - jstests/core/oro.js
-
-  # Expects certain number of operations in the system.profile collection.
-  - jstests/core/profile*.js
 
   # Parallel Shell - we do not signal the override to end a txn when a parallel shell closes.
   - jstests/core/awaitdata_getmore_cmd.js
@@ -238,6 +196,7 @@ selector:
   - jstests/core/count10.js
   - jstests/core/count_plan_summary.js
   - jstests/core/coveredIndex3.js
+  - jstests/core/crud_ops_do_not_throw_locktimeout.js
   - jstests/core/currentop.js
   - jstests/core/distinct3.js
   - jstests/core/find_and_modify_concurrent_update.js
@@ -246,7 +205,6 @@ selector:
   - jstests/core/killop_drop_collection.js
   - jstests/core/loadserverscripts.js
   - jstests/core/mr_killop.js
-  - jstests/core/queryoptimizer3.js
   - jstests/core/remove9.js
   - jstests/core/removeb.js
   - jstests/core/removec.js
@@ -256,20 +214,28 @@ selector:
   # Command expects to see result from parallel operation.
   # E.g. Suppose the following sequence of events: op1, join() op2 in parallel shell, op3.
   # op3 will still be using the snapshot from op1, and not see op2 at all.
-  - jstests/core/cursora.js
   - jstests/core/bench_test1.js
   - jstests/core/benchrun_pipeline_updates.js
+  - jstests/core/cursora.js
 
   # Does not support tojson of command objects.
   - jstests/core/SERVER-23626.js
 
   exclude_with_any_tags:
+  - assumes_standalone_mongod
   # "Cowardly refusing to override read concern of command: ..."
   - assumes_read_concern_unchanged
   # "writeConcern is not allowed within a multi-statement transaction"
   - assumes_write_concern_unchanged
   # Transactions are not allowed to operate on capped collections.
   - requires_capped
+  - requires_profiling
+  # Retrying a query can change whether a plan cache entry is active.
+  - inspects_whether_plan_cache_entry_is_active
+  - does_not_support_transactions
+  # Transaction-continuing commands must use the same API parameters as the first command, so tests
+  # that use API parameters cannot be run with transactions.
+  - uses_api_parameters
 
 executor:
   archive:

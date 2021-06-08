@@ -29,6 +29,7 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/base/shim.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/embedded/not_implemented.h"
@@ -73,11 +74,13 @@ public:
         UASSERT_NOT_IMPLEMENTED;
     }
 
-    Status getRoleDescription(OperationContext*,
-                              const RoleName&,
-                              PrivilegeFormat,
-                              AuthenticationRestrictionsFormat,
-                              BSONObj*) override {
+    Status rolesExist(OperationContext*, const std::vector<RoleName>&) override {
+        UASSERT_NOT_IMPLEMENTED;
+    }
+
+    StatusWith<ResolvedRoleData> resolveRoles(OperationContext*,
+                                              const std::vector<RoleName>&,
+                                              ResolveRoleOption) override {
         UASSERT_NOT_IMPLEMENTED;
     }
 
@@ -85,7 +88,14 @@ public:
                                const std::vector<RoleName>&,
                                PrivilegeFormat,
                                AuthenticationRestrictionsFormat,
-                               BSONObj*) override {
+                               std::vector<BSONObj>*) override {
+        UASSERT_NOT_IMPLEMENTED;
+    }
+
+    Status getRolesAsUserFragment(OperationContext*,
+                                  const std::vector<RoleName>&,
+                                  AuthenticationRestrictionsFormat,
+                                  BSONObj*) override {
         UASSERT_NOT_IMPLEMENTED;
     }
 
@@ -102,9 +112,7 @@ public:
         UASSERT_NOT_IMPLEMENTED;
     }
 
-    StatusWith<UserHandle> acquireUserForSessionRefresh(OperationContext*,
-                                                        const UserName&,
-                                                        const User::UserId&) override {
+    StatusWith<UserHandle> reacquireUser(OperationContext*, const UserHandle&) override {
         UASSERT_NOT_IMPLEMENTED;
     }
 
@@ -124,12 +132,8 @@ public:
         UASSERT_NOT_IMPLEMENTED;
     }
 
-    Status _initializeUserFromPrivilegeDocument(User*, const BSONObj&) override {
-        UASSERT_NOT_IMPLEMENTED;
-    }
-
     void logOp(OperationContext*,
-               const char*,
+               StringData,
                const NamespaceString&,
                const BSONObj&,
                const BSONObj*) override { /* do nothing*/
@@ -146,10 +150,19 @@ public:
 private:
     bool _shouldValidate = false;
 };
+
 }  // namespace
 }  // namespace embedded
 
-MONGO_REGISTER_SHIM(AuthorizationManager::create)()->std::unique_ptr<AuthorizationManager> {
+namespace {
+
+std::unique_ptr<AuthorizationManager> authorizationManagerCreateImpl(ServiceContext*) {
     return std::make_unique<embedded::AuthorizationManager>();
 }
+
+auto authorizationManagerCreateRegistration =
+    MONGO_WEAK_FUNCTION_REGISTRATION(AuthorizationManager::create, authorizationManagerCreateImpl);
+
+}  // namespace
+
 }  // namespace mongo

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -36,6 +36,8 @@
 #include <functional>
 
 namespace mongo {
+
+const ShardId ShardId::kConfigServerId("config");
 
 bool ShardId::isValid() const {
     return !_shardId.empty();

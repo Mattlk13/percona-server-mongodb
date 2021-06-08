@@ -4,13 +4,9 @@
 function buildCommandProfile(command, sharded) {
     let commandProfile = {};
 
-    if (sharded && command.mapReduce) {
-        // Unlike other read commands, mapReduce is rewritten to a different format when sent to
-        // shards if the input collection is sharded, because it is executed in two phases.
-        // We do not check for the 'map' and 'reduce' fields, because they are functions, and
-        // we cannot compaare functions for equality.
-        commandProfile["command.out"] = {$regex: "^tmp.mrs"};
-        commandProfile["command.shardedFirstPass"] = true;
+    if (command.mapReduce) {
+        // MapReduce is rewritten to an aggregate pipeline.
+        commandProfile["command.aggregate"] = command.mapReduce;
     } else if (command.update) {
         // Updates are batched, but only allow using buildCommandProfile() for an update batch that
         // contains a single update, since the profiler generates separate entries for each update
@@ -39,16 +35,21 @@ function buildCommandProfile(command, sharded) {
     return commandProfile;
 }
 
-// Retrieve latest system.profile entry.
-function getLatestProfilerEntry(profileDB, filter) {
+// Retrieve N latest system.profile entries.
+function getNLatestProfilerEntries(profileDB, count, filter) {
     if (filter === null) {
         filter = {};
     }
-    var cursor = profileDB.system.profile.find(filter).sort({$natural: -1});
+    var cursor = profileDB.system.profile.find(filter).sort({$natural: -1}).limit(count);
     assert(
         cursor.hasNext(),
         "could not find any entries in the profile collection matching filter: " + tojson(filter));
-    return cursor.next();
+    return cursor.toArray();
+}
+
+// Retrieve latest system.profile entry.
+function getLatestProfilerEntry(profileDB, filter) {
+    return getNLatestProfilerEntries(profileDB, 1, filter)[0];
 }
 
 // Returns a string representing the wire protocol used for commands run on the given connection.

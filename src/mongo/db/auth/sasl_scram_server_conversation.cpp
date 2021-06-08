@@ -27,8 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kAccessControl
-
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/auth/sasl_scram_server_conversation.h"
@@ -41,25 +39,25 @@
 #include "mongo/base/string_data.h"
 #include "mongo/crypto/mechanism_scram.h"
 #include "mongo/crypto/sha1_block.h"
+#include "mongo/db/auth/sasl_command_constants.h"
 #include "mongo/db/auth/sasl_mechanism_policies.h"
 #include "mongo/db/auth/sasl_mechanism_registry.h"
 #include "mongo/db/auth/sasl_options.h"
 #include "mongo/platform/random.h"
 #include "mongo/util/base64.h"
-#include "mongo/util/log.h"
 #include "mongo/util/sequence_util.h"
 #include "mongo/util/str.h"
 #include "mongo/util/text.h"
 
 namespace mongo {
 
-
 template <typename Policy>
 StatusWith<std::tuple<bool, std::string>> SaslSCRAMServerMechanism<Policy>::stepImpl(
     OperationContext* opCtx, StringData inputData) {
     _step++;
 
-    if (_step > 3 || _step <= 0) {
+    const int numSteps = (_skipEmptyExchange ? 2 : 3);
+    if (_step > numSteps || _step <= 0) {
         return Status(ErrorCodes::AuthenticationFailed,
                       str::stream() << "Invalid SCRAM authentication step: " << _step);
     }
@@ -99,8 +97,7 @@ StatusWith<std::tuple<bool, std::string>> SaslSCRAMServerMechanism<Policy>::_fir
         return Status(ErrorCodes::BadValue,
                       str::stream()
                           << "Incorrect number of arguments for first SCRAM client message, got "
-                          << got
-                          << " expected at least 3");
+                          << got << " expected at least 3");
     };
 
     /**
@@ -168,8 +165,7 @@ StatusWith<std::tuple<bool, std::string>> SaslSCRAMServerMechanism<Policy>::_fir
     if (!authzId.empty() && ServerMechanismBase::_principalName != authzId) {
         return Status(ErrorCodes::BadValue,
                       str::stream() << "SCRAM user name " << ServerMechanismBase::_principalName
-                                    << " does not match authzid "
-                                    << authzId);
+                                    << " does not match authzid " << authzId);
     }
 
     if (!str::startsWith(input[1], "r=") || input[1].size() < 6) {
@@ -212,10 +208,15 @@ StatusWith<std::tuple<bool, std::string>> SaslSCRAMServerMechanism<Policy>::_fir
             return Status(ErrorCodes::AuthenticationFailed,
                           "It is not possible to authenticate as the __system user "
                           "on servers started without a --keyFile parameter");
+        } else if (scramCredentials.empty()) {
+            return {ErrorCodes::MechanismUnavailable,
+                    str::stream() << "Unable to use " << Policy::getName()
+                                  << " based authentication for user without any "
+                                  << Policy::getName() << " credentials registered"};
         } else {
-            return Status(ErrorCodes::AuthenticationFailed,
-                          "Unable to perform SCRAM authentication for a user with missing "
-                          "or invalid SCRAM credentials");
+            return {ErrorCodes::AuthenticationFailed,
+                    str::stream() << "Unable to validate " << Policy::getName()
+                                  << " authentication due to corrupted stored credentials"};
         }
     }
 
@@ -237,21 +238,17 @@ StatusWith<std::tuple<bool, std::string>> SaslSCRAMServerMechanism<Policy>::_fir
     const int nonceLenQWords = 3;
     uint64_t binaryNonce[nonceLenQWords];
 
-    std::unique_ptr<SecureRandom> sr(SecureRandom::create());
+    SecureRandom().fill(binaryNonce, sizeof(binaryNonce));
 
-    binaryNonce[0] = sr->nextInt64();
-    binaryNonce[1] = sr->nextInt64();
-    binaryNonce[2] = sr->nextInt64();
-
-    _nonce =
-        clientNonce + base64::encode(reinterpret_cast<char*>(binaryNonce), sizeof(binaryNonce));
+    _nonce = clientNonce +
+        base64::encode(StringData(reinterpret_cast<char*>(binaryNonce), sizeof(binaryNonce)));
     StringBuilder sb;
     sb << "r=" << _nonce << ",s=" << scramCredentials.salt
        << ",i=" << scramCredentials.iterationCount;
     std::string outputData = sb.str();
 
     // add client-first-message-bare and server-first-message to _authMessage
-    _authMessage = client_first_message_bare.toString() + "," + outputData;
+    _authMessage = str::stream() << client_first_message_bare.toString() << "," << outputData;
 
     return std::make_tuple(false, std::move(outputData));
 }
@@ -267,7 +264,7 @@ StatusWith<std::tuple<bool, std::string>> SaslSCRAMServerMechanism<Policy>::_fir
  * e=message
  *
  * NOTE: we are ignoring the channel binding part of the message
-**/
+ **/
 template <typename Policy>
 StatusWith<std::tuple<bool, std::string>> SaslSCRAMServerMechanism<Policy>::_secondStep(
     OperationContext* opCtx, StringData inputData) {
@@ -275,8 +272,7 @@ StatusWith<std::tuple<bool, std::string>> SaslSCRAMServerMechanism<Policy>::_sec
         return Status(ErrorCodes::BadValue,
                       str::stream()
                           << "Incorrect number of arguments for second SCRAM client message, got "
-                          << got
-                          << " expected at least 3");
+                          << got << " expected at least 3");
     };
 
     /**
@@ -322,9 +318,7 @@ StatusWith<std::tuple<bool, std::string>> SaslSCRAMServerMechanism<Policy>::_sec
         return Status(ErrorCodes::BadValue,
                       str::stream()
                           << "Unmatched SCRAM nonce received from client in second step, expected "
-                          << _nonce
-                          << " but received "
-                          << nonce);
+                          << _nonce << " but received " << nonce);
     }
 
     // Do server side computations, compare storedKeys and generate client-final-message
@@ -351,12 +345,24 @@ StatusWith<std::tuple<bool, std::string>> SaslSCRAMServerMechanism<Policy>::_sec
                       "SCRAM authentication failed, storedKey mismatch");
     }
 
-    invariant(!serverSignature.empty());
-    StringBuilder sb;
     // ServerSignature := HMAC(ServerKey, AuthMessage)
-    sb << "v=" << serverSignature;
+    invariant(!serverSignature.empty());
+    std::string reply("v=" + serverSignature);
+    return std::make_tuple(_skipEmptyExchange, reply);
+}
 
-    return std::make_tuple(false, sb.str());
+template <typename Policy>
+Status SaslSCRAMServerMechanism<Policy>::setOptions(BSONObj options) {
+    auto see = options[saslCommandOptionSkipEmptyExchange];
+    if (!see.eoo()) {
+        if (!see.isBoolean()) {
+            return {ErrorCodes::BadValue,
+                    str::stream() << saslCommandOptionSkipEmptyExchange << " must be boolean"};
+        }
+        _skipEmptyExchange = see.boolean();
+    }
+
+    return Status::OK();
 }
 
 template class SaslSCRAMServerMechanism<SCRAMSHA1Policy>;

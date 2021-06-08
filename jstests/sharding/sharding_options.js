@@ -1,4 +1,4 @@
-// TODO SERVER-35447: Multiple users cannot be authenticated on one connection within a session.
+// Multiple users cannot be authenticated on one connection within a session.
 TestData.disableImplicitSessions = true;
 
 var baseName = "jstests_sharding_sharding_options";
@@ -29,8 +29,7 @@ testGetCmdLineOptsMongod({config: "jstests/libs/config_files/enable_paranoia.jso
 // Sharding Role
 jsTest.log("Testing \"configsvr\" command line option");
 var expectedResult = {
-    "parsed":
-        {"sharding": {"clusterRole": "configsvr"}, "storage": {"journal": {"enabled": true}}}
+    "parsed": {"sharding": {"clusterRole": "configsvr"}, "storage": {"journal": {"enabled": true}}}
 };
 testGetCmdLineOptsMongod({configsvr: "", journal: ""}, expectedResult);
 

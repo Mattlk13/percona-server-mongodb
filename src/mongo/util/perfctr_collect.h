@@ -39,7 +39,6 @@
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/stdx/unordered_map.h"
 
 namespace mongo {
@@ -270,6 +269,12 @@ private:
      * Check if any of the counters we want depends on system ticks per second as a time base.
      */
     void checkForTicksTimeBase();
+
+    /**
+     * Add and get a counter by an English name in a language independent way.
+     */
+    StatusWith<std::tuple<PDH_HCOUNTER, std::unique_ptr<PDH_COUNTER_INFO>>> addAndGetCounter(
+        StringData path);
 
 private:
     // PDH Query

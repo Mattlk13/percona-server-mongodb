@@ -27,15 +27,16 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kASIO
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kASIO
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/executor/connection_pool_tl.h"
 
 #include "mongo/client/authenticate.h"
+#include "mongo/config.h"
 #include "mongo/db/auth/authorization_manager.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 namespace executor {
@@ -56,21 +57,21 @@ void TLTypeFactory::shutdown() {
     // Stop any attempt to schedule timers in the future
     _inShutdown.store(true);
 
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
 
-    log() << "Killing all outstanding egress activity.";
+    LOGV2(22582, "Killing all outstanding egress activity.");
     for (auto collar : _collars) {
         collar->kill();
     }
 }
 
 void TLTypeFactory::fasten(Type* type) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     _collars.insert(type);
 }
 
 void TLTypeFactory::release(Type* type) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     _collars.erase(type);
 
     type->_wasReleased = true;
@@ -94,7 +95,7 @@ void TLTimer::setTimeout(Milliseconds timeoutVal, TimeoutCallback cb) {
     // We will not wait on a timeout if we are in shutdown.
     // The clients will be canceled as an inevitable consequence of pools shutting down.
     if (inShutdown()) {
-        LOG(2) << "Skipping timeout due to impending shutdown.";
+        LOGV2_DEBUG(22583, 2, "Skipping timeout due to impending shutdown.");
         return;
     }
 
@@ -133,23 +134,42 @@ bool TLConnection::isHealthy() {
     return _client->isStillConnected();
 }
 
+bool TLConnection::maybeHealthy() {
+    // The connection has been successfully used after the last time we checked for its health, so
+    // we may assume it's still healthy.
+    if (auto lastUsedWithTimeout = getLastUsed() + kIsHealthyCacheTimeout;
+        lastUsedWithTimeout > _isHealthyExpiresAt) {
+        _isHealthyExpiresAt = lastUsedWithTimeout;
+        // We may reset `_isHealthyCache` below if `now()` has already passed `_isHealthyExpiresAt`.
+        _isHealthyCache = true;
+    }
+
+    if (auto currentTime = now(); !_isHealthyCache || currentTime >= _isHealthyExpiresAt) {
+        _isHealthyCache = isHealthy();
+        _isHealthyExpiresAt = currentTime + kIsHealthyCacheTimeout;
+    }
+    return _isHealthyCache;
+}
+
 AsyncDBClient* TLConnection::client() {
     return _client.get();
 }
 
 void TLConnection::setTimeout(Milliseconds timeout, TimeoutCallback cb) {
     auto anchor = shared_from_this();
-    _timer->setTimeout(timeout, [ cb = std::move(cb), anchor = std::move(anchor) ] { cb(); });
+    _timer->setTimeout(timeout, [cb = std::move(cb), anchor = std::move(anchor)] { cb(); });
 }
 
 void TLConnection::cancelTimeout() {
     _timer->cancelTimeout();
 }
 
+namespace {
+
 class TLConnectionSetupHook : public executor::NetworkConnectionHook {
 public:
-    explicit TLConnectionSetupHook(executor::NetworkConnectionHook* hookToWrap)
-        : _wrappedHook(hookToWrap) {}
+    explicit TLConnectionSetupHook(executor::NetworkConnectionHook* hookToWrap, bool x509AuthOnly)
+        : _wrappedHook(hookToWrap), _x509AuthOnly(x509AuthOnly) {}
 
     BSONObj augmentIsMasterRequest(BSONObj cmdObj) override {
         BSONObjBuilder bob(std::move(cmdObj));
@@ -158,18 +178,37 @@ public:
             bob.append("saslSupportedMechs", internalSecurity.user->getName().getUnambiguousName());
         }
 
+        if (_x509AuthOnly) {
+            _speculativeAuthType = auth::SpeculativeAuthType::kAuthenticate;
+        } else {
+            _speculativeAuthType = auth::speculateInternalAuth(&bob, &_session);
+        }
+
         return bob.obj();
     }
 
     Status validateHost(const HostAndPort& remoteHost,
                         const BSONObj& isMasterRequest,
                         const RemoteCommandResponse& isMasterReply) override try {
-        const auto saslMechsElem = isMasterReply.data.getField("saslSupportedMechs");
-        if (saslMechsElem.type() == Array) {
-            auto array = saslMechsElem.Array();
-            for (const auto& elem : array) {
-                _saslMechsForInternalAuth.push_back(elem.checkAndGetStringData().toString());
+        const auto& reply = isMasterReply.data;
+
+        // X.509 auth only means we only want to use a single mechanism regards of what hello says
+        if (_x509AuthOnly) {
+            _saslMechsForInternalAuth.clear();
+            _saslMechsForInternalAuth.push_back("MONGODB-X509");
+        } else {
+            const auto saslMechsElem = reply.getField("saslSupportedMechs");
+            if (saslMechsElem.type() == Array) {
+                auto array = saslMechsElem.Array();
+                for (const auto& elem : array) {
+                    _saslMechsForInternalAuth.push_back(elem.checkAndGetStringData().toString());
+                }
             }
+        }
+
+        const auto specAuth = reply.getField(auth::kSpeculativeAuthenticate);
+        if (specAuth.type() == Object) {
+            _speculativeAuthenticate = specAuth.Obj().getOwned();
         }
 
         if (!_wrappedHook) {
@@ -202,10 +241,56 @@ public:
         return _saslMechsForInternalAuth;
     }
 
+    std::shared_ptr<SaslClientSession> getSession() {
+        return _session;
+    }
+
+    auth::SpeculativeAuthType getSpeculativeAuthType() const {
+        return _speculativeAuthType;
+    }
+
+    BSONObj getSpeculativeAuthenticateReply() {
+        return _speculativeAuthenticate;
+    }
+
 private:
     std::vector<std::string> _saslMechsForInternalAuth;
+    std::shared_ptr<SaslClientSession> _session;
+    auth::SpeculativeAuthType _speculativeAuthType;
+    BSONObj _speculativeAuthenticate;
     executor::NetworkConnectionHook* const _wrappedHook = nullptr;
+    bool _x509AuthOnly;
 };
+
+#ifdef MONGO_CONFIG_SSL
+class TransientInternalAuthParametersProvider : public auth::InternalAuthParametersProvider {
+public:
+    TransientInternalAuthParametersProvider(
+        const std::shared_ptr<const transport::SSLConnectionContext> transientSSLContext)
+        : _transientSSLContext(transientSSLContext) {}
+
+    ~TransientInternalAuthParametersProvider() = default;
+
+    BSONObj get(size_t index, StringData mechanism) final {
+        if (_transientSSLContext) {
+            if (index == 0) {
+                return auth::createInternalX509AuthDocument(
+                    boost::optional<StringData>{_transientSSLContext->manager->getSSLConfiguration()
+                                                    .clientSubjectName.toString()});
+            } else {
+                return BSONObj();
+            }
+        }
+
+        return auth::getInternalAuthParams(index, mechanism);
+    }
+
+private:
+    const std::shared_ptr<const transport::SSLConnectionContext> _transientSSLContext;
+};
+#endif
+
+}  // namespace
 
 void TLConnection::setup(Milliseconds timeout, SetupCallback cb) {
     auto anchor = shared_from_this();
@@ -213,14 +298,14 @@ void TLConnection::setup(Milliseconds timeout, SetupCallback cb) {
     auto pf = makePromiseFuture<void>();
     auto handler = std::make_shared<TimeoutHandler>(std::move(pf.promise));
     std::move(pf.future).thenRunOn(_reactor).getAsync(
-        [ this, cb = std::move(cb), anchor ](Status status) { cb(this, std::move(status)); });
+        [this, cb = std::move(cb), anchor](Status status) { cb(this, std::move(status)); });
 
     setTimeout(timeout, [this, handler, timeout] {
         if (handler->done.swap(true)) {
             return;
         }
-        std::string reason = str::stream() << "Timed out connecting to " << _peer << " after "
-                                           << timeout;
+        std::string reason = str::stream()
+            << "Timed out connecting to " << _peer << " after " << timeout;
         handler->promise.setError(
             Status(ErrorCodes::NetworkInterfaceExceededTimeLimit, std::move(reason)));
 
@@ -229,9 +314,21 @@ void TLConnection::setup(Milliseconds timeout, SetupCallback cb) {
         }
     });
 
-    auto isMasterHook = std::make_shared<TLConnectionSetupHook>(_onConnectHook);
+#ifdef MONGO_CONFIG_SSL
+    bool x509AuthOnly =
+        _transientSSLContext.get() && _transientSSLContext->targetClusterURI.has_value();
+    auto authParametersProvider =
+        std::make_shared<TransientInternalAuthParametersProvider>(_transientSSLContext);
+#else
+    bool x509AuthOnly = false;
+    auto authParametersProvider = auth::createDefaultInternalAuthProvider();
+#endif
 
-    AsyncDBClient::connect(_peer, _sslMode, _serviceContext, _reactor, timeout)
+    // For transient connections, only use X.509 auth.
+    auto isMasterHook = std::make_shared<TLConnectionSetupHook>(_onConnectHook, x509AuthOnly);
+
+    AsyncDBClient::connect(
+        _peer, _sslMode, _serviceContext, _reactor, timeout, _transientSSLContext)
         .thenRunOn(_reactor)
         .onError([](StatusWith<AsyncDBClient::Handle> swc) -> StatusWith<AsyncDBClient::Handle> {
             return Status(ErrorCodes::HostUnreachable, swc.getStatus().reason());
@@ -240,15 +337,25 @@ void TLConnection::setup(Milliseconds timeout, SetupCallback cb) {
             _client = std::move(client);
             return _client->initWireVersion("NetworkInterfaceTL", isMasterHook.get());
         })
-        .then([this, isMasterHook] {
+        .then([this, isMasterHook]() -> Future<bool> {
             if (_skipAuth) {
+                return false;
+            }
+
+            return _client->completeSpeculativeAuth(isMasterHook->getSession(),
+                                                    auth::getInternalAuthDB(),
+                                                    isMasterHook->getSpeculativeAuthenticateReply(),
+                                                    isMasterHook->getSpeculativeAuthType());
+        })
+        .then([this, isMasterHook, authParametersProvider](bool authenticatedDuringConnect) {
+            if (_skipAuth || authenticatedDuringConnect) {
                 return Future<void>::makeReady();
             }
 
             boost::optional<std::string> mechanism;
             if (!isMasterHook->saslMechsForInternalAuth().empty())
                 mechanism = isMasterHook->saslMechsForInternalAuth().front();
-            return _client->authenticateInternal(std::move(mechanism));
+            return _client->authenticateInternal(std::move(mechanism), authParametersProvider);
         })
         .then([this] {
             if (!_onConnectHook) {
@@ -273,11 +380,16 @@ void TLConnection::setup(Milliseconds timeout, SetupCallback cb) {
             if (status.isOK()) {
                 handler->promise.emplaceValue();
             } else {
-                LOG(2) << "Failed to connect to " << _peer << " - " << redact(status);
+                LOGV2_DEBUG(22584,
+                            2,
+                            "Failed to connect to {hostAndPort} - {error}",
+                            "Failed to connect",
+                            "hostAndPort"_attr = _peer,
+                            "error"_attr = redact(status));
                 handler->promise.setError(status);
             }
         });
-    LOG(2) << "Finished connection setup.";
+    LOGV2_DEBUG(22585, 2, "Finished connection setup.");
 }
 
 void TLConnection::refresh(Milliseconds timeout, RefreshCallback cb) {
@@ -286,7 +398,7 @@ void TLConnection::refresh(Milliseconds timeout, RefreshCallback cb) {
     auto pf = makePromiseFuture<void>();
     auto handler = std::make_shared<TimeoutHandler>(std::move(pf.promise));
     std::move(pf.future).thenRunOn(_reactor).getAsync(
-        [ this, cb = std::move(cb), anchor ](Status status) { cb(this, status); });
+        [this, cb = std::move(cb), anchor](Status status) { cb(this, status); });
 
     setTimeout(timeout, [this, handler] {
         if (handler->done.swap(true)) {
@@ -344,7 +456,8 @@ std::shared_ptr<ConnectionPool::ConnectionInterface> TLTypeFactory::makeConnecti
                                                sslMode,
                                                generation,
                                                _onConnectHook.get(),
-                                               _connPoolOptions.skipAuthentication);
+                                               _connPoolOptions.skipAuthentication,
+                                               _transientSSLContext);
     fasten(conn.get());
     return conn;
 }
@@ -361,4 +474,4 @@ Date_t TLTypeFactory::now() {
 
 }  // namespace connection_pool_tl
 }  // namespace executor
-}  // namespace
+}  // namespace mongo

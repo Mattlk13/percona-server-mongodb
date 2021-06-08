@@ -27,35 +27,43 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/s/async_requests_sender.h"
 
+#include <fmt/format.h>
+#include <memory>
+
 #include "mongo/client/remote_command_targeter.h"
 #include "mongo/executor/remote_command_request.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/s/hedge_options_util.h"
 #include "mongo/transport/baton.h"
 #include "mongo/transport/transport_layer.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
+
+using namespace fmt::literals;
 
 namespace mongo {
 
 namespace {
 
-// Maximum number of retries for network and replication notMaster errors (per host).
+// Maximum number of retries for network and replication NotPrimary errors (per host).
 const int kMaxNumFailedHostRetryAttempts = 3;
+
+MONGO_FAIL_POINT_DEFINE(hangBeforeSchedulingRemoteCommand);
+MONGO_FAIL_POINT_DEFINE(hangBeforePollResponse);
 
 }  // namespace
 
 AsyncRequestsSender::AsyncRequestsSender(OperationContext* opCtx,
-                                         executor::TaskExecutor* executor,
+                                         std::shared_ptr<executor::TaskExecutor> executor,
                                          StringData dbName,
                                          const std::vector<AsyncRequestsSender::Request>& requests,
                                          const ReadPreferenceSetting& readPreference,
@@ -64,7 +72,7 @@ AsyncRequestsSender::AsyncRequestsSender(OperationContext* opCtx,
       _db(dbName.toString()),
       _readPreference(readPreference),
       _retryPolicy(retryPolicy),
-      _subExecutor(executor),
+      _subExecutor(std::move(executor)),
       _subBaton(opCtx->getBaton()->makeSubBaton()) {
 
     _remotesLeft = requests.size();
@@ -82,12 +90,23 @@ AsyncRequestsSender::AsyncRequestsSender(OperationContext* opCtx,
 AsyncRequestsSender::Response AsyncRequestsSender::next() noexcept {
     invariant(!done());
 
+    hangBeforePollResponse.executeIf(
+        [&](const BSONObj& data) {
+            while (MONGO_unlikely(hangBeforePollResponse.shouldFail())) {
+                LOGV2(4840900, "Hanging in ARS::next due to 'hangBeforePollResponse' failpoint");
+                sleepmillis(100);
+            }
+        },
+        [&](const BSONObj& data) {
+            return MONGO_unlikely(_remotesLeft == (size_t)data.getIntField("remotesLeft"));
+        });
+
     _remotesLeft--;
 
     // If we've been interrupted, the response queue should be filled with interrupted answers, go
     // ahead and return one of those
     if (!_interruptStatus.isOK()) {
-        return _responseQueue.pop(_opCtx);
+        return _responseQueue.pop();
     }
 
     // Try to pop a value from the queue
@@ -113,7 +132,7 @@ AsyncRequestsSender::Response AsyncRequestsSender::next() noexcept {
     // shutdown the scoped task executor
     _subExecutor->shutdown();
 
-    return _responseQueue.pop(_opCtx);
+    return _responseQueue.pop();
 }
 
 void AsyncRequestsSender::stopRetrying() noexcept {
@@ -140,21 +159,31 @@ std::shared_ptr<Shard> AsyncRequestsSender::RemoteData::getShard() {
 void AsyncRequestsSender::RemoteData::executeRequest() {
     scheduleRequest()
         .thenRunOn(*_ars->_subBaton)
-        .getAsync([this](StatusWith<executor::RemoteCommandResponse> rcr) {
+        .getAsync([this](StatusWith<RemoteCommandOnAnyCallbackArgs> rcr) {
             _done = true;
-            _ars->_responseQueue.push({std::move(_shardId), rcr, std::move(_shardHostAndPort)});
+            if (rcr.isOK()) {
+                _ars->_responseQueue.push(
+                    {std::move(_shardId), rcr.getValue().response, std::move(_shardHostAndPort)});
+            } else {
+                _ars->_responseQueue.push(
+                    {std::move(_shardId), rcr.getStatus(), std::move(_shardHostAndPort)});
+            }
         });
 }
 
-SemiFuture<executor::RemoteCommandResponse> AsyncRequestsSender::RemoteData::scheduleRequest() {
-    return resolveShardIdToHostAndPort(_ars->_readPreference)
+auto AsyncRequestsSender::RemoteData::scheduleRequest()
+    -> SemiFuture<RemoteCommandOnAnyCallbackArgs> {
+    return resolveShardIdToHostAndPorts(_ars->_readPreference)
         .thenRunOn(*_ars->_subBaton)
-        .then([this](auto&& hostAndPort) { return scheduleRemoteCommand(std::move(hostAndPort)); })
+        .then([this](auto&& hostAndPorts) {
+            _shardHostAndPort.emplace(hostAndPorts.front());
+            return scheduleRemoteCommand(std::move(hostAndPorts));
+        })
         .then([this](auto&& rcr) { return handleResponse(std::move(rcr)); })
         .semi();
 }
 
-SemiFuture<HostAndPort> AsyncRequestsSender::RemoteData::resolveShardIdToHostAndPort(
+SemiFuture<std::vector<HostAndPort>> AsyncRequestsSender::RemoteData::resolveShardIdToHostAndPorts(
     const ReadPreferenceSetting& readPref) {
     const auto shard = getShard();
     if (!shard) {
@@ -162,45 +191,65 @@ SemiFuture<HostAndPort> AsyncRequestsSender::RemoteData::resolveShardIdToHostAnd
                       str::stream() << "Could not find shard " << _shardId);
     }
 
-    return shard->getTargeter()->findHostWithMaxWait(readPref, Seconds(20));
+    return shard->getTargeter()->findHosts(readPref, CancellationToken::uncancelable());
 }
 
-SemiFuture<executor::RemoteCommandResponse> AsyncRequestsSender::RemoteData::scheduleRemoteCommand(
-    HostAndPort&& hostAndPort) {
-    _shardHostAndPort = std::move(hostAndPort);
+auto AsyncRequestsSender::RemoteData::scheduleRemoteCommand(std::vector<HostAndPort>&& hostAndPorts)
+    -> SemiFuture<RemoteCommandOnAnyCallbackArgs> {
+    hangBeforeSchedulingRemoteCommand.executeIf(
+        [&](const BSONObj& data) {
+            while (MONGO_unlikely(hangBeforeSchedulingRemoteCommand.shouldFail())) {
+                LOGV2(4625505,
+                      "Hanging in ARS due to "
+                      "'hangBeforeSchedulingRemoteCommand' failpoint");
+                sleepmillis(100);
+            }
+        },
+        [&](const BSONObj& data) {
+            return MONGO_unlikely(std::count(hostAndPorts.begin(),
+                                             hostAndPorts.end(),
+                                             HostAndPort(data.getStringField("hostAndPort"))));
+        });
 
-    executor::RemoteCommandRequest request(
-        *_shardHostAndPort, _ars->_db, _cmdObj, _ars->_metadataObj, _ars->_opCtx);
+    auto hedgeOptions = extractHedgeOptions(_cmdObj, _ars->_readPreference);
+    executor::RemoteCommandRequestOnAny request(std::move(hostAndPorts),
+                                                _ars->_db,
+                                                _cmdObj,
+                                                _ars->_metadataObj,
+                                                _ars->_opCtx,
+                                                hedgeOptions);
 
     // We have to make a promise future pair because the TaskExecutor doesn't currently support a
     // future returning variant of scheduleRemoteCommand
-    auto[p, f] = makePromiseFuture<executor::RemoteCommandResponse>();
+    auto [p, f] = makePromiseFuture<RemoteCommandOnAnyCallbackArgs>();
 
     // Failures to schedule skip the retry loop
-    uassertStatusOK(_ars->_subExecutor->scheduleRemoteCommand(
+    uassertStatusOK(_ars->_subExecutor->scheduleRemoteCommandOnAny(
         request,
         // We have to make a shared_ptr<Promise> here because scheduleRemoteCommand requires
         // copyable callbacks
-        [p = std::make_shared<Promise<executor::RemoteCommandResponse>>(std::move(p))](
-            const executor::TaskExecutor::RemoteCommandCallbackArgs& cbData) {
-            p->emplaceValue(cbData.response);
-        },
+        [p = std::make_shared<Promise<RemoteCommandOnAnyCallbackArgs>>(std::move(p))](
+            const RemoteCommandOnAnyCallbackArgs& cbData) { p->emplaceValue(cbData); },
         *_ars->_subBaton));
 
     return std::move(f).semi();
 }
 
-SemiFuture<executor::RemoteCommandResponse> AsyncRequestsSender::RemoteData::handleResponse(
-    executor::RemoteCommandResponse&& rcr) {
 
-    auto status = rcr.status;
+auto AsyncRequestsSender::RemoteData::handleResponse(RemoteCommandOnAnyCallbackArgs&& rcr)
+    -> SemiFuture<RemoteCommandOnAnyCallbackArgs> {
+    if (rcr.response.target) {
+        _shardHostAndPort = rcr.response.target;
+    }
+
+    auto status = rcr.response.status;
 
     if (status.isOK()) {
-        status = getStatusFromCommandResult(rcr.data);
+        status = getStatusFromCommandResult(rcr.response.data);
     }
 
     if (status.isOK()) {
-        status = getWriteConcernStatusFromCommandResult(rcr.data);
+        status = getWriteConcernStatusFromCommandResult(rcr.response.data);
     }
 
     // If we're okay (RemoteCommandResponse, command result and write concern)-wise we're done.
@@ -214,14 +263,27 @@ SemiFuture<executor::RemoteCommandResponse> AsyncRequestsSender::RemoteData::han
     if (!shard) {
         uasserted(ErrorCodes::ShardNotFound, str::stream() << "Could not find shard " << _shardId);
     } else {
-        if (_shardHostAndPort) {
-            shard->updateReplSetMonitor(*_shardHostAndPort, status);
+        std::vector<HostAndPort> failedTargets;
+
+        if (rcr.response.target) {
+            failedTargets = {*rcr.response.target};
+        } else {
+            failedTargets = rcr.request.target;
         }
+
+        shard->updateReplSetMonitor(failedTargets.front(), status);
+        bool isStartingTransaction = _cmdObj.getField("startTransaction").booleanSafe();
         if (!_ars->_stopRetrying && shard->isRetriableError(status.code(), _ars->_retryPolicy) &&
-            _retryCount < kMaxNumFailedHostRetryAttempts) {
-            LOG(1) << "Command to remote " << _shardId << " at host " << *_shardHostAndPort
-                   << " failed with retriable error and will be retried "
-                   << causedBy(redact(status));
+            _retryCount < kMaxNumFailedHostRetryAttempts && !isStartingTransaction) {
+
+            LOGV2_DEBUG(4615637,
+                        1,
+                        "Command to remote {shardId} for hosts {hosts} failed with retryable error "
+                        "{error} and will be retried",
+                        "Command to remote shard failed with retryable error and will be retried",
+                        "shardId"_attr = _shardId,
+                        "hosts"_attr = failedTargets,
+                        "error"_attr = redact(status));
             ++_retryCount;
             _shardHostAndPort.reset();
             // retry through recursion
@@ -230,7 +292,7 @@ SemiFuture<executor::RemoteCommandResponse> AsyncRequestsSender::RemoteData::han
     }
 
     // Status' in the response.status field that aren't retried get converted to top level errors
-    uassertStatusOK(rcr.status);
+    uassertStatusOK(rcr.response.status);
 
     // We're not okay (on the remote), but still not going to retry
     return std::move(rcr);

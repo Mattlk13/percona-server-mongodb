@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -38,19 +38,21 @@
 #include "mongo/db/curop_failpoint_helpers.h"
 #include "mongo/db/ops/write_ops.h"
 #include "mongo/db/pipeline/document_path_support.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/util/destructor_guard.h"
-#include "mongo/util/log.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 using namespace fmt::literals;
 
-static AtomicWord<unsigned> aggOutCounter;
-
 MONGO_FAIL_POINT_DEFINE(hangWhileBuildingDocumentSourceOutBatch);
+MONGO_FAIL_POINT_DEFINE(outWaitAfterTempCollectionCreation);
 REGISTER_DOCUMENT_SOURCE(out,
                          DocumentSourceOut::LiteParsed::parse,
-                         DocumentSourceOut::createFromBson);
+                         DocumentSourceOut::createFromBson,
+                         LiteParsedDocumentSource::AllowedWithApiStrict::kAlways);
 
 DocumentSourceOut::~DocumentSourceOut() {
     DESTRUCTOR_GUARD(
@@ -67,52 +69,58 @@ DocumentSourceOut::~DocumentSourceOut() {
 
             DocumentSourceWriteBlock writeBlock(cleanupOpCtx.get());
 
-            // Reset the operation context back to original once dropCollection is done.
-            ON_BLOCK_EXIT(
-                [this] { pExpCtx->mongoProcessInterface->setOperationContext(pExpCtx->opCtx); });
-
-            pExpCtx->mongoProcessInterface->setOperationContext(cleanupOpCtx.get());
-            pExpCtx->mongoProcessInterface->directClient()->dropCollection(_tempNs.ns());
+            pExpCtx->mongoProcessInterface->dropCollection(cleanupOpCtx.get(), _tempNs);
         });
 }
 
+NamespaceString DocumentSourceOut::parseNsFromElem(const BSONElement& spec,
+                                                   const StringData& defaultDB) {
+    if (spec.type() == BSONType::String) {
+        return NamespaceString(defaultDB, spec.valueStringData());
+    } else if (spec.type() == BSONType::Object) {
+        auto nsObj = spec.Obj();
+        uassert(16994,
+                str::stream() << "If an object is passed to " << kStageName
+                              << " it must have exactly 2 fields: 'db' and 'coll'",
+                nsObj.nFields() == 2 && nsObj.hasField("coll") && nsObj.hasField("db"));
+        return NamespaceString(nsObj["db"].String(), nsObj["coll"].String());
+    } else {
+        uassert(16990,
+                "{} only supports a string or object argument, but found {}"_format(
+                    kStageName, typeName(spec.type())),
+                spec.type() == BSONType::String);
+    }
+    MONGO_UNREACHABLE;
+}
+
 std::unique_ptr<DocumentSourceOut::LiteParsed> DocumentSourceOut::LiteParsed::parse(
-    const AggregationRequest& request, const BSONElement& spec) {
+    const NamespaceString& nss, const BSONElement& spec) {
 
-    uassert(ErrorCodes::TypeMismatch,
-            "{} stage requires a string argument, but found {}"_format(kStageName,
-                                                                       typeName(spec.type())),
-            spec.type() == BSONType::String);
-
-    NamespaceString targetNss{request.getNamespaceString().db(), spec.valueStringData()};
+    NamespaceString targetNss = parseNsFromElem(spec, nss.db());
     uassert(ErrorCodes::InvalidNamespace,
             "Invalid {} target namespace, {}"_format(kStageName, targetNss.ns()),
             targetNss.isValid());
-
-    ActionSet actions{ActionType::insert, ActionType::remove};
-    if (request.shouldBypassDocumentValidation()) {
-        actions.addAction(ActionType::bypassDocumentValidation);
-    }
-
-    PrivilegeVector privileges{Privilege(ResourcePattern::forExactNamespace(targetNss), actions)};
-
-    return stdx::make_unique<DocumentSourceOut::LiteParsed>(std::move(targetNss),
-                                                            std::move(privileges));
+    return std::make_unique<DocumentSourceOut::LiteParsed>(spec.fieldName(), std::move(targetNss));
 }
 
 void DocumentSourceOut::initialize() {
     DocumentSourceWriteBlock writeBlock(pExpCtx->opCtx);
 
-    DBClientBase* conn = pExpCtx->mongoProcessInterface->directClient();
-
     const auto& outputNs = getOutputNs();
-    _tempNs = NamespaceString(str::stream() << outputNs.db() << ".tmp.agg_out."
-                                            << aggOutCounter.addAndFetch(1));
+    // We will write all results into a temporary collection, then rename the temporary collection
+    // to be the target collection once we are done.
+    // Note that this temporary collection name is used by MongoMirror and thus should not be
+    // changed without consultation.
+    _tempNs = NamespaceString(str::stream() << outputNs.db() << ".tmp.agg_out." << UUID::gen());
 
     // Save the original collection options and index specs so we can check they didn't change
     // during computation.
-    _originalOutOptions = pExpCtx->mongoProcessInterface->getCollectionOptions(outputNs);
-    _originalIndexes = conn->getIndexSpecs(outputNs.ns());
+    _originalOutOptions =
+        // The uuid field is considered an option, but cannot be passed to createCollection.
+        pExpCtx->mongoProcessInterface->getCollectionOptions(pExpCtx->opCtx, outputNs)
+            .removeField("uuid");
+    _originalIndexes = pExpCtx->mongoProcessInterface->getIndexSpecs(
+        pExpCtx->opCtx, outputNs, false /* includeBuildUUIDs */);
 
     // Check if it's capped to make sure we have a chance of succeeding before we do all the work.
     // If the collection becomes capped during processing, the collection options will have changed,
@@ -121,38 +129,34 @@ void DocumentSourceOut::initialize() {
             "namespace '{}' is capped so it can't be used for {}"_format(outputNs.ns(), kStageName),
             _originalOutOptions["capped"].eoo());
 
-    // We will write all results into a temporary collection, then rename the temporary
-    // collection to be the target collection once we are done.
-    _tempNs = NamespaceString(str::stream() << outputNs.db() << ".tmp.agg_out."
-                                            << aggOutCounter.addAndFetch(1));
-
-    // Create temp collection, copying options from the existing output collection if any.
     {
         BSONObjBuilder cmd;
         cmd << "create" << _tempNs.coll();
         cmd << "temp" << true;
         cmd.appendElementsUnique(_originalOutOptions);
 
-        BSONObj info;
-        uassert(16994,
-                "failed to create temporary {} collection '{}': {}"_format(
-                    kStageName, _tempNs.ns(), getStatusFromCommandResult(info).reason()),
-                conn->runCommand(outputNs.db().toString(), cmd.done(), info));
+        pExpCtx->mongoProcessInterface->createCollection(
+            pExpCtx->opCtx, _tempNs.db().toString(), cmd.done());
     }
 
+    CurOpFailpointHelpers::waitWhileFailPointEnabled(
+        &outWaitAfterTempCollectionCreation,
+        pExpCtx->opCtx,
+        "outWaitAfterTempCollectionCreation",
+        []() {
+            LOGV2(20901,
+                  "Hanging aggregation due to 'outWaitAfterTempCollectionCreation' failpoint");
+        });
     if (_originalIndexes.empty()) {
         return;
     }
 
     // Copy the indexes of the output collection to the temp collection.
-    std::vector<BSONObj> tempNsIndexes;
-    for (const auto& indexSpec : _originalIndexes) {
-        // Replace the spec's 'ns' field value, which is the original collection, with the temp
-        // collection.
-        tempNsIndexes.push_back(indexSpec.addField(BSON("ns" << _tempNs.ns()).firstElement()));
-    }
     try {
-        conn->createIndexes(_tempNs.ns(), tempNsIndexes);
+        std::vector<BSONObj> tempNsIndexes = {std::begin(_originalIndexes),
+                                              std::end(_originalIndexes)};
+        pExpCtx->mongoProcessInterface->createIndexesOnEmptyCollection(
+            pExpCtx->opCtx, _tempNs, tempNsIndexes);
     } catch (DBException& ex) {
         ex.addContext("Copying indexes for $out failed");
         throw;
@@ -176,48 +180,33 @@ void DocumentSourceOut::finalize() {
 boost::intrusive_ptr<DocumentSource> DocumentSourceOut::create(
     NamespaceString outputNs, const boost::intrusive_ptr<ExpressionContext>& expCtx) {
 
-    // TODO (SERVER-36832): Allow this combination.
-    uassert(50939,
-            "{} is not supported when the output collection is in a different "
-            "database"_format(kStageName),
-            outputNs.db() == expCtx->ns.db());
-
     uassert(ErrorCodes::OperationNotSupportedInTransaction,
             "{} cannot be used in a transaction"_format(kStageName),
             !expCtx->inMultiDocumentTransaction);
 
-    auto readConcernLevel = repl::ReadConcernArgs::get(expCtx->opCtx).getLevel();
-    uassert(ErrorCodes::InvalidOptions,
-            "{} cannot be used with a 'linearizable' read concern level"_format(kStageName),
-            readConcernLevel != repl::ReadConcernLevel::kLinearizableReadConcern);
-
-    uassert(17017,
-            "{} is not supported to an existing *sharded* output collection"_format(kStageName),
-            !expCtx->mongoProcessInterface->isSharded(expCtx->opCtx, outputNs));
+    uassert(ErrorCodes::InvalidNamespace,
+            "Invalid {} target namespace, {}"_format(kStageName, outputNs.ns()),
+            outputNs.isValid());
 
     uassert(17385,
             "Can't {} to special collection: {}"_format(kStageName, outputNs.coll()),
-            !outputNs.isSpecial());
+            !outputNs.isSystem());
+
+    uassert(31321,
+            "Can't {} to internal database: {}"_format(kStageName, outputNs.db()),
+            !outputNs.isOnInternalDb());
 
     return new DocumentSourceOut(std::move(outputNs), expCtx);
 }
 
 boost::intrusive_ptr<DocumentSource> DocumentSourceOut::createFromBson(
     BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& expCtx) {
-    uassert(16990,
-            "{} only supports a string argument, but found {}"_format(kStageName,
-                                                                      typeName(elem.type())),
-            elem.type() == BSONType::String);
-
-    return create({expCtx->ns.db(), elem.str()}, expCtx);
+    auto targetNS = parseNsFromElem(elem, expCtx->ns.db());
+    return create(targetNS, expCtx);
 }
 
 Value DocumentSourceOut::serialize(boost::optional<ExplainOptions::Verbosity> explain) const {
-    massert(17000,
-            "{} shouldn't have different db than input"_format(kStageName),
-            _outputNs.db() == pExpCtx->ns.db());
-
-    return Value(DOC(getSourceName() << _outputNs.coll()));
+    return Value(DOC(kStageName << DOC("db" << _outputNs.db() << "coll" << _outputNs.coll())));
 }
 
 void DocumentSourceOut::waitWhileFailPointEnabled() {
@@ -226,8 +215,8 @@ void DocumentSourceOut::waitWhileFailPointEnabled() {
         pExpCtx->opCtx,
         "hangWhileBuildingDocumentSourceOutBatch",
         []() {
-            log() << "Hanging aggregation due to 'hangWhileBuildingDocumentSourceOutBatch' "
-                  << "failpoint";
+            LOGV2(20902,
+                  "Hanging aggregation due to 'hangWhileBuildingDocumentSourceOutBatch' failpoint");
         });
 }
 

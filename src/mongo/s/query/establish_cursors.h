@@ -30,15 +30,16 @@
 #pragma once
 
 #include <boost/optional.hpp>
+#include <memory>
 #include <vector>
 
 #include "mongo/base/status_with.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/cursor_id.h"
 #include "mongo/executor/task_executor.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/s/client/shard.h"
 #include "mongo/s/query/async_results_merger_params_gen.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/time_support.h"
 
@@ -64,7 +65,7 @@ class CursorResponse;
  */
 std::vector<RemoteCursor> establishCursors(
     OperationContext* opCtx,
-    executor::TaskExecutor* executor,
+    std::shared_ptr<executor::TaskExecutor> executor,
     const NamespaceString& nss,
     const ReadPreferenceSetting readPref,
     const std::vector<std::pair<ShardId, BSONObj>>& remotes,
@@ -72,18 +73,14 @@ std::vector<RemoteCursor> establishCursors(
     Shard::RetryPolicy retryPolicy = Shard::RetryPolicy::kIdempotent);
 
 /**
- * Schedules a remote killCursor command for each of the cursors in 'remoteCursors'.
+ * Schedules a remote killCursor command for 'cursor'.
  *
  * Note that this method is optimistic and does not check the return status for the killCursors
- * commands.
+ * command.
  */
-void killRemoteCursors(OperationContext* opCtx,
-                       executor::TaskExecutor* executor,
-                       std::vector<RemoteCursor>&& remoteCursors,
-                       const NamespaceString& nss);
-
 void killRemoteCursor(OperationContext* opCtx,
                       executor::TaskExecutor* executor,
                       RemoteCursor&& cursor,
                       const NamespaceString& nss);
+
 }  // namespace mongo

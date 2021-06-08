@@ -34,7 +34,7 @@
 #include "mongo/s/client/shard.h"
 
 #include "mongo/executor/task_executor.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 
 namespace mongo {
 
@@ -51,15 +51,13 @@ public:
      * Instantiates a new shard connection management object for the specified shard.
      */
     ShardRemote(const ShardId& id,
-                const ConnectionString& originalConnString,
+                const ConnectionString& connString,
                 std::unique_ptr<RemoteCommandTargeter> targeter);
 
     ~ShardRemote();
 
-    const ConnectionString getConnString() const override;
-
-    const ConnectionString originalConnString() const override {
-        return _originalConnString;
+    const ConnectionString getConnString() const override {
+        return _connString;
     }
 
     std::shared_ptr<RemoteCommandTargeter> getTargeter() const override {
@@ -86,6 +84,10 @@ public:
                                  const ReadPreferenceSetting& readPref,
                                  const std::string& dbName,
                                  const BSONObj& cmdObj) final;
+
+    Status runAggregation(OperationContext* opCtx,
+                          const AggregateCommandRequest& aggRequest,
+                          std::function<bool(const std::vector<BSONObj>& batch)> callback);
 
 private:
     struct AsyncCmdHandle {
@@ -120,7 +122,8 @@ private:
         const NamespaceString& nss,
         const BSONObj& query,
         const BSONObj& sort,
-        boost::optional<long long> limit) final;
+        boost::optional<long long> limit,
+        const boost::optional<BSONObj>& hint = boost::none) final;
 
     StatusWith<AsyncCmdHandle> _scheduleCommand(
         OperationContext* opCtx,
@@ -131,26 +134,27 @@ private:
         const executor::TaskExecutor::RemoteCommandCallbackFn& cb);
 
     /**
-     * Protects _lastCommittedOpTime.
-     */
-    mutable stdx::mutex _lastCommittedOpTimeMutex;
-
-    /**
-    * Logical time representing the latest opTime timestamp known to be in this shard's majority
-    * committed snapshot. Only the latest time is kept because lagged secondaries may return earlier
-    * times.
-    */
-    LogicalTime _lastCommittedOpTime;
-
-    /**
      * Connection string for the shard at the creation time.
      */
-    const ConnectionString _originalConnString;
+    ConnectionString _connString;
 
     /**
      * Targeter for obtaining hosts from which to read or to which to write.
      */
-    const std::shared_ptr<RemoteCommandTargeter> _targeter;
+    std::shared_ptr<RemoteCommandTargeter> _targeter;
+
+    /**
+     * Protects _lastCommittedOpTime.
+     */
+    mutable Mutex _lastCommittedOpTimeMutex =
+        MONGO_MAKE_LATCH("ShardRemote::_lastCommittedOpTimeMutex");
+
+    /**
+     * Logical time representing the latest opTime timestamp known to be in this shard's majority
+     * committed snapshot. Only the latest time is kept because lagged secondaries may return
+     * earlier times.
+     */
+    LogicalTime _lastCommittedOpTime;
 };
 
 }  // namespace mongo

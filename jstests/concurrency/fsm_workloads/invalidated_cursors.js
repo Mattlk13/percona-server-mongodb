@@ -11,9 +11,9 @@
  */
 
 load('jstests/concurrency/fsm_workload_helpers/server_types.js');  // for isMongos
+load("jstests/concurrency/fsm_workload_helpers/assert_handle_fail_in_transaction.js");
 
 var $config = (function() {
-
     let data = {
         chooseRandomlyFrom: function chooseRandomlyFrom(arr) {
             if (!Array.isArray(arr)) {
@@ -34,16 +34,33 @@ var $config = (function() {
          * multiple threads to perform this function simultaneously.
          */
         populateDataAndIndexes: function populateDataAndIndexes(db, collName) {
-            let bulk = db[collName].initializeUnorderedBulkOp();
-            for (let i = 0; i < this.numDocs; ++i) {
-                bulk.insert({});
+            try {
+                let bulk = db[collName].initializeUnorderedBulkOp();
+                for (let i = 0; i < this.numDocs; ++i) {
+                    bulk.insert({});
+                }
+                let res = bulk.execute();
+                assertAlways.commandWorked(res);
+                assertAlways.eq(this.numDocs, res.nInserted, tojson(res));
+            } catch (ex) {
+                assert.eq(true, ex instanceof BulkWriteError);
+                assert.writeErrorWithCode(ex, ErrorCodes.DatabaseDropPending);
             }
-            let res = bulk.execute();
-            assertAlways.writeOK(res);
-            assertAlways.eq(this.numDocs, res.nInserted, tojson(res));
 
             this.indexSpecs.forEach(indexSpec => {
-                assertAlways.commandWorked(db[collName].createIndex(indexSpec));
+                let res = db[collName].createIndex(indexSpec);
+                assertWorkedOrFailedHandleTxnErrors(res,
+                                                    [
+                                                        ErrorCodes.DatabaseDropPending,
+                                                        ErrorCodes.IndexBuildAborted,
+                                                        ErrorCodes.IndexBuildAlreadyInProgress,
+                                                        ErrorCodes.NoMatchingDocument,
+                                                    ],
+                                                    [
+                                                        ErrorCodes.DatabaseDropPending,
+                                                        ErrorCodes.IndexBuildAborted,
+                                                        ErrorCodes.NoMatchingDocument,
+                                                    ]);
             });
         },
 
@@ -162,11 +179,12 @@ var $config = (function() {
                     // killOp.
                     assertAlways.contains(e.code,
                                           [
-                                            ErrorCodes.OperationFailed,
-                                            ErrorCodes.QueryPlanKilled,
-                                            ErrorCodes.CursorNotFound,
-                                            ErrorCodes.CursorKilled,
-                                            ErrorCodes.Interrupted,
+                                              ErrorCodes.CursorKilled,
+                                              ErrorCodes.CursorNotFound,
+                                              ErrorCodes.Interrupted,
+                                              ErrorCodes.NamespaceNotFound,
+                                              ErrorCodes.OperationFailed,
+                                              ErrorCodes.QueryPlanKilled,
                                           ],
                                           'unexpected error code: ' + e.code + ': ' + e.message);
                 }
@@ -234,7 +252,11 @@ var $config = (function() {
             myDB[targetColl].dropIndex(indexSpec);
 
             // Re-create the index that was dropped.
-            assertAlways.commandWorked(myDB[targetColl].createIndex(indexSpec));
+            assertAlways.commandWorkedOrFailedWithCode(myDB[targetColl].createIndex(indexSpec), [
+                ErrorCodes.DatabaseDropPending,
+                ErrorCodes.IndexBuildAborted,
+                ErrorCodes.NoMatchingDocument,
+            ]);
         }
     };
 

@@ -30,13 +30,50 @@ global:
 
 
 imports:
+    - "mongo/db/auth/access_checks.idl"
+    - "mongo/db/auth/action_type.idl"
     - "mongo/idl/basic_types.idl"
 
+structs:
+    ListDatabasesReplyItem:
+        description: "Individual result"
+        fields:
+            name: string
+            sizeOnDisk:
+                type: long
+                optional: true
+            empty:
+                type: bool
+                optional: true
+            shards:
+                type: object_owned
+                optional: true
+
+    ListDatabasesReply:
+        description: "The listDatabases command's reply."
+        fields:
+            databases: array<ListDatabasesReplyItem>
+            totalSize:
+                type: long
+                optional: true
+            totalSizeMb:
+                type: long
+                optional: true
 
 commands:
-    listDatabasesCommand:
+    listDatabases:
         description: "listDatabases Command"
+        command_name: "listDatabases"
+        cpp_name: ListDatabasesCommand
         namespace: ignored
+        api_version: "1"
+        access_check:
+            complex:
+                - check: is_authorized_for_any_action_on_any_resource_in_db
+                - privilege:
+                    resource_pattern: cluster
+                    action_type: listDatabases
+        strict: true
         fields:
             nameOnly:
                 description: "Return just the database name without metadata"
@@ -50,3 +87,4 @@ commands:
                 description: "Filter description to limit results"
                 type: object
                 optional: true
+        reply_type: ListDatabasesReply

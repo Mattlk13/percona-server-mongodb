@@ -27,16 +27,22 @@
  *    it in the license file.
  */
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
 #include "mongo/platform/basic.h"
 
+#include <cmath>
+#include <memory>
+
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/document_value_test_util.h"
 #include "mongo/db/pipeline/accumulation_statement.h"
 #include "mongo/db/pipeline/accumulator.h"
-#include "mongo/db/pipeline/document.h"
-#include "mongo/db/pipeline/document_value_test_util.h"
+#include "mongo/db/pipeline/accumulator_for_window_functions.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
 #include "mongo/db/query/collation/collator_interface_mock.h"
 #include "mongo/dbtests/dbtests.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/logv2/log.h"
 
 namespace AccumulatorTests {
 
@@ -45,20 +51,20 @@ using std::numeric_limits;
 using std::string;
 
 /**
- * Takes the name of an Accumulator as its first argument and a list of pairs of arguments and
- * expected results as its second argument, and asserts that for the given Accumulator the arguments
- * evaluate to the expected results.
+ * Takes the name of an AccumulatorState as its template argument and a list of pairs of arguments
+ * and expected results as its second argument, and asserts that for the given AccumulatorState the
+ * arguments evaluate to the expected results.
  */
+template <typename AccName>
 static void assertExpectedResults(
-    std::string accumulatorName,
-    const intrusive_ptr<ExpressionContext>& expCtx,
-    std::initializer_list<std::pair<std::vector<Value>, Value>> operations) {
-    auto factory = AccumulationStatement::getFactory(accumulatorName);
+    ExpressionContext* const expCtx,
+    std::initializer_list<std::pair<std::vector<Value>, Value>> operations,
+    bool skipMerging = false) {
     for (auto&& op : operations) {
         try {
             // Asserts that result equals expected result when not sharded.
             {
-                boost::intrusive_ptr<Accumulator> accum(factory(expCtx));
+                auto accum = AccName::create(expCtx);
                 for (auto&& val : op.first) {
                     accum->process(val, false);
                 }
@@ -68,9 +74,9 @@ static void assertExpectedResults(
             }
 
             // Asserts that result equals expected result when all input is on one shard.
-            {
-                boost::intrusive_ptr<Accumulator> accum(factory(expCtx));
-                boost::intrusive_ptr<Accumulator> shard(factory(expCtx));
+            if (!skipMerging) {
+                auto accum = AccName::create(expCtx);
+                auto shard = AccName::create(expCtx);
                 for (auto&& val : op.first) {
                     shard->process(val, false);
                 }
@@ -81,10 +87,10 @@ static void assertExpectedResults(
             }
 
             // Asserts that result equals expected result when each input is on a separate shard.
-            {
-                boost::intrusive_ptr<Accumulator> accum(factory(expCtx));
+            if (!skipMerging) {
+                auto accum = AccName::create(expCtx);
                 for (auto&& val : op.first) {
-                    boost::intrusive_ptr<Accumulator> shard(factory(expCtx));
+                    auto shard = AccName::create(expCtx);
                     shard->process(val, false);
                     accum->process(shard->getValue(true), true);
                 }
@@ -93,17 +99,16 @@ static void assertExpectedResults(
                 ASSERT_EQUALS(op.second.getType(), result.getType());
             }
         } catch (...) {
-            log() << "failed with arguments: " << Value(op.first);
+            LOGV2(24180, "failed", "argument"_attr = Value(op.first));
             throw;
         }
     }
 }
 
 TEST(Accumulators, Avg) {
-    intrusive_ptr<ExpressionContext> expCtx(new ExpressionContextForTest());
-    assertExpectedResults(
-        "$avg",
-        expCtx,
+    auto expCtx = ExpressionContextForTest{};
+    assertExpectedResults<AccumulatorAvg>(
+        &expCtx,
         {
             // No documents evaluated.
             {{}, Value(BSONNULL)},
@@ -156,10 +161,9 @@ TEST(Accumulators, Avg) {
 }
 
 TEST(Accumulators, First) {
-    intrusive_ptr<ExpressionContext> expCtx(new ExpressionContextForTest());
-    assertExpectedResults(
-        "$first",
-        expCtx,
+    auto expCtx = ExpressionContextForTest{};
+    assertExpectedResults<AccumulatorFirst>(
+        &expCtx,
         {// No documents evaluated.
          {{}, Value()},
 
@@ -175,10 +179,9 @@ TEST(Accumulators, First) {
 }
 
 TEST(Accumulators, Last) {
-    intrusive_ptr<ExpressionContext> expCtx(new ExpressionContextForTest());
-    assertExpectedResults(
-        "$last",
-        expCtx,
+    auto expCtx = ExpressionContextForTest{};
+    assertExpectedResults<AccumulatorLast>(
+        &expCtx,
         {// No documents evaluated.
          {{}, Value()},
 
@@ -194,10 +197,9 @@ TEST(Accumulators, Last) {
 }
 
 TEST(Accumulators, Min) {
-    intrusive_ptr<ExpressionContext> expCtx(new ExpressionContextForTest());
-    assertExpectedResults(
-        "$min",
-        expCtx,
+    auto expCtx = ExpressionContextForTest{};
+    assertExpectedResults<AccumulatorMin>(
+        &expCtx,
         {// No documents evaluated.
          {{}, Value(BSONNULL)},
 
@@ -213,17 +215,18 @@ TEST(Accumulators, Min) {
 }
 
 TEST(Accumulators, MinRespectsCollation) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kReverseString);
-    expCtx->setCollator(&collator);
-    assertExpectedResults("$min", expCtx, {{{Value("abc"_sd), Value("cba"_sd)}, Value("cba"_sd)}});
+    auto expCtx = ExpressionContextForTest{};
+    auto collator =
+        std::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kReverseString);
+    expCtx.setCollator(std::move(collator));
+    assertExpectedResults<AccumulatorMin>(&expCtx,
+                                          {{{Value("abc"_sd), Value("cba"_sd)}, Value("cba"_sd)}});
 }
 
 TEST(Accumulators, Max) {
-    intrusive_ptr<ExpressionContext> expCtx(new ExpressionContextForTest());
-    assertExpectedResults(
-        "$max",
-        expCtx,
+    auto expCtx = ExpressionContextForTest{};
+    assertExpectedResults<AccumulatorMax>(
+        &expCtx,
         {// No documents evaluated.
          {{}, Value(BSONNULL)},
 
@@ -239,17 +242,18 @@ TEST(Accumulators, Max) {
 }
 
 TEST(Accumulators, MaxRespectsCollation) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kReverseString);
-    expCtx->setCollator(&collator);
-    assertExpectedResults("$max", expCtx, {{{Value("abc"_sd), Value("cba"_sd)}, Value("abc"_sd)}});
+    auto expCtx = ExpressionContextForTest{};
+    auto collator =
+        std::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kReverseString);
+    expCtx.setCollator(std::move(collator));
+    assertExpectedResults<AccumulatorMax>(&expCtx,
+                                          {{{Value("abc"_sd), Value("cba"_sd)}, Value("abc"_sd)}});
 }
 
 TEST(Accumulators, Sum) {
-    intrusive_ptr<ExpressionContext> expCtx(new ExpressionContextForTest());
-    assertExpectedResults(
-        "$sum",
-        expCtx,
+    auto expCtx = ExpressionContextForTest{};
+    assertExpectedResults<AccumulatorSum>(
+        &expCtx,
         {// No documents evaluated.
          {{}, Value(0)},
 
@@ -335,72 +339,301 @@ TEST(Accumulators, Sum) {
          {{Value(9), Value()}, Value(9)}});
 }
 
+TEST(Accumulators, Rank) {
+    auto expCtx = ExpressionContextForTest{};
+    assertExpectedResults<AccumulatorRank>(
+        &expCtx,
+        {
+            // Document number is correct.
+            {{Value(0)}, Value(1)},
+            {{Value(0), Value(2)}, Value(2)},
+            {{Value(0), Value(2), Value(4)}, Value(3)},
+            // Ties don't increment
+            {{Value(1), Value(1)}, Value(1)},
+            // Ties skip next value correctly.
+            {{Value(1), Value(1), Value(3)}, Value(3)},
+            {{Value(1), Value(1), Value(1), Value(3)}, Value(4)},
+            {{Value(1), Value(1), Value(1), Value(3), Value(3), Value(7)}, Value(6)},
+            // Expected results with empty values.
+            {{Value{}}, Value(1)},
+            {{Value{}, Value{}}, Value(1)},
+
+        },
+        true /* rank can't be merged */);
+}
+
+TEST(Accumulators, DenseRank) {
+    auto expCtx = ExpressionContextForTest{};
+    assertExpectedResults<AccumulatorDenseRank>(
+        &expCtx,
+        {
+            // Document number is correct.
+            {{Value(0)}, Value(1)},
+            {{Value(0), Value(2)}, Value(2)},
+            {{Value(0), Value(2), Value(4)}, Value(3)},
+            // Ties don't increment
+            {{Value(1), Value(1)}, Value(1)},
+            // Ties don't skip values.
+            {{Value(1), Value(1), Value(3)}, Value(2)},
+            {{Value(1), Value(1), Value(1), Value(3)}, Value(2)},
+            {{Value(1), Value(1), Value(1), Value(3), Value(3), Value(7)}, Value(3)},
+
+        },
+        true /* denseRank can't be merged */);
+}
+
+TEST(Accumulators, DocumentNumberRank) {
+    auto expCtx = ExpressionContextForTest{};
+    assertExpectedResults<AccumulatorDocumentNumber>(
+        &expCtx,
+        {
+            // Document number is correct.
+            {{Value(0)}, Value(1)},
+            {{Value(0), Value(2)}, Value(2)},
+            {{Value(0), Value(2), Value(4)}, Value(3)},
+            // Ties increment
+            {{Value(1), Value(1)}, Value(2)},
+            {{Value(1), Value(1), Value(3)}, Value(3)},
+            {{Value(1), Value(1), Value(1), Value(3)}, Value(4)},
+            {{Value(1), Value(1), Value(1), Value(3), Value(3), Value(7)}, Value(6)},
+
+        },
+        true /* denseRank can't be merged */);
+}
+
 TEST(Accumulators, AddToSetRespectsCollation) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kAlwaysEqual);
-    expCtx->setCollator(&collator);
-    assertExpectedResults("$addToSet",
-                          expCtx,
-                          {{{Value("a"_sd), Value("b"_sd), Value("c"_sd)},
-                            Value(std::vector<Value>{Value("a"_sd)})}});
+    auto expCtx = ExpressionContextForTest{};
+    auto collator =
+        std::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kAlwaysEqual);
+    expCtx.setCollator(std::move(collator));
+    assertExpectedResults<AccumulatorAddToSet>(&expCtx,
+                                               {{{Value("a"_sd), Value("b"_sd), Value("c"_sd)},
+                                                 Value(std::vector<Value>{Value("a"_sd)})}});
+}
+
+TEST(Accumulators, AddToSetRespectsMaxMemoryConstraint) {
+    auto expCtx = ExpressionContextForTest{};
+    const int maxMemoryBytes = 20ull;
+    auto addToSet = AccumulatorAddToSet(&expCtx, maxMemoryBytes);
+    ASSERT_THROWS_CODE(
+        addToSet.process(
+            Value("This is a large string. Certainly we must be over 20 bytes by now"_sd), false),
+        AssertionException,
+        ErrorCodes::ExceededMemoryLimit);
+}
+
+TEST(Accumulators, PushRespectsMaxMemoryConstraint) {
+    auto expCtx = ExpressionContextForTest{};
+    const int maxMemoryBytes = 20ull;
+    auto addToSet = AccumulatorPush(&expCtx, maxMemoryBytes);
+    ASSERT_THROWS_CODE(
+        addToSet.process(
+            Value("This is a large string. Certainly we must be over 20 bytes by now"_sd), false),
+        AssertionException,
+        ErrorCodes::ExceededMemoryLimit);
+}
+
+/* ------------------------- AccumulatorCorvariance(Samp/Pop) -------------------------- */
+
+// Calculate covariance using the offline algorithm.
+double offlineCovariance(const std::vector<Value>& input, bool isSamp) {
+    // Edge cases return 0 though 'input' should not be empty. Empty input is tested elsewhere.
+    if (input.size() <= 1)
+        return 0;
+
+    double adjustedN = isSamp ? input.size() - 1 : input.size();
+    double meanX = 0;
+    double meanY = 0;
+    double cXY = 0;
+
+    for (auto&& value : input) {
+        meanX += value.getArray()[0].coerceToDouble();
+        meanY += value.getArray()[1].coerceToDouble();
+    }
+    meanX /= input.size();
+    meanY /= input.size();
+
+    for (auto&& value : input) {
+        cXY += (value.getArray()[0].coerceToDouble() - meanX) *
+            (value.getArray()[1].coerceToDouble() - meanY);
+    }
+
+    return cXY / adjustedN;
+}
+
+// Test the accumulator-output covariance (using an online algorithm:
+// https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Online) is equal to the
+// covariance calculated based on the offline algorithm (cov(x,y) = Σ((xi-avg(x))*(yi-avg(y)))/n)).
+// If 'result' is given, the covariance should also be tested against the given result.
+template <typename AccName>
+static void assertCovariance(ExpressionContext* const expCtx,
+                             const std::vector<Value>& input,
+                             boost::optional<double> result = boost::none) {
+    auto accum = AccName::create(expCtx);
+    for (auto&& val : input) {
+        accum->process(val, false);
+    }
+    double onlineCov = accum->getValue(false).coerceToDouble();
+    double offlineCov =
+        offlineCovariance(input, std::is_same_v<AccName, AccumulatorCovarianceSamp>);
+
+    ASSERT_LTE(fabs(onlineCov - offlineCov), 1e-10);
+    if (result) {
+        ASSERT_LTE(fabs(onlineCov - *result), 1e-5);
+    }
+}
+
+TEST(Accumulators, CovarianceEdgeCases) {
+    auto expCtx = ExpressionContextForTest{};
+
+    // The sample covariance of variables of single value should be undefined.
+    const std::vector<Value> singlePoint = {
+        Value(std::vector<Value>({Value(0), Value(1)})),
+    };
+
+    // This is actually an "undefined" case because NaN/Inf is not counted.
+    const std::vector<Value> nonFiniteOnly = {
+        Value(std::vector<Value>({Value(numeric_limits<double>::quiet_NaN()),
+                                  Value(numeric_limits<double>::quiet_NaN())})),
+        Value(std::vector<Value>({Value(numeric_limits<double>::infinity()),
+                                  Value(numeric_limits<double>::infinity())})),
+    };
+
+    const std::vector<Value> mixedPoints = {
+        Value(std::vector<Value>({Value(numeric_limits<double>::quiet_NaN()),
+                                  Value(numeric_limits<double>::quiet_NaN())})),
+        Value(std::vector<Value>({Value(numeric_limits<double>::infinity()),
+                                  Value(numeric_limits<double>::infinity())})),
+        Value(std::vector<Value>({Value(0), Value(1)})),
+        Value(std::vector<Value>({Value(1), Value(2)})),
+    };
+
+    assertExpectedResults<AccumulatorCovariancePop>(
+        &expCtx,
+        {
+            {{}, Value(BSONNULL)},
+            {singlePoint, Value(0.0)},
+            {nonFiniteOnly, Value(BSONNULL)},
+            {mixedPoints, Value(numeric_limits<double>::quiet_NaN())},
+        },
+        true /* Covariance accumulator can't be merged */);
+
+    assertExpectedResults<AccumulatorCovarianceSamp>(
+        &expCtx,
+        {
+            {{}, Value(BSONNULL)},
+            {singlePoint, Value(BSONNULL)},
+            {nonFiniteOnly, Value(BSONNULL)},
+            {mixedPoints, Value(numeric_limits<double>::quiet_NaN())},
+        },
+        true /* Covariance accumulator can't be merged */);
+}
+
+TEST(Accumulators, PopulationCovariance) {
+    auto expCtx = ExpressionContextForTest{};
+
+    // Some doubles as input.
+    const std::vector<Value> multiplePoints = {
+        Value(std::vector<Value>({Value(0), Value(1.5)})),
+        Value(std::vector<Value>({Value(1.4), Value(2.5)})),
+        Value(std::vector<Value>({Value(4.7), Value(3.6)})),
+    };
+
+    // Test both offline and online corvariance algorithm with a given result.
+    assertCovariance<AccumulatorCovariancePop>(&expCtx, multiplePoints, 1.655556);
+}
+
+TEST(Accumulators, SampleCovariance) {
+    auto expCtx = ExpressionContextForTest{};
+
+    // Some doubles as input.
+    std::vector<Value> multiplePoints = {
+        Value(std::vector<Value>({Value(0), Value(1.5)})),
+        Value(std::vector<Value>({Value(1.4), Value(2.5)})),
+        Value(std::vector<Value>({Value(4.7), Value(3.6)})),
+    };
+
+    // Test both offline and online corvariance algorithm with a given result.
+    assertCovariance<AccumulatorCovarianceSamp>(&expCtx, multiplePoints, 2.483334);
+}
+
+std::vector<Value> generateRandomVariables() {
+    auto seed = Date_t::now().asInt64();
+    LOGV2(5424001, "Generated new seed is {seed}", "seed"_attr = seed);
+
+    std::vector<Value> output;
+    PseudoRandom prng(seed);
+    const int variableSize = prng.nextInt32(1000) + 2;
+
+    for (int i = 0; i < variableSize; i++) {
+        std::vector<Value> newXY;
+        newXY.push_back(Value(prng.nextCanonicalDouble()));
+        newXY.push_back(Value(prng.nextCanonicalDouble()));
+        output.push_back(Value(newXY));
+    }
+
+    return output;
+}
+
+TEST(Accumulators, CovarianceWithRandomVariables) {
+    auto expCtx = ExpressionContextForTest{};
+
+    // Some randomly generated variables as input.
+    std::vector<Value> randomVariables = generateRandomVariables();
+
+    assertCovariance<AccumulatorCovariancePop>(&expCtx, randomVariables, boost::none);
+    assertCovariance<AccumulatorCovarianceSamp>(&expCtx, randomVariables, boost::none);
 }
 
 /* ------------------------- AccumulatorMergeObjects -------------------------- */
 
-namespace AccumulatorMergeObjects {
-
 TEST(AccumulatorMergeObjects, MergingZeroObjectsShouldReturnEmptyDocument) {
-    intrusive_ptr<ExpressionContext> expCtx(new ExpressionContextForTest());
+    auto expCtx = ExpressionContextForTest{};
 
-    assertExpectedResults("$mergeObjects", expCtx, {{{}, {Value(Document({}))}}});
+    assertExpectedResults<AccumulatorMergeObjects>(&expCtx, {{{}, {Value(Document({}))}}});
 }
 
 TEST(AccumulatorMergeObjects, MergingWithSingleObjectShouldLeaveUnchanged) {
-    intrusive_ptr<ExpressionContext> expCtx(new ExpressionContextForTest());
+    auto expCtx = ExpressionContextForTest{};
 
-    assertExpectedResults("$mergeObjects", expCtx, {{{}, {Value(Document({}))}}});
+    assertExpectedResults<AccumulatorMergeObjects>(&expCtx, {{{}, {Value(Document({}))}}});
 
     auto doc = Value(Document({{"a", 1}, {"b", 1}}));
-    assertExpectedResults("$mergeObjects", expCtx, {{{doc}, doc}});
+    assertExpectedResults<AccumulatorMergeObjects>(&expCtx, {{{doc}, doc}});
 }
 
 TEST(AccumulatorMergeObjects, MergingDisjointObjectsShouldIncludeAllFields) {
-    intrusive_ptr<ExpressionContext> expCtx(new ExpressionContextForTest());
+    auto expCtx = ExpressionContextForTest{};
     auto first = Value(Document({{"a", 1}, {"b", 1}}));
     auto second = Value(Document({{"c", 1}}));
-    assertExpectedResults("$mergeObjects",
-                          expCtx,
-                          {{{first, second}, Value(Document({{"a", 1}, {"b", 1}, {"c", 1}}))}});
+    assertExpectedResults<AccumulatorMergeObjects>(
+        &expCtx, {{{first, second}, Value(Document({{"a", 1}, {"b", 1}, {"c", 1}}))}});
 }
 
 TEST(AccumulatorMergeObjects, MergingIntersectingObjectsShouldOverrideInOrderReceived) {
-    intrusive_ptr<ExpressionContext> expCtx(new ExpressionContextForTest());
+    auto expCtx = ExpressionContextForTest{};
     auto first = Value(Document({{"a", "oldValue"_sd}, {"b", 0}, {"c", 1}}));
     auto second = Value(Document({{"a", "newValue"_sd}}));
-    assertExpectedResults(
-        "$mergeObjects",
-        expCtx,
-        {{{first, second}, Value(Document({{"a", "newValue"_sd}, {"b", 0}, {"c", 1}}))}});
+    assertExpectedResults<AccumulatorMergeObjects>(
+        &expCtx, {{{first, second}, Value(Document({{"a", "newValue"_sd}, {"b", 0}, {"c", 1}}))}});
 }
 
 TEST(AccumulatorMergeObjects, MergingIntersectingEmbeddedObjectsShouldOverrideInOrderReceived) {
-    intrusive_ptr<ExpressionContext> expCtx(new ExpressionContextForTest());
+    auto expCtx = ExpressionContextForTest{};
     auto firstSubDoc = Document({{"a", 1}, {"b", 2}, {"c", 3}});
     auto secondSubDoc = Document({{"a", 2}, {"b", 1}});
     auto first = Value(Document({{"d", 1}, {"subDoc", firstSubDoc}}));
     auto second = Value(Document({{"subDoc", secondSubDoc}}));
     auto expected = Value(Document({{"d", 1}, {"subDoc", secondSubDoc}}));
-    assertExpectedResults("$mergeObjects", expCtx, {{{first, second}, expected}});
+    assertExpectedResults<AccumulatorMergeObjects>(&expCtx, {{{first, second}, expected}});
 }
 
 TEST(AccumulatorMergeObjects, MergingWithEmptyDocumentShouldIgnore) {
-    intrusive_ptr<ExpressionContext> expCtx(new ExpressionContextForTest());
+    auto expCtx = ExpressionContextForTest{};
     auto first = Value(Document({{"a", 0}, {"b", 1}, {"c", 1}}));
     auto second = Value(Document({}));
     auto expected = Value(Document({{"a", 0}, {"b", 1}, {"c", 1}}));
-    assertExpectedResults("$mergeObjects", expCtx, {{{first, second}, expected}});
+    assertExpectedResults<AccumulatorMergeObjects>(&expCtx, {{{first, second}, expected}});
 }
-
-}  // namespace AccumulatorMergeObjects
 
 }  // namespace AccumulatorTests

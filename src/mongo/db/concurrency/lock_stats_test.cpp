@@ -36,14 +36,15 @@
 
 namespace mongo {
 
-class LockStatsTest : public unittest::Test, public ScopedGlobalServiceContextForTest {};
+class LockStatsTest : public ServiceContextTest {};
 
 TEST_F(LockStatsTest, NoWait) {
     const ResourceId resId(RESOURCE_COLLECTION, std::string("LockStats.NoWait"));
 
     resetGlobalLockStats();
 
-    LockerForTests locker(MODE_IX);
+    auto opCtx = makeOperationContext();
+    LockerForTests locker(opCtx.get(), MODE_IX);
     locker.lock(resId, MODE_X);
     locker.unlock(resId);
 
@@ -61,19 +62,20 @@ TEST_F(LockStatsTest, Wait) {
 
     resetGlobalLockStats();
 
-    LockerForTests locker(MODE_IX);
+    auto opCtx = makeOperationContext();
+    LockerForTests locker(opCtx.get(), MODE_IX);
     locker.lock(resId, MODE_X);
 
     {
         // This will block
-        LockerForTests lockerConflict(MODE_IX);
-        ASSERT_EQUALS(LOCK_WAITING, lockerConflict.lockBegin(nullptr, resId, MODE_S));
+        LockerForTests lockerConflict(opCtx.get(), MODE_IX);
+        ASSERT_EQUALS(LOCK_WAITING, lockerConflict.lockBeginForTest(opCtx.get(), resId, MODE_S));
 
         // Sleep 1 millisecond so the wait time passes
-        ASSERT_THROWS_CODE(
-            lockerConflict.lockComplete(resId, MODE_S, Date_t::now() + Milliseconds(5)),
-            AssertionException,
-            ErrorCodes::LockTimeout);
+        ASSERT_THROWS_CODE(lockerConflict.lockCompleteForTest(
+                               opCtx.get(), resId, MODE_S, Date_t::now() + Milliseconds(5)),
+                           AssertionException,
+                           ErrorCodes::LockTimeout);
     }
 
     // Make sure that the waits/blocks are non-zero
@@ -94,7 +96,8 @@ TEST_F(LockStatsTest, Reporting) {
 
     resetGlobalLockStats();
 
-    LockerForTests locker(MODE_IX);
+    auto opCtx = makeOperationContext();
+    LockerForTests locker(opCtx.get(), MODE_IX);
     locker.lock(resId, MODE_X);
     locker.unlock(resId);
 
@@ -111,14 +114,16 @@ TEST_F(LockStatsTest, Subtraction) {
 
     resetGlobalLockStats();
 
-    LockerForTests locker(MODE_IX);
+    auto opCtx = makeOperationContext();
+    LockerForTests locker(opCtx.get(), MODE_IX);
     locker.lock(resId, MODE_X);
 
     {
-        LockerForTests lockerConflict(MODE_IX);
-        ASSERT_THROWS_CODE(lockerConflict.lock(resId, MODE_S, Date_t::now() + Milliseconds(5)),
-                           AssertionException,
-                           ErrorCodes::LockTimeout);
+        LockerForTests lockerConflict(opCtx.get(), MODE_IX);
+        ASSERT_THROWS_CODE(
+            lockerConflict.lock(opCtx.get(), resId, MODE_S, Date_t::now() + Milliseconds(5)),
+            AssertionException,
+            ErrorCodes::LockTimeout);
     }
 
     SingleThreadedLockStats stats;
@@ -128,10 +133,11 @@ TEST_F(LockStatsTest, Subtraction) {
     ASSERT_GREATER_THAN(stats.get(resId, MODE_S).combinedWaitTimeMicros, 0);
 
     {
-        LockerForTests lockerConflict(MODE_IX);
-        ASSERT_THROWS_CODE(lockerConflict.lock(resId, MODE_S, Date_t::now() + Milliseconds(5)),
-                           AssertionException,
-                           ErrorCodes::LockTimeout);
+        LockerForTests lockerConflict(opCtx.get(), MODE_IX);
+        ASSERT_THROWS_CODE(
+            lockerConflict.lock(opCtx.get(), resId, MODE_S, Date_t::now() + Milliseconds(5)),
+            AssertionException,
+            ErrorCodes::LockTimeout);
     }
 
     SingleThreadedLockStats stats2;
@@ -152,7 +158,7 @@ namespace {
  * reported locked if 'rid' is the global lock resource, or unlocked if 'rid' is not the global lock
  * resource.
  */
-void assertGlobalAcquisitionStats(ResourceId rid) {
+void assertGlobalAcquisitionStats(OperationContext* opCtx, ResourceId rid) {
     resetGlobalLockStats();
 
     SingleThreadedLockStats stats;
@@ -161,7 +167,7 @@ void assertGlobalAcquisitionStats(ResourceId rid) {
 
     LockerImpl locker;
     if (rid == resourceIdGlobal) {
-        locker.lockGlobal(LockMode::MODE_IX);
+        locker.lockGlobal(opCtx, LockMode::MODE_IX);
     } else {
         locker.lock(rid, LockMode::MODE_IX);
     }
@@ -182,9 +188,10 @@ void assertGlobalAcquisitionStats(ResourceId rid) {
 }  // namespace
 
 TEST_F(LockStatsTest, GlobalRetrievableSeparately) {
-    assertGlobalAcquisitionStats(resourceIdGlobal);
-    assertGlobalAcquisitionStats(resourceIdParallelBatchWriterMode);
-    assertGlobalAcquisitionStats(resourceIdReplicationStateTransitionLock);
+    auto opCtx = makeOperationContext();
+    assertGlobalAcquisitionStats(opCtx.get(), resourceIdGlobal);
+    assertGlobalAcquisitionStats(opCtx.get(), resourceIdParallelBatchWriterMode);
+    assertGlobalAcquisitionStats(opCtx.get(), resourceIdReplicationStateTransitionLock);
 }
 
 TEST_F(LockStatsTest, ServerStatus) {
@@ -199,7 +206,8 @@ TEST_F(LockStatsTest, ServerStatus) {
 
     // Take the global, PBWM and RSTL locks in MODE_IX to create acquisition stats for them.
     LockerImpl locker;
-    locker.lockGlobal(LockMode::MODE_IX);
+    auto opCtx = makeOperationContext();
+    locker.lockGlobal(opCtx.get(), LockMode::MODE_IX);
     locker.lock(resourceIdParallelBatchWriterMode, LockMode::MODE_IX);
     locker.lock(resourceIdReplicationStateTransitionLock, LockMode::MODE_IX);
 
@@ -215,7 +223,7 @@ TEST_F(LockStatsTest, ServerStatus) {
     ASSERT_EQUALS(
         1, lockingStats.getObjectField("Global").getObjectField("acquireCount").getIntField("w"));
     ASSERT_EQUALS(1,
-                  lockingStats.getObjectField("ParallelBatchWriter")
+                  lockingStats.getObjectField("ParallelBatchWriterMode")
                       .getObjectField("acquireCount")
                       .getIntField("w"));
     ASSERT_EQUALS(1,

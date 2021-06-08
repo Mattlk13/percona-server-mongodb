@@ -32,6 +32,8 @@
 #include <string>
 
 #include "mongo/db/jsobj.h"
+#include "mongo/db/read_write_concern_provenance.h"
+#include "mongo/idl/basic_types_gen.h"
 
 namespace mongo {
 
@@ -41,6 +43,10 @@ struct WriteConcernOptions {
 public:
     enum class SyncMode { UNSET, NONE, FSYNC, JOURNAL };
 
+    // This specifies the condition to check to satisfy given tags.
+    // Users can only provide OpTime condition, the others are used internally.
+    enum class CheckCondition { OpTime, Config };
+
     static constexpr int kNoTimeout = 0;
     static constexpr int kNoWaiting = -1;
 
@@ -48,6 +54,7 @@ public:
     static const BSONObj Acknowledged;
     static const BSONObj Unacknowledged;
     static const BSONObj Majority;
+    static const BSONObj kInternalWriteDefault;
 
     static constexpr StringData kWriteConcernField = "writeConcern"_sd;
     static const char kMajority[];  // = "majority"
@@ -57,13 +64,16 @@ public:
     static constexpr Seconds kWriteConcernTimeoutSharding{60};
     static constexpr Seconds kWriteConcernTimeoutUserCommand{60};
 
-    WriteConcernOptions() {
-        reset();
-        // It is assumed that a default-constructed WriteConcernOptions will be populated with the
-        // default options. If it is subsequently populated with non-default options, it is the
-        // caller's responsibility to set this flag accordingly.
-        usedDefault = true;
-    }
+    // It is assumed that a default-constructed WriteConcernOptions will be populated with the
+    // default options. If it is subsequently populated with non-default options, it is the caller's
+    // responsibility to set the usedDefault and usedDefaultW flag correctly.
+    WriteConcernOptions()
+        : syncMode(SyncMode::UNSET),
+          wNumNodes(1),
+          wMode(""),
+          wTimeout(0),
+          usedDefault(true),
+          usedDefaultW(true) {}
 
     WriteConcernOptions(int numNodes, SyncMode sync, int timeout);
 
@@ -73,7 +83,7 @@ public:
 
     WriteConcernOptions(const std::string& mode, SyncMode sync, Milliseconds timeout);
 
-    Status parse(const BSONObj& obj);
+    static StatusWith<WriteConcernOptions> parse(const BSONObj& obj);
 
     /**
      * Returns an instance of WriteConcernOptions from a BSONObj.
@@ -86,25 +96,30 @@ public:
      * Attempts to extract a writeConcern from cmdObj.
      * Verifies that the writeConcern is of type Object (BSON type).
      */
-    static StatusWith<WriteConcernOptions> extractWCFromCommand(
-        const BSONObj& cmdObj, const WriteConcernOptions& defaultWC = WriteConcernOptions());
+    static StatusWith<WriteConcernOptions> extractWCFromCommand(const BSONObj& cmdObj);
 
     /**
      * Return true if the server needs to wait for other secondary nodes to satisfy this
      * write concern setting. Errs on the false positive for non-empty wMode.
      */
-    bool shouldWaitForOtherNodes() const;
+    bool needToWaitForOtherNodes() const;
 
-    void reset() {
-        syncMode = SyncMode::UNSET;
-        wNumNodes = 0;
-        wMode = "";
-        wTimeout = 0;
+    ReadWriteConcernProvenance& getProvenance() {
+        return _provenance;
+    }
+    const ReadWriteConcernProvenance& getProvenance() const {
+        return _provenance;
     }
 
     // Returns the BSON representation of this object.
     // Warning: does not return the same object passed on the last parse() call.
     BSONObj toBSON() const;
+
+    bool operator==(const WriteConcernOptions& other) const;
+
+    bool operator!=(const WriteConcernOptions& other) const {
+        return !operator==(other);
+    }
 
     SyncMode syncMode;
 
@@ -124,6 +139,12 @@ public:
 
     // True if the default 'w' value of w:1 was used.
     bool usedDefaultW = false;
+
+    CheckCondition checkCondition = CheckCondition::OpTime;
+
+private:
+    ReadWriteConcernProvenance _provenance;
+    static StatusWith<WriteConcernOptions> convertFromIdl(const WriteConcernIdl& writeConcernIdl);
 };
 
 }  // namespace mongo

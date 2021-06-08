@@ -116,8 +116,19 @@ static BCryptHashLoader& getBCryptHashLoader() {
  * Computes a SHA hash of 'input'.
  */
 template <typename HashType>
-HashType computeHashImpl(BCRYPT_ALG_HANDLE algo, std::initializer_list<ConstDataRange> input) {
-    HashType output;
+void computeHashImpl(BCRYPT_ALG_HANDLE algo,
+                     std::initializer_list<ConstDataRange> input,
+                     HashType* const output) {
+    if (input.size() == 1) {
+        auto it = begin(input);
+        invariant(BCryptHash(algo,
+                             NULL,
+                             0,
+                             reinterpret_cast<PUCHAR>(const_cast<char*>(it->data())),
+                             it->length(),
+                             output->data(),
+                             output->size()) == STATUS_SUCCESS);
+    }
 
     BCRYPT_HASH_HANDLE hHash;
 
@@ -134,11 +145,9 @@ HashType computeHashImpl(BCRYPT_ALG_HANDLE algo, std::initializer_list<ConstData
                                            0) == STATUS_SUCCESS;
                             }) &&
 
-                BCryptFinishHash(hHash, output.data(), output.size(), 0) == STATUS_SUCCESS &&
+                BCryptFinishHash(hHash, output->data(), output->size(), 0) == STATUS_SUCCESS &&
 
                 BCryptDestroyHash(hHash) == STATUS_SUCCESS);
-
-    return output;
 }
 
 /**
@@ -151,6 +160,17 @@ void computeHmacImpl(BCRYPT_ALG_HANDLE algo,
                      std::initializer_list<ConstDataRange> input,
                      HashType* const output) {
     invariant(key);
+
+    if (input.size() == 1) {
+        auto it = begin(input);
+        invariant(BCryptHash(algo,
+                             const_cast<PUCHAR>(key),
+                             keyLen,
+                             reinterpret_cast<PUCHAR>(const_cast<char*>(it->data())),
+                             it->length(),
+                             output->data(),
+                             output->size()) == STATUS_SUCCESS);
+    }
 
     BCRYPT_HASH_HANDLE hHash;
 
@@ -175,22 +195,22 @@ void computeHmacImpl(BCRYPT_ALG_HANDLE algo,
 
 }  // namespace
 
-SHA1BlockTraits::HashType SHA1BlockTraits::computeHash(
-    std::initializer_list<ConstDataRange> input) {
-    return computeHashImpl<SHA1BlockTraits::HashType>(getBCryptHashLoader().getAlgoSHA1(),
-                                                      std::move(input));
+void SHA1BlockTraits::computeHash(std::initializer_list<ConstDataRange> input,
+                                  HashType* const output) {
+    computeHashImpl<SHA1BlockTraits::HashType>(
+        getBCryptHashLoader().getAlgoSHA1(), std::move(input), output);
 }
 
-SHA256BlockTraits::HashType SHA256BlockTraits::computeHash(
-    std::initializer_list<ConstDataRange> input) {
-    return computeHashImpl<SHA256BlockTraits::HashType>(getBCryptHashLoader().getAlgoSHA256(),
-                                                        std::move(input));
+void SHA256BlockTraits::computeHash(std::initializer_list<ConstDataRange> input,
+                                    HashType* const output) {
+    computeHashImpl<SHA256BlockTraits::HashType>(
+        getBCryptHashLoader().getAlgoSHA256(), std::move(input), output);
 }
 
-SHA512BlockTraits::HashType SHA512BlockTraits::computeHash(
-    std::initializer_list<ConstDataRange> input) {
-    return computeHashImpl<SHA512BlockTraits::HashType>(getBCryptHashLoader().getAlgoSHA512(),
-                                                        std::move(input));
+void SHA512BlockTraits::computeHash(std::initializer_list<ConstDataRange> input,
+                                    HashType* const output) {
+    computeHashImpl<SHA512BlockTraits::HashType>(
+        getBCryptHashLoader().getAlgoSHA512(), std::move(input), output);
 }
 
 void SHA1BlockTraits::computeHmac(const uint8_t* key,

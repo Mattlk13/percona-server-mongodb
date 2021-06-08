@@ -34,12 +34,17 @@
 #include "mongo/base/status_with.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/util/bson_extract.h"
+#include "mongo/db/commands/feature_compatibility_version.h"
 
 namespace mongo {
 namespace {
 
 const char kRecvChunkStart[] = "_recvChunkStart";
 const char kFromShardConnectionString[] = "from";
+// Note: The UUID parsing code relies on this field being named 'uuid'.
+const char kMigrationId[] = "uuid";
+const char kLsid[] = "lsid";
+const char kTxnNumber[] = "txnNumber";
 const char kFromShardId[] = "fromShardName";
 const char kToShardId[] = "toShardName";
 const char kChunkMinKey[] = "min";
@@ -147,12 +152,20 @@ StatusWith<StartChunkCloneRequest> StartChunkCloneRequest::createFromCommand(Nam
         }
     }
 
+    request._migrationId = UUID::parse(obj);
+    request._lsid =
+        LogicalSessionId::parse(IDLParserErrorContext("StartChunkCloneRequest"), obj[kLsid].Obj());
+    request._txnNumber = obj.getField(kTxnNumber).Long();
+
     return request;
 }
 
 void StartChunkCloneRequest::appendAsCommand(
     BSONObjBuilder* builder,
     const NamespaceString& nss,
+    const UUID& migrationId,
+    const LogicalSessionId& lsid,
+    TxnNumber txnNumber,
     const MigrationSessionId& sessionId,
     const ConnectionString& fromShardConnectionString,
     const ShardId& fromShardId,
@@ -166,6 +179,11 @@ void StartChunkCloneRequest::appendAsCommand(
     invariant(fromShardConnectionString.isValid());
 
     builder->append(kRecvChunkStart, nss.ns());
+
+    migrationId.appendToBuilder(builder, kMigrationId);
+    builder->append(kLsid, lsid.toBSON());
+    builder->append(kTxnNumber, txnNumber);
+
     sessionId.append(builder);
     builder->append(kFromShardConnectionString, fromShardConnectionString.toString());
     builder->append(kFromShardId, fromShardId.toString());

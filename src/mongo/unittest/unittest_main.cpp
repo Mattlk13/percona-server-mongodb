@@ -31,25 +31,45 @@
 #include <string>
 #include <vector>
 
+#include "mongo/base/init.h"
 #include "mongo/base/initializer.h"
 #include "mongo/base/status.h"
-#include "mongo/logger/logger.h"
+#include "mongo/db/commands/test_commands_enabled.h"
+#include "mongo/db/wire_version.h"
+#include "mongo/logv2/log_domain_global.h"
+#include "mongo/logv2/log_manager.h"
+#include "mongo/unittest/log_test.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/unittest/unittest_options_gen.h"
 #include "mongo/util/options_parser/environment.h"
 #include "mongo/util/options_parser/option_section.h"
 #include "mongo/util/options_parser/options_parser.h"
 #include "mongo/util/signal_handlers_synchronous.h"
+#include "mongo/util/testing_proctor.h"
 
 using mongo::Status;
 
 namespace moe = ::mongo::optionenvironment;
 
-int main(int argc, char** argv, char** envp) {
+namespace mongo {
+namespace {
+
+MONGO_INITIALIZER(WireSpec)(InitializerContext*) {
+    WireSpec::instance().initialize(WireSpec::Specification{});
+}
+
+}  // namespace
+}  // namespace mongo
+
+int main(int argc, char** argv) {
+    std::vector<std::string> argVec(argv, argv + argc);
+
     ::mongo::clearSignalMask();
     ::mongo::setupSynchronousSignalHandlers();
 
-    ::mongo::runGlobalInitializersOrDie(argc, argv, envp);
+    ::mongo::TestingProctor::instance().setEnabled(true);
+    ::mongo::runGlobalInitializersOrDie(argVec);
+    ::mongo::setTestCommandsEnabled(true);
 
     moe::OptionSection options;
 
@@ -61,9 +81,7 @@ int main(int argc, char** argv, char** envp) {
 
     moe::OptionsParser parser;
     moe::Environment environment;
-    std::map<std::string, std::string> env;
-    std::vector<std::string> argVector(argv, argv + argc);
-    Status ret = parser.run(options, argVector, env, &environment);
+    Status ret = parser.run(options, argVec, &environment);
     if (!ret.isOK()) {
         std::cerr << options.helpString();
         return EXIT_FAILURE;
@@ -74,6 +92,8 @@ int main(int argc, char** argv, char** envp) {
     std::string filter;
     int repeat = 1;
     std::string verbose;
+    std::string fileNameFilter;
+
     // "list" and "repeat" will be assigned with default values, if not present.
     invariant(environment.get("list", &list));
     invariant(environment.get("repeat", &repeat));
@@ -81,6 +101,7 @@ int main(int argc, char** argv, char** envp) {
     environment.get("suite", &suites).ignore();
     environment.get("filter", &filter).ignore();
     environment.get("verbose", &verbose).ignore();
+    environment.get("fileNameFilter", &fileNameFilter).ignore();
 
     if (std::any_of(verbose.cbegin(), verbose.cend(), [](char ch) { return ch != 'v'; })) {
         std::cerr << "The string for the --verbose option cannot contain characters other than 'v'"
@@ -88,8 +109,7 @@ int main(int argc, char** argv, char** envp) {
         std::cerr << options.helpString();
         return EXIT_FAILURE;
     }
-    ::mongo::logger::globalLogDomain()->setMinimumLoggedSeverity(
-        ::mongo::logger::LogSeverity::Debug(verbose.length()));
+    mongo::unittest::setMinimumLoggedSeverity(mongo::logv2::LogSeverity::Debug(verbose.size()));
 
     if (list) {
         auto suiteNames = ::mongo::unittest::getAllSuiteNames();
@@ -99,12 +119,14 @@ int main(int argc, char** argv, char** envp) {
         return EXIT_SUCCESS;
     }
 
-    auto result = ::mongo::unittest::Suite::run(suites, filter, repeat);
+    auto result = ::mongo::unittest::Suite::run(suites, filter, fileNameFilter, repeat);
 
     ret = ::mongo::runGlobalDeinitializers();
     if (!ret.isOK()) {
         std::cerr << "Global deinitilization failed: " << ret.reason() << std::endl;
     }
+
+    ::mongo::TestingProctor::instance().exitAbruptlyIfDeferredErrors();
 
     return result;
 }

@@ -39,11 +39,11 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/json.h"
+#include "mongo/db/exec/document_value/document_value_test_util.h"
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
 #include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/document_source_mock.h"
 #include "mongo/db/pipeline/document_source_sort.h"
-#include "mongo/db/pipeline/document_value_test_util.h"
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/unittest/temp_dir.h"
 #include "mongo/unittest/unittest.h"
@@ -122,7 +122,7 @@ TEST_F(DocumentSourceSortTest, SortWithLimit) {
     auto expCtx = getExpCtx();
     createSort(BSON("a" << 1));
 
-    ASSERT_EQUALS(sort()->getLimit(), -1);
+    ASSERT(!sort()->getLimit());
     Pipeline::SourceContainer container;
     container.push_back(sort());
 
@@ -139,25 +139,23 @@ TEST_F(DocumentSourceSortTest, SortWithLimit) {
     container.push_back(DocumentSourceLimit::create(expCtx, 10));
     sort()->optimizeAt(container.begin(), &container);
     ASSERT_EQUALS(container.size(), 1U);
-    ASSERT_EQUALS(sort()->getLimit(), 10);
+    ASSERT_EQUALS(*sort()->getLimit(), 10);
 
     // unchanged
     container.push_back(DocumentSourceLimit::create(expCtx, 15));
     sort()->optimizeAt(container.begin(), &container);
     ASSERT_EQUALS(container.size(), 1U);
-    ASSERT_EQUALS(sort()->getLimit(), 10);
+    ASSERT_EQUALS(*sort()->getLimit(), 10);
 
     // reduced
     container.push_back(DocumentSourceLimit::create(expCtx, 5));
     sort()->optimizeAt(container.begin(), &container);
     ASSERT_EQUALS(container.size(), 1U);
-    ASSERT_EQUALS(sort()->getLimit(), 5);
+    ASSERT_EQUALS(*sort()->getLimit(), 5);
 
     vector<Value> arr;
     sort()->serializeToArray(arr);
-    ASSERT_VALUE_EQ(
-        Value(arr),
-        DOC_ARRAY(DOC("$sort" << DOC("a" << 1)) << DOC("$limit" << sort()->getLimit())));
+    ASSERT_VALUE_EQ(Value(arr), DOC_ARRAY(DOC("$sort" << DOC("a" << 1)) << DOC("$limit" << 5)));
 
     ASSERT(sort()->distributedPlanLogic());
     ASSERT(sort()->distributedPlanLogic()->shardsStage != nullptr);
@@ -173,7 +171,7 @@ TEST_F(DocumentSourceSortTest, Dependencies) {
     ASSERT_EQUALS(1U, dependencies.fields.count("a"));
     ASSERT_EQUALS(1U, dependencies.fields.count("b.c"));
     ASSERT_EQUALS(false, dependencies.needWholeDocument);
-    ASSERT_EQUALS(false, dependencies.getNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE));
+    ASSERT_EQUALS(false, dependencies.getNeedsMetadata(DocumentMetadataFields::kTextScore));
 }
 
 TEST_F(DocumentSourceSortTest, ReportsNoPathsModified) {
@@ -189,7 +187,7 @@ public:
                       BSONObj sortSpec,
                       string expectedResultSetString) {
         createSort(sortSpec);
-        auto source = DocumentSourceMock::createForTest(inputDocs);
+        auto source = DocumentSourceMock::createForTest(inputDocs, getExpCtx());
         sort()->setSource(source.get());
 
         // Load the results from the DocumentSourceUnwind.
@@ -309,9 +307,9 @@ TEST_F(DocumentSourceSortExecutionTest, NullValue) {
  */
 TEST_F(DocumentSourceSortExecutionTest, TextScore) {
     MutableDocument first(Document{{"_id", 0}});
-    first.setTextScore(10);
+    first.metadata().setTextScore(10);
     MutableDocument second(Document{{"_id", 1}});
-    second.setTextScore(20);
+    second.metadata().setTextScore(20);
 
     checkResults({first.freeze(), second.freeze()},
                  BSON("$computed0" << metaTextScore),
@@ -323,9 +321,9 @@ TEST_F(DocumentSourceSortExecutionTest, TextScore) {
  */
 TEST_F(DocumentSourceSortExecutionTest, RandMeta) {
     MutableDocument first(Document{{"_id", 0}});
-    first.setRandMetaField(0.01);
+    first.metadata().setRandVal(0.01);
     MutableDocument second(Document{{"_id", 1}});
-    second.setRandMetaField(0.02);
+    second.metadata().setRandVal(0.02);
 
     checkResults({first.freeze(), second.freeze()},
                  BSON("$computed0" << BSON("$meta"
@@ -354,7 +352,8 @@ TEST_F(DocumentSourceSortExecutionTest, ShouldPauseWhenAskedTo) {
     auto mock =
         DocumentSourceMock::createForTest({DocumentSource::GetNextResult::makePauseExecution(),
                                            Document{{"a", 0}},
-                                           DocumentSource::GetNextResult::makePauseExecution()});
+                                           DocumentSource::GetNextResult::makePauseExecution()},
+                                          getExpCtx());
     sort->setSource(mock.get());
 
     // Should propagate the first pause.
@@ -374,7 +373,8 @@ TEST_F(DocumentSourceSortExecutionTest, ShouldResumePopulationBetweenPauses) {
     auto mock =
         DocumentSourceMock::createForTest({Document{{"a", 1}},
                                            DocumentSource::GetNextResult::makePauseExecution(),
-                                           Document{{"a", 0}}});
+                                           Document{{"a", 0}}},
+                                          getExpCtx());
     sort->setSource(mock.get());
 
     // Should load the first document, then propagate the pause.
@@ -403,7 +403,8 @@ TEST_F(DocumentSourceSortExecutionTest, ShouldBeAbleToPauseLoadingWhileSpilled) 
     expCtx->allowDiskUse = true;
     const size_t maxMemoryUsageBytes = 1000;
 
-    auto sort = DocumentSourceSort::create(expCtx, BSON("_id" << -1), -1, maxMemoryUsageBytes);
+    auto sort =
+        DocumentSourceSort::create(expCtx, {BSON("_id" << -1), expCtx}, 0, maxMemoryUsageBytes);
 
     string largeStr(maxMemoryUsageBytes, 'x');
     auto mock =
@@ -411,7 +412,8 @@ TEST_F(DocumentSourceSortExecutionTest, ShouldBeAbleToPauseLoadingWhileSpilled) 
                                            DocumentSource::GetNextResult::makePauseExecution(),
                                            Document{{"_id", 1}, {"largeStr", largeStr}},
                                            DocumentSource::GetNextResult::makePauseExecution(),
-                                           Document{{"_id", 2}, {"largeStr", largeStr}}});
+                                           Document{{"_id", 2}, {"largeStr", largeStr}}},
+                                          expCtx);
     sort->setSource(mock.get());
 
     // There were 2 pauses, so we should expect 2 paused results before any results can be returned.
@@ -438,14 +440,17 @@ TEST_F(DocumentSourceSortExecutionTest,
     expCtx->allowDiskUse = false;
     const size_t maxMemoryUsageBytes = 1000;
 
-    auto sort = DocumentSourceSort::create(expCtx, BSON("_id" << -1), -1, maxMemoryUsageBytes);
+    auto sort =
+        DocumentSourceSort::create(expCtx, {BSON("_id" << -1), expCtx}, 0, maxMemoryUsageBytes);
 
     string largeStr(maxMemoryUsageBytes, 'x');
     auto mock = DocumentSourceMock::createForTest({Document{{"_id", 0}, {"largeStr", largeStr}},
-                                                   Document{{"_id", 1}, {"largeStr", largeStr}}});
+                                                   Document{{"_id", 1}, {"largeStr", largeStr}}},
+                                                  expCtx);
     sort->setSource(mock.get());
 
-    ASSERT_THROWS_CODE(sort->getNext(), AssertionException, 16819);
+    ASSERT_THROWS_CODE(
+        sort->getNext(), AssertionException, ErrorCodes::QueryExceededMemoryLimitNoDiskUseAllowed);
 }
 
 TEST_F(DocumentSourceSortExecutionTest, ShouldCorrectlyTrackMemoryUsageBetweenPauses) {
@@ -453,21 +458,24 @@ TEST_F(DocumentSourceSortExecutionTest, ShouldCorrectlyTrackMemoryUsageBetweenPa
     expCtx->allowDiskUse = false;
     const size_t maxMemoryUsageBytes = 1000;
 
-    auto sort = DocumentSourceSort::create(expCtx, BSON("_id" << -1), -1, maxMemoryUsageBytes);
+    auto sort =
+        DocumentSourceSort::create(expCtx, {BSON("_id" << -1), expCtx}, 0, maxMemoryUsageBytes);
 
     string largeStr(maxMemoryUsageBytes / 2, 'x');
     auto mock =
         DocumentSourceMock::createForTest({Document{{"_id", 0}, {"largeStr", largeStr}},
                                            DocumentSource::GetNextResult::makePauseExecution(),
                                            Document{{"_id", 1}, {"largeStr", largeStr}},
-                                           Document{{"_id", 2}, {"largeStr", largeStr}}});
+                                           Document{{"_id", 2}, {"largeStr", largeStr}}},
+                                          expCtx);
     sort->setSource(mock.get());
 
     // The first getNext() should pause.
     ASSERT_TRUE(sort->getNext().isPaused());
 
     // The next should realize it's used too much memory.
-    ASSERT_THROWS_CODE(sort->getNext(), AssertionException, 16819);
+    ASSERT_THROWS_CODE(
+        sort->getNext(), AssertionException, ErrorCodes::QueryExceededMemoryLimitNoDiskUseAllowed);
 }
 
 }  // namespace

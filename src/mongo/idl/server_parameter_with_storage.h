@@ -38,6 +38,7 @@
 #include <functional>
 #include <string>
 
+#include "mongo/base/parse_number.h"
 #include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonelement.h"
@@ -54,7 +55,7 @@ namespace idl_server_parameter_detail {
 template <typename T>
 inline StatusWith<T> coerceFromString(StringData str) {
     T value;
-    Status status = parseNumberFromString(str, &value);
+    Status status = NumberParser{}(str, &value);
     if (!status.isOK()) {
         return status;
     }
@@ -247,8 +248,9 @@ public:
     Status set(const BSONElement& newValueElement) final {
         element_type newValue;
 
-        if (!newValueElement.coerce(&newValue)) {
-            return Status(ErrorCodes::BadValue, "Can't coerce value");
+        if (auto status = newValueElement.tryCoerce(&newValue); !status.isOK()) {
+            return {status.code(),
+                    str::stream() << "Failed setting " << name() << ": " << status.reason()};
         }
 
         return setValue(newValue);
@@ -293,15 +295,12 @@ public:
      */
     template <class predicate>
     void addBound(const element_type& bound) {
-        addValidator([ bound, spname = name() ](const element_type& value) {
+        addValidator([bound, spname = name()](const element_type& value) {
             if (!predicate::evaluate(value, bound)) {
                 return Status(ErrorCodes::BadValue,
-                              str::stream() << "Invalid value for parameter " << spname << ": "
-                                            << value
-                                            << " is not "
-                                            << predicate::description
-                                            << " "
-                                            << bound);
+                              str::stream()
+                                  << "Invalid value for parameter " << spname << ": " << value
+                                  << " is not " << predicate::description << " " << bound);
             }
             return Status::OK();
         });

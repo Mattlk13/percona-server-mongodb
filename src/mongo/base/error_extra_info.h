@@ -100,12 +100,10 @@ private:
  * You must separately #include "mongo/base/init.h" since including it here would create an include
  * cycle.
  */
-#define MONGO_INIT_REGISTER_ERROR_EXTRA_INFO(type)                            \
-    MONGO_INITIALIZER_GENERAL(                                                \
-        RegisterErrorExtraInfoFor##type, MONGO_NO_PREREQUISITES, ("default")) \
-    (InitializerContext * context) {                                          \
-        ErrorExtraInfo::registerType<type>();                                 \
-        return Status::OK();                                                  \
+#define MONGO_INIT_REGISTER_ERROR_EXTRA_INFO(type)                              \
+    MONGO_INITIALIZER_GENERAL(RegisterErrorExtraInfoFor##type, (), ("default")) \
+    (InitializerContext*) {                                                     \
+        ErrorExtraInfo::registerType<type>();                                   \
     }
 
 /**
@@ -137,6 +135,37 @@ public:
 private:
     static bool isParserEnabledForTest;
 };
+
+/**
+ * This is an example ErrorExtraInfo subclass. It is used for testing the ErrorExtraInfoHandling.
+ *
+ * It is meant to be a duplicate of ErrorExtraInfoExample, except that it is optional. This will
+ * make sure we don't crash the server when an ErrorExtraInfo class is meant to be optional.
+ */
+class OptionalErrorExtraInfoExample final : public ErrorExtraInfo {
+public:
+    static constexpr auto code = ErrorCodes::ForTestingOptionalErrorExtraInfo;
+
+    void serialize(BSONObjBuilder*) const override;
+    static std::shared_ptr<const ErrorExtraInfo> parse(const BSONObj&);
+
+    // Everything else in this class is just for testing and shouldn't by copied by users.
+
+    struct EnableParserForTest {
+        EnableParserForTest() {
+            isParserEnabledForTest = true;
+        }
+        ~EnableParserForTest() {
+            isParserEnabledForTest = false;
+        }
+    };
+
+    OptionalErrorExtraInfoExample(int data) : data(data) {}
+    int data;  // This uses the fieldname "data".
+private:
+    static bool isParserEnabledForTest;
+};
+
 
 namespace nested::twice {
 

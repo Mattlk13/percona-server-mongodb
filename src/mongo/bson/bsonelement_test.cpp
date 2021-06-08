@@ -29,6 +29,9 @@
 
 #include "mongo/platform/basic.h"
 
+#include <array>
+#include <fmt/format.h>
+
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
@@ -37,6 +40,8 @@
 
 namespace mongo {
 namespace {
+
+using namespace fmt::literals;
 
 TEST(BSONElement, BinDataToString) {
     BSONObjBuilder builder;
@@ -85,6 +90,44 @@ TEST(BSONElement, BinDataToString) {
               "62696E6172792064617461007769746820616E20756E6B6E6F776E2074797065)");
 }
 
+std::string vecStr(std::vector<uint8_t> v) {
+    std::string r = "[";
+    StringData sep;
+    for (const uint8_t& b : v) {
+        r += "{}{:02x}"_format(sep, (unsigned)b);
+        sep = ","_sd;
+    }
+    r += "]";
+    return r;
+}
+
+TEST(BSONElement, BinDataVectorWithByteArrayDeprecated) {
+    // ByteArrayDeprecated has a nonsense 4-byte redundant length field
+    // that _binDataVector should ignore.
+    std::vector<uint8_t> payload{'1', '2', '3', '4', '5', '6', '7', '8', '9'};
+    std::vector<uint8_t> input = payload;
+
+    // Insert a 4-byte prefix for the ignored ByteArrayDeprecated "length"
+    std::array<uint8_t, 4> ignoredPrefix{0xcc, 0xdd, 0xee, 0xff};
+    input.insert(input.begin(), ignoredPrefix.begin(), ignoredPrefix.end());
+
+    ASSERT_EQ(vecStr(BSONObjBuilder{}
+                         .appendBinData("f", input.size(), ByteArrayDeprecated, input.data())
+                         .obj()["f"]
+                         ._binDataVector()),
+              vecStr(payload));
+}
+
+TEST(BSONElement, BinDataVectorWithBinDataGeneral) {
+    std::vector<uint8_t> payload{'1', '2', '3', '4', '5', '6', '7', '8', '9'};
+    std::vector<uint8_t> input = payload;
+    ASSERT_EQ(vecStr(BSONObjBuilder{}
+                         .appendBinData("f", input.size(), BinDataGeneral, input.data())
+                         .obj()["f"]
+                         ._binDataVector()),
+              vecStr(payload));
+}
+
 
 TEST(BSONElement, TimestampToString) {
 
@@ -128,15 +171,13 @@ TEST(BSONElement, ExtractLargeSubObject) {
 }
 
 TEST(BSONElement, SafeNumberLongPositiveBound) {
-    BSONObj obj = BSON("kLongLongMaxPlusOneAsDouble"
-                       << BSONElement::kLongLongMaxPlusOneAsDouble
-                       << "towardsZero"
-                       << std::nextafter(BSONElement::kLongLongMaxPlusOneAsDouble, 0.0)
-                       << "towardsInfinity"
-                       << std::nextafter(BSONElement::kLongLongMaxPlusOneAsDouble,
-                                         std::numeric_limits<double>::max())
-                       << "positiveInfinity"
-                       << std::numeric_limits<double>::infinity());
+    BSONObj obj =
+        BSON("kLongLongMaxPlusOneAsDouble"
+             << BSONElement::kLongLongMaxPlusOneAsDouble << "towardsZero"
+             << std::nextafter(BSONElement::kLongLongMaxPlusOneAsDouble, 0.0) << "towardsInfinity"
+             << std::nextafter(BSONElement::kLongLongMaxPlusOneAsDouble,
+                               std::numeric_limits<double>::max())
+             << "positiveInfinity" << std::numeric_limits<double>::infinity());
 
     // kLongLongMaxPlusOneAsDouble is the least double value that will overflow a 64-bit signed
     // two's-complement integer. Historically, converting this value with safeNumberLong() would
@@ -182,13 +223,10 @@ TEST(BSONElement, SafeNumberLongNegativeBound) {
         static_cast<double>(std::numeric_limits<long long>::lowest());
     BSONObj obj =
         BSON("lowestLongLongAsDouble"  // This comment forces clang-format to break here.
-             << lowestLongLongAsDouble
-             << "towardsZero"
-             << std::nextafter(lowestLongLongAsDouble, 0.0)
-             << "towardsNegativeInfinity"
+             << lowestLongLongAsDouble << "towardsZero"
+             << std::nextafter(lowestLongLongAsDouble, 0.0) << "towardsNegativeInfinity"
              << std::nextafter(lowestLongLongAsDouble, std::numeric_limits<double>::lowest())
-             << "negativeInfinity"
-             << -std::numeric_limits<double>::infinity());
+             << "negativeInfinity" << -std::numeric_limits<double>::infinity());
 
     ASSERT_EQ(obj["lowestLongLongAsDouble"].safeNumberLongForHash(),
               std::numeric_limits<long long>::lowest());
@@ -206,6 +244,41 @@ TEST(BSONElement, SafeNumberLongNegativeBound) {
     ASSERT_EQ(obj["negativeInfinity"].safeNumberLongForHash(),
               std::numeric_limits<long long>::lowest());
     ASSERT_EQ(obj["negativeInfinity"].safeNumberLong(), std::numeric_limits<long long>::lowest());
+}
+
+TEST(BSONElement, SafeNumberDoublePositiveBound) {
+    BSONObj obj = BSON("kLargestSafeLongLongAsDouble"
+                       << BSONElement::kLargestSafeLongLongAsDouble << "towardsZero"
+                       << BSONElement::kLargestSafeLongLongAsDouble - 1 << "towardsInfinity"
+                       << BSONElement::kLargestSafeLongLongAsDouble + 1 << "positiveInfinity"
+                       << std::numeric_limits<long long>::max());
+
+    ASSERT_EQ(obj["kLargestSafeLongLongAsDouble"].safeNumberDouble(),
+              (double)BSONElement::kLargestSafeLongLongAsDouble);
+    ASSERT_EQ(obj["towardsZero"].safeNumberDouble(),
+              (double)(BSONElement::kLargestSafeLongLongAsDouble - 1));
+    ASSERT_EQ(obj["towardsInfinity"].safeNumberDouble(),
+              (double)BSONElement::kLargestSafeLongLongAsDouble);
+    ASSERT_EQ(obj["positiveInfinity"].safeNumberDouble(),
+              (double)BSONElement::kLargestSafeLongLongAsDouble);
+}
+
+TEST(BSONElement, SafeNumberDoubleNegativeBound) {
+    BSONObj obj =
+        BSON("kSmallestSafeLongLongAsDouble"
+             << BSONElement::kSmallestSafeLongLongAsDouble << "towardsZero"
+             << BSONElement::kSmallestSafeLongLongAsDouble + 1 << "towardsNegativeInfinity"
+             << BSONElement::kSmallestSafeLongLongAsDouble - 1 << "negativeInfinity"
+             << std::numeric_limits<long long>::min());
+
+    ASSERT_EQ(obj["kSmallestSafeLongLongAsDouble"].safeNumberDouble(),
+              (double)BSONElement::kSmallestSafeLongLongAsDouble);
+    ASSERT_EQ(obj["towardsZero"].safeNumberDouble(),
+              (double)(BSONElement::kSmallestSafeLongLongAsDouble + 1));
+    ASSERT_EQ(obj["towardsNegativeInfinity"].safeNumberDouble(),
+              (double)BSONElement::kSmallestSafeLongLongAsDouble);
+    ASSERT_EQ(obj["negativeInfinity"].safeNumberDouble(),
+              (double)BSONElement::kSmallestSafeLongLongAsDouble);
 }
 
 TEST(BSONElementIntegerParseTest, ParseIntegerElementToNonNegativeLongRejectsNegative) {

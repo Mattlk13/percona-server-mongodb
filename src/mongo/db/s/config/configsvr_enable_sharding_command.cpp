@@ -27,11 +27,9 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
-
-#include <set>
 
 #include "mongo/db/audit.h"
 #include "mongo/db/auth/action_set.h"
@@ -39,21 +37,14 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/field_parser.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
-#include "mongo/s/catalog/type_database.h"
-#include "mongo/s/catalog_cache.h"
 #include "mongo/s/grid.h"
-#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
-
-using std::shared_ptr;
-using std::set;
-using std::string;
-
 namespace {
 
 /**
@@ -74,6 +65,8 @@ public:
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return true;
     }
+
+    static constexpr StringData kShardNameField = "primaryShard"_sd;
 
     std::string help() const override {
         return "Internal command, which is exported by the sharding config server. Do not call "
@@ -102,6 +95,11 @@ public:
         uassert(ErrorCodes::IllegalOperation,
                 "_configsvrEnableSharding can only be run on config servers",
                 serverGlobalParams.clusterRole == ClusterRole::ConfigServer);
+        uassert(ErrorCodes::InvalidOptions,
+                str::stream()
+                    << "_configsvrEnableSharding must be called with majority writeConcern, got "
+                    << cmdObj,
+                opCtx->getWriteConcern().wMode == WriteConcernOptions::kMajority);
 
         // Set the operation context read concern level to local for reads into the config database.
         repl::ReadConcernArgs::get(opCtx) =
@@ -109,30 +107,15 @@ public:
 
         const std::string dbname = parseNs("", cmdObj);
 
-        uassert(
-            ErrorCodes::InvalidNamespace,
-            str::stream() << "invalid db name specified: " << dbname,
-            NamespaceString::validDBName(dbname, NamespaceString::DollarInDbNameBehavior::Allow));
+        auto shardElem = cmdObj[kShardNameField];
+        ShardingCatalogManager::get(opCtx)->createDatabase(
+            opCtx,
+            dbname,
+            shardElem.ok() ? boost::optional<ShardId>(shardElem.String())
+                           : boost::optional<ShardId>(),
+            true);
 
-        if (dbname == NamespaceString::kAdminDb || dbname == NamespaceString::kLocalDb) {
-            uasserted(ErrorCodes::InvalidOptions,
-                      str::stream() << "can't shard " + dbname + " database");
-        }
-
-        uassert(ErrorCodes::InvalidOptions,
-                str::stream() << "enableSharding must be called with majority writeConcern, got "
-                              << cmdObj,
-                opCtx->getWriteConcern().wMode == WriteConcernOptions::kMajority);
-
-        // Make sure to force update of any stale metadata
-        ON_BLOCK_EXIT([opCtx, dbname] { Grid::get(opCtx)->catalogCache()->purgeDatabase(dbname); });
-
-        auto dbDistLock =
-            uassertStatusOK(Grid::get(opCtx)->catalogClient()->getDistLockManager()->lock(
-                opCtx, dbname, "enableSharding", DistLockManager::kDefaultLockTimeout));
-
-        ShardingCatalogManager::get(opCtx)->enableSharding(opCtx, dbname);
-        audit::logEnableSharding(Client::getCurrent(), dbname);
+        audit::logEnableSharding(opCtx->getClient(), dbname);
 
         return true;
     }

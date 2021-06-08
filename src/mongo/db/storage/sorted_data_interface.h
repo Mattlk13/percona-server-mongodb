@@ -34,7 +34,10 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/record_id.h"
+#include "mongo/db/storage/ident.h"
 #include "mongo/db/storage/index_entry_comparison.h"
+#include "mongo/db/storage/key_format.h"
+#include "mongo/db/storage/key_string.h"
 
 #pragma once
 
@@ -43,22 +46,28 @@ namespace mongo {
 class BSONObjBuilder;
 class BucketDeletionNotification;
 class SortedDataBuilderInterface;
-struct ValidateResults;
-
-/**
- * This enum is returned by any functions that could potentially insert special format onto disk. It
- * is a way to inform the callers to do something when special format exists on disk.
- * TODO SERVER-36385: Remove this enum in 4.4.
- */
-enum SpecialFormatInserted { NoSpecialFormatInserted = 0, LongTypeBitsInserted = 1 };
+struct IndexValidateResults;
 
 /**
  * This is the uniform interface for storing indexes and supporting point queries as well as range
  * queries. The actual implementation is up to the storage engine. All the storage engines must
  * support an index key size up to the maximum document size.
  */
-class SortedDataInterface {
+class SortedDataInterface : public Ident {
 public:
+    /**
+     * Constructs a SortedDataInterface. The rsKeyFormat is the RecordId key format of the related
+     * RecordStore.
+     */
+    SortedDataInterface(StringData ident,
+                        KeyString::Version keyStringVersion,
+                        Ordering ordering,
+                        KeyFormat rsKeyFormat)
+        : Ident(ident.toString()),
+          _keyStringVersion(keyStringVersion),
+          _ordering(ordering),
+          _rsKeyFormat(rsKeyFormat) {}
+
     virtual ~SortedDataInterface() {}
 
     //
@@ -74,14 +83,13 @@ public:
      * @param opCtx the transaction under which keys are added to 'this' index
      * @param dupsAllowed true if duplicate keys are allowed, and false
      *        otherwise
-     *
-     * @return caller takes ownership
      */
-    virtual SortedDataBuilderInterface* getBulkBuilder(OperationContext* opCtx,
-                                                       bool dupsAllowed) = 0;
+    virtual std::unique_ptr<SortedDataBuilderInterface> makeBulkBuilder(OperationContext* opCtx,
+                                                                        bool dupsAllowed) = 0;
 
     /**
-     * Insert an entry into the index with the specified key and RecordId.
+     * Insert an entry into the index with the specified KeyString, which must have a RecordId
+     * appended to the end.
      *
      * @param opCtx the transaction under which the insert takes place
      * @param dupsAllowed true if duplicate keys are allowed, and false
@@ -89,37 +97,33 @@ public:
      *
      * @return Status::OK() if the insert succeeded,
      *
-     *         ErrorCodes::DuplicateKey if 'key' already exists in 'this' index
+     *         ErrorCodes::DuplicateKey if 'keyString' already exists in 'this' index
      *         at a RecordId other than 'loc' and duplicates were not allowed
-     *
-     *         SpecialFormatInserted::LongTypeBitsInserted if the key we've
-     *         inserted has long typebits.
      */
-    virtual StatusWith<SpecialFormatInserted> insert(OperationContext* opCtx,
-                                                     const BSONObj& key,
-                                                     const RecordId& loc,
-                                                     bool dupsAllowed) = 0;
+    virtual Status insert(OperationContext* opCtx,
+                          const KeyString::Value& keyString,
+                          bool dupsAllowed) = 0;
 
     /**
-     * Remove the entry from the index with the specified key and RecordId.
+     * Remove the entry from the index with the specified KeyString, which must have a RecordId
+     * appended to the end.
      *
      * @param opCtx the transaction under which the remove takes place
-     * @param dupsAllowed true if duplicate keys are allowed, and false
-     *        otherwise
+     * @param dupsAllowed true to enforce strict checks to ensure we only delete a key with an exact
+     *        match, false otherwise
      */
     virtual void unindex(OperationContext* opCtx,
-                         const BSONObj& key,
-                         const RecordId& loc,
+                         const KeyString::Value& keyString,
                          bool dupsAllowed) = 0;
 
     /**
-     * Return ErrorCodes::DuplicateKey if there is more than one occurence of 'key' in this index,
-     * and Status::OK() otherwise. This call is only allowed on a unique index, and will invariant
-     * otherwise.
+     * Return ErrorCodes::DuplicateKey if there is more than one occurence of 'KeyString' in this
+     * index, and Status::OK() otherwise. This call is only allowed on a unique index, and will
+     * invariant otherwise.
      *
      * @param opCtx the transaction under which this operation takes place
      */
-    virtual Status dupKeyCheck(OperationContext* opCtx, const BSONObj& key) = 0;
+    virtual Status dupKeyCheck(OperationContext* opCtx, const KeyString::Value& keyString) = 0;
 
     /**
      * Attempt to reduce the storage space used by this index via compaction. Only called if the
@@ -138,7 +142,7 @@ public:
      */
     virtual void fullValidate(OperationContext* opCtx,
                               long long* numKeysOut,
-                              ValidateResults* fullResults) const = 0;
+                              IndexValidateResults* fullResults) const = 0;
 
     virtual bool appendCustomStats(OperationContext* opCtx,
                                    BSONObjBuilder* output,
@@ -155,22 +159,14 @@ public:
     virtual long long getSpaceUsedBytes(OperationContext* opCtx) const = 0;
 
     /**
+     * The number of unused free bytes consumed by this index on disk.
+     */
+    virtual long long getFreeStorageBytes(OperationContext* opCtx) const = 0;
+
+    /**
      * Return true if 'this' index is empty, and false otherwise.
      */
     virtual bool isEmpty(OperationContext* opCtx) = 0;
-
-    /**
-     * Attempt to bring the entirety of 'this' index into memory.
-     *
-     * If the underlying storage engine does not support the operation,
-     * returns ErrorCodes::CommandNotSupported
-     *
-     * @return Status::OK()
-     */
-    virtual Status touch(OperationContext* opCtx) const {
-        return Status(ErrorCodes::CommandNotSupported,
-                      "this storage engine does not support touch");
-    }
 
     /**
      * Return the number of entries in 'this' index.
@@ -180,8 +176,29 @@ public:
      */
     virtual long long numEntries(OperationContext* opCtx) const {
         long long x = -1;
-        fullValidate(opCtx, &x, NULL);
+        fullValidate(opCtx, &x, nullptr);
         return x;
+    }
+
+    /*
+     * Return the KeyString version for 'this' index.
+     */
+    KeyString::Version getKeyStringVersion() const {
+        return _keyStringVersion;
+    }
+
+    /*
+     * Return the ordering for 'this' index.
+     */
+    Ordering getOrdering() const {
+        return _ordering;
+    }
+
+    /**
+     * Returns the format of the associated RecordStore's RecordId keys.
+     */
+    KeyFormat rsKeyFormat() const {
+        return _rsKeyFormat;
     }
 
     /**
@@ -257,44 +274,50 @@ public:
          * If not positioned, returns boost::none.
          */
         virtual boost::optional<IndexKeyEntry> next(RequestedInfo parts = kKeyAndLoc) = 0;
+        virtual boost::optional<KeyStringEntry> nextKeyString() = 0;
 
         //
         // Seeking
         //
 
         /**
-         * Seeks to the provided key and returns current position.
-         *
-         * TODO consider removing once IndexSeekPoint has been cleaned up a bit. In particular,
-         * need a way to specify use whole keyPrefix and nothing else and to support the
-         * combination of empty and exclusive. Should also make it easier to construct for the
-         * common cases.
+         * Seeks to the provided keyString and returns the KeyStringEntry.
+         * The provided keyString has discriminator information encoded.
          */
-        virtual boost::optional<IndexKeyEntry> seek(const BSONObj& key,
-                                                    bool inclusive,
-                                                    RequestedInfo parts = kKeyAndLoc) = 0;
+        virtual boost::optional<KeyStringEntry> seekForKeyString(
+            const KeyString::Value& keyString) = 0;
 
         /**
-         * Seeks to the position described by seekPoint and returns the current position.
-         *
-         * NOTE: most implementations should just pass seekPoint to
-         * IndexEntryComparison::makeQueryObject().
+         * Seeks to the provided keyString and returns the IndexKeyEntry.
+         * The provided keyString has discriminator information encoded.
          */
-        virtual boost::optional<IndexKeyEntry> seek(const IndexSeekPoint& seekPoint,
+        virtual boost::optional<IndexKeyEntry> seek(const KeyString::Value& keyString,
                                                     RequestedInfo parts = kKeyAndLoc) = 0;
 
         /**
          * Seeks to a key with a hint to the implementation that you only want exact matches. If
          * an exact match can't be found, boost::none will be returned and the resulting
          * position of the cursor is unspecified.
+         *
+         * This will not accept a KeyString with a Discriminator other than kInclusive. Since
+         * keys are not stored with Discriminators, an exact match would never be found.
          */
-        virtual boost::optional<IndexKeyEntry> seekExact(const BSONObj& key,
-                                                         RequestedInfo parts = kKeyAndLoc) {
-            auto kv = seek(key, true, kKeyAndLoc);
-            if (kv && kv->key.woCompare(key, BSONObj(), /*considerFieldNames*/ false) == 0)
-                return kv;
-            return {};
-        }
+        virtual boost::optional<KeyStringEntry> seekExactForKeyString(
+            const KeyString::Value& keyString) = 0;
+
+        /**
+         * Seeks to a key with a hint to the implementation that you only want exact matches. If
+         * an exact match can't be found, boost::none will be returned and the resulting
+         * position of the cursor is unspecified.
+         *
+         * This will not accept a KeyString with a Discriminator other than kInclusive. Since
+         * keys are not stored with Discriminators, an exact match would never be found.
+         *
+         * Unlike the previous method, this one will return IndexKeyEntry if an exact match is
+         * found.
+         */
+        virtual boost::optional<IndexKeyEntry> seekExact(const KeyString::Value& keyString,
+                                                         RequestedInfo parts = kKeyAndLoc) = 0;
 
         //
         // Saving and restoring state
@@ -364,6 +387,11 @@ public:
     //
 
     virtual Status initAsEmpty(OperationContext* opCtx) = 0;
+
+protected:
+    const KeyString::Version _keyStringVersion;
+    const Ordering _ordering;
+    const KeyFormat _rsKeyFormat;
 };
 
 /**
@@ -374,37 +402,16 @@ public:
     virtual ~SortedDataBuilderInterface() {}
 
     /**
-     * Adds 'key' to intermediate storage.
+     * Adds 'keyString' to intermediate storage.
      *
-     * 'key' must be > or >= the last key passed to this function (depends on _dupsAllowed).  If
-     * this is violated an error Status (ErrorCodes::InternalError) will be returned.
+     * 'keyString' must be > or >= the last key passed to this function (depends on _dupsAllowed).
+     * If this is violated an error Status (ErrorCodes::InternalError) will be returned.
      *
-     * @return Status::OK() if addKey succeeded,
-     *
-     *         SpecialFormatInserted::LongTypeBitsInserted if we've inserted any
-     *         key with long typebits.
+     * Some storage engines require callers to manage a WriteUnitOfWork to perform these inserts
+     * transactionally. Other storage engines do not perform inserts transactionally and will ignore
+     * any parent WriteUnitOfWork.
      */
-    virtual StatusWith<SpecialFormatInserted> addKey(const BSONObj& key, const RecordId& loc) = 0;
-
-    /**
-     * Do any necessary work to finish building the tree.
-     *
-     * The default implementation may be used if no commit phase is necessary because addKey
-     * always leaves the tree in a valid state.
-     *
-     * This is called outside of any WriteUnitOfWork to allow implementations to split this up
-     * into multiple units.
-     *
-     * @return SpecialFormatInserted::LongTypeBitsInserted if we've inserted any
-     * key with long typebits.
-     *
-     * TODO SERVER-36385: Change the return type from SpecialFormatInserted back to "void" as that
-     * was a hack introduced in SERVER-36280 for detecting long TypeBits in an edge case in one of
-     * the unique index builder implementations.
-     */
-    virtual SpecialFormatInserted commit(bool mayInterrupt) {
-        return SpecialFormatInserted::NoSpecialFormatInserted;
-    }
+    virtual Status addKey(const KeyString::Value& keyString) = 0;
 };
 
 }  // namespace mongo

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 
 #include "mongo/platform/basic.h"
@@ -37,7 +37,6 @@
 #include "mongo/s/commands/document_shard_key_update_util.h"
 
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/log.h"
 
 
 namespace mongo {
@@ -53,9 +52,8 @@ public:
 TEST_F(DocumentShardKeyUpdateTest, constructShardKeyDeleteCmdObj) {
     NamespaceString nss("test.foo");
     BSONObj updatePreImage = BSON("x" << 4 << "y" << 3 << "_id" << 20);
-    int stmtId = 1;
 
-    auto deleteCmdObj = constructShardKeyDeleteCmdObj(nss, updatePreImage, stmtId);
+    auto deleteCmdObj = constructShardKeyDeleteCmdObj(nss, updatePreImage);
 
     auto deletesObj = deleteCmdObj["deletes"].Array();
     ASSERT_EQ(deletesObj.size(), 1U);
@@ -65,15 +63,13 @@ TEST_F(DocumentShardKeyUpdateTest, constructShardKeyDeleteCmdObj) {
     ASSERT_EQ(predicate["_id"].Int(), 20);
 
     ASSERT_EQ(deleteCmdObj["delete"].String(), nss.coll());
-    ASSERT_EQ(deleteCmdObj["stmtId"].Int(), stmtId);
 }
 
 TEST_F(DocumentShardKeyUpdateTest, constructShardKeyInsertCmdObj) {
     NamespaceString nss("test.foo");
     BSONObj updatePostImage = BSON("x" << 4 << "y" << 3 << "_id" << 20);
-    int stmtId = 1;
 
-    auto insertCmdObj = constructShardKeyInsertCmdObj(nss, updatePostImage, stmtId);
+    auto insertCmdObj = constructShardKeyInsertCmdObj(nss, updatePostImage);
 
     auto insertsObj = insertCmdObj["documents"].Array();
     ASSERT_EQ(insertsObj.size(), 1U);
@@ -84,7 +80,6 @@ TEST_F(DocumentShardKeyUpdateTest, constructShardKeyInsertCmdObj) {
     ASSERT_EQ(insert["_id"].Int(), 20);
 
     ASSERT_EQ(insertCmdObj["insert"].String(), nss.coll());
-    ASSERT_EQ(insertCmdObj["stmtId"].Int(), stmtId);
 }
 }  // namespace
 }  // namespace mongo

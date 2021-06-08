@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -36,18 +36,19 @@
 #include "mongo/base/error_codes.h"
 #include "mongo/base/owned_pointer_map.h"
 #include "mongo/base/status.h"
-#include "mongo/base/transaction_error.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/client/connection_string.h"
 #include "mongo/client/remote_command_targeter.h"
+#include "mongo/db/error_labels.h"
+#include "mongo/db/logical_session_id_helpers.h"
 #include "mongo/executor/task_executor_pool.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/multi_statement_transaction_requests_sender.h"
 #include "mongo/s/transaction_router.h"
 #include "mongo/s/write_ops/batch_write_op.h"
 #include "mongo/s/write_ops/write_error_detail.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
@@ -59,24 +60,38 @@ const ReadPreferenceSetting kPrimaryOnlyReadPreference(ReadPreference::PrimaryOn
 // This is needed since the dispatcher only returns hosts with responses.
 //
 
-// TODO: Unordered map?
-typedef OwnedPointerMap<ShardId, TargetedWriteBatch> OwnedShardBatchMap;
-
 WriteErrorDetail errorFromStatus(const Status& status) {
     WriteErrorDetail error;
     error.setStatus(status);
     return error;
 }
 
-// Helper to note several stale errors from a response
-void noteStaleResponses(const std::vector<ShardError>& staleErrors, NSTargeter* targeter) {
+// Helper to note several stale shard errors from a response
+void noteStaleShardResponses(const std::vector<ShardError>& staleErrors, NSTargeter* targeter) {
     for (const auto& error : staleErrors) {
-        LOG(4) << "Noting stale config response " << error.error.getErrInfo() << " from shard "
-               << error.endpoint.shardName;
-        targeter->noteStaleResponse(
+        LOGV2_DEBUG(22902,
+                    4,
+                    "Noting stale config response from {shardId}: {errorInfo}",
+                    "Noting stale config response",
+                    "shardId"_attr = error.endpoint.shardName,
+                    "errorInfo"_attr = error.error.getErrInfo());
+        targeter->noteStaleShardResponse(
             error.endpoint,
             StaleConfigInfo::parseFromCommandError(
                 error.error.isErrInfoSet() ? error.error.getErrInfo() : BSONObj()));
+    }
+}
+
+// Helper to note several stale db errors from a response
+void noteStaleDbResponses(const std::vector<ShardError>& staleErrors, NSTargeter* targeter) {
+    for (const auto& error : staleErrors) {
+        LOGV2_DEBUG(22903,
+                    4,
+                    "Noting stale database response from {shardId}: errorInfo",
+                    "shardId"_attr = error.endpoint.shardName,
+                    "errorInfo"_attr = error.error.toBSON());
+        targeter->noteStaleDbResponse(
+            error.endpoint, StaleDbRoutingVersion::parseFromCommandError(error.error.toBSON()));
     }
 }
 
@@ -87,7 +102,7 @@ bool hasTransientTransactionError(const BatchedCommandResponse& response) {
 
     const auto& errorLabels = response.getErrorLabels();
     auto iter = std::find_if(errorLabels.begin(), errorLabels.end(), [](const std::string& label) {
-        return label == txn::TransientTxnErrorFieldName;
+        return label == ErrorLabel::kTransientTransaction;
     });
     return iter != errorLabels.end();
 }
@@ -105,8 +120,12 @@ void BatchWriteExec::executeBatch(OperationContext* opCtx,
                                   BatchWriteExecStats* stats) {
     const auto& nss(clientRequest.getNS());
 
-    LOG(4) << "Starting execution of write batch of size "
-           << static_cast<int>(clientRequest.sizeWriteOps()) << " for " << nss.ns();
+    LOGV2_DEBUG(22904,
+                4,
+                "Starting execution of a write batch of size {size} for collection {namespace}",
+                "Starting execution of a write batch",
+                "namespace"_attr = nss.ns(),
+                "size"_attr = clientRequest.sizeWriteOps());
 
     BatchWriteOp batchOp(opCtx, clientRequest);
 
@@ -178,8 +197,9 @@ void BatchWriteExec::executeBatch(OperationContext* opCtx,
 
         while (numSent != numToSend) {
             // Collect batches out on the network, mapped by endpoint
-            OwnedShardBatchMap ownedPendingBatches;
-            OwnedShardBatchMap::MapType& pendingBatches = ownedPendingBatches.mutableMap();
+            OwnedPointerMap<ShardId, TargetedWriteBatch> ownedPendingBatches;
+            OwnedPointerMap<ShardId, TargetedWriteBatch>::MapType& pendingBatches =
+                ownedPendingBatches.mutableMap();
 
             //
             // Construct the requests.
@@ -197,7 +217,6 @@ void BatchWriteExec::executeBatch(OperationContext* opCtx,
 
                 // If we already have a batch for this shard, wait until the next time
                 const auto& targetShardId = nextBatch->getEndpoint().shardName;
-
                 if (pendingBatches.count(targetShardId))
                     continue;
 
@@ -208,22 +227,17 @@ void BatchWriteExec::executeBatch(OperationContext* opCtx,
 
                     BSONObjBuilder requestBuilder;
                     shardBatchRequest.serialize(&requestBuilder);
-
-                    {
-                        OperationSessionInfo sessionInfo;
-
-                        if (opCtx->getLogicalSessionId()) {
-                            sessionInfo.setSessionId(*opCtx->getLogicalSessionId());
-                        }
-
-                        sessionInfo.setTxnNumber(opCtx->getTxnNumber());
-                        sessionInfo.serialize(&requestBuilder);
-                    }
+                    logical_session_id_helpers::serializeLsidAndTxnNumber(opCtx, &requestBuilder);
 
                     return requestBuilder.obj();
                 }();
 
-                LOG(4) << "Sending write batch to " << targetShardId << ": " << redact(request);
+                LOGV2_DEBUG(22905,
+                            4,
+                            "Sending write batch to {shardId}: {request}",
+                            "Sending write batch",
+                            "shardId"_attr = targetShardId,
+                            "request"_attr = redact(request));
 
                 requests.emplace_back(targetShardId, request);
 
@@ -259,28 +273,9 @@ void BatchWriteExec::executeBatch(OperationContext* opCtx,
                 dassert(pendingBatches.find(response.shardId) != pendingBatches.end());
                 TargetedWriteBatch* batch = pendingBatches.find(response.shardId)->second;
 
-                // First check if we were able to target a shard host.
-                if (!response.shardHostAndPort) {
-                    invariant(!response.swResponse.isOK());
-
-                    // Record a resolve failure
-                    batchOp.noteBatchError(*batch,
-                                           errorFromStatus(response.swResponse.getStatus()));
-
-                    // TODO: It may be necessary to refresh the cache if stale, or maybe just cancel
-                    // and retarget the batch
-                    LOG(4) << "Unable to send write batch to " << batch->getEndpoint().shardName
-                           << causedBy(response.swResponse.getStatus());
-
-                    // We're done with this batch. Clean up when we can't resolve a host.
-                    auto it = childBatches.find(batch->getEndpoint().shardName);
-                    invariant(it != childBatches.end());
-                    delete it->second;
-                    it->second = nullptr;
-                    continue;
-                }
-
-                const auto shardHost(std::move(*response.shardHostAndPort));
+                const auto shardInfo = response.shardHostAndPort
+                    ? response.shardHostAndPort->toString()
+                    : batch->getEndpoint().shardName;
 
                 // Then check if we successfully got a response.
                 Status responseStatus = response.swResponse.getStatus();
@@ -297,10 +292,14 @@ void BatchWriteExec::executeBatch(OperationContext* opCtx,
                 if (responseStatus.isOK()) {
                     TrackedErrors trackedErrors;
                     trackedErrors.startTracking(ErrorCodes::StaleShardVersion);
-                    trackedErrors.startTracking(ErrorCodes::CannotImplicitlyCreateCollection);
+                    trackedErrors.startTracking(ErrorCodes::StaleDbVersion);
 
-                    LOG(4) << "Write results received from " << shardHost.toString() << ": "
-                           << redact(batchedCommandResponse.toStatus());
+                    LOGV2_DEBUG(22907,
+                                4,
+                                "Write results received from {shardInfo}: {response}",
+                                "Write results received",
+                                "shardInfo"_attr = shardInfo,
+                                "status"_attr = redact(batchedCommandResponse.toStatus()));
 
                     // Dispatch was ok, note response
                     batchOp.noteBatchResponse(*batch, batchedCommandResponse, &trackedErrors);
@@ -312,7 +311,7 @@ void BatchWriteExec::executeBatch(OperationContext* opCtx,
                         if (!batchStatus.isOK() &&
                             batchStatus != ErrorCodes::WouldChangeOwningShard) {
                             auto newStatus = batchStatus.withContext(
-                                str::stream() << "Encountered error from " << shardHost.toString()
+                                str::stream() << "Encountered error from " << shardInfo
                                               << " during a transaction");
 
                             batchOp.forgetTargetedBatchesOnTransactionAbortingError();
@@ -329,59 +328,63 @@ void BatchWriteExec::executeBatch(OperationContext* opCtx,
                     }
 
                     // Note if anything was stale
-                    const auto& staleErrors =
+                    const auto& staleShardErrors =
                         trackedErrors.getErrors(ErrorCodes::StaleShardVersion);
-                    if (!staleErrors.empty()) {
-                        noteStaleResponses(staleErrors, &targeter);
-                        ++stats->numStaleBatches;
+                    const auto& staleDbErrors = trackedErrors.getErrors(ErrorCodes::StaleDbVersion);
+
+                    if (!staleShardErrors.empty()) {
+                        invariant(staleDbErrors.empty());
+                        noteStaleShardResponses(staleShardErrors, &targeter);
+                        ++stats->numStaleShardBatches;
                     }
 
-                    const auto& cannotImplicitlyCreateErrors =
-                        trackedErrors.getErrors(ErrorCodes::CannotImplicitlyCreateCollection);
-                    if (!cannotImplicitlyCreateErrors.empty()) {
-                        // This forces the chunk manager to reload so we can attach the correct
-                        // version on retry and make sure we route to the correct shard.
-                        targeter.noteCouldNotTarget();
-
-                        // It is also possible that information about which shard is the primary
-                        // for this collection collection is stale, so refresh the database as
-                        // well.
-                        Grid::get(opCtx)->catalogCache()->invalidateDatabaseEntry(
-                            targeter.getNS().db());
+                    if (!staleDbErrors.empty()) {
+                        invariant(staleShardErrors.empty());
+                        noteStaleDbResponses(staleDbErrors, &targeter);
+                        ++stats->numStaleDbBatches;
                     }
 
-                    // Remember that we successfully wrote to this shard
-                    // NOTE: This will record lastOps for shards where we actually didn't update
-                    // or delete any documents, which preserves old behavior but is conservative
-                    stats->noteWriteAt(shardHost,
-                                       batchedCommandResponse.isLastOpSet()
-                                           ? batchedCommandResponse.getLastOp()
-                                           : repl::OpTime(),
-                                       batchedCommandResponse.isElectionIdSet()
-                                           ? batchedCommandResponse.getElectionId()
-                                           : OID());
+                    if (response.shardHostAndPort) {
+                        // Remember that we successfully wrote to this shard
+                        // NOTE: This will record lastOps for shards where we actually didn't update
+                        // or delete any documents, which preserves old behavior but is conservative
+                        stats->noteWriteAt(*response.shardHostAndPort,
+                                           batchedCommandResponse.isLastOpSet()
+                                               ? batchedCommandResponse.getLastOp()
+                                               : repl::OpTime(),
+                                           batchedCommandResponse.isElectionIdSet()
+                                               ? batchedCommandResponse.getElectionId()
+                                               : OID());
+                    }
                 } else {
                     // Error occurred dispatching, note it
                     const Status status = responseStatus.withContext(
-                        str::stream() << "Write results unavailable from " << shardHost);
+                        str::stream() << "Write results unavailable "
+                                      << (response.shardHostAndPort
+                                              ? "from "
+                                              : "from failing to target a host in the shard ")
+                                      << shardInfo);
 
                     batchOp.noteBatchError(*batch, errorFromStatus(status));
 
-                    LOG(4) << "Unable to receive write results from " << shardHost
-                           << causedBy(redact(status));
+                    LOGV2_DEBUG(22908,
+                                4,
+                                "Unable to receive write results from {shardInfo}: {error}",
+                                "Unable to receive write results",
+                                "shardInfo"_attr = shardInfo,
+                                "error"_attr = redact(status));
 
                     // If we are in a transaction, we must stop immediately (even for unordered).
                     if (TransactionRouter::get(opCtx)) {
                         batchOp.forgetTargetedBatchesOnTransactionAbortingError();
-                        abortBatch = true;
 
                         // Throw when there is a transient transaction error since this should be a
-                        // top
-                        // level error and not just a write error.
+                        // top level error and not just a write error.
                         if (isTransientTransactionError(status.code(), false, false)) {
                             uassertStatusOK(status);
                         }
 
+                        abortBatch = true;
                         break;
                     }
                 }
@@ -402,14 +405,36 @@ void BatchWriteExec::executeBatch(OperationContext* opCtx,
         //
 
         bool targeterChanged = false;
-        Status refreshStatus = targeter.refreshIfNeeded(opCtx, &targeterChanged);
-
-        LOG(4) << "executeBatch targeter changed: " << targeterChanged;
-
-        if (!refreshStatus.isOK()) {
-            // It's okay if we can't refresh, we'll just record errors for the ops if
-            // needed.
-            warning() << "could not refresh targeter" << causedBy(refreshStatus.reason());
+        try {
+            LOGV2_DEBUG_OPTIONS(4817406,
+                                2,
+                                {logv2::LogComponent::kShardMigrationPerf},
+                                "Starting post-migration commit refresh on the router");
+            targeter.refreshIfNeeded(opCtx, &targeterChanged);
+            LOGV2_DEBUG_OPTIONS(4817407,
+                                2,
+                                {logv2::LogComponent::kShardMigrationPerf},
+                                "Finished post-migration commit refresh on the router");
+        } catch (const ExceptionFor<ErrorCodes::StaleEpoch>& ex) {
+            LOGV2_DEBUG_OPTIONS(4817408,
+                                2,
+                                {logv2::LogComponent::kShardMigrationPerf},
+                                "Finished post-migration commit refresh on the router with error",
+                                "error"_attr = redact(ex));
+            batchOp.abortBatch(errorFromStatus(
+                ex.toStatus("collection was dropped in the middle of the operation")));
+            break;
+        } catch (const DBException& ex) {
+            LOGV2_DEBUG_OPTIONS(4817409,
+                                2,
+                                {logv2::LogComponent::kShardMigrationPerf},
+                                "Finished post-migration commit refresh on the router with error",
+                                "error"_attr = redact(ex));
+            // It's okay if we can't refresh, we'll just record errors for the ops if needed
+            LOGV2_WARNING(22911,
+                          "Could not refresh targeter due to {error}",
+                          "Could not refresh targeter",
+                          "error"_attr = redact(ex));
         }
 
         //
@@ -428,27 +453,29 @@ void BatchWriteExec::executeBatch(OperationContext* opCtx,
             batchOp.abortBatch(errorFromStatus(
                 {ErrorCodes::NoProgressMade,
                  str::stream() << "no progress was made executing batch write op in "
-                               << clientRequest.getNS().ns()
-                               << " after "
-                               << kMaxRoundsWithoutProgress
-                               << " rounds ("
-                               << numCompletedOps
-                               << " ops completed in "
-                               << rounds
-                               << " rounds total)"}));
+                               << clientRequest.getNS().ns() << " after "
+                               << kMaxRoundsWithoutProgress << " rounds (" << numCompletedOps
+                               << " ops completed in " << rounds << " rounds total)"}));
             break;
         }
     }
 
+    auto nShardsOwningChunks = batchOp.getNShardsOwningChunks();
+    if (nShardsOwningChunks)
+        stats->noteNumShardsOwningChunks(*nShardsOwningChunks);
+
     batchOp.buildClientResponse(clientResponse);
 
-    LOG(4) << "Finished execution of write batch"
-           << (clientResponse->isErrDetailsSet() ? " with write errors" : "")
-           << (clientResponse->isErrDetailsSet() && clientResponse->isWriteConcernErrorSet()
-                   ? " and"
-                   : "")
-           << (clientResponse->isWriteConcernErrorSet() ? " with write concern error" : "")
-           << " for " << clientRequest.getNS();
+    LOGV2_DEBUG(22910,
+                4,
+                "Finished execution of write batch. Execution {succeededOrFailed}, writeConcern "
+                "{wcSucceededOrFailed} for namespace {namespace}",
+                "Finished execution of write batch",
+                "succeededOrFailed"_attr =
+                    (clientResponse->isErrDetailsSet() ? "failed" : "succeeded"),
+                "wcSucceededOrFailed"_attr =
+                    (clientResponse->isWriteConcernErrorSet() ? "failed" : "succeeded"),
+                "namespace"_attr = clientRequest.getNS());
 }
 
 void BatchWriteExecStats::noteTargetedShard(const ShardId& shardId) {
@@ -461,6 +488,10 @@ void BatchWriteExecStats::noteWriteAt(const HostAndPort& host,
     _writeOpTimes[ConnectionString(host)] = HostOpTime(opTime, electionId);
 }
 
+void BatchWriteExecStats::noteNumShardsOwningChunks(const int nShardsOwningChunks) {
+    _numShardsOwningChunks.emplace(nShardsOwningChunks);
+}
+
 const std::set<ShardId>& BatchWriteExecStats::getTargetedShards() const {
     return _targetedShards;
 }
@@ -469,4 +500,8 @@ const HostOpTimeMap& BatchWriteExecStats::getWriteOpTimes() const {
     return _writeOpTimes;
 }
 
-}  // namespace
+const boost::optional<int> BatchWriteExecStats::getNumShardsOwningChunks() const {
+    return _numShardsOwningChunks;
+}
+
+}  // namespace mongo

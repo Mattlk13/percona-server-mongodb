@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -43,7 +43,6 @@
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/update_zone_key_range_request_type.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -91,25 +90,33 @@ public:
 
     Status checkAuthForCommand(Client* client,
                                const std::string& dbname,
-                               const BSONObj& cmdObj) const override {
-        if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
+                               const BSONObj& cmdObj) const final {
+        auto* as = AuthorizationSession::get(client);
+
+        if (as->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
+                                                 ActionType::enableSharding)) {
+            return Status::OK();
+        }
+
+        // Fallback on permissions to directly modify the shard config.
+        if (!as->isAuthorizedForActionsOnResource(
                 ResourcePattern::forExactNamespace(ShardType::ConfigNS), ActionType::find)) {
-            return Status(ErrorCodes::Unauthorized, "Unauthorized");
+            return {ErrorCodes::Unauthorized, "Unauthorized"};
         }
 
-        if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
+        if (!as->isAuthorizedForActionsOnResource(
                 ResourcePattern::forExactNamespace(TagsType::ConfigNS), ActionType::find)) {
-            return Status(ErrorCodes::Unauthorized, "Unauthorized");
+            return {ErrorCodes::Unauthorized, "Unauthorized"};
         }
 
-        if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
+        if (!as->isAuthorizedForActionsOnResource(
                 ResourcePattern::forExactNamespace(TagsType::ConfigNS), ActionType::update)) {
-            return Status(ErrorCodes::Unauthorized, "Unauthorized");
+            return {ErrorCodes::Unauthorized, "Unauthorized"};
         }
 
-        if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
+        if (!as->isAuthorizedForActionsOnResource(
                 ResourcePattern::forExactNamespace(TagsType::ConfigNS), ActionType::remove)) {
-            return Status(ErrorCodes::Unauthorized, "Unauthorized");
+            return {ErrorCodes::Unauthorized, "Unauthorized"};
         }
 
         return Status::OK();

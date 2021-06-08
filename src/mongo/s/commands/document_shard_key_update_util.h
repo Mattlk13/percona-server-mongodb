@@ -72,20 +72,19 @@ static constexpr StringData kNonDuplicateKeyErrorContext =
  */
 bool updateShardKeyForDocument(OperationContext* opCtx,
                                const NamespaceString& nss,
-                               const WouldChangeOwningShardInfo& documentKeyChangeInfo,
-                               int stmtId);
+                               const WouldChangeOwningShardInfo& documentKeyChangeInfo);
 
 /**
- * Gets the transaction router and starts a transaction on this session. This method is called when
- * WouldChangeOwningShard is thrown for a write that is not in a transaction already.
+ * Starts a transaction on this session. This method is called when WouldChangeOwningShard is thrown
+ * for a write that is not in a transaction already.
  */
-TransactionRouter* startTransactionForShardKeyUpdate(OperationContext* opCtx);
+void startTransactionForShardKeyUpdate(OperationContext* opCtx);
 
 /**
  * Commits the transaction on this session. This method is called to commit the transaction started
  * when WouldChangeOwningShard is thrown for a write that is not in a transaction already.
  */
-BSONObj commitShardKeyUpdateTransaction(OperationContext* opCtx, TransactionRouter* txnRouter);
+BSONObj commitShardKeyUpdateTransaction(OperationContext* opCtx);
 
 /**
  * Creates the BSONObj that will be used to delete the pre-image document. Will also attach
@@ -94,9 +93,7 @@ BSONObj commitShardKeyUpdateTransaction(OperationContext* opCtx, TransactionRout
  * This method should not be called outside of this class. It is only temporarily exposed for
  * intermediary test coverage.
  */
-BSONObj constructShardKeyDeleteCmdObj(const NamespaceString& nss,
-                                      const BSONObj& updatePreImage,
-                                      int stmtId);
+BSONObj constructShardKeyDeleteCmdObj(const NamespaceString& nss, const BSONObj& updatePreImage);
 
 /*
  * Creates the BSONObj that will be used to insert the new document with the post-update image.
@@ -105,8 +102,6 @@ BSONObj constructShardKeyDeleteCmdObj(const NamespaceString& nss,
  * This method should not be called outside of this class. It is only temporarily exposed for
  * intermediary test coverage.
  */
-BSONObj constructShardKeyInsertCmdObj(const NamespaceString& nss,
-                                      const BSONObj& updatePostImage,
-                                      int stmtId);
+BSONObj constructShardKeyInsertCmdObj(const NamespaceString& nss, const BSONObj& updatePostImage);
 }  // namespace documentShardKeyUpdateUtil
 }  // namespace mongo

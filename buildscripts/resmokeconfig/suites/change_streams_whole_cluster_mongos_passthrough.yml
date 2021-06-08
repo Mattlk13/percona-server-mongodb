@@ -3,10 +3,6 @@ test_kind: js_test
 selector:
   roots:
   - jstests/change_streams/**/*.js
-  exclude_files:
-  # This test exercises an internal detail of mongos<->mongod communication and is not expected
-  # to work against a mongos.
-  - jstests/change_streams/report_latest_observed_oplog_timestamp.js
   exclude_with_any_tags:
   ##
   # The next tags correspond to the special errors thrown by the
@@ -16,10 +12,10 @@ selector:
   ##
   # "Cowardly refusing to override write concern of command: ..."
   - assumes_write_concern_unchanged
-  # Transactions not supported on sharded clusters.
-  - uses_transactions
   # Not relevant for whole-cluster change streams.
   - do_not_run_in_whole_cluster_passthrough
+  # Exclude any that assume sharding is disabled
+  - assumes_against_mongod_not_mongos
 
 executor:
   archive:
@@ -60,4 +56,3 @@ executor:
         enableTestCommands: 1
         periodicNoopIntervalSecs: 1
         writePeriodicNoops: true
-    num_rs_nodes_per_shard: 1

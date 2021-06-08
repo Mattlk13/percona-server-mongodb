@@ -29,20 +29,20 @@
 
 #include "mongo/platform/basic.h"
 
+#include <memory>
 #include <set>
 #include <string>
 
 #include "mongo/db/jsobj.h"
 #include "mongo/db/key_generator.h"
 #include "mongo/db/keys_collection_client_sharded.h"
-#include "mongo/db/keys_collection_document.h"
-#include "mongo/db/logical_clock.h"
-#include "mongo/s/catalog/dist_lock_manager_mock.h"
-#include "mongo/s/config_server_test_fixture.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/db/keys_collection_document_gen.h"
+#include "mongo/db/s/config/config_server_test_fixture.h"
+#include "mongo/db/time_proof_service.h"
+#include "mongo/db/vector_clock_mutable.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/clock_source_mock.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 
 namespace mongo {
 namespace {
@@ -52,23 +52,14 @@ protected:
     void setUp() override {
         ConfigServerTestFixture::setUp();
 
-        auto clockSource = stdx::make_unique<ClockSourceMock>();
+        auto clockSource = std::make_unique<ClockSourceMock>();
         operationContext()->getServiceContext()->setFastClockSource(std::move(clockSource));
-        _catalogClient = stdx::make_unique<KeysCollectionClientSharded>(
+        _catalogClient = std::make_unique<KeysCollectionClientSharded>(
             Grid::get(operationContext())->catalogClient());
     }
 
     KeysCollectionClient* catalogClient() const {
         return _catalogClient.get();
-    }
-
-    /**
-     * Intentionally create a DistLockManagerMock, even though this is a config serfver test in
-     * order to avoid the lock pinger thread from executing and accessing uninitialized state.
-     */
-    std::unique_ptr<DistLockManager> makeDistLockManager(
-        std::unique_ptr<DistLockCatalog> distLockCatalog) override {
-        return stdx::make_unique<DistLockManagerMock>(std::move(distLockCatalog));
     }
 
 private:
@@ -79,7 +70,7 @@ TEST_F(KeyGeneratorUpdateTest, ShouldCreate2KeysFromEmpty) {
     KeyGenerator generator("dummy", catalogClient(), Seconds(5));
 
     const LogicalTime currentTime(LogicalTime(Timestamp(100, 2)));
-    LogicalClock::get(operationContext())->setClusterTimeFromTrustedSource(currentTime);
+    VectorClockMutable::get(operationContext())->tickClusterTimeTo(currentTime);
 
     auto generateStatus = generator.generateNewKeysIfNeeded(operationContext());
     ASSERT_OK(generateStatus);
@@ -105,7 +96,7 @@ TEST_F(KeyGeneratorUpdateTest, ShouldPropagateWriteError) {
     KeyGenerator generator("dummy", catalogClient(), Seconds(5));
 
     const LogicalTime currentTime(LogicalTime(Timestamp(100, 2)));
-    LogicalClock::get(operationContext())->setClusterTimeFromTrustedSource(currentTime);
+    VectorClockMutable::get(operationContext())->tickClusterTimeTo(currentTime);
 
     FailPointEnableBlock failWriteBlock("failCollectionInserts");
 
@@ -116,13 +107,13 @@ TEST_F(KeyGeneratorUpdateTest, ShouldPropagateWriteError) {
 TEST_F(KeyGeneratorUpdateTest, ShouldCreateAnotherKeyIfOnlyOneKeyExists) {
     KeyGenerator generator("dummy", catalogClient(), Seconds(5));
 
-    LogicalClock::get(operationContext())
-        ->setClusterTimeFromTrustedSource(LogicalTime(Timestamp(100, 2)));
+    VectorClockMutable::get(operationContext())->tickClusterTimeTo(LogicalTime(Timestamp(100, 2)));
 
-    KeysCollectionDocument origKey1(
-        1, "dummy", TimeProofService::generateRandomKey(), LogicalTime(Timestamp(105, 0)));
+    KeysCollectionDocument origKey1(1);
+    origKey1.setKeysCollectionDocumentBase(
+        {"dummy", TimeProofService::generateRandomKey(), LogicalTime(Timestamp(105, 0))});
     ASSERT_OK(insertToConfigCollection(
-        operationContext(), KeysCollectionDocument::ConfigNS, origKey1.toBSON()));
+        operationContext(), NamespaceString::kKeysCollectionNamespace, origKey1.toBSON()));
 
     {
         auto allKeys = getKeys(operationContext());
@@ -135,7 +126,8 @@ TEST_F(KeyGeneratorUpdateTest, ShouldCreateAnotherKeyIfOnlyOneKeyExists) {
         ASSERT_EQ(Timestamp(105, 0), key1.getExpiresAt().asTimestamp());
     }
 
-    auto currentTime = LogicalClock::get(operationContext())->getClusterTime();
+    const auto currentTime = VectorClock::get(operationContext())->getTime();
+    const auto clusterTime = currentTime.clusterTime();
 
     auto generateStatus = generator.generateNewKeysIfNeeded(operationContext());
     ASSERT_OK(generateStatus);
@@ -152,7 +144,7 @@ TEST_F(KeyGeneratorUpdateTest, ShouldCreateAnotherKeyIfOnlyOneKeyExists) {
         ASSERT_EQ(Timestamp(105, 0), key1.getExpiresAt().asTimestamp());
 
         const auto& key2 = allKeys.back();
-        ASSERT_EQ(currentTime.asTimestamp().asLL(), key2.getKeyId());
+        ASSERT_EQ(clusterTime.asTimestamp().asLL(), key2.getKeyId());
         ASSERT_EQ("dummy", key2.getPurpose());
         ASSERT_EQ(Timestamp(110, 0), key2.getExpiresAt().asTimestamp());
 
@@ -163,18 +155,19 @@ TEST_F(KeyGeneratorUpdateTest, ShouldCreateAnotherKeyIfOnlyOneKeyExists) {
 TEST_F(KeyGeneratorUpdateTest, ShouldCreateAnotherKeyIfNoValidKeyAfterCurrent) {
     KeyGenerator generator("dummy", catalogClient(), Seconds(5));
 
-    LogicalClock::get(operationContext())
-        ->setClusterTimeFromTrustedSource(LogicalTime(Timestamp(108, 2)));
+    VectorClockMutable::get(operationContext())->tickClusterTimeTo(LogicalTime(Timestamp(108, 2)));
 
-    KeysCollectionDocument origKey1(
-        1, "dummy", TimeProofService::generateRandomKey(), LogicalTime(Timestamp(105, 0)));
+    KeysCollectionDocument origKey1(1);
+    origKey1.setKeysCollectionDocumentBase(
+        {"dummy", TimeProofService::generateRandomKey(), LogicalTime(Timestamp(105, 0))});
     ASSERT_OK(insertToConfigCollection(
-        operationContext(), KeysCollectionDocument::ConfigNS, origKey1.toBSON()));
+        operationContext(), NamespaceString::kKeysCollectionNamespace, origKey1.toBSON()));
 
-    KeysCollectionDocument origKey2(
-        2, "dummy", TimeProofService::generateRandomKey(), LogicalTime(Timestamp(110, 0)));
+    KeysCollectionDocument origKey2(2);
+    origKey2.setKeysCollectionDocumentBase(
+        {"dummy", TimeProofService::generateRandomKey(), LogicalTime(Timestamp(110, 0))});
     ASSERT_OK(insertToConfigCollection(
-        operationContext(), KeysCollectionDocument::ConfigNS, origKey2.toBSON()));
+        operationContext(), NamespaceString::kKeysCollectionNamespace, origKey2.toBSON()));
 
     {
         auto allKeys = getKeys(operationContext());
@@ -192,7 +185,8 @@ TEST_F(KeyGeneratorUpdateTest, ShouldCreateAnotherKeyIfNoValidKeyAfterCurrent) {
         ASSERT_EQ(Timestamp(110, 0), key2.getExpiresAt().asTimestamp());
     }
 
-    auto currentTime = LogicalClock::get(operationContext())->getClusterTime();
+    const auto currentTime = VectorClock::get(operationContext())->getTime();
+    const auto clusterTime = currentTime.clusterTime();
 
     auto generateStatus = generator.generateNewKeysIfNeeded(operationContext());
     ASSERT_OK(generateStatus);
@@ -233,7 +227,7 @@ TEST_F(KeyGeneratorUpdateTest, ShouldCreateAnotherKeyIfNoValidKeyAfterCurrent) {
     {
         ++citer;
         const auto& key = *citer;
-        ASSERT_EQ(currentTime.asTimestamp().asLL(), key.getKeyId());
+        ASSERT_EQ(clusterTime.asTimestamp().asLL(), key.getKeyId());
         ASSERT_EQ("dummy", key.getPurpose());
         ASSERT_EQ(Timestamp(115, 0), key.getExpiresAt().asTimestamp());
 
@@ -246,18 +240,19 @@ TEST_F(KeyGeneratorUpdateTest, ShouldCreateAnotherKeyIfNoValidKeyAfterCurrent) {
 TEST_F(KeyGeneratorUpdateTest, ShouldCreate2KeysIfAllKeysAreExpired) {
     KeyGenerator generator("dummy", catalogClient(), Seconds(5));
 
-    LogicalClock::get(operationContext())
-        ->setClusterTimeFromTrustedSource(LogicalTime(Timestamp(120, 2)));
+    VectorClockMutable::get(operationContext())->tickClusterTimeTo(LogicalTime(Timestamp(120, 2)));
 
-    KeysCollectionDocument origKey1(
-        1, "dummy", TimeProofService::generateRandomKey(), LogicalTime(Timestamp(105, 0)));
+    KeysCollectionDocument origKey1(1);
+    origKey1.setKeysCollectionDocumentBase(
+        {"dummy", TimeProofService::generateRandomKey(), LogicalTime(Timestamp(105, 0))});
     ASSERT_OK(insertToConfigCollection(
-        operationContext(), KeysCollectionDocument::ConfigNS, origKey1.toBSON()));
+        operationContext(), NamespaceString::kKeysCollectionNamespace, origKey1.toBSON()));
 
-    KeysCollectionDocument origKey2(
-        2, "dummy", TimeProofService::generateRandomKey(), LogicalTime(Timestamp(110, 0)));
+    KeysCollectionDocument origKey2(2);
+    origKey2.setKeysCollectionDocumentBase(
+        {"dummy", TimeProofService::generateRandomKey(), LogicalTime(Timestamp(110, 0))});
     ASSERT_OK(insertToConfigCollection(
-        operationContext(), KeysCollectionDocument::ConfigNS, origKey2.toBSON()));
+        operationContext(), NamespaceString::kKeysCollectionNamespace, origKey2.toBSON()));
 
     {
         auto allKeys = getKeys(operationContext());
@@ -275,7 +270,8 @@ TEST_F(KeyGeneratorUpdateTest, ShouldCreate2KeysIfAllKeysAreExpired) {
         ASSERT_EQ(Timestamp(110, 0), key2.getExpiresAt().asTimestamp());
     }
 
-    auto currentTime = LogicalClock::get(operationContext())->getClusterTime();
+    const auto currentTime = VectorClock::get(operationContext())->getTime();
+    const auto clusterTime = currentTime.clusterTime();
 
     auto generateStatus = generator.generateNewKeysIfNeeded(operationContext());
     ASSERT_OK(generateStatus);
@@ -316,7 +312,7 @@ TEST_F(KeyGeneratorUpdateTest, ShouldCreate2KeysIfAllKeysAreExpired) {
     {
         ++citer;
         const auto& key = *citer;
-        ASSERT_EQ(currentTime.asTimestamp().asLL(), key.getKeyId());
+        ASSERT_EQ(clusterTime.asTimestamp().asLL(), key.getKeyId());
         ASSERT_EQ("dummy", key.getPurpose());
         ASSERT_EQ(Timestamp(125, 0), key.getExpiresAt().asTimestamp());
 
@@ -328,7 +324,7 @@ TEST_F(KeyGeneratorUpdateTest, ShouldCreate2KeysIfAllKeysAreExpired) {
     {
         ++citer;
         const auto& key = *citer;
-        ASSERT_EQ(currentTime.asTimestamp().asLL() + 1, key.getKeyId());
+        ASSERT_EQ(clusterTime.asTimestamp().asLL() + 1, key.getKeyId());
         ASSERT_EQ("dummy", key.getPurpose());
         ASSERT_NE(origKey1.getKey(), key.getKey());
         ASSERT_NE(origKey2.getKey(), key.getKey());
@@ -344,17 +340,19 @@ TEST_F(KeyGeneratorUpdateTest, ShouldNotCreateNewKeyIfThereAre2UnexpiredKeys) {
     KeyGenerator generator("dummy", catalogClient(), Seconds(5));
 
     const LogicalTime currentTime(LogicalTime(Timestamp(100, 2)));
-    LogicalClock::get(operationContext())->setClusterTimeFromTrustedSource(currentTime);
+    VectorClockMutable::get(operationContext())->tickClusterTimeTo(currentTime);
 
-    KeysCollectionDocument origKey1(
-        1, "dummy", TimeProofService::generateRandomKey(), LogicalTime(Timestamp(105, 0)));
+    KeysCollectionDocument origKey1(1);
+    origKey1.setKeysCollectionDocumentBase(
+        {"dummy", TimeProofService::generateRandomKey(), LogicalTime(Timestamp(105, 0))});
     ASSERT_OK(insertToConfigCollection(
-        operationContext(), KeysCollectionDocument::ConfigNS, origKey1.toBSON()));
+        operationContext(), NamespaceString::kKeysCollectionNamespace, origKey1.toBSON()));
 
-    KeysCollectionDocument origKey2(
-        2, "dummy", TimeProofService::generateRandomKey(), LogicalTime(Timestamp(110, 0)));
+    KeysCollectionDocument origKey2(2);
+    origKey2.setKeysCollectionDocumentBase(
+        {"dummy", TimeProofService::generateRandomKey(), LogicalTime(Timestamp(110, 0))});
     ASSERT_OK(insertToConfigCollection(
-        operationContext(), KeysCollectionDocument::ConfigNS, origKey2.toBSON()));
+        operationContext(), NamespaceString::kKeysCollectionNamespace, origKey2.toBSON()));
 
     {
         auto allKeys = getKeys(operationContext());
@@ -403,7 +401,7 @@ TEST_F(KeyGeneratorUpdateTest, ShouldNotCreateKeysWithDisableKeyGenerationFailPo
     KeyGenerator generator("dummy", catalogClient(), Seconds(5));
 
     const LogicalTime currentTime(LogicalTime(Timestamp(100, 0)));
-    LogicalClock::get(operationContext())->setClusterTimeFromTrustedSource(currentTime);
+    VectorClockMutable::get(operationContext())->tickClusterTimeTo(currentTime);
 
     {
         FailPointEnableBlock failKeyGenerationBlock("disableKeyGeneration");

@@ -31,7 +31,7 @@ Copyright (C) 2018-present Percona and/or its affiliates. All rights reserved.
 
 #include "mongo/db/redaction_parameter_gen.h"
 #include "mongo/db/server_options.h"
-#include "mongo/logger/logger.h"
+#include "mongo/logv2/log_util.h"
 
 namespace mongo {
 
@@ -40,13 +40,13 @@ namespace mongo {
 void RedactClientLogDataParameter::append(OperationContext* txn,
                                    BSONObjBuilder& b,
                                    const std::string& name) {
-    b.append(name, logger::globalLogDomain()->shouldRedactLogs());
+    b.append(name, logv2::shouldRedactLogs());
 }
 
 namespace {
 
 Status _set(bool v) {
-    logger::globalLogDomain()->setShouldRedactLogs(v);
+    logv2::setShouldRedactLogs(v);
     return Status::OK();
 }
 

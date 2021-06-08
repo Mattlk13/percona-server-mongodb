@@ -28,7 +28,7 @@
  */
 
 #include "mongo/util/assert_util.h"
-#include "mongo/util/boost_assert_shim.h"
+#include "mongo/util/shim_boost_assert.h"
 
 #if defined(BOOST_ENABLE_ASSERT_DEBUG_HANDLER) && !defined(NDEBUG)
 
@@ -40,8 +40,11 @@ struct BoostAssertImpl {
                 invariantFailed(expr, file, line);
             };
 
-        BoostAssertFuncs::global().assertMsgFunc = [](
-            char const* expr, char const* msg, char const* function, char const* file, long line) {
+        BoostAssertFuncs::global().assertMsgFunc = [](char const* expr,
+                                                      char const* msg,
+                                                      char const* function,
+                                                      char const* file,
+                                                      long line) {
             invariantFailedWithMsg(expr, msg, file, line);
         };
     }

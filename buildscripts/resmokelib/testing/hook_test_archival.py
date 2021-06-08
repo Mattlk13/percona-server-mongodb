@@ -3,9 +3,10 @@
 import os
 import threading
 
-from .. import config
-from .. import utils
-from ..utils import globstar
+from buildscripts.resmokelib import config
+from buildscripts.resmokelib import errors
+from buildscripts.resmokelib import utils
+from buildscripts.resmokelib.utils import globstar
 
 
 class HookTestArchival(object):
@@ -36,54 +37,49 @@ class HookTestArchival(object):
             elif archive_config["hooks"]:
                 for hook in hooks:
                     self.hooks.append(hook["class"])
-
         self._tests_repeat = {}
         self._lock = threading.Lock()
 
-    def _should_archive(self, success):
-        """Return True if failed test or 'on_success' is True."""
-        return not success or self.on_success
+    def archive(self, logger, result, manager):
+        """
+        Archive data files for hooks or tests.
 
-    def _archive_hook(self, logger, hook, test, success):
-        """Provide helper to archive hooks."""
-        hook_match = hook.REGISTERED_NAME in self.hooks
-        if not hook_match or not self._should_archive(success):
+        :param logger: Where the logging output should be placed.
+        :param result: A TestResult named tuple containing the test, hook, and outcome.
+        :param manager: FixtureTestCaseManager object for the calling Job.
+        """
+
+        success = result.success
+        should_archive = (config.ARCHIVE_FILE and self.archive_instance
+                          and (not success or self.on_success))
+
+        if not should_archive:
             return
 
-        test_name = "{}:{}".format(test.short_name(), hook.REGISTERED_NAME)
-        self._archive_hook_or_test(logger, test_name, test)
-
-    def _archive_test(self, logger, test, success):
-        """Provide helper to archive tests."""
-        test_name = test.test_name
-
-        if self.archive_all:
-            test_match = True
+        if result.hook and result.hook.REGISTERED_NAME in self.hooks:
+            test_name = "{}:{}".format(result.test.short_name(), result.hook.REGISTERED_NAME)
+            should_archive = True
         else:
-            test_match = False
-            for arch_test in self.tests:
-                # Ensure that the test_name is in the same format as the arch_test.
-                if os.path.normpath(test_name) == os.path.normpath(arch_test):
-                    test_match = True
-                    break
+            test_name = result.test.test_name
+            if self.archive_all:
+                should_archive = True
+            else:
+                should_archive = False
+                for arch_test in self.tests:
+                    # Ensure that the test_name is in the same format as the arch_test.
+                    if os.path.normpath(test_name) == os.path.normpath(arch_test):
+                        should_archive = True
+                        break
 
-        if not test_match or not self._should_archive(success):
-            return
+        if should_archive or config.FORCE_ARCHIVE_ALL_DATA_FILES:
+            self._archive_hook_or_test(logger, test_name, result.test, manager)
 
-        self._archive_hook_or_test(logger, test_name, test)
-
-    def archive(self, logger, test, success, hook=None):
-        """Archive data files for hooks or tests."""
-        if not config.ARCHIVE_FILE or not self.archive_instance:
-            return
-        if hook:
-            self._archive_hook(logger, hook, test, success)
-        else:
-            self._archive_test(logger, test, success)
-
-    def _archive_hook_or_test(self, logger, test_name, test):
+    def _archive_hook_or_test(self, logger, test_name, test, manager):
         """Trigger archive of data files for a test or hook."""
 
+        # We can still attempt archiving even if the teardown fails.
+        if not manager.teardown_fixture(logger, abort=True):
+            logger.warning("Error while aborting test fixtures; data files may be invalid.")
         with self._lock:
             # Test repeat number is how many times the particular test has been archived.
             if test_name not in self._tests_repeat:
@@ -111,3 +107,6 @@ class HookTestArchival(object):
             logger.warning("Archive failed for %s: %s", test_name, message)
         else:
             logger.info("Archive succeeded for %s: %s", test_name, message)
+
+        if not manager.setup_fixture(logger):
+            raise errors.StopExecution("Error while restarting test fixtures after archiving.")

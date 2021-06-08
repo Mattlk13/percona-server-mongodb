@@ -54,6 +54,8 @@ public:
     void startup() override;
     void shutdown() override;
     void join() override;
+    SharedSemiFuture<void> joinAsync() override;
+    bool isShuttingDown() const override;
     void appendDiagnosticBSON(BSONObjBuilder* builder) const override;
     Date_t now() override;
     StatusWith<EventHandle> makeEvent() override;
@@ -65,9 +67,15 @@ public:
                                              Date_t deadline) override;
     StatusWith<CallbackHandle> scheduleWork(CallbackFn&& work) override;
     StatusWith<CallbackHandle> scheduleWorkAt(Date_t when, CallbackFn&& work) override;
-    StatusWith<CallbackHandle> scheduleRemoteCommand(const executor::RemoteCommandRequest& request,
-                                                     const RemoteCommandCallbackFn& cb,
-                                                     const BatonHandle& baton = nullptr) override;
+    StatusWith<CallbackHandle> scheduleRemoteCommandOnAny(
+        const executor::RemoteCommandRequestOnAny& request,
+        const RemoteCommandOnAnyCallbackFn& cb,
+        const BatonHandle& baton = nullptr) override;
+    StatusWith<CallbackHandle> scheduleExhaustRemoteCommandOnAny(
+        const executor::RemoteCommandRequestOnAny& request,
+        const RemoteCommandOnAnyCallbackFn& cb,
+        const BatonHandle& baton = nullptr) override;
+    bool hasTasks() override;
     void cancel(const CallbackHandle& cbHandle) override;
     void wait(const CallbackHandle& cbHandle,
               Interruptible* interruptible = Interruptible::notInterruptible()) override;
@@ -75,7 +83,7 @@ public:
 
 private:
     // Not owned by us.
-    executor::TaskExecutor* _executor;
+    AtomicWord<executor::TaskExecutor*> _executor;
 };
 
 }  // namespace unittest

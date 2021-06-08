@@ -32,6 +32,7 @@
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/expression_text_base.h"
 #include "mongo/db/matcher/expression_where_base.h"
+#include "mongo/db/pipeline/expression_context.h"
 
 namespace mongo {
 
@@ -43,9 +44,11 @@ class ExtensionsCallback {
 public:
     virtual ~ExtensionsCallback() {}
 
-    virtual StatusWithMatchExpression parseText(BSONElement text) const = 0;
-
-    virtual StatusWithMatchExpression parseWhere(BSONElement where) const = 0;
+    virtual std::unique_ptr<MatchExpression> createText(
+        TextMatchExpressionBase::TextParams text) const = 0;
+    virtual std::unique_ptr<MatchExpression> createWhere(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        WhereMatchExpressionBase::WhereParams where) const = 0;
 
     /**
      * Returns true if extensions (e.g. $text and $where) are allowed but are converted into no-ops.
@@ -56,6 +59,11 @@ public:
     virtual bool hasNoopExtensions() const {
         return false;
     }
+
+    // Convenience wrappers for BSON.
+    StatusWithMatchExpression parseText(BSONElement text) const;
+    StatusWithMatchExpression parseWhere(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                         BSONElement where) const;
 
 protected:
     /**

@@ -316,8 +316,7 @@ void ValueWriter::_writeObject(BSONObjBuilder* b,
 
             if (scope->getProto<CodeInfo>().getJSClass() == jsclass) {
                 if (o.hasOwnField(InternedString::scope)  // CodeWScope
-                    &&
-                    o.type(InternedString::scope) == mongo::Object) {
+                    && o.type(InternedString::scope) == mongo::Object) {
                     if (o.type(InternedString::code) != mongo::String) {
                         uasserted(ErrorCodes::BadValue, "code must be a string");
                     }
@@ -360,10 +359,14 @@ void ValueWriter::_writeObject(BSONObjBuilder* b,
 
                 auto binData = base64::decode(*str);
 
+                auto subType = o.getNumber(InternedString::type);
+                uassert(5677700,
+                        "BinData sub type must be between 0 and 255",
+                        subType >= 0 && subType <= 255);
+
                 b->appendBinData(sd,
                                  binData.size(),
-                                 static_cast<mongo::BinDataType>(
-                                     static_cast<int>(o.getNumber(InternedString::type))),
+                                 static_cast<mongo::BinDataType>(static_cast<int>(subType)),
                                  binData.c_str());
 
                 return;

@@ -31,21 +31,25 @@
 
 #include "mongo/db/pipeline/accumulator.h"
 
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/accumulation_statement.h"
 #include "mongo/db/pipeline/expression.h"
-#include "mongo/db/pipeline/value.h"
+#include "mongo/db/pipeline/window_function/window_function_expression.h"
+#include "mongo/db/pipeline/window_function/window_function_min_max.h"
 
 namespace mongo {
 
 using boost::intrusive_ptr;
 
-REGISTER_ACCUMULATOR(max, AccumulatorMax::create);
-REGISTER_ACCUMULATOR(min, AccumulatorMin::create);
+REGISTER_ACCUMULATOR(max, genericParseSingleExpressionAccumulator<AccumulatorMax>);
+REGISTER_ACCUMULATOR(min, genericParseSingleExpressionAccumulator<AccumulatorMin>);
 REGISTER_EXPRESSION(max, ExpressionFromAccumulator<AccumulatorMax>::parse);
 REGISTER_EXPRESSION(min, ExpressionFromAccumulator<AccumulatorMin>::parse);
+REGISTER_REMOVABLE_WINDOW_FUNCTION(max, AccumulatorMax, WindowFunctionMax);
+REGISTER_REMOVABLE_WINDOW_FUNCTION(min, AccumulatorMin, WindowFunctionMin);
 
 const char* AccumulatorMinMax::getOpName() const {
-    if (_sense == 1)
+    if (_sense == Sense::kMin)
         return "$min";
     return "$max";
 }
@@ -69,9 +73,8 @@ Value AccumulatorMinMax::getValue(bool toBeMerged) {
     return _val;
 }
 
-AccumulatorMinMax::AccumulatorMinMax(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                     Sense sense)
-    : Accumulator(expCtx), _sense(sense) {
+AccumulatorMinMax::AccumulatorMinMax(ExpressionContext* const expCtx, Sense sense)
+    : AccumulatorState(expCtx), _sense(sense) {
     _memUsageBytes = sizeof(*this);
 }
 
@@ -80,13 +83,11 @@ void AccumulatorMinMax::reset() {
     _memUsageBytes = sizeof(*this);
 }
 
-intrusive_ptr<Accumulator> AccumulatorMin::create(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+intrusive_ptr<AccumulatorState> AccumulatorMin::create(ExpressionContext* const expCtx) {
     return new AccumulatorMin(expCtx);
 }
 
-intrusive_ptr<Accumulator> AccumulatorMax::create(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+intrusive_ptr<AccumulatorState> AccumulatorMax::create(ExpressionContext* const expCtx) {
     return new AccumulatorMax(expCtx);
 }
-}
+}  // namespace mongo

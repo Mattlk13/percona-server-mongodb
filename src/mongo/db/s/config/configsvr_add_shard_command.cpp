@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -42,16 +42,13 @@
 #include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/catalog/type_shard.h"
-#include "mongo/s/grid.h"
 #include "mongo/s/request_types/add_shard_request_type.h"
-#include "mongo/util/log.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
 namespace {
-
-using std::string;
 
 const long long kMaxSizeMBDefault = 0;
 
@@ -96,6 +93,11 @@ public:
         uassert(ErrorCodes::IllegalOperation,
                 "_configsvrAddShard can only be run on config servers",
                 serverGlobalParams.clusterRole == ClusterRole::ConfigServer);
+        uassert(
+            ErrorCodes::InvalidOptions,
+            str::stream() << "_configsvrAddShard must be called with majority writeConcern, got "
+                          << cmdObj,
+            opCtx->getWriteConcern().wMode == WriteConcernOptions::kMajority);
 
         // Set the operation context read concern level to local for reads into the config database.
         repl::ReadConcernArgs::get(opCtx) =
@@ -111,26 +113,24 @@ public:
         auto validationStatus = parsedRequest.validate(rsConfig.isLocalHostAllowed());
         uassertStatusOK(validationStatus);
 
-        uassert(ErrorCodes::InvalidOptions,
-                str::stream() << "addShard must be called with majority writeConcern, got "
-                              << cmdObj,
-                opCtx->getWriteConcern().wMode == WriteConcernOptions::kMajority);
-
         audit::logAddShard(Client::getCurrent(),
                            parsedRequest.hasName() ? parsedRequest.getName() : "",
                            parsedRequest.getConnString().toString(),
                            parsedRequest.hasMaxSize() ? parsedRequest.getMaxSize()
                                                       : kMaxSizeMBDefault);
 
-        StatusWith<string> addShardResult = ShardingCatalogManager::get(opCtx)->addShard(
+        StatusWith<std::string> addShardResult = ShardingCatalogManager::get(opCtx)->addShard(
             opCtx,
             parsedRequest.hasName() ? &parsedRequest.getName() : nullptr,
             parsedRequest.getConnString(),
             parsedRequest.hasMaxSize() ? parsedRequest.getMaxSize() : kMaxSizeMBDefault);
 
         if (!addShardResult.isOK()) {
-            log() << "addShard request '" << parsedRequest << "'"
-                  << "failed" << causedBy(addShardResult.getStatus());
+            LOGV2(21920,
+                  "addShard request '{request}' failed: {error}",
+                  "addShard request failed",
+                  "request"_attr = parsedRequest,
+                  "error"_attr = addShardResult.getStatus());
             uassertStatusOK(addShardResult.getStatus());
         }
 

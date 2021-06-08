@@ -52,6 +52,5 @@ MONGO_STARTUP_OPTIONS_STORE(InMemoryOptions)(InitializerContext* context) {
         std::cerr << "try '" << context->args()[0] << " --help' for more information" << std::endl;
         ::_exit(EXIT_BADOPTIONS);
     }
-    return Status::OK();
 }
 }

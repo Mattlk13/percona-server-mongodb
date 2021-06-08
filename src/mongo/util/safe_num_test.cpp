@@ -30,7 +30,6 @@
 #include <limits>
 
 #include "mongo/platform/basic.h"
-#undef MONGO_PCH_WHITELISTED  // for malloc/realloc pulled from bson
 
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsontypes.h"
@@ -40,8 +39,8 @@
 
 namespace {
 
-using mongo::SafeNum;
 using mongo::Decimal128;
+using mongo::SafeNum;
 
 TEST(Basics, Initialization) {
     const SafeNum numInt(0);

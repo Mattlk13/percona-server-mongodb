@@ -1,22 +1,32 @@
 // Tests that an aggregate sent with batchSize: 0 will still obey the write concern sent on the
 // original request, even though the writes happen in the getMore.
 (function() {
-    "use strict";
+"use strict";
 
-    load("jstests/aggregation/extras/out_helpers.js");  // For withEachKindOfWriteStage.
-    load("jstests/libs/write_concern_util.js");         // For [stop|restart]ServerReplication.
+load("jstests/aggregation/extras/merge_helpers.js");  // For withEachKindOfWriteStage.
+load("jstests/libs/write_concern_util.js");           // For [stop|restart]ServerReplication.
 
-    // Start a replica set with two nodes: one with the default configuration and one with priority
-    // zero to ensure we don't have any elections.
-    const rst = new ReplSetTest({nodes: [{}, {rsConfig: {priority: 0}}]});
-    rst.startSet();
-    rst.initiate();
+// Start a replica set with two nodes: one with the default configuration and one with priority
+// zero to ensure we don't have any elections.
+const rst = new ReplSetTest({nodes: [{}, {rsConfig: {priority: 0}}]});
+rst.startSet();
+rst.initiate();
 
-    const testDB = rst.getPrimary().getDB("test");
-    const source = testDB.agg_write_concern_zero_batch_size;
-    const target = testDB.agg_write_concern_zero_batch_size_target;
-    assert.commandWorked(source.insert([{_id: 0}, {_id: 1}, {_id: 2}]));
+// The default WC is majority and stopServerReplication will prevent satisfying any majority writes.
+assert.commandWorked(rst.getPrimary().adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
 
+const testDB = rst.getPrimary().getDB("test");
+const source = testDB.agg_write_concern_zero_batch_size;
+const target = testDB.agg_write_concern_zero_batch_size_target;
+assert.commandWorked(source.insert([{_id: 0}, {_id: 1}, {_id: 2}]));
+
+// This test will cause commands to fail with writeConcern timeout. This normally triggers the
+// hang analyzer, but we do not want to run it on expected timeouts. Thus we temporarily disable
+// it.
+MongoRunner.runHangAnalyzer.disable();
+
+try {
     withEachKindOfWriteStage(target, (stageSpec) => {
         assert.commandWorked(target.remove({}));
 
@@ -68,6 +78,9 @@
 
         restartServerReplication(rst.getSecondary());
     });
+} finally {
+    MongoRunner.runHangAnalyzer.enable();
+}
 
-    rst.stopSet();
+rst.stopSet();
 }());

@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
 import os, re, sys, textwrap
-from dist import compare_srcfile
+from dist import compare_srcfile, format_srcfile
 import log_data
 
 # Temporary file.
@@ -85,6 +85,19 @@ def printf_setup(f, i, nl_indent):
 
 def n_setup(f):
     return len(field_types[f[0]][4])
+
+# Check for an operation that has a file id type. Redact any user data
+# if the redact flag is set, but print operations for file id 0, known
+# to be the metadata.
+def check_redact(optype):
+    for f  in optype.fields:
+        if f[0] == 'uint32_id':
+            redact_str = '\tif (!FLD_ISSET(args->flags, WT_TXN_PRINTLOG_UNREDACT) && '
+            redact_str += '%s != WT_METAFILE_ID) {\n' % (f[1])
+            redact_str += '\t\tWT_RET(__wt_fprintf(session, args->fs, " REDACTED"));\n'
+            redact_str += '\t\treturn (0);\n\t}\n'
+            return redact_str
+    return ''
 
 # Create a printf line, with an optional setup function.
 # ishex indicates that the the field name in the output is modified
@@ -287,6 +300,7 @@ __wt_logop_%(name)s_print(WT_SESSION_IMPL *session,
 \t%(arg_init)sWT_RET(__wt_logop_%(name)s_unpack(
 \t    session, pp, end%(arg_addrs)s));
 
+\t%(redact)s
 \tWT_RET(__wt_fprintf(session, args->fs,
 \t    " \\"optype\\": \\"%(name)s\\",\\n"));
 %(print_args)s
@@ -303,6 +317,7 @@ __wt_logop_%(name)s_print(WT_SESSION_IMPL *session,
     'arg_fini' : ('\nerr:\t__wt_free(session, escaped);\n\treturn (ret);'
     if has_escape(optype.fields) else '\treturn (0);'),
     'arg_addrs' : ''.join(', &%s' % f[1] for f in optype.fields),
+    'redact' : check_redact(optype),
     'print_args' : ('\t' + '\n\t'.join(printf_line(f, optype, i, s)
         for i,f in enumerate(optype.fields) for s in range(0, n_setup(f)))
         if optype.fields else ''),
@@ -333,7 +348,7 @@ for optype in log_data.optypes:
 })
 
 tfile.write('''
-\tWT_ILLEGAL_VALUE(session, optype);
+\tdefault:\n\t\treturn (__wt_illegal_value(session, optype));
 \t}
 
 \treturn (0);
@@ -341,4 +356,5 @@ tfile.write('''
 ''')
 
 tfile.close()
+format_srcfile(tmp_file)
 compare_srcfile(tmp_file, f)

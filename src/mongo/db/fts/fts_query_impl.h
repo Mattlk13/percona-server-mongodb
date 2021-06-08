@@ -85,5 +85,5 @@ private:
     std::vector<std::string> _negatedPhrases;
     std::set<std::string> _termsForBounds;
 };
-}
-}
+}  // namespace fts
+}  // namespace mongo

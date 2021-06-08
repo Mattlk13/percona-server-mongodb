@@ -90,6 +90,14 @@ public:
         return _collator.get();
     }
 
+    /**
+     * Returns 'true' if this view is a time-series collection. That is, it is backed by a
+     * time-series buckets collection.
+     */
+    bool timeseries() const {
+        return _viewOnNss.isTimeseriesBucketsCollection();
+    }
+
     void setViewOn(const NamespaceString& viewOnNss);
 
     /**

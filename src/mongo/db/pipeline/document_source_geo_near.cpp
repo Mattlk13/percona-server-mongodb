@@ -27,27 +27,27 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/pipeline/document_source_geo_near.h"
 
-#include "mongo/db/pipeline/document.h"
+#include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/pipeline/document_source_sort.h"
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 
 using boost::intrusive_ptr;
 
 constexpr StringData DocumentSourceGeoNear::kKeyFieldName;
-constexpr const char* DocumentSourceGeoNear::kStageName;
 
 REGISTER_DOCUMENT_SOURCE(geoNear,
                          LiteParsedDocumentSourceDefault::parse,
-                         DocumentSourceGeoNear::createFromBson);
+                         DocumentSourceGeoNear::createFromBson,
+                         LiteParsedDocumentSource::AllowedWithApiStrict::kAlways);
 
 Value DocumentSourceGeoNear::serialize(boost::optional<ExplainOptions::Verbosity> explain) const {
     MutableDocument result;
@@ -95,6 +95,10 @@ intrusive_ptr<DocumentSource> DocumentSourceGeoNear::createFromBson(
     intrusive_ptr<DocumentSourceGeoNear> out = new DocumentSourceGeoNear(pCtx);
     out->parseOptions(elem.embeddedObjectUserCheck());
     return out;
+}
+
+bool DocumentSourceGeoNear::hasQuery() const {
+    return true;
 }
 
 void DocumentSourceGeoNear::parseOptions(BSONObj options) {
@@ -172,7 +176,7 @@ void DocumentSourceGeoNear::parseOptions(BSONObj options) {
     }
 
     if (options.hasField("uniqueDocs"))
-        warning() << "ignoring deprecated uniqueDocs option in $geoNear aggregation stage";
+        LOGV2_WARNING(23758, "ignoring deprecated uniqueDocs option in $geoNear aggregation stage");
 
     if (auto keyElt = options[kKeyFieldName]) {
         uassert(ErrorCodes::TypeMismatch,
@@ -226,15 +230,15 @@ DepsTracker::State DocumentSourceGeoNear::getDependencies(DepsTracker* deps) con
     // produced by this stage, and we could inform the query system that it need not include it in
     // its response. For now, assume that we require the entire document as well as the appropriate
     // geoNear metadata.
-    deps->setNeedsMetadata(DepsTracker::MetadataType::GEO_NEAR_DISTANCE, true);
-    deps->setNeedsMetadata(DepsTracker::MetadataType::GEO_NEAR_POINT, needsGeoNearPoint());
+    deps->setNeedsMetadata(DocumentMetadataFields::kGeoNearDist, true);
+    deps->setNeedsMetadata(DocumentMetadataFields::kGeoNearPoint, needsGeoNearPoint());
 
     deps->needWholeDocument = true;
     return DepsTracker::State::EXHAUSTIVE_FIELDS;
 }
 
 DocumentSourceGeoNear::DocumentSourceGeoNear(const intrusive_ptr<ExpressionContext>& pExpCtx)
-    : DocumentSource(pExpCtx), coordsIsArray(false), spherical(false) {}
+    : DocumentSource(kStageName, pExpCtx), coordsIsArray(false), spherical(false) {}
 
 boost::optional<DocumentSource::DistributedPlanLogic>
 DocumentSourceGeoNear::distributedPlanLogic() {

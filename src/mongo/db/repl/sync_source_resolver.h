@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include <functional>
 #include <memory>
 
 #include "mongo/base/status.h"
@@ -36,10 +37,10 @@
 #include "mongo/client/fetcher.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/replication_process.h"
 #include "mongo/executor/task_executor.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/time_support.h"
 
@@ -73,8 +74,9 @@ struct SyncSourceResolverResponse {
 
     // Rollback ID of the selected sync source.
     // The rbid is fetched before the required optime so callers can be sure that as long as the
-    // rbid is the same, the required optime is still present.
-    int rbid;
+    // rbid is the same, the required optime is still present. The rbid will remain set to
+    // 'kUninitializedRollbackId' if _requiredOpTime is null.
+    int rbid = ReplicationProcess::kUninitializedRollbackId;
 
     bool isOK() {
         return syncSourceStatus.isOK();
@@ -97,17 +99,17 @@ class SyncSourceResolver {
 public:
     static const NamespaceString kLocalOplogNss;
     static const Seconds kFetcherTimeout;
-    static const Seconds kFetcherErrorBlacklistDuration;
-    static const Seconds kOplogEmptyBlacklistDuration;
-    static const Seconds kFirstOplogEntryEmptyBlacklistDuration;
-    static const Seconds kFirstOplogEntryNullTimestampBlacklistDuration;
-    static const Minutes kTooStaleBlacklistDuration;
-    static const Seconds kNoRequiredOpTimeBlacklistDuration;
+    static const Seconds kFetcherErrorDenylistDuration;
+    static const Seconds kOplogEmptyDenylistDuration;
+    static const Seconds kFirstOplogEntryEmptyDenylistDuration;
+    static const Seconds kFirstOplogEntryNullTimestampDenylistDuration;
+    static const Minutes kTooStaleDenylistDuration;
+    static const Seconds kNoRequiredOpTimeDenylistDuration;
 
     /**
      * Callback function to report final status of resolving sync source.
      */
-    typedef stdx::function<void(const SyncSourceResolverResponse&)> OnCompletionFn;
+    typedef std::function<void(const SyncSourceResolverResponse&)> OnCompletionFn;
 
     SyncSourceResolver(executor::TaskExecutor* taskExecutor,
                        SyncSourceSelector* syncSourceSelector,
@@ -217,7 +219,7 @@ private:
     // Executor used to send remote commands to sync source candidates.
     executor::TaskExecutor* const _taskExecutor;
 
-    // Sync source selector used to obtain sync source candidates and for us to blacklist non-viable
+    // Sync source selector used to obtain sync source candidates and for us to denylist non-viable
     // candidates.
     SyncSourceSelector* const _syncSourceSelector;
 
@@ -234,7 +236,7 @@ private:
     const OnCompletionFn _onCompletion;
 
     // Protects members of this sync source resolver defined below.
-    mutable stdx::mutex _mutex;
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("SyncSourceResolverResponse::_mutex");
     mutable stdx::condition_variable _condition;
 
     // State transitions:

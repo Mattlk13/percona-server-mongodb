@@ -2,7 +2,7 @@
 // update/delete on a sharded collection must contain an exact match on _id or contain the shard
 // key.
 //
-// @tags: [assumes_unsharded_collection, requires_fastcount]
+// @tags: [assumes_unsharded_collection, requires_fastcount, requires_fcv_50]
 
 t = db.update_addToSet1;
 t.drop();
@@ -71,27 +71,47 @@ t.update({_id: 1}, {$addToSet: {a: {$each: [3, 2, 2, 3, 3]}}});
 o.a.push(3);
 assert.eq(o, t.findOne(), "D4");
 
-// Test that dotted and '$' prefixed field names fail.
-t.drop();
-o = {
-    _id: 1,
-    a: [1, 2]
-};
-assert.writeOK(t.insert(o));
+var isDotsAndDollarsEnabled = db.adminCommand({getParameter: 1, featureFlagDotsAndDollars: 1})
+                                  .featureFlagDotsAndDollars.value;
+if (!isDotsAndDollarsEnabled) {
+    // Test that dotted and '$' prefixed field names fail.
+    t.drop();
+    o = {_id: 1, a: [1, 2]};
+    assert.commandWorked(t.insert(o));
 
-assert.writeOK(t.update({}, {$addToSet: {a: {'x.$.y': 'bad'}}}));
-assert.writeOK(t.update({}, {$addToSet: {a: {b: {'x.$.y': 'bad'}}}}));
+    assert.commandWorked(t.update({}, {$addToSet: {a: {'x.$.y': 'bad'}}}));
+    assert.commandWorked(t.update({}, {$addToSet: {a: {b: {'x.$.y': 'bad'}}}}));
 
-assert.writeError(t.update({}, {$addToSet: {a: {"$bad": "bad"}}}));
-assert.writeError(t.update({}, {$addToSet: {a: {b: {"$bad": "bad"}}}}));
+    assert.writeError(t.update({}, {$addToSet: {a: {"$bad": "bad"}}}));
+    assert.writeError(t.update({}, {$addToSet: {a: {b: {"$bad": "bad"}}}}));
 
-assert.writeOK(t.update({}, {$addToSet: {a: {_id: {"x.y": 2}}}}));
+    assert.commandWorked(t.update({}, {$addToSet: {a: {_id: {"x.y": 2}}}}));
 
-assert.writeOK(t.update({}, {$addToSet: {a: {$each: [{'x.$.y': 'bad'}]}}}));
-assert.writeOK(t.update({}, {$addToSet: {a: {$each: [{b: {'x.$.y': 'bad'}}]}}}));
+    assert.commandWorked(t.update({}, {$addToSet: {a: {$each: [{'x.$.y': 'bad'}]}}}));
+    assert.commandWorked(t.update({}, {$addToSet: {a: {$each: [{b: {'x.$.y': 'bad'}}]}}}));
 
-assert.writeError(t.update({}, {$addToSet: {a: {$each: [{'$bad': 'bad'}]}}}));
-assert.writeError(t.update({}, {$addToSet: {a: {$each: [{b: {'$bad': 'bad'}}]}}}));
+    assert.writeError(t.update({}, {$addToSet: {a: {$each: [{'$bad': 'bad'}]}}}));
+    assert.writeError(t.update({}, {$addToSet: {a: {$each: [{b: {'$bad': 'bad'}}]}}}));
+} else {
+    // Test that dotted and '$' prefixed field names work when nested.
+    t.drop();
+    o = {_id: 1, a: [1, 2]};
+    assert.commandWorked(t.insert(o));
+
+    assert.commandWorked(t.update({}, {$addToSet: {a: {'x.$.y': 'bad'}}}));
+    assert.commandWorked(t.update({}, {$addToSet: {a: {b: {'x.$.y': 'bad'}}}}));
+
+    assert.commandWorked(t.update({}, {$addToSet: {a: {"$bad": "bad"}}}));
+    assert.commandWorked(t.update({}, {$addToSet: {a: {b: {"$bad": "bad"}}}}));
+
+    assert.commandWorked(t.update({}, {$addToSet: {a: {_id: {"x.y": 2}}}}));
+
+    assert.commandWorked(t.update({}, {$addToSet: {a: {$each: [{'x.$.y': 'bad'}]}}}));
+    assert.commandWorked(t.update({}, {$addToSet: {a: {$each: [{b: {'x.$.y': 'bad'}}]}}}));
+
+    assert.commandWorked(t.update({}, {$addToSet: {a: {$each: [{'$bad': 'bad'}]}}}));
+    assert.commandWorked(t.update({}, {$addToSet: {a: {$each: [{b: {'$bad': 'bad'}}]}}}));
+}
 
 // Test that nested _id fields are allowed.
 t.drop();
@@ -99,10 +119,10 @@ o = {
     _id: 1,
     a: [1, 2]
 };
-assert.writeOK(t.insert(o));
+assert.commandWorked(t.insert(o));
 
-assert.writeOK(t.update({}, {$addToSet: {a: {_id: ["foo", "bar", "baz"]}}}));
-assert.writeOK(t.update({}, {$addToSet: {a: {_id: /acme.*corp/}}}));
+assert.commandWorked(t.update({}, {$addToSet: {a: {_id: ["foo", "bar", "baz"]}}}));
+assert.commandWorked(t.update({}, {$addToSet: {a: {_id: /acme.*corp/}}}));
 
 // Test that DBRefs are allowed.
 t.drop();
@@ -110,19 +130,19 @@ o = {
     _id: 1,
     a: [1, 2]
 };
-assert.writeOK(t.insert(o));
+assert.commandWorked(t.insert(o));
 
 foo = {
     "foo": "bar"
 };
-assert.writeOK(t.insert(foo));
+assert.commandWorked(t.insert(foo));
 let fooDoc = t.findOne(foo);
 assert.eq(fooDoc.foo, foo.foo);
 
 let fooDocRef = {reference: new DBRef(t.getName(), fooDoc._id, t.getDB().getName())};
 
-assert.writeOK(t.update({_id: o._id}, {$addToSet: {a: fooDocRef}}));
+assert.commandWorked(t.update({_id: o._id}, {$addToSet: {a: fooDocRef}}));
 assert.eq(t.findOne({_id: o._id}).a[2], fooDocRef);
 
-assert.writeOK(t.update({_id: o._id}, {$addToSet: {a: {b: fooDocRef}}}));
+assert.commandWorked(t.update({_id: o._id}, {$addToSet: {a: {b: fooDocRef}}}));
 assert.eq(t.findOne({_id: o._id}).a[3].b, fooDocRef);

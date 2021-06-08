@@ -39,8 +39,6 @@
 
 namespace mongo {
 
-using unittest::log;
-
 namespace {
 
 class IndexBuildsManagerTest : public CatalogTestFixture {
@@ -75,27 +73,24 @@ std::vector<BSONObj> makeSpecs(const NamespaceString& nss, std::vector<std::stri
     ASSERT(keys.size());
     std::vector<BSONObj> indexSpecs;
     for (auto keyName : keys) {
-        indexSpecs.push_back(BSON("ns" << nss.toString() << "v" << 2 << "key" << BSON(keyName << 1)
-                                       << "name"
-                                       << (keyName + "_1")));
+        indexSpecs.push_back(
+            BSON("v" << 2 << "key" << BSON(keyName << 1) << "name" << (keyName + "_1")));
     }
     return indexSpecs;
 }
 
 TEST_F(IndexBuildsManagerTest, IndexBuildsManagerSetUpAndTearDown) {
     AutoGetCollection autoColl(operationContext(), _nss, MODE_X);
+    CollectionWriter collection(autoColl);
 
     auto specs = makeSpecs(_nss, {"a", "b"});
-    ASSERT_OK(_indexBuildsManager.setUpIndexBuild(operationContext(),
-                                                  autoColl.getCollection(),
-                                                  specs,
-                                                  _buildUUID,
-                                                  MultiIndexBlock::kNoopOnInitFn));
+    ASSERT_OK(_indexBuildsManager.setUpIndexBuild(
+        operationContext(), collection, specs, _buildUUID, MultiIndexBlock::kNoopOnInitFn));
 
-    _indexBuildsManager.tearDownIndexBuild(
-        operationContext(), autoColl.getCollection(), _buildUUID);
+    _indexBuildsManager.abortIndexBuild(
+        operationContext(), collection, _buildUUID, MultiIndexBlock::kNoopOnCleanUpFn);
+    _indexBuildsManager.unregisterIndexBuild(_buildUUID);
 }
-
 }  // namespace
 
 }  // namespace mongo

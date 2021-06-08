@@ -32,9 +32,11 @@
 #include <vector>
 
 #include "mongo/db/s/transaction_coordinator_util.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 
 namespace mongo {
+
+class TransactionCoordinatorMetricsObserver;
 
 /**
  * State machine, which implements the two-phase commit protocol for a specific transaction,
@@ -50,6 +52,18 @@ class TransactionCoordinator {
 
 public:
     /**
+     * The two-phase commit steps.
+     */
+    enum class Step {
+        kInactive,
+        kWritingParticipantList,
+        kWaitingForVotes,
+        kWritingDecision,
+        kWaitingForDecisionAcks,
+        kDeletingCoordinatorDoc,
+    };
+
+    /**
      * Instantiates a new TransactioncCoordinator for the specified lsid + txnNumber pair and gives
      * it a 'scheduler' to use for any asynchronous tasks it spawns.
      *
@@ -57,7 +71,7 @@ public:
      * cause the coordinator to be put in a cancelled state, if runCommit is not eventually
      * received.
      */
-    TransactionCoordinator(ServiceContext* serviceContext,
+    TransactionCoordinator(OperationContext* operationContext,
                            const LogicalSessionId& lsid,
                            TxnNumber txnNumber,
                            std::unique_ptr<txn::AsyncWorkScheduler> scheduler,
@@ -71,7 +85,7 @@ public:
      *
      * Subsequent calls will not re-run the commit process.
      */
-    void runCommit(std::vector<ShardId> participantShards);
+    void runCommit(OperationContext* opCtx, std::vector<ShardId> participantShards);
 
     /**
      * To be used to continue coordinating a transaction on step up.
@@ -81,17 +95,15 @@ public:
     /**
      * Gets a Future that will contain the decision that the coordinator reaches. Note that this
      * will never be signaled unless runCommit has been called.
-     *
-     * TODO (SERVER-37364): Remove this when it is no longer needed by the coordinator service.
      */
-    SharedSemiFuture<txn::CommitDecision> getDecision();
+    SharedSemiFuture<txn::CommitDecision> getDecision() const;
 
     /**
      * Returns a future which can be listened on for when all the asynchronous activity spawned by
      * this coordinator has completed. It will always eventually be set and once set it is safe to
      * dispose of the TransactionCoordinator object.
      */
-    Future<void> onCompletion();
+    SharedSemiFuture<txn::CommitDecision> onCompletion();
 
     /**
      * If runCommit has not yet been called, this will transition this coordinator object to
@@ -103,13 +115,38 @@ public:
      */
     void cancelIfCommitNotYetStarted();
 
+    /**
+     * Returns the TransactionCoordinatorMetricsObserver for this TransactionCoordinator.
+     */
+    const TransactionCoordinatorMetricsObserver& getMetricsObserverForTest() {
+        return *_transactionCoordinatorMetricsObserver;
+    }
+
+    void reportState(BSONObjBuilder& parent) const;
+    std::string toString(Step step) const;
+
+    Step getStep() const;
+
+
 private:
+    void _updateAssociatedClient(Client* client);
+
     bool _reserveKickOffCommitPromise();
 
     /**
      * Helper for handling errors that occur during either phase of commit coordination.
      */
     void _done(Status s);
+
+    /**
+     * Logs the diagnostic string for a commit coordination.
+     */
+    void _logSlowTwoPhaseCommit(const txn::CoordinatorCommitDecision& decision);
+
+    /**
+     * Builds the diagnostic string for a commit coordination.
+     */
+    std::string _twoPhaseCommitInfoForLog(const txn::CoordinatorCommitDecision& decision) const;
 
     // Shortcut to the service context under which this coordinator runs
     ServiceContext* const _serviceContext;
@@ -127,7 +164,10 @@ private:
     std::unique_ptr<txn::AsyncWorkScheduler> _sendPrepareScheduler;
 
     // Protects the state below
-    mutable stdx::mutex _mutex;
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("TransactionCoordinator::_mutex");
+
+    // Tracks which step of the 2PC coordination is currently (or was most recently) executing
+    Step _step{Step::kInactive};
 
     // Promise/future pair which will be signaled when the coordinator has completed
     bool _kickOffCommitPromiseSet{false};
@@ -154,10 +194,14 @@ private:
 
     // A list of all promises corresponding to futures that were returned to callers of
     // onCompletion.
-    //
-    // TODO (SERVER-38346): Remove this when SharedSemiFuture supports continuations.
-    bool _completionPromisesFired{false};
-    std::vector<Promise<void>> _completionPromises;
+    SharedPromise<txn::CommitDecision> _completionPromise;
+
+    // Store as unique_ptr to avoid a circular dependency between the TransactionCoordinator and
+    // the TransactionCoordinatorMetricsObserver.
+    std::unique_ptr<TransactionCoordinatorMetricsObserver> _transactionCoordinatorMetricsObserver;
+
+    // The deadline for the TransactionCoordinator to reach a decision
+    Date_t _deadline;
 };
 
 }  // namespace mongo

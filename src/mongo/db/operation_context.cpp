@@ -27,40 +27,32 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/operation_context.h"
 
-#include "mongo/bson/inline_decls.h"
 #include "mongo/db/client.h"
+#include "mongo/db/operation_key_manager.h"
 #include "mongo/db/service_context.h"
+#include "mongo/logv2/log.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/platform/random.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/transport/baton.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/clock_source.h"
-#include "mongo/util/fail_point_service.h"
-#include "mongo/util/log.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/system_tick_source.h"
 
 namespace mongo {
 
-namespace {
-// Enabling the maxTimeAlwaysTimeOut fail point will cause any query or command run with a
-// valid non-zero max time to fail immediately.  Any getmore operation on a cursor already
-// created with a valid non-zero max time will also fail immediately.
-//
-// This fail point cannot be used with the maxTimeNeverTimeOut fail point.
 MONGO_FAIL_POINT_DEFINE(maxTimeAlwaysTimeOut);
 
-// Enabling the maxTimeNeverTimeOut fail point will cause the server to never time out any
-// query, command, or getmore operation, regardless of whether a max time is set.
-//
-// This fail point cannot be used with the maxTimeAlwaysTimeOut fail point.
 MONGO_FAIL_POINT_DEFINE(maxTimeNeverTimeOut);
+
+namespace {
 
 // Enabling the checkForInterruptFail fail point will start a game of random chance on the
 // connection specified in the fail point data, generating an interrupt with a given fixed
@@ -77,23 +69,29 @@ MONGO_FAIL_POINT_DEFINE(maxTimeNeverTimeOut);
 MONGO_FAIL_POINT_DEFINE(checkForInterruptFail);
 
 const auto kNoWaiterThread = stdx::thread::id();
-
 }  // namespace
 
-OperationContext::OperationContext(Client* client, unsigned int opId)
+OperationContext::OperationContext(Client* client, OperationId opId)
+    : OperationContext(client, OperationIdSlot(opId)) {}
+
+OperationContext::OperationContext(Client* client, OperationIdSlot&& opIdSlot)
     : _client(client),
-      _opId(opId),
+      _opId(std::move(opIdSlot)),
       _elapsedTime(client ? client->getServiceContext()->getTickSource()
                           : SystemTickSource::get()) {}
 
-OperationContext::~OperationContext() = default;
+OperationContext::~OperationContext() {
+    releaseOperationKey();
+}
 
 void OperationContext::setDeadlineAndMaxTime(Date_t when,
                                              Microseconds maxTime,
                                              ErrorCodes::Error timeoutError) {
     invariant(!getClient()->isInDirectClient() || _hasArtificialDeadline);
     invariant(ErrorCodes::isExceededTimeLimitError(timeoutError));
-    invariant(!ErrorExtraInfo::parserFor(timeoutError));
+    if (ErrorCodes::mustHaveExtraInfo(timeoutError)) {
+        invariant(!ErrorExtraInfo::parserFor(timeoutError));
+    }
     uassert(40120,
             "Illegal attempt to change operation deadline",
             _hasArtificialDeadline || !hasDeadline());
@@ -140,10 +138,10 @@ bool OperationContext::hasDeadlineExpired() const {
     if (!hasDeadline()) {
         return false;
     }
-    if (MONGO_FAIL_POINT(maxTimeNeverTimeOut)) {
+    if (MONGO_unlikely(maxTimeNeverTimeOut.shouldFail())) {
         return false;
     }
-    if (MONGO_FAIL_POINT(maxTimeAlwaysTimeOut)) {
+    if (MONGO_unlikely(maxTimeAlwaysTimeOut.shouldFail())) {
         return true;
     }
 
@@ -177,6 +175,27 @@ Microseconds OperationContext::getRemainingMaxTimeMicros() const {
     return _maxTime - getElapsedTime();
 }
 
+void OperationContext::restoreMaxTimeMS() {
+    if (!_storedMaxTime) {
+        return;
+    }
+
+    auto maxTime = *_storedMaxTime;
+    _storedMaxTime = boost::none;
+
+    if (maxTime <= Microseconds::zero()) {
+        maxTime = Microseconds::max();
+    }
+
+    if (maxTime == Microseconds::max()) {
+        _deadline = Date_t::max();
+    } else {
+        auto clock = getServiceContext()->getFastClockSource();
+        _deadline = clock->now() + clock->getPrecision() + maxTime - _elapsedTime.elapsed();
+    }
+    _maxTime = maxTime;
+}
+
 namespace {
 
 // Helper function for checkForInterrupt fail point.  Decides whether the operation currently
@@ -199,10 +218,17 @@ bool opShouldFail(Client* client, const BSONObj& failPointInfo) {
 }  // namespace
 
 Status OperationContext::checkForInterruptNoAssert() noexcept {
-    // TODO: Remove the MONGO_likely(getClient()) once all operation contexts are constructed with
-    // clients.
-    if (MONGO_likely(getClient() && getServiceContext()) &&
-        getServiceContext()->getKillAllOperations() && !_isExecutingShutdown) {
+    // TODO: Remove the MONGO_likely(hasClientAndServiceContext) once all operation contexts are
+    // constructed with clients.
+    const auto hasClientAndServiceContext = getClient() && getServiceContext();
+
+    if (MONGO_likely(hasClientAndServiceContext) && getClient()->getKilled() &&
+        !_isExecutingShutdown) {
+        return Status(ErrorCodes::ClientMarkedKilled, "client has been killed");
+    }
+
+    if (MONGO_likely(hasClientAndServiceContext) && getServiceContext()->getKillAllOperations() &&
+        !_isExecutingShutdown) {
         return Status(ErrorCodes::InterruptedAtShutdown, "interrupted at shutdown");
     }
 
@@ -217,15 +243,21 @@ Status OperationContext::checkForInterruptNoAssert() noexcept {
         return Status::OK();
     }
 
-    MONGO_FAIL_POINT_BLOCK(checkForInterruptFail, scopedFailPoint) {
-        if (opShouldFail(getClient(), scopedFailPoint.getData())) {
-            log() << "set pending kill on op " << getOpID() << ", for checkForInterruptFail";
+    checkForInterruptFail.executeIf(
+        [&](auto&&) {
+            LOGV2(20882, "Marking operation as killed for failpoint", "opId"_attr = getOpID());
             markKilled();
-        }
-    }
+        },
+        [&](auto&& data) { return opShouldFail(getClient(), data); });
 
     const auto killStatus = getKillStatus();
     if (killStatus != ErrorCodes::OK) {
+        if (killStatus == ErrorCodes::TransactionExceededLifetimeLimitSeconds)
+            return Status(
+                killStatus,
+                "operation was interrupted because the transaction exceeded the configured "
+                "'transactionLifetimeLimitSeconds'");
+
         return Status(killStatus, "operation was interrupted");
     }
 
@@ -246,7 +278,6 @@ Status OperationContext::checkForInterruptNoAssert() noexcept {
     return Status::OK();
 }
 
-
 // waitForConditionOrInterruptNoAssertUntil returns when:
 //
 // Normal condvar wait criteria:
@@ -260,13 +291,13 @@ Status OperationContext::checkForInterruptNoAssert() noexcept {
 // Baton criteria:
 // - _baton is notified (someone's queuing work for the baton)
 // - _baton::run returns (timeout fired / networking is ready / socket disconnected)
+//
+// We release the lock held by m whenever we call markKilled, since it may trigger
+// CancellationSource cancellation which can in turn emplace a SharedPromise which then may acquire
+// a mutex.
 StatusWith<stdx::cv_status> OperationContext::waitForConditionOrInterruptNoAssertUntil(
-    stdx::condition_variable& cv, stdx::unique_lock<stdx::mutex>& m, Date_t deadline) noexcept {
+    stdx::condition_variable& cv, BasicLockableAdapter m, Date_t deadline) noexcept {
     invariant(getClient());
-
-    if (auto status = checkForInterruptNoAssert(); !status.isOK()) {
-        return status;
-    }
 
     // If the maxTimeNeverTimeOut failpoint is set, behave as though the operation's deadline does
     // not exist. Under normal circumstances, if the op has an existing deadline which is sooner
@@ -276,7 +307,7 @@ StatusWith<stdx::cv_status> OperationContext::waitForConditionOrInterruptNoAsser
     // maxTimeNeverTimeOut is set) then we assume that the incongruity is due to a clock mismatch
     // and return _timeoutError regardless. To prevent this behaviour, only consider the op's
     // deadline in the event that the maxTimeNeverTimeOut failpoint is not set.
-    bool opHasDeadline = (hasDeadline() && !MONGO_FAIL_POINT(maxTimeNeverTimeOut));
+    bool opHasDeadline = (hasDeadline() && !MONGO_unlikely(maxTimeNeverTimeOut.shouldFail()));
 
     if (opHasDeadline) {
         deadline = std::min(deadline, getDeadline());
@@ -291,17 +322,13 @@ StatusWith<stdx::cv_status> OperationContext::waitForConditionOrInterruptNoAsser
             cv, m, deadline, _baton.get());
     }();
 
-    if (auto status = checkForInterruptNoAssert(); !status.isOK()) {
-        return status;
-    }
-
     if (opHasDeadline && waitStatus == stdx::cv_status::timeout && deadline == getDeadline()) {
         // It's possible that the system clock used in stdx::condition_variable::wait_until
         // is slightly ahead of the FastClock used in checkForInterrupt. In this case,
         // we treat the operation as though it has exceeded its time limit, just as if the
         // FastClock and system clock had agreed.
         if (!_hasArtificialDeadline) {
-            markKilled(_timeoutError);
+            interruptible_detail::doWithoutLock(m, [&] { markKilled(_timeoutError); });
         }
         return Status(_timeoutError, "operation exceeded time limit");
     }
@@ -311,14 +338,19 @@ StatusWith<stdx::cv_status> OperationContext::waitForConditionOrInterruptNoAsser
 
 void OperationContext::markKilled(ErrorCodes::Error killCode) {
     invariant(killCode != ErrorCodes::OK);
-    invariant(!ErrorExtraInfo::parserFor(killCode));
-
-    if (killCode == ErrorCodes::ClientDisconnect) {
-        log() << "operation was interrupted because a client disconnected";
+    if (ErrorCodes::mustHaveExtraInfo(killCode)) {
+        invariant(!ErrorExtraInfo::parserFor(killCode));
     }
 
-    if (_killCode.compareAndSwap(ErrorCodes::OK, killCode) == ErrorCodes::OK) {
-        _baton->notify();
+    if (killCode == ErrorCodes::ClientDisconnect) {
+        LOGV2(20883, "Interrupted operation as its client disconnected", "opId"_attr = getOpID());
+    }
+
+    if (auto status = ErrorCodes::OK; _killCode.compareAndSwap(&status, killCode)) {
+        _cancelSource.cancel();
+        if (_baton) {
+            _baton->notify();
+        }
     }
 }
 
@@ -354,6 +386,21 @@ void OperationContext::setLogicalSessionId(LogicalSessionId lsid) {
     _lsid = std::move(lsid);
 }
 
+void OperationContext::setOperationKey(OperationKey opKey) {
+    // Only set the opKey once
+    invariant(!_opKey);
+
+    _opKey.emplace(std::move(opKey));
+    OperationKeyManager::get(_client).add(*_opKey, _opId.getId());
+}
+
+void OperationContext::releaseOperationKey() {
+    if (_opKey) {
+        OperationKeyManager::get(_client).remove(*_opKey);
+    }
+    _opKey = boost::none;
+}
+
 void OperationContext::setTxnNumber(TxnNumber txnNumber) {
     invariant(_lsid);
     _txnNumber = txnNumber;
@@ -377,7 +424,7 @@ void OperationContext::setLockState(std::unique_ptr<Locker> locker) {
     _locker = std::move(locker);
 }
 
-std::unique_ptr<Locker> OperationContext::swapLockState(std::unique_ptr<Locker> locker) {
+std::unique_ptr<Locker> OperationContext::swapLockState(std::unique_ptr<Locker> locker, WithLock) {
     invariant(_locker);
     invariant(locker);
     _locker.swap(locker);
@@ -386,6 +433,10 @@ std::unique_ptr<Locker> OperationContext::swapLockState(std::unique_ptr<Locker> 
 
 Date_t OperationContext::getExpirationDateForWaitForValue(Milliseconds waitFor) {
     return getServiceContext()->getPreciseClockSource()->now() + waitFor;
+}
+
+bool OperationContext::isIgnoringInterrupts() const {
+    return _ignoreInterrupts;
 }
 
 }  // namespace mongo

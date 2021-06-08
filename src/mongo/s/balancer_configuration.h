@@ -34,8 +34,8 @@
 #include <cstdint>
 
 #include "mongo/platform/atomic_word.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/s/request_types/migration_secondary_throttle_options.h"
-#include "mongo/stdx/mutex.h"
 
 namespace mongo {
 
@@ -107,6 +107,15 @@ public:
         return _waitForDelete;
     }
 
+    /**
+     * Returns whether the balancer should schedule migrations of chunks that are 'large' rather
+     * than marking these chunks as 'jumbo' (meaning they will not be scheduled for split or
+     * migration).
+     */
+    bool attemptToBalanceJumboChunks() const {
+        return _attemptToBalanceJumboChunks;
+    }
+
 private:
     BalancerSettingsType();
 
@@ -118,6 +127,8 @@ private:
     MigrationSecondaryThrottleOptions _secondaryThrottle;
 
     bool _waitForDelete{false};
+
+    bool _attemptToBalanceJumboChunks{false};
 };
 
 /**
@@ -236,11 +247,23 @@ public:
     bool waitForDelete() const;
 
     /**
+     * Returns whether the balancer should attempt to schedule migrations of 'large' chunks. If
+     * false, the balancer will instead mark these chunks as 'jumbo', meaning they will not be
+     * scheduled for any split or move in the future.
+     */
+    bool attemptToBalanceJumboChunks() const;
+
+    /**
      * Returns the max chunk size after which a chunk would be considered jumbo.
      */
     uint64_t getMaxChunkSizeBytes() const {
         return _maxChunkSizeBytes.loadRelaxed();
     }
+
+    /**
+     * Change the cluster wide auto split settings.
+     */
+    Status enableAutoSplit(OperationContext* opCtx, bool enable);
 
     bool getShouldAutoSplit() const {
         return _shouldAutoSplit.loadRelaxed();
@@ -278,7 +301,8 @@ private:
     Status _refreshAutoSplitSettings(OperationContext* opCtx);
 
     // The latest read balancer settings and a mutex to protect its swaps
-    mutable stdx::mutex _balancerSettingsMutex;
+    mutable Mutex _balancerSettingsMutex =
+        MONGO_MAKE_LATCH("BalancerConfiguration::_balancerSettingsMutex");
     BalancerSettingsType _balancerSettings;
 
     // Max chunk size after which a chunk would be considered jumbo and won't be moved. This value

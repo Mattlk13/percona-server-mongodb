@@ -30,6 +30,7 @@
 #pragma once
 
 #include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/document_source_coll_stats_gen.h"
 
 namespace mongo {
 
@@ -39,22 +40,37 @@ namespace mongo {
  */
 class DocumentSourceCollStats : public DocumentSource {
 public:
+    static constexpr StringData kStageName = "$collStats"_sd;
+
     class LiteParsed final : public LiteParsedDocumentSource {
     public:
-        static std::unique_ptr<LiteParsed> parse(const AggregationRequest& request,
-                                                 const BSONElement& spec) {
-            return stdx::make_unique<LiteParsed>(request.getNamespaceString());
+        static std::unique_ptr<LiteParsed> parse(const NamespaceString& nss,
+                                                 const BSONElement& specElem) {
+            uassert(5447000,
+                    str::stream() << "$collStats must take a nested object but found: " << specElem,
+                    specElem.type() == BSONType::Object);
+            auto spec = DocumentSourceCollStatsSpec::parse(IDLParserErrorContext(kStageName),
+                                                           specElem.embeddedObject());
+            return std::make_unique<LiteParsed>(specElem.fieldName(), nss, std::move(spec));
         }
 
-        explicit LiteParsed(NamespaceString nss) : _nss(std::move(nss)) {}
+        explicit LiteParsed(std::string parseTimeName,
+                            NamespaceString nss,
+                            DocumentSourceCollStatsSpec spec)
+            : LiteParsedDocumentSource(std::move(parseTimeName)),
+              _nss(std::move(nss)),
+              _spec(std::move(spec)) {}
 
         bool isCollStats() const final {
             return true;
         }
 
-        PrivilegeVector requiredPrivileges(bool isMongos) const final {
+        PrivilegeVector requiredPrivileges(bool isMongos,
+                                           bool bypassDocumentValidation) const final {
             return {Privilege(ResourcePattern::forExactNamespace(_nss), ActionType::collStats)};
         }
+
+        void assertPermittedInAPIVersion(const APIParameters&) const;
 
         stdx::unordered_set<NamespaceString> getInvolvedNamespaces() const final {
             return stdx::unordered_set<NamespaceString>();
@@ -66,12 +82,12 @@ public:
 
     private:
         const NamespaceString _nss;
+        const DocumentSourceCollStatsSpec _spec;
     };
 
-    DocumentSourceCollStats(const boost::intrusive_ptr<ExpressionContext>& pExpCtx)
-        : DocumentSource(pExpCtx) {}
-
-    GetNextResult getNext() final;
+    DocumentSourceCollStats(const boost::intrusive_ptr<ExpressionContext>& pExpCtx,
+                            DocumentSourceCollStatsSpec spec)
+        : DocumentSource(kStageName, pExpCtx), _collStatsSpec(std::move(spec)) {}
 
     const char* getSourceName() const final;
 
@@ -82,7 +98,8 @@ public:
                                      DiskUseRequirement::kNoDiskUse,
                                      FacetRequirement::kNotAllowed,
                                      TransactionRequirement::kNotAllowed,
-                                     LookupRequirement::kAllowed);
+                                     LookupRequirement::kAllowed,
+                                     UnionRequirement::kAllowed);
 
         constraints.requiresInputDocSource = false;
         return constraints;
@@ -98,8 +115,10 @@ public:
         BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
 
 private:
+    GetNextResult doGetNext() final;
+
     // The raw object given to $collStats containing user specified options.
-    BSONObj _collStatsSpec;
+    DocumentSourceCollStatsSpec _collStatsSpec;
     bool _finished = false;
 };
 

@@ -37,27 +37,23 @@
 #include "mongo/bson/bsonobjbuilder.h"
 
 namespace mongo {
-namespace {
-
-constexpr auto kOperationTime = "operationTime"_sd;
-
-}  // namespace
 
 const LogicalTime LogicalTime::kUninitialized = LogicalTime();
 
 LogicalTime::LogicalTime(Timestamp ts) : _time(ts.asULL()) {}
 
 LogicalTime LogicalTime::fromOperationTime(const BSONObj& obj) {
-    const auto opTimeElem(obj[kOperationTime]);
+    const auto opTimeElem(obj[kOperationTimeFieldName]);
     uassert(ErrorCodes::FailedToParse, "No operationTime found", !opTimeElem.eoo());
     uassert(ErrorCodes::BadValue,
-            "Operation time is of the wrong value",
+            str::stream() << kOperationTimeFieldName << " is of the wrong type '"
+                          << typeName(opTimeElem.type()) << "'",
             opTimeElem.type() == bsonTimestamp);
     return LogicalTime(opTimeElem.timestamp());
 }
 
 void LogicalTime::appendAsOperationTime(BSONObjBuilder* builder) const {
-    builder->append(kOperationTime, asTimestamp());
+    builder->append(kOperationTimeFieldName, asTimestamp());
 }
 
 void LogicalTime::addTicks(uint64_t ticks) {
@@ -82,6 +78,14 @@ BSONObj LogicalTime::toBSON() const {
     BSONObjBuilder bldr;
     bldr.append("ts", asTimestamp());
     return bldr.obj();
+}
+
+void LogicalTime::serializeToBSON(StringData fieldName, BSONObjBuilder* bob) const {
+    bob->appendElements(BSON(fieldName << asTimestamp()));
+}
+
+LogicalTime LogicalTime::parseFromBSON(const BSONElement& elem) {
+    return LogicalTime(elem.timestamp());
 }
 
 }  // namespace mongo

@@ -27,15 +27,19 @@
  *    it in the license file.
  */
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/ops/write_ops_retryability.h"
 
+#include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/ops/find_and_modify_result.h"
-#include "mongo/db/query/find_and_modify_request.h"
-#include "mongo/logger/redaction.h"
+#include "mongo/db/ops/write_ops_gen.h"
+#include "mongo/db/repl/image_collection_entry_gen.h"
+#include "mongo/logv2/log.h"
+#include "mongo/logv2/redaction.h"
 
 namespace mongo {
 namespace {
@@ -45,68 +49,58 @@ namespace {
  * In the case of nested oplog entry where the correct links are in the top level
  * oplog, oplogWithCorrectLinks can be used to specify the outer oplog.
  */
-void validateFindAndModifyRetryability(const FindAndModifyRequest& request,
+void validateFindAndModifyRetryability(const write_ops::FindAndModifyCommandRequest& request,
                                        const repl::OplogEntry& oplogEntry,
                                        const repl::OplogEntry& oplogWithCorrectLinks) {
     auto opType = oplogEntry.getOpType();
     auto ts = oplogEntry.getTimestamp();
+    const bool needsRetryImage = oplogEntry.getNeedsRetryImage().is_initialized();
 
     if (opType == repl::OpTypeEnum::kDelete) {
         uassert(
             40606,
             str::stream() << "findAndModify retry request: " << redact(request.toBSON({}))
                           << " is not compatible with previous write in the transaction of type: "
-                          << OpType_serializer(oplogEntry.getOpType())
-                          << ", oplogTs: "
-                          << ts.toString()
-                          << ", oplog: "
-                          << redact(oplogEntry.toBSON()),
-            request.isRemove());
+                          << OpType_serializer(oplogEntry.getOpType()) << ", oplogTs: "
+                          << ts.toString() << ", oplog: " << redact(oplogEntry.toBSONForLogging()),
+            request.getRemove().value_or(false));
         uassert(40607,
                 str::stream() << "No pre-image available for findAndModify retry request:"
                               << redact(request.toBSON({})),
-                oplogWithCorrectLinks.getPreImageOpTime());
+                oplogWithCorrectLinks.getPreImageOpTime() || needsRetryImage);
     } else if (opType == repl::OpTypeEnum::kInsert) {
         uassert(
             40608,
             str::stream() << "findAndModify retry request: " << redact(request.toBSON({}))
                           << " is not compatible with previous write in the transaction of type: "
-                          << OpType_serializer(oplogEntry.getOpType())
-                          << ", oplogTs: "
-                          << ts.toString()
-                          << ", oplog: "
-                          << redact(oplogEntry.toBSON()),
-            request.isUpsert());
+                          << OpType_serializer(oplogEntry.getOpType()) << ", oplogTs: "
+                          << ts.toString() << ", oplog: " << redact(oplogEntry.toBSONForLogging()),
+            request.getUpsert().value_or(false));
     } else {
         uassert(
             40609,
             str::stream() << "findAndModify retry request: " << redact(request.toBSON({}))
                           << " is not compatible with previous write in the transaction of type: "
-                          << OpType_serializer(oplogEntry.getOpType())
-                          << ", oplogTs: "
-                          << ts.toString()
-                          << ", oplog: "
-                          << redact(oplogEntry.toBSON()),
+                          << OpType_serializer(oplogEntry.getOpType()) << ", oplogTs: "
+                          << ts.toString() << ", oplog: " << redact(oplogEntry.toBSONForLogging()),
             opType == repl::OpTypeEnum::kUpdate);
 
-        if (request.shouldReturnNew()) {
+        if (request.getNew().value_or(false)) {
             uassert(40611,
                     str::stream() << "findAndModify retry request: " << redact(request.toBSON({}))
                                   << " wants the document after update returned, but only before "
                                      "update document is stored, oplogTs: "
                                   << ts.toString()
-                                  << ", oplog: "
-                                  << redact(oplogEntry.toBSON()),
-                    oplogWithCorrectLinks.getPostImageOpTime());
+                                  << ", oplog: " << redact(oplogEntry.toBSONForLogging()),
+                    oplogWithCorrectLinks.getPostImageOpTime() || needsRetryImage);
         } else {
             uassert(40612,
                     str::stream() << "findAndModify retry request: " << redact(request.toBSON({}))
                                   << " wants the document before update returned, but only after "
                                      "update document is stored, oplogTs: "
                                   << ts.toString()
-                                  << ", oplog: "
-                                  << redact(oplogEntry.toBSON()),
-                    oplogWithCorrectLinks.getPreImageOpTime());
+                                  << ", oplog: " << redact(oplogEntry.toBSONForLogging()),
+                    oplogWithCorrectLinks.getPreImageOpTime() || needsRetryImage);
         }
     }
 }
@@ -116,21 +110,74 @@ void validateFindAndModifyRetryability(const FindAndModifyRequest& request,
  * oplog.
  */
 BSONObj extractPreOrPostImage(OperationContext* opCtx, const repl::OplogEntry& oplog) {
-    invariant(oplog.getPreImageOpTime() || oplog.getPostImageOpTime());
+    invariant(oplog.getPreImageOpTime() || oplog.getPostImageOpTime() ||
+              oplog.getNeedsRetryImage());
+    DBDirectClient client(opCtx);
+    if (oplog.getNeedsRetryImage()) {
+        // Extract image from side collection.
+        LogicalSessionId sessionId = oplog.getSessionId().get();
+        TxnNumber txnNumber = oplog.getTxnNumber().get();
+        Timestamp ts = oplog.getTimestamp();
+        const auto query = BSON("_id" << sessionId.toBSON());
+        BSONObj imageDoc = client.findOne(NamespaceString::kConfigImagesNamespace.ns(), query);
+        if (imageDoc.isEmpty()) {
+            LOGV2_WARNING(5676402,
+                          "Image lookup for a retryable findAndModify was not found",
+                          "sessionId"_attr = sessionId,
+                          "txnNumber"_attr = txnNumber,
+                          "timestamp"_attr = ts);
+            uasserted(
+                5637601,
+                str::stream()
+                    << "image collection no longer contains the complete write history of this "
+                       "transaction, record with sessionId: "
+                    << sessionId.toBSON() << " cannot be found");
+        }
+
+        auto entry =
+            repl::ImageEntry::parse(IDLParserErrorContext("ImageEntryForRequest"), imageDoc);
+        if (entry.getInvalidated()) {
+            // This case is expected when a node could not correctly compute a retry image due
+            // to data inconsistency while in initial sync.
+            uasserted(ErrorCodes::IncompleteTransactionHistory,
+                      str::stream() << "Incomplete transaction history for sessionId: "
+                                    << sessionId.toBSON() << " txnNumber: " << txnNumber);
+        }
+
+        if (entry.getTs() != oplog.getTimestamp() || entry.getTxnNumber() != oplog.getTxnNumber()) {
+            // We found a corresponding image document, but the timestamp and transaction number
+            // associated with the session record did not match the expected values from the oplog
+            // entry.
+
+            // Otherwise, it's unclear what went wrong.
+            LOGV2_WARNING(5676403,
+                          "Image lookup for a retryable findAndModify was unable to be verified",
+                          "sessionId"_attr = sessionId,
+                          "txnNumberRequested"_attr = txnNumber,
+                          "timestampRequested"_attr = ts,
+                          "txnNumberFound"_attr = entry.getTxnNumber(),
+                          "timestampFound"_attr = entry.getTs());
+            uasserted(
+                5637602,
+                str::stream()
+                    << "image collection no longer contains the complete write history of this "
+                       "transaction, record with sessionId: "
+                    << sessionId.toBSON() << " cannot be found");
+        }
+
+        return entry.getImage();
+    }
+
     auto opTime = oplog.getPreImageOpTime() ? oplog.getPreImageOpTime().value()
                                             : oplog.getPostImageOpTime().value();
 
-    DBDirectClient client(opCtx);
-    auto oplogDoc = client.findOne(NamespaceString::kRsOplogNamespace.ns(),
-                                   opTime.asQuery(),
-                                   nullptr,
-                                   QueryOption_OplogReplay);
+    auto oplogDoc =
+        client.findOne(NamespaceString::kRsOplogNamespace.ns(), opTime.asQuery(), nullptr);
 
     uassert(40613,
             str::stream() << "oplog no longer contains the complete write history of this "
                              "transaction, log with opTime "
-                          << opTime.toString()
-                          << " cannot be found",
+                          << opTime.toString() << " cannot be found",
             !oplogDoc.isEmpty());
 
     auto oplogEntry = uassertStatusOK(repl::OplogEntry::parse(oplogDoc));
@@ -138,42 +185,55 @@ BSONObj extractPreOrPostImage(OperationContext* opCtx, const repl::OplogEntry& o
 }
 
 /**
- * Extracts the findAndModify result by inspecting the oplog entries that where generated by a
+ * Extracts the findAndModify result by inspecting the oplog entries that were generated by a
  * previous execution of the command. In the case of nested oplog entry where the correct links
  * are in the top level oplog, oplogWithCorrectLinks can be used to specify the outer oplog.
  */
-void parseOplogEntryForFindAndModify(OperationContext* opCtx,
-                                     const FindAndModifyRequest& request,
-                                     const repl::OplogEntry& oplogEntry,
-                                     const repl::OplogEntry& oplogWithCorrectLinks,
-                                     BSONObjBuilder* builder) {
+write_ops::FindAndModifyCommandReply parseOplogEntryForFindAndModify(
+    OperationContext* opCtx,
+    const write_ops::FindAndModifyCommandRequest& request,
+    const repl::OplogEntry& oplogEntry,
+    const repl::OplogEntry& oplogWithCorrectLinks) {
     validateFindAndModifyRetryability(request, oplogEntry, oplogWithCorrectLinks);
 
+    write_ops::FindAndModifyCommandReply result;
+    write_ops::FindAndModifyLastError lastError;
+    lastError.setNumDocs(1);
+
     switch (oplogEntry.getOpType()) {
-        case repl::OpTypeEnum::kInsert:
-            return find_and_modify::serializeUpsert(
-                1,
-                request.shouldReturnNew() ? oplogEntry.getObject() : boost::optional<BSONObj>(),
-                false,
-                oplogEntry.getObject(),
-                builder);
-        case repl::OpTypeEnum::kUpdate:
-            return find_and_modify::serializeUpsert(
-                1, extractPreOrPostImage(opCtx, oplogWithCorrectLinks), true, {}, builder);
         case repl::OpTypeEnum::kDelete:
-            return find_and_modify::serializeRemove(
-                1, extractPreOrPostImage(opCtx, oplogWithCorrectLinks), builder);
+            result.setValue(extractPreOrPostImage(opCtx, oplogWithCorrectLinks));
+            break;
+        case repl::OpTypeEnum::kUpdate:
+            lastError.setUpdatedExisting(true);
+            result.setValue(extractPreOrPostImage(opCtx, oplogWithCorrectLinks));
+            break;
+        case repl::OpTypeEnum::kInsert: {
+            lastError.setUpdatedExisting(false);
+
+            auto owned = oplogEntry.getObject().getOwned();
+            auto id = owned.getField("_id");
+            if (id) {
+                lastError.setUpserted(IDLAnyTypeOwned(id, owned));
+            }
+
+            if (request.getNew().value_or(false)) {
+                result.setValue(oplogEntry.getObject().getOwned());
+            }
+            break;
+        }
         default:
             MONGO_UNREACHABLE;
     }
+    result.setLastErrorObject(std::move(lastError));
+    return result;
 }
 
 repl::OplogEntry getInnerNestedOplogEntry(const repl::OplogEntry& entry) {
     uassert(40635,
             str::stream() << "expected nested oplog entry with ts: "
                           << entry.getTimestamp().toString()
-                          << " to have o2 field: "
-                          << redact(entry.toBSON()),
+                          << " to have o2 field: " << redact(entry.toBSONForLogging()),
             entry.getObject2());
     return uassertStatusOK(repl::OplogEntry::parse(*entry.getObject2()));
 }
@@ -200,26 +260,24 @@ SingleWriteResult parseOplogEntryForUpdate(const repl::OplogEntry& entry) {
                   str::stream() << "update retry request is not compatible with previous write in "
                                    "the transaction of type: "
                                 << OpType_serializer(entry.getOpType())
-                                << ", oplogTs: "
-                                << entry.getTimestamp().toString()
-                                << ", oplog: "
-                                << redact(entry.toBSON()));
+                                << ", oplogTs: " << entry.getTimestamp().toString()
+                                << ", oplog: " << redact(entry.toBSONForLogging()));
     }
 
     return res;
 }
 
-void parseOplogEntryForFindAndModify(OperationContext* opCtx,
-                                     const FindAndModifyRequest& request,
-                                     const repl::OplogEntry& oplogEntry,
-                                     BSONObjBuilder* builder) {
+write_ops::FindAndModifyCommandReply parseOplogEntryForFindAndModify(
+    OperationContext* opCtx,
+    const write_ops::FindAndModifyCommandRequest& request,
+    const repl::OplogEntry& oplogEntry) {
     // Migrated op case.
     if (oplogEntry.getOpType() == repl::OpTypeEnum::kNoop) {
-        parseOplogEntryForFindAndModify(
-            opCtx, request, getInnerNestedOplogEntry(oplogEntry), oplogEntry, builder);
-    } else {
-        parseOplogEntryForFindAndModify(opCtx, request, oplogEntry, oplogEntry, builder);
+        return parseOplogEntryForFindAndModify(
+            opCtx, request, getInnerNestedOplogEntry(oplogEntry), oplogEntry);
     }
+
+    return parseOplogEntryForFindAndModify(opCtx, request, oplogEntry, oplogEntry);
 }
 
 }  // namespace mongo

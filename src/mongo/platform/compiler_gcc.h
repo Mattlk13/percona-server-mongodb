@@ -62,8 +62,6 @@
 
 #endif
 
-#define MONGO_COMPILER_VARIABLE_UNUSED __attribute__((__unused__))
-
 #define MONGO_COMPILER_ALIGN_TYPE(ALIGNMENT) __attribute__((__aligned__(ALIGNMENT)))
 
 #define MONGO_COMPILER_ALIGN_VARIABLE(ALIGNMENT) __attribute__((__aligned__(ALIGNMENT)))
@@ -86,6 +84,7 @@
 
 #define MONGO_COMPILER_API_EXPORT __attribute__((__visibility__("default")))
 #define MONGO_COMPILER_API_IMPORT
+#define MONGO_COMPILER_API_HIDDEN_FUNCTION __attribute__((visibility("hidden")))
 #define MONGO_COMPILER_API_CALLING_CONVENTION
 
 #define MONGO_likely(x) static_cast<bool>(__builtin_expect(static_cast<bool>(x), 1))
@@ -94,3 +93,5 @@
 #define MONGO_COMPILER_ALWAYS_INLINE [[gnu::always_inline]]
 
 #define MONGO_COMPILER_UNREACHABLE __builtin_unreachable()
+
+#define MONGO_COMPILER_NOINLINE [[gnu::noinline]]

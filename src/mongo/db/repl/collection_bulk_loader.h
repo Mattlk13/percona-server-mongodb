@@ -31,16 +31,23 @@
 #pragma once
 
 #include <string>
+#include <vector>
+
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonobj.h"
 
 namespace mongo {
 
 class Collection;
+class CollectionPtr;
 class OperationContext;
 
 namespace repl {
 
 /**
  * Used on a local Collection to create and bulk build indexes.
+ *
+ * Note that no methods on this class are thread-safe.
  */
 class CollectionBulkLoader {
 public:

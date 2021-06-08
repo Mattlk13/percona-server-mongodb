@@ -29,6 +29,8 @@
 
 #pragma once
 
+#include <boost/optional.hpp>
+
 #include "mongo/bson/unordered_fields_bsonobj_comparator.h"
 #include "mongo/db/matcher/expression.h"
 
@@ -49,8 +51,10 @@ public:
     /**
      * Constructs a new match expression, taking ownership of 'rhs'.
      */
-    explicit InternalSchemaRootDocEqMatchExpression(BSONObj rhs)
-        : MatchExpression(MatchExpression::INTERNAL_SCHEMA_ROOT_DOC_EQ), _rhsObj(std::move(rhs)) {}
+    explicit InternalSchemaRootDocEqMatchExpression(
+        BSONObj rhs, clonable_ptr<ErrorAnnotation> annotation = nullptr)
+        : MatchExpression(MatchExpression::INTERNAL_SCHEMA_ROOT_DOC_EQ, std::move(annotation)),
+          _rhsObj(std::move(rhs)) {}
 
     bool matches(const MatchableDocument* doc, MatchDetails* details = nullptr) const final;
 
@@ -67,7 +71,7 @@ public:
 
     void debugString(StringBuilder& debug, int indentationLevel = 0) const final;
 
-    void serialize(BSONObjBuilder* out) const final;
+    void serialize(BSONObjBuilder* out, bool includePath) const final;
 
     bool equivalent(const MatchExpression* other) const final;
 
@@ -79,12 +83,20 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    std::vector<MatchExpression*>* getChildVector() final {
+    std::vector<std::unique_ptr<MatchExpression>>* getChildVector() final {
         return nullptr;
     }
 
     MatchCategory getCategory() const final {
         return MatchCategory::kOther;
+    }
+
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
     }
 
 protected:

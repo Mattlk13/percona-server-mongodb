@@ -27,12 +27,11 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/unittest/unittest.h"
 
 #include "mongo/platform/random.h"
-#include "mongo/util/log.h"
 #include "mongo/util/string_map.h"
 #include "mongo/util/timer.h"
 
@@ -212,11 +211,14 @@ TEST(StringMapTest, Assign) {
 
 TEST(StringMapTest, InitWithInitializerList) {
     StringMap<int> smap{
-        {"q", 1}, {"coollog", 2}, {"mango", 3}, {"mango", 4},
+        {"q", 1},
+        {"coollog", 2},
+        {"mango", 3},
+        {"mango", 4},
     };
 
     ASSERT_EQ(1, smap["q"]);
     ASSERT_EQ(2, smap["coollog"]);
     ASSERT_EQ(3, smap["mango"]);
 }
-}
+}  // namespace

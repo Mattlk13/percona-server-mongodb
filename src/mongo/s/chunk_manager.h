@@ -29,41 +29,125 @@
 
 #pragma once
 
-#include <map>
 #include <set>
 #include <string>
 #include <vector>
 
+#include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/s/chunk.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/client/shard.h"
+#include "mongo/s/database_version.h"
+#include "mongo/s/resharding/type_collection_fields_gen.h"
 #include "mongo/s/shard_key_pattern.h"
+#include "mongo/s/type_collection_timeseries_fields_gen.h"
+#include "mongo/stdx/unordered_map.h"
 #include "mongo/util/concurrency/ticketholder.h"
+#include "mongo/util/read_through_cache.h"
 
 namespace mongo {
 
 class CanonicalQuery;
 struct QuerySolutionNode;
-class OperationContext;
 class ChunkManager;
 
-// Ordered map from the max for each chunk to an entry describing the chunk
-using ChunkInfoMap = std::map<std::string, std::shared_ptr<ChunkInfo>>;
+struct ShardVersionTargetingInfo {
+    // Indicates whether the shard is stale and thus needs a catalog cache refresh
+    AtomicWord<bool> isStale{false};
 
-// Map from a shard is to the max chunk version on that shard
-using ShardVersionMap = std::map<ShardId, ChunkVersion>;
+    // Max chunk version for the shard
+    ChunkVersion shardVersion;
+
+    ShardVersionTargetingInfo(const OID& epoch, const boost::optional<Timestamp>& timestamp);
+};
+
+// Map from a shard to a struct indicating both the max chunk version on that shard and whether the
+// shard is currently marked as needing a catalog cache refresh (stale).
+using ShardVersionMap = stdx::unordered_map<ShardId, ShardVersionTargetingInfo, ShardId::Hasher>;
+
+/**
+ * This class serves as a Facade around how the mapping of ranges to chunks is represented. It also
+ * provides a simpler, high-level interface for domain specific operations without exposing the
+ * underlying implementation.
+ */
+class ChunkMap {
+    // Vector of chunks ordered by max key.
+    using ChunkVector = std::vector<std::shared_ptr<ChunkInfo>>;
+
+public:
+    explicit ChunkMap(OID epoch,
+                      const boost::optional<Timestamp>& timestamp,
+                      size_t initialCapacity = 0)
+        : _collectionVersion(0, 0, epoch, timestamp) {
+        _chunkMap.reserve(initialCapacity);
+    }
+
+    size_t size() const {
+        return _chunkMap.size();
+    }
+
+    ChunkVersion getVersion() const {
+        return _collectionVersion;
+    }
+
+    template <typename Callable>
+    void forEach(Callable&& handler, const BSONObj& shardKey = BSONObj()) const {
+        auto it = shardKey.isEmpty() ? _chunkMap.begin() : _findIntersectingChunk(shardKey);
+
+        for (; it != _chunkMap.end(); ++it) {
+            if (!handler(*it))
+                break;
+        }
+    }
+
+    template <typename Callable>
+    void forEachOverlappingChunk(const BSONObj& min,
+                                 const BSONObj& max,
+                                 bool isMaxInclusive,
+                                 Callable&& handler) const {
+        const auto bounds = _overlappingBounds(min, max, isMaxInclusive);
+
+        for (auto it = bounds.first; it != bounds.second; ++it) {
+            if (!handler(*it))
+                break;
+        }
+    }
+
+    ShardVersionMap constructShardVersionMap() const;
+    std::shared_ptr<ChunkInfo> findIntersectingChunk(const BSONObj& shardKey) const;
+
+    void appendChunk(const std::shared_ptr<ChunkInfo>& chunk);
+
+    ChunkMap createMerged(const std::vector<std::shared_ptr<ChunkInfo>>& changedChunks) const;
+
+    BSONObj toBSON() const;
+
+private:
+    ChunkVector::const_iterator _findIntersectingChunk(const BSONObj& shardKey,
+                                                       bool isMaxInclusive = true) const;
+    std::pair<ChunkVector::const_iterator, ChunkVector::const_iterator> _overlappingBounds(
+        const BSONObj& min, const BSONObj& max, bool isMaxInclusive) const;
+
+    ChunkVector _chunkMap;
+
+    // Max version across all chunks
+    ChunkVersion _collectionVersion;
+};
 
 /**
  * In-memory representation of the routing table for a single sharded collection at various points
  * in time.
  */
-class RoutingTableHistory : public std::enable_shared_from_this<RoutingTableHistory> {
+class RoutingTableHistory {
     RoutingTableHistory(const RoutingTableHistory&) = delete;
     RoutingTableHistory& operator=(const RoutingTableHistory&) = delete;
 
 public:
+    RoutingTableHistory(RoutingTableHistory&&) = default;
+    RoutingTableHistory& operator=(RoutingTableHistory&&) = default;
+
     /**
      * Makes an instance with a routing table for collection "nss", sharded on
      * "shardKeyPattern".
@@ -74,14 +158,21 @@ public:
      *
      * The "chunks" vector must contain the chunk routing information sorted in ascending order by
      * chunk version, and adhere to the requirements of the routing table update algorithm.
+     *
+     * The existence of "reshardingFields" inside the optional implies that this field was present
+     * inside the config.collections entry when refreshing.
      */
-    static std::shared_ptr<RoutingTableHistory> makeNew(
+    static RoutingTableHistory makeNew(
         NamespaceString nss,
         boost::optional<UUID>,
         KeyPattern shardKeyPattern,
         std::unique_ptr<CollatorInterface> defaultCollator,
         bool unique,
         OID epoch,
+        const boost::optional<Timestamp>& timestamp,
+        boost::optional<TypeCollectionTimeseriesFields> timeseriesFields,
+        boost::optional<TypeCollectionReshardingFields> reshardingFields,
+        bool allowMigrations,
         const std::vector<ChunkType>& chunks);
 
     /**
@@ -90,17 +181,25 @@ public:
      *
      * The changes in "changedChunks" must be sorted in ascending order by chunk version, and adhere
      * to the requirements of the routing table update algorithm.
+     *
+     * The existence of "reshardingFields" inside the optional implies that this field was present
+     * inside the config.collections entry when refreshing. An uninitialized "reshardingFields"
+     * parameter implies that the field was not present, and will clear any currently held
+     * resharding fields inside the resulting RoutingTableHistory.
      */
-    std::shared_ptr<RoutingTableHistory> makeUpdated(const std::vector<ChunkType>& changedChunks);
+    RoutingTableHistory makeUpdated(
+        boost::optional<TypeCollectionReshardingFields> reshardingFields,
+        bool allowMigrations,
+        const std::vector<ChunkType>& changedChunks) const;
 
     /**
-     * Returns an increasing number of the reload sequence number of this chunk manager.
+     * Constructs a new instance with the same routing table but adding or removing timestamp on all
+     * chunks
      */
-    unsigned long long getSequenceNumber() const {
-        return _sequenceNumber;
-    }
+    RoutingTableHistory makeUpdatedReplacingTimestamp(
+        const boost::optional<Timestamp>& timestamp) const;
 
-    const NamespaceString& getns() const {
+    const NamespaceString& nss() const {
         return _nss;
     }
 
@@ -116,20 +215,66 @@ public:
         return _unique;
     }
 
+    /**
+     * Mark the given shard as stale, indicating that requests targetted to this shard (for this
+     * namespace) need to block on a catalog cache refresh.
+     */
+    void setShardStale(const ShardId& shardId);
+
+    /**
+     * Mark all shards as not stale, indicating that a refresh has happened and requests targeted
+     * to all shards (for this namespace) do not currently need to block on a catalog cache refresh.
+     */
+    void setAllShardsRefreshed();
+
     ChunkVersion getVersion() const {
-        return _collectionVersion;
+        return _chunkMap.getVersion();
     }
 
+    /**
+     * Retrieves the shard version for the given shard. Will throw a ShardInvalidatedForTargeting
+     * exception if the shard is marked as stale.
+     */
     ChunkVersion getVersion(const ShardId& shardId) const;
 
-    const ChunkInfoMap& getChunkMap() const {
-        return _chunkMap;
+    /**
+     * Retrieves the shard version for the given shard. Will not throw if the shard is marked as
+     * stale. Only use when logging the given chunk version -- if the caller must execute logic
+     * based on the returned version, use getVersion() instead.
+     */
+    ChunkVersion getVersionForLogging(const ShardId& shardId) const;
+
+    size_t numChunks() const {
+        return _chunkMap.size();
+    }
+
+    template <typename Callable>
+    void forEachChunk(Callable&& handler, const BSONObj& shardKey = BSONObj()) const {
+        _chunkMap.forEach(std::forward<Callable>(handler), shardKey);
+    }
+
+    template <typename Callable>
+    void forEachOverlappingChunk(const BSONObj& min,
+                                 const BSONObj& max,
+                                 bool isMaxInclusive,
+                                 Callable&& handler) const {
+        _chunkMap.forEachOverlappingChunk(
+            min, max, isMaxInclusive, std::forward<Callable>(handler));
+    }
+
+    std::shared_ptr<ChunkInfo> findIntersectingChunk(const BSONObj& shardKey) const {
+        return _chunkMap.findIntersectingChunk(shardKey);
     }
 
     /**
      * Returns the ids of all shards on which the collection has any chunks.
      */
     void getAllShardIds(std::set<ShardId>* all) const;
+
+    /**
+     * Returns the number of shards on which the collection has any chunks
+     */
+    int getNShardsOwningChunks() const;
 
     /**
      * Returns true if, for this shard, the chunks are identical in both chunk managers
@@ -142,159 +287,291 @@ public:
         return _uuid && *_uuid == uuid;
     }
 
+    bool sameAllowMigrations(const RoutingTableHistory& other) const {
+        return _allowMigrations == other._allowMigrations;
+    }
+
+    bool sameReshardingFields(const RoutingTableHistory& other) const {
+        if (_reshardingFields && other._reshardingFields) {
+            return _reshardingFields->toBSON().woCompare(other._reshardingFields->toBSON()) == 0;
+        } else {
+            return !_reshardingFields && !other._reshardingFields;
+        }
+    }
+
     boost::optional<UUID> getUUID() const {
         return _uuid;
     }
 
-    std::pair<ChunkInfoMap::const_iterator, ChunkInfoMap::const_iterator> overlappingRanges(
-        const BSONObj& min, const BSONObj& max, bool isMaxInclusive) const;
+    const boost::optional<TypeCollectionTimeseriesFields>& getTimeseriesFields() const {
+        return _timeseriesFields;
+    }
 
+    const boost::optional<TypeCollectionReshardingFields>& getReshardingFields() const {
+        return _reshardingFields;
+    }
+
+    bool allowMigrations() const {
+        return _allowMigrations;
+    }
 
 private:
+    friend class ChunkManager;
+
     RoutingTableHistory(NamespaceString nss,
                         boost::optional<UUID> uuid,
                         KeyPattern shardKeyPattern,
                         std::unique_ptr<CollatorInterface> defaultCollator,
                         bool unique,
-                        ChunkInfoMap chunkMap,
-                        ChunkVersion collectionVersion);
+                        boost::optional<TypeCollectionTimeseriesFields> timeseriesFields,
+                        boost::optional<TypeCollectionReshardingFields> reshardingFields,
+                        bool allowMigrations,
+                        ChunkMap chunkMap);
 
-    /**
-     * Does a single pass over the chunkMap and constructs the ShardVersionMap object.
-     */
-    ShardVersionMap _constructShardVersionMap() const;
-
-    std::string _extractKeyString(const BSONObj& shardKeyValue) const;
-
-    // The shard versioning mechanism hinges on keeping track of the number of times we reload
-    // ChunkManagers.
-    const unsigned long long _sequenceNumber;
+    ChunkVersion _getVersion(const ShardId& shardName, bool throwOnStaleShard) const;
 
     // Namespace to which this routing information corresponds
-    const NamespaceString _nss;
+    NamespaceString _nss;
 
     // The invariant UUID of the collection.  This is optional in 3.6, except in change streams.
-    const boost::optional<UUID> _uuid;
+    boost::optional<UUID> _uuid;
 
     // The key pattern used to shard the collection
-    const ShardKeyPattern _shardKeyPattern;
-
-    const Ordering _shardKeyOrdering;
+    ShardKeyPattern _shardKeyPattern;
 
     // Default collation to use for routing data queries for this collection
-    const std::unique_ptr<CollatorInterface> _defaultCollator;
+    std::unique_ptr<CollatorInterface> _defaultCollator;
 
     // Whether the sharding key is unique
-    const bool _unique;
+    bool _unique;
+
+    // This information will be valid if the collection is a time-series buckets collection.
+    boost::optional<TypeCollectionTimeseriesFields> _timeseriesFields;
+
+    // The set of fields related to an ongoing resharding operation involving this collection. The
+    // presence of the type inside the optional indicates that the collection is involved in a
+    // resharding operation, and that these fields were present in the config.collections entry
+    // for this collection.
+    boost::optional<TypeCollectionReshardingFields> _reshardingFields;
+
+    bool _allowMigrations;
 
     // Map from the max for each chunk to an entry describing the chunk. The union of all chunks'
     // ranges must cover the complete space from [MinKey, MaxKey).
-    const ChunkInfoMap _chunkMap;
+    ChunkMap _chunkMap;
 
-    // Max version across all chunks
-    const ChunkVersion _collectionVersion;
-
-    // Map from shard id to the maximum chunk version for that shard. If a shard contains no
-    // chunks, it won't be present in this map.
-    const ShardVersionMap _shardVersions;
-
-    friend class ChunkManager;
+    // The representation of shard versions and staleness indicators for this namespace. If a
+    // shard does not exist, it will not have an entry in the map.
+    // Note: this declaration must not be moved before _chunkMap since it is initialized by using
+    // the _chunkMap instance.
+    ShardVersionMap _shardVersions;
 };
 
-// This will be renamed to RoutingTableHistory and the original RoutingTableHistory will be
-// ChunkHistoryMap
-class ChunkManager : public std::enable_shared_from_this<ChunkManager> {
-    ChunkManager(const ChunkManager&) = delete;
-    ChunkManager& operator=(const ChunkManager&) = delete;
-
+/**
+ * Constructed to be used exclusively by the CatalogCache as a vector clock (Time) to drive
+ * CollectionCache's lookups.
+ *
+ * The ChunkVersion class contains a non comparable epoch, which makes impossible to compare two
+ * ChunkVersions when their epochs's differ.
+ *
+ * This class wraps a ChunkVersion object with a node-local sequence number
+ * (_epochDisambiguatingSequenceNum) that allows the comparision.
+ *
+ * This class should go away once a cluster-wide comparable ChunkVersion is implemented.
+ */
+class ComparableChunkVersion {
 public:
-    class ConstChunkIterator {
-    public:
-        ConstChunkIterator() = default;
-        explicit ConstChunkIterator(ChunkInfoMap::const_iterator iter,
-                                    boost::optional<Timestamp> clusterTime)
-            : _iter{std::move(iter)}, _clusterTime{std::move(clusterTime)} {}
-
-        ConstChunkIterator& operator++() {
-            ++_iter;
-            return *this;
-        }
-        ConstChunkIterator operator++(int) {
-            return ConstChunkIterator{_iter++, _clusterTime};
-        }
-        bool operator==(const ConstChunkIterator& other) const {
-            return _iter == other._iter;
-        }
-        bool operator!=(const ConstChunkIterator& other) const {
-            return !(*this == other);
-        }
-        const Chunk operator*() const {
-            return Chunk{*_iter->second, _clusterTime};
-        }
-
-    private:
-        ChunkInfoMap::const_iterator _iter;
-        boost::optional<Timestamp> _clusterTime;
-    };
-
-    class ConstRangeOfChunks {
-    public:
-        ConstRangeOfChunks(ConstChunkIterator begin, ConstChunkIterator end)
-            : _begin{std::move(begin)}, _end{std::move(end)} {}
-
-        ConstChunkIterator begin() const {
-            return _begin;
-        }
-        ConstChunkIterator end() const {
-            return _end;
-        }
-
-    private:
-        ConstChunkIterator _begin;
-        ConstChunkIterator _end;
-    };
-
-    ChunkManager(std::shared_ptr<RoutingTableHistory> rt, boost::optional<Timestamp> clusterTime)
-        : _rt(std::move(rt)), _clusterTime(std::move(clusterTime)) {}
+    /**
+     * Creates a ComparableChunkVersion that wraps the given ChunkVersion.
+     * Each object created through this method will have a local sequence number greater than the
+     * previously created ones.
+     */
+    static ComparableChunkVersion makeComparableChunkVersion(const ChunkVersion& version);
 
     /**
-     * Returns an increasing number of the reload sequence number of this chunk manager.
+     * Creates a new instance which will artificially be greater than any
+     * previously created ComparableChunkVersion and smaller than any instance
+     * created afterwards. Used as means to cause the collections cache to
+     * attempt a refresh in situations where causal consistency cannot be
+     * inferred.
      */
-    unsigned long long getSequenceNumber() const {
-        return _rt->getSequenceNumber();
+    static ComparableChunkVersion makeComparableChunkVersionForForcedRefresh();
+
+    /**
+     * Empty constructor needed by the ReadThroughCache.
+     *
+     * Instances created through this constructor will be always less then the ones created through
+     * the two static constructors, but they do not carry any meaningful value and can only be used
+     * for comparison purposes.
+     */
+    ComparableChunkVersion() = default;
+
+    BSONObj toBSONForLogging() const;
+
+    bool sameEpoch(const ComparableChunkVersion& other) const {
+        return _chunkVersion->epoch() == other._chunkVersion->epoch();
     }
 
-    const NamespaceString& getns() const {
-        return _rt->getns();
+    bool operator==(const ComparableChunkVersion& other) const;
+
+    bool operator!=(const ComparableChunkVersion& other) const {
+        return !(*this == other);
     }
 
-    const ShardKeyPattern& getShardKeyPattern() const {
-        return _rt->getShardKeyPattern();
+    /**
+     * In case the two compared instances have different epochs, the most recently created one will
+     * be greater, otherwise the comparision will be driven by the major/minor versions of the
+     * underlying ChunkVersion.
+     */
+    bool operator<(const ComparableChunkVersion& other) const;
+
+    bool operator>(const ComparableChunkVersion& other) const {
+        return other < *this;
     }
 
-    const CollatorInterface* getDefaultCollator() const {
-        return _rt->getDefaultCollator();
+    bool operator<=(const ComparableChunkVersion& other) const {
+        return !(*this > other);
     }
 
-    bool isUnique() const {
-        return _rt->isUnique();
+    bool operator>=(const ComparableChunkVersion& other) const {
+        return !(*this < other);
     }
 
-    ChunkVersion getVersion() const {
-        return _rt->getVersion();
+private:
+    friend class CatalogCache;
+
+    static AtomicWord<uint64_t> _epochDisambiguatingSequenceNumSource;
+    static AtomicWord<uint64_t> _forcedRefreshSequenceNumSource;
+
+    ComparableChunkVersion(uint64_t forcedRefreshSequenceNum,
+                           boost::optional<ChunkVersion> version,
+                           uint64_t epochDisambiguatingSequenceNum)
+        : _forcedRefreshSequenceNum(forcedRefreshSequenceNum),
+          _chunkVersion(std::move(version)),
+          _epochDisambiguatingSequenceNum(epochDisambiguatingSequenceNum) {}
+
+    void setChunkVersion(const ChunkVersion& version);
+
+    uint64_t _forcedRefreshSequenceNum{0};
+
+    boost::optional<ChunkVersion> _chunkVersion;
+
+    // Locally incremented sequence number that allows to compare two colection versions with
+    // different epochs. Each new comparableChunkVersion will have a greater sequence number than
+    // the ones created before.
+    uint64_t _epochDisambiguatingSequenceNum{0};
+};
+
+/**
+ * This intermediate structure is necessary to be able to store UNSHARDED collections in the routing
+ * table history cache below. The reason is that currently the RoutingTableHistory class only
+ * supports sharded collections (i.e., collections which have entries in config.collections and
+ * config.chunks).
+ */
+struct OptionalRoutingTableHistory {
+    // UNSHARDED collection constructor
+    OptionalRoutingTableHistory() = default;
+
+    // SHARDED collection constructor
+    OptionalRoutingTableHistory(RoutingTableHistory&& rt) : optRt(std::move(rt)) {}
+
+    // If boost::none, the collection is UNSHARDED, otherwise it is SHARDED
+    boost::optional<RoutingTableHistory> optRt;
+};
+
+using RoutingTableHistoryCache =
+    ReadThroughCache<NamespaceString, OptionalRoutingTableHistory, ComparableChunkVersion>;
+using RoutingTableHistoryValueHandle = RoutingTableHistoryCache::ValueHandle;
+
+/**
+ * Combines a shard, the shard version, and database version that the shard should be using
+ */
+struct ShardEndpoint {
+    ShardEndpoint(const ShardId& shardName,
+                  boost::optional<ChunkVersion> shardVersion,
+                  boost::optional<DatabaseVersion> dbVersion);
+
+    ShardId shardName;
+
+    boost::optional<ChunkVersion> shardVersion;
+    boost::optional<DatabaseVersion> databaseVersion;
+};
+
+/**
+ * Wrapper around a RoutingTableHistory, which pins it to a particular point in time.
+ */
+class ChunkManager {
+public:
+    ChunkManager(ShardId dbPrimary,
+                 DatabaseVersion dbVersion,
+                 RoutingTableHistoryValueHandle rt,
+                 boost::optional<Timestamp> clusterTime)
+        : _dbPrimary(std::move(dbPrimary)),
+          _dbVersion(std::move(dbVersion)),
+          _rt(std::move(rt)),
+          _clusterTime(std::move(clusterTime)) {}
+
+    // Methods supported on both sharded and unsharded collections
+
+    bool isSharded() const {
+        return bool(_rt->optRt);
     }
 
-    ChunkVersion getVersion(const ShardId& shardId) const {
-        return _rt->getVersion(shardId);
+    /**
+     * Indicates that this collection must not honour any moveChunk requests, because it is required
+     * to provide a stable view of its constituent shards.
+     */
+    bool allowMigrations() const;
+
+    const ShardId& dbPrimary() const {
+        return _dbPrimary;
     }
 
-    ConstRangeOfChunks chunks() const {
-        return {ConstChunkIterator{_rt->getChunkMap().cbegin(), _clusterTime},
-                ConstChunkIterator{_rt->getChunkMap().cend(), _clusterTime}};
+    const DatabaseVersion& dbVersion() const {
+        return _dbVersion;
     }
 
     int numChunks() const {
-        return _rt->getChunkMap().size();
+        return _rt->optRt ? _rt->optRt->numChunks() : 1;
+    }
+
+    std::string toString() const;
+
+    // Methods only supported on sharded collections (caller must check isSharded())
+
+    const ShardKeyPattern& getShardKeyPattern() const {
+        return _rt->optRt->getShardKeyPattern();
+    }
+
+    const CollatorInterface* getDefaultCollator() const {
+        return _rt->optRt->getDefaultCollator();
+    }
+
+    bool isUnique() const {
+        return _rt->optRt->isUnique();
+    }
+
+    ChunkVersion getVersion() const {
+        return _rt->optRt->getVersion();
+    }
+
+    ChunkVersion getVersion(const ShardId& shardId) const {
+        return _rt->optRt->getVersion(shardId);
+    }
+
+    ChunkVersion getVersionForLogging(const ShardId& shardId) const {
+        return _rt->optRt->getVersionForLogging(shardId);
+    }
+
+    template <typename Callable>
+    void forEachChunk(Callable&& handler) const {
+        _rt->optRt->forEachChunk(
+            [this, handler = std::forward<Callable>(handler)](const auto& chunkInfo) mutable {
+                if (!handler(Chunk{*chunkInfo, _clusterTime}))
+                    return false;
+
+                return true;
+            });
     }
 
     /**
@@ -311,10 +588,10 @@ public:
 
     /**
      * Given a shardKey, returns the first chunk which is owned by shardId and overlaps or sorts
-     * after that shardKey. The returned iterator range always contains one or zero entries. If zero
-     * entries are returned, this means no such chunk exists.
+     * after that shardKey. If the return value is empty, this means no such chunk exists.
      */
-    ConstRangeOfChunks getNextChunkOnShard(const BSONObj& shardKey, const ShardId& shardId) const;
+    boost::optional<Chunk> getNextChunkOnShard(const BSONObj& shardKey,
+                                               const ShardId& shardId) const;
 
     /**
      * Given a shard key (or a prefix) that has been extracted from a document, returns the chunk
@@ -338,10 +615,16 @@ public:
     }
 
     /**
+     * Finds the shard id of the shard that owns the chunk minKey belongs to, assuming the simple
+     * collation because shard keys do not support non-simple collations.
+     */
+    ShardId getMinKeyShardIdWithSimpleCollation() const;
+
+    /**
      * Finds the shard IDs for a given filter and collation. If collation is empty, we use the
      * collection default collation for targeting.
      */
-    void getShardIdsForQuery(OperationContext* opCtx,
+    void getShardIdsForQuery(boost::intrusive_ptr<ExpressionContext> expCtx,
                              const BSONObj& query,
                              const BSONObj& collation,
                              std::set<ShardId>* shardIds) const;
@@ -358,7 +641,14 @@ public:
      * Returns the ids of all shards on which the collection has any chunks.
      */
     void getAllShardIds(std::set<ShardId>* all) const {
-        _rt->getAllShardIds(all);
+        _rt->optRt->getAllShardIds(all);
+    }
+
+    /**
+     * Returns the number of shards on which the collection has any chunks
+     */
+    int getNShardsOwningChunks() const {
+        return _rt->optRt->getNShardsOwningChunks();
     }
 
     // Transforms query into bounds for each field in the shard key
@@ -381,30 +671,44 @@ public:
     static IndexBounds collapseQuerySolution(const QuerySolutionNode* node);
 
     /**
+     * Constructs a new ChunkManager, which is a view of the underlying routing table at a different
+     * `clusterTime`.
+     */
+    static ChunkManager makeAtTime(const ChunkManager& cm, Timestamp clusterTime);
+
+    /**
      * Returns true if, for this shard, the chunks are identical in both chunk managers
      */
     bool compatibleWith(const ChunkManager& other, const ShardId& shard) const {
-        return _rt->compatibleWith(*other._rt, shard);
-    }
-
-    std::string toString() const {
-        return _rt->toString();
+        return _rt->optRt->compatibleWith(*other._rt->optRt, shard);
     }
 
     bool uuidMatches(UUID uuid) const {
-        return _rt->uuidMatches(uuid);
-    }
-
-    auto getRoutingHistory() const {
-        return _rt;
+        return _rt->optRt->uuidMatches(uuid);
     }
 
     boost::optional<UUID> getUUID() const {
-        return _rt->getUUID();
+        return _rt->optRt->getUUID();
+    }
+
+    const boost::optional<TypeCollectionTimeseriesFields>& getTimeseriesFields() const {
+        return _rt->optRt->getTimeseriesFields();
+    }
+
+    const boost::optional<TypeCollectionReshardingFields>& getReshardingFields() const {
+        return _rt->optRt->getReshardingFields();
+    }
+
+    const RoutingTableHistory& getRoutingTableHistory_ForTest() const {
+        return *_rt->optRt;
     }
 
 private:
-    std::shared_ptr<RoutingTableHistory> _rt;
+    ShardId _dbPrimary;
+    DatabaseVersion _dbVersion;
+
+    RoutingTableHistoryValueHandle _rt;
+
     boost::optional<Timestamp> _clusterTime;
 };
 

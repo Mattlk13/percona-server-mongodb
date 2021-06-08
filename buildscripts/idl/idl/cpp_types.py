@@ -28,9 +28,9 @@
 """IDL C++ Code Generator."""
 
 from abc import ABCMeta, abstractmethod
-import string
+
 import textwrap
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 from . import ast
 from . import bson
@@ -48,23 +48,12 @@ def is_primitive_scalar_type(cpp_type):
     Primitive scalar types need to have a default value to prevent warnings from Coverity.
     """
     cpp_type = cpp_type.replace(' ', '')
+    # TODO (SERVER-50101): Remove 'FeatureCompatibility::Version' once IDL supports a commmand
+    # cpp_type of C++ enum.
     return cpp_type in [
-        'bool', 'double', 'std::int32_t', 'std::uint32_t', 'std::uint64_t', 'std::int64_t'
+        'bool', 'double', 'ServerGlobalParams::FeatureCompatibility::Version', 'std::int32_t',
+        'std::uint32_t', 'std::uint64_t', 'std::int64_t'
     ]
-
-
-def get_primitive_scalar_type_default_value(cpp_type):
-    # type: (str) -> str
-    """
-    Return a default value for a primitive scalar type.
-
-    Assumes the IDL generated code verifies the user sets the value before serialization.
-    """
-    # pylint: disable=invalid-name
-    assert is_primitive_scalar_type(cpp_type)
-    if cpp_type == 'bool':
-        return 'false'
-    return '-1'
 
 
 def is_primitive_type(cpp_type):
@@ -98,10 +87,11 @@ def _optionally_make_call(method_name, param):
 class CppTypeBase(metaclass=ABCMeta):
     """Base type for C++ Type information."""
 
-    def __init__(self, field):
-        # type: (ast.Field) -> None
+    def __init__(self, field, cpp_type_name):
+        # type: (ast.Field, str) -> None
         """Construct a CppTypeBase."""
         self._field = field
+        self._cpp_type_name = cpp_type_name
 
     @abstractmethod
     def get_type_name(self):
@@ -175,12 +165,7 @@ class _CppTypeBasic(CppTypeBase):
 
     def get_type_name(self):
         # type: () -> str
-        if self._field.struct_type:
-            cpp_type = common.title_case(self._field.struct_type)
-        else:
-            cpp_type = self._field.cpp_type
-
-        return cpp_type
+        return self._cpp_type_name
 
     def get_storage_type(self):
         # type: () -> str
@@ -193,7 +178,7 @@ class _CppTypeBasic(CppTypeBase):
     def is_const_type(self):
         # type: () -> bool
         # Enum types are never const since they are mapped to primitive types, and coverity warns.
-        if self._field.enum_type:
+        if self._field.type.is_enum:
             return False
 
         type_name = self.get_type_name().replace(' ', '')
@@ -210,7 +195,7 @@ class _CppTypeBasic(CppTypeBase):
 
     def return_by_reference(self):
         # type: () -> bool
-        return not is_primitive_type(self.get_type_name()) and not self._field.enum_type
+        return not is_primitive_type(self.get_type_name()) and not self._field.type.is_enum
 
     def disable_xvalue(self):
         # type: () -> bool
@@ -243,11 +228,11 @@ class _CppTypeBasic(CppTypeBase):
 class _CppTypeView(CppTypeBase):
     """Base type for C++ View Types information."""
 
-    def __init__(self, field, storage_type, view_type):
-        # type: (ast.Field, str, str) -> None
+    def __init__(self, field, cpp_type_name, storage_type, view_type):
+        # type: (ast.Field, str, str, str) -> None
         self._storage_type = storage_type
         self._view_type = view_type
-        super(_CppTypeView, self).__init__(field)
+        super(_CppTypeView, self).__init__(field, cpp_type_name)
 
     def get_type_name(self):
         # type: () -> str
@@ -304,9 +289,13 @@ class _CppTypeView(CppTypeBase):
 class _CppTypeVector(CppTypeBase):
     """Base type for C++ Std::Vector Types information."""
 
+    def __init__(self, field):
+        # type: (ast.Field) -> None
+        super(_CppTypeVector, self).__init__(field, 'std::vector<std::uint8_t>')
+
     def get_type_name(self):
         # type: () -> str
-        return 'std::vector<std::uint8_t>'
+        return self._cpp_type_name
 
     def get_storage_type(self):
         # type: () -> str
@@ -360,10 +349,10 @@ class _CppTypeVector(CppTypeBase):
 class _CppTypeDelegating(CppTypeBase):
     """Delegates all method calls a nested instance of CppTypeBase. Used to build other classes."""
 
-    def __init__(self, base, field):
-        # type: (CppTypeBase, ast.Field) -> None
+    def __init__(self, base, field, cpp_type_name):
+        # type: (CppTypeBase, ast.Field, str) -> None
         self._base = base
-        super(_CppTypeDelegating, self).__init__(field)
+        super(_CppTypeDelegating, self).__init__(field, cpp_type_name)
 
     def get_type_name(self):
         # type: () -> str
@@ -532,23 +521,27 @@ class _CppTypeOptional(_CppTypeDelegating):
         return self._base.get_setter_body(member_name, validator_method_name)
 
 
+def get_cpp_type_from_cpp_type_name(field, cpp_type_name, array):
+    # type: (ast.Field, str, bool) -> CppTypeBase
+    """Get the C++ Type information for the given C++ type name, e.g. std::string."""
+    cpp_type_info: CppTypeBase
+    if cpp_type_name == 'std::string':
+        cpp_type_info = _CppTypeView(field, 'std::string', 'std::string', 'StringData')
+    elif cpp_type_name == 'std::vector<std::uint8_t>':
+        cpp_type_info = _CppTypeVector(field)
+    else:
+        cpp_type_info = _CppTypeBasic(field, cpp_type_name)
+
+    if array:
+        cpp_type_info = _CppTypeArray(cpp_type_info, field, cpp_type_name)
+
+    return cpp_type_info
+
+
 def get_cpp_type_without_optional(field):
     # type: (ast.Field) -> CppTypeBase
     """Get the C++ Type information for the given field but ignore optional."""
-
-    cpp_type_info = None  # type: Any
-
-    if field.cpp_type == 'std::string':
-        cpp_type_info = _CppTypeView(field, 'std::string', 'StringData')
-    elif field.cpp_type == 'std::vector<std::uint8_t>':
-        cpp_type_info = _CppTypeVector(field)
-    else:
-        cpp_type_info = _CppTypeBasic(field)
-
-    if field.array:
-        cpp_type_info = _CppTypeArray(cpp_type_info, field)
-
-    return cpp_type_info
+    return get_cpp_type_from_cpp_type_name(field, field.type.cpp_type, field.type.is_array)
 
 
 def get_cpp_type(field):
@@ -558,7 +551,7 @@ def get_cpp_type(field):
     cpp_type_info = get_cpp_type_without_optional(field)
 
     if field.optional:
-        cpp_type_info = _CppTypeOptional(cpp_type_info, field)
+        return _CppTypeOptional(cpp_type_info, field, field.type.cpp_type)
 
     return cpp_type_info
 
@@ -566,10 +559,10 @@ def get_cpp_type(field):
 class BsonCppTypeBase(object, metaclass=ABCMeta):
     """Base type for custom C++ support for BSON Types information."""
 
-    def __init__(self, field):
-        # type: (ast.Field) -> None
+    def __init__(self, ast_type):
+        # type: (ast.Type) -> None
         """Construct a BsonCppTypeBase."""
-        self._field = field
+        self._ast_type = ast_type
 
     @abstractmethod
     def gen_deserializer_expression(self, indented_writer, object_instance):
@@ -602,7 +595,7 @@ def _call_method_or_global_function(expression, method_name):
     short_method_name = writer.get_method_name(method_name)
     if writer.is_function(method_name):
         return common.template_args('${method_name}(${expression})', expression=expression,
-                                    method_name=short_method_name)
+                                    method_name=method_name)
 
     return common.template_args('${expression}.${method_name}()', expression=expression,
                                 method_name=short_method_name)
@@ -611,10 +604,10 @@ def _call_method_or_global_function(expression, method_name):
 class _CommonBsonCppTypeBase(BsonCppTypeBase):
     """Custom C++ support for basic BSON types."""
 
-    def __init__(self, field, deserialize_method_name):
-        # type: (ast.Field, str) -> None
+    def __init__(self, ast_type, deserialize_method_name):
+        # type: (ast.Type, str) -> None
         self._deserialize_method_name = deserialize_method_name
-        super(_CommonBsonCppTypeBase, self).__init__(field)
+        super(_CommonBsonCppTypeBase, self).__init__(ast_type)
 
     def gen_deserializer_expression(self, indented_writer, object_instance):
         # type: (writer.IndentedTextWriter, str) -> str
@@ -624,11 +617,11 @@ class _CommonBsonCppTypeBase(BsonCppTypeBase):
 
     def has_serializer(self):
         # type: () -> bool
-        return self._field.serializer is not None
+        return self._ast_type.serializer is not None
 
     def gen_serializer_expression(self, indented_writer, expression):
         # type: (writer.IndentedTextWriter, str) -> str
-        return _call_method_or_global_function(expression, self._field.serializer)
+        return _call_method_or_global_function(expression, self._ast_type.serializer)
 
 
 class _ObjectBsonCppTypeBase(BsonCppTypeBase):
@@ -636,7 +629,7 @@ class _ObjectBsonCppTypeBase(BsonCppTypeBase):
 
     def gen_deserializer_expression(self, indented_writer, object_instance):
         # type: (writer.IndentedTextWriter, str) -> str
-        if self._field.deserializer:
+        if self._ast_type.deserializer:
             # Call a method like: Class::method(const BSONObj& value)
             indented_writer.write_line(
                 common.template_args('const BSONObj localObject = ${object_instance}.Obj();',
@@ -648,11 +641,11 @@ class _ObjectBsonCppTypeBase(BsonCppTypeBase):
 
     def has_serializer(self):
         # type: () -> bool
-        return self._field.serializer is not None
+        return self._ast_type.serializer is not None
 
     def gen_serializer_expression(self, indented_writer, expression):
         # type: (writer.IndentedTextWriter, str) -> str
-        method_name = writer.get_method_name(self._field.serializer)
+        method_name = writer.get_method_name(self._ast_type.serializer)
         indented_writer.write_line(
             common.template_args('const BSONObj localObject = ${expression}.${method_name}();',
                                  expression=expression, method_name=method_name))
@@ -664,8 +657,8 @@ class _BinDataBsonCppTypeBase(BsonCppTypeBase):
 
     def gen_deserializer_expression(self, indented_writer, object_instance):
         # type: (writer.IndentedTextWriter, str) -> str
-        if self._field.bindata_subtype == 'uuid':
-            return common.template_args('${object_instance}.uuid()',
+        if self._ast_type.bindata_subtype == 'uuid':
+            return common.template_args('uassertStatusOK(UUID::parse(${object_instance}))',
                                         object_instance=object_instance)
         return common.template_args('${object_instance}._binDataVector()',
                                     object_instance=object_instance)
@@ -676,8 +669,8 @@ class _BinDataBsonCppTypeBase(BsonCppTypeBase):
 
     def gen_serializer_expression(self, indented_writer, expression):
         # type: (writer.IndentedTextWriter, str) -> str
-        if self._field.serializer:
-            method_name = writer.get_method_name(self._field.serializer)
+        if self._ast_type.serializer:
+            method_name = writer.get_method_name(self._ast_type.serializer)
             indented_writer.write_line(
                 common.template_args('ConstDataRange tempCDR = ${expression}.${method_name}();',
                                      expression=expression, method_name=method_name))
@@ -688,31 +681,31 @@ class _BinDataBsonCppTypeBase(BsonCppTypeBase):
 
         return common.template_args(
             'BSONBinData(tempCDR.data(), tempCDR.length(), ${bindata_subtype})',
-            bindata_subtype=bson.cpp_bindata_subtype_type_name(self._field.bindata_subtype))
+            bindata_subtype=bson.cpp_bindata_subtype_type_name(self._ast_type.bindata_subtype))
 
 
-# For some fields, we want to support custom serialization but defer most of the serialization to
+# For some types, we want to support custom serialization but defer most of the serialization to
 # the core BSONElement class. This means that callers need to only process a string, a vector of
 # bytes, or a integer, not a BSONElement or BSONObj.
-def get_bson_cpp_type(field):
-    # type: (ast.Field) -> Optional[BsonCppTypeBase]
+def get_bson_cpp_type(ast_type):
+    # type: (ast.Type) -> Optional[BsonCppTypeBase]
     """Get a class that provides custom serialization for the given BSON type."""
 
     # Does not support list of types
-    if len(field.bson_serialization_type) > 1:
+    if len(ast_type.bson_serialization_type) > 1:
         return None
 
-    if field.bson_serialization_type[0] == 'string':
-        return _CommonBsonCppTypeBase(field, "valueStringData")
+    if ast_type.bson_serialization_type[0] == 'string':
+        return _CommonBsonCppTypeBase(ast_type, "valueStringData")
 
-    if field.bson_serialization_type[0] == 'object':
-        return _ObjectBsonCppTypeBase(field)
+    if ast_type.bson_serialization_type[0] == 'object':
+        return _ObjectBsonCppTypeBase(ast_type)
 
-    if field.bson_serialization_type[0] == 'bindata':
-        return _BinDataBsonCppTypeBase(field)
+    if ast_type.bson_serialization_type[0] == 'bindata':
+        return _BinDataBsonCppTypeBase(ast_type)
 
-    if field.bson_serialization_type[0] == 'int':
-        return _CommonBsonCppTypeBase(field, "_numberInt")
+    if ast_type.bson_serialization_type[0] == 'int':
+        return _CommonBsonCppTypeBase(ast_type, "_numberInt")
 
     # Unsupported type
     return None

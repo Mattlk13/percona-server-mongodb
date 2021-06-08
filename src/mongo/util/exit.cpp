@@ -27,27 +27,27 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl;
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/util/exit.h"
 
 #include <boost/optional.hpp>
+#include <functional>
 #include <stack>
 
+#include "mongo/logv2/log.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
-#include "mongo/util/log.h"
 #include "mongo/util/quick_exit.h"
 
 namespace mongo {
 
 namespace {
 
-stdx::mutex shutdownMutex;
+Mutex shutdownMutex;
 stdx::condition_variable shutdownTasksComplete;
 boost::optional<ExitCode> shutdownExitCode;
 bool shutdownTasksInProgress = false;
@@ -68,7 +68,7 @@ void runTasks(decltype(shutdownTasks) tasks, const ShutdownTaskArgs& shutdownArg
 // has its own 'quickExitMutex' to prohibit multiple threads from attempting to call _exit().
 MONGO_COMPILER_NORETURN void logAndQuickExit_inlock() {
     ExitCode code = shutdownExitCode.get();
-    log() << "shutting down with code:" << code;
+    LOGV2(23138, "Shutting down with code: {exitCode}", "Shutting down", "exitCode"_attr = code);
     quickExit(code);
 }
 
@@ -83,7 +83,7 @@ bool globalInShutdownDeprecated() {
 }
 
 ExitCode waitForShutdown() {
-    stdx::unique_lock<stdx::mutex> lk(shutdownMutex);
+    stdx::unique_lock<Latch> lk(shutdownMutex);
     shutdownTasksComplete.wait(lk, [] {
         const auto shutdownStarted = static_cast<bool>(shutdownExitCode);
         return shutdownStarted && !shutdownTasksInProgress;
@@ -93,7 +93,7 @@ ExitCode waitForShutdown() {
 }
 
 void registerShutdownTask(unique_function<void(const ShutdownTaskArgs&)> task) {
-    stdx::lock_guard<stdx::mutex> lock(shutdownMutex);
+    stdx::lock_guard<Latch> lock(shutdownMutex);
     invariant(!globalInShutdownDeprecated());
     shutdownTasks.emplace(std::move(task));
 }
@@ -102,7 +102,7 @@ void shutdown(ExitCode code, const ShutdownTaskArgs& shutdownArgs) {
     decltype(shutdownTasks) localTasks;
 
     {
-        stdx::unique_lock<stdx::mutex> lock(shutdownMutex);
+        stdx::unique_lock<Latch> lock(shutdownMutex);
 
         if (shutdownTasksInProgress) {
             // Someone better have called shutdown in some form already.
@@ -113,10 +113,14 @@ void shutdown(ExitCode code, const ShutdownTaskArgs& shutdownArgs) {
 
             ExitCode originallyRequestedCode = shutdownExitCode.get();
             if (code != originallyRequestedCode) {
-                log() << "While running shutdown tasks with the intent to exit with code "
-                      << originallyRequestedCode << ", an additional shutdown request arrived with "
-                                                    "the intent to exit with a different exit code "
-                      << code << "; ignoring the conflicting exit code";
+                LOGV2(23139,
+                      "While running shutdown tasks with the intent to exit with code "
+                      "{originalExitCode}, an additional shutdown request arrived with "
+                      "the intent to exit with a different exit code {newExitCode}; "
+                      "ignoring the conflicting exit code",
+                      "Conflicting exit code at shutdown",
+                      "originalExitCode"_attr = originallyRequestedCode,
+                      "newExitCode"_attr = code);
             }
 
             // Wait for the shutdown tasks to complete
@@ -137,7 +141,7 @@ void shutdown(ExitCode code, const ShutdownTaskArgs& shutdownArgs) {
     runTasks(std::move(localTasks), shutdownArgs);
 
     {
-        stdx::lock_guard<stdx::mutex> lock(shutdownMutex);
+        stdx::lock_guard<Latch> lock(shutdownMutex);
         shutdownTasksInProgress = false;
 
         shutdownTasksComplete.notify_all();
@@ -150,7 +154,7 @@ void shutdownNoTerminate(const ShutdownTaskArgs& shutdownArgs) {
     decltype(shutdownTasks) localTasks;
 
     {
-        stdx::lock_guard<stdx::mutex> lock(shutdownMutex);
+        stdx::lock_guard<Latch> lock(shutdownMutex);
 
         if (globalInShutdownDeprecated())
             return;
@@ -165,7 +169,7 @@ void shutdownNoTerminate(const ShutdownTaskArgs& shutdownArgs) {
     runTasks(std::move(localTasks), shutdownArgs);
 
     {
-        stdx::lock_guard<stdx::mutex> lock(shutdownMutex);
+        stdx::lock_guard<Latch> lock(shutdownMutex);
         shutdownTasksInProgress = false;
         shutdownExitCode.emplace(EXIT_CLEAN);
     }

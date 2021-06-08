@@ -17,10 +17,6 @@ input.drop();
 inputDoesntExist.drop();  // never created
 output.drop();
 
-function collectionExists(coll) {
-    return Array.contains(coll.getDB().getCollectionNames(), coll.getName());
-}
-
 function getOutputIndexes() {
     return output.getIndexes().sort(function(a, b) {
         if (a.name < b.name) {
@@ -37,8 +33,8 @@ function test(input, pipeline, expected) {
 
     var cursor = input.aggregate(pipeline);
 
-    assert.eq(cursor.itcount(), 0);                // empty cursor returned
-    assert.eq(output.find().toArray(), expected);  // correct results
+    assert.eq(cursor.itcount(), 0);                    // empty cursor returned
+    assert(anyEq(output.find().toArray(), expected));  // correct results
     var outputIndexes = getOutputIndexes();
     assert.eq(outputIndexes.length, indexes.length);  // number of indexes maintained
     for (var i = 0; i < outputIndexes.length; i++) {
@@ -70,7 +66,7 @@ test(input,
 
 // test with indexes
 assert.eq(output.getIndexes().length, 1);
-output.ensureIndex({a: 1});
+output.createIndex({a: 1});
 assert.eq(output.getIndexes().length, 2);
 test(input,
      [{$project: {a: {$multiply: ['$_id', '$_id']}}}],
@@ -81,12 +77,12 @@ test(input, [{$match: {_id: 11}}], []);
 assert.eq(output.getIndexes().length, 2);
 
 // test with geo index
-output.ensureIndex({b: "2d"});
+output.createIndex({b: "2d"});
 assert.eq(output.getIndexes().length, 3);
 test(input, [{$project: {b: "$_id"}}], [{_id: 1, b: 1}, {_id: 2, b: 2}, {_id: 3, b: 3}]);
 
 // test with full text index
-output.ensureIndex({c: "text"});
+output.createIndex({c: "text"});
 assert.eq(output.getIndexes().length, 4);
 test(input, [{$project: {c: {$concat: ["hello there ", "_id"]}}}], [
     {_id: 1, c: "hello there _id"},
@@ -94,20 +90,12 @@ test(input, [{$project: {c: {$concat: ["hello there ", "_id"]}}}], [
     {_id: 3, c: "hello there _id"}
 ]);
 
-// test with capped collection, skip for mobile SE as it doesn't support capped collections.
-if (jsTest.options().storageEngine !== "mobile") {
-    cappedOutput.drop();
-    db.createCollection(cappedOutput.getName(), {capped: true, size: 2});
-    assertErrorCode(input, {$out: cappedOutput.getName()}, 17152);
-}
+cappedOutput.drop();
+db.createCollection(cappedOutput.getName(), {capped: true, size: 2});
+assertErrorCode(input, {$out: cappedOutput.getName()}, 17152);
 
 // ensure everything works even if input doesn't exist.
 test(inputDoesntExist, [], []);
-
-// ensure we cant do dangerous things to system collections
-var outputInSystem = db.system.server3253_out;
-assertErrorCode(input, {$out: outputInSystem.getName()}, 17385);
-assert(!collectionExists(outputInSystem));
 
 // shoudn't leave temp collections laying around
 assert.eq([], listCollections(/tmp\.agg_out/));

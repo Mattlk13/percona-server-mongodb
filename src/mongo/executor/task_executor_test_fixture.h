@@ -32,12 +32,12 @@
 #include <memory>
 
 #include "mongo/base/string_data.h"
+#include "mongo/executor/remote_command_request.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
 namespace executor {
 
-struct RemoteCommandRequest;
 class TaskExecutor;
 class NetworkInterface;
 class NetworkInterfaceMock;
@@ -90,13 +90,13 @@ private:
      */
     void _doTest() override;
 
-    virtual std::unique_ptr<TaskExecutor> makeTaskExecutor(
+    virtual std::shared_ptr<TaskExecutor> makeTaskExecutor(
         std::unique_ptr<NetworkInterfaceMock> net) = 0;
 
     virtual void postExecutorThreadLaunch();
 
     NetworkInterfaceMock* _net;
-    std::unique_ptr<TaskExecutor> _executor;
+    std::shared_ptr<TaskExecutor> _executor;
 };
 
 }  // namespace executor

@@ -53,8 +53,8 @@ var Cluster = function(options) {
         getObjectKeys(options).forEach(function(option) {
             assert.contains(option,
                             allowedKeys,
-                            'invalid option: ' + tojson(option) + '; valid options are: ' +
-                                tojson(allowedKeys));
+                            'invalid option: ' + tojson(option) +
+                                '; valid options are: ' + tojson(allowedKeys));
         });
 
         options.replication = options.replication || {};
@@ -231,6 +231,24 @@ var Cluster = function(options) {
                 replSets.push(rs);
             }
 
+            // SERVER-43099 Reenable random chunk migration failpoint for concurrency with_balancer
+            // suites
+            // if (options.sharded.enableBalancer === true) {
+            //     st._configServers.forEach((conn) => {
+            //         const configDb = conn.getDB('admin');
+
+            //         configDb.adminCommand({
+            //             configureFailPoint: 'balancerShouldReturnRandomMigrations',
+            //             mode: 'alwaysOn'
+            //         });
+            //         configDb.adminCommand({
+            //             configureFailPoint: 'overrideBalanceRoundInterval',
+            //             mode: 'alwaysOn',
+            //             data: {intervalMs: 100}
+            //         });
+            //     });
+            // }
+
         } else if (options.replication.enabled) {
             rst = new ReplSetTest(db.getMongo().host);
 
@@ -271,7 +289,7 @@ var Cluster = function(options) {
     this.executeOnMongodNodes = function executeOnMongodNodes(fn) {
         assert(initialized, 'cluster must be initialized first');
 
-        if (!fn || typeof(fn) !== 'function' || fn.length !== 1) {
+        if (!fn || typeof (fn) !== 'function' || fn.length !== 1) {
             throw new Error('mongod function must be a function that takes a db as an argument');
         }
         _conns.mongod.forEach(function(mongodConn) {
@@ -282,7 +300,7 @@ var Cluster = function(options) {
     this.executeOnMongosNodes = function executeOnMongosNodes(fn) {
         assert(initialized, 'cluster must be initialized first');
 
-        if (!fn || typeof(fn) !== 'function' || fn.length !== 1) {
+        if (!fn || typeof (fn) !== 'function' || fn.length !== 1) {
             throw new Error('mongos function must be a function that takes a db as an argument');
         }
         _conns.mongos.forEach(function(mongosConn) {
@@ -293,7 +311,7 @@ var Cluster = function(options) {
     this.executeOnConfigNodes = function executeOnConfigNodes(fn) {
         assert(initialized, 'cluster must be initialized first');
 
-        if (!fn || typeof(fn) !== 'function' || fn.length !== 1) {
+        if (!fn || typeof (fn) !== 'function' || fn.length !== 1) {
             throw new Error('config function must be a function that takes a db as an argument');
         }
         st._configServers.forEach(function(conn) {
@@ -372,7 +390,7 @@ var Cluster = function(options) {
         assert(this.isSharded(), 'cluster is not sharded');
 
         // If we are continuously stepping down shards, the config server may have stale view of the
-        // cluster, so retry on retryable errors, e.g. NotMaster.
+        // cluster, so retry on retryable errors, e.g. NotWritablePrimary.
         if (this.shouldPerformContinuousStepdowns()) {
             assert.soon(() => {
                 try {
@@ -386,7 +404,7 @@ var Cluster = function(options) {
                     // done.
                     //
                     // TODO SERVER-30949: Remove this try catch block once listCollections and
-                    // listIndexes automatically retry on NotMaster errors.
+                    // listIndexes automatically retry on NotWritablePrimary errors.
                     if (e.code === 18630 ||  // listCollections failure
                         e.code === 18631) {  // listIndexes failure
                         print("Caught retryable error from shardCollection, retrying: " +
@@ -493,18 +511,25 @@ var Cluster = function(options) {
             res.databases.forEach(dbInfo => {
                 // Don't perform listCollections on the admin or config database through a mongos
                 // connection when stepping down the config server primary, because both are stored
-                // on the config server, and listCollections may return a not master error if the
+                // on the config server, and listCollections may return a NotPrimaryError if the
                 // mongos is stale.
                 //
                 // TODO SERVER-30949: listCollections through mongos should automatically retry on
-                // NotMaster errors. Once that is true, remove this check.
+                // NotWritablePrimary errors. Once that is true, remove this check.
                 if (isSteppingDownConfigServers && isMongos &&
                     (dbInfo.name === "admin" || dbInfo.name === "config")) {
                     return;
                 }
 
+                const validateOptions = {full: true, enforceFastCount: true};
+                // TODO (SERVER-24266): Once fast counts are tolerant to unclean shutdowns, remove
+                // the check for TestData.allowUncleanShutdowns.
+                if (TestData.skipEnforceFastCountOnValidate || TestData.allowUncleanShutdowns) {
+                    validateOptions.enforceFastCount = false;
+                }
+
                 assert.commandWorked(
-                    validateCollections(db.getSiblingDB(dbInfo.name), {full: true}),
+                    validateCollections(db.getSiblingDB(dbInfo.name), validateOptions),
                     phase + ' collection validation failed');
             });
         };
@@ -517,7 +542,7 @@ var Cluster = function(options) {
         jsTest.log('Finished validating collections in ' + totalTime + ' ms, ' + phase);
     };
 
-    this.checkReplicationConsistency = function checkReplicationConsistency(dbBlacklist, phase) {
+    this.checkReplicationConsistency = function checkReplicationConsistency(dbDenylist, phase) {
         assert(initialized, 'cluster must be initialized first');
 
         if (!this.isReplication()) {
@@ -529,16 +554,14 @@ var Cluster = function(options) {
         replSets.forEach(rst => {
             var startTime = Date.now();
             var res;
-
-            // Use '_master' instead of getPrimary() to avoid the detection of a new primary.
-            var primary = rst._master;
+            var primary = rst.getPrimary();
 
             if (shouldCheckDBHashes) {
                 jsTest.log('Starting consistency checks for replica set with ' + primary.host +
                            ' assumed to still be primary, ' + phase);
 
                 // Compare the dbhashes of the primary and secondaries.
-                rst.checkReplicatedDataHashes(phase, dbBlacklist);
+                rst.checkReplicatedDataHashes(phase, dbDenylist);
                 var totalTime = Date.now() - startTime;
                 jsTest.log('Finished consistency checks of replica set with ' + primary.host +
                            ' as primary in ' + totalTime + ' ms, ' + phase);
@@ -553,8 +576,8 @@ var Cluster = function(options) {
 
                 var primaryInfo = replSetStatus.members.find(memberInfo => memberInfo.self);
                 assert(primaryInfo !== undefined,
-                       phase + ', failed to find self in replication status: ' +
-                           tojson(replSetStatus));
+                       phase +
+                           ', failed to find self in replication status: ' + tojson(replSetStatus));
 
                 // Wait for all previous workload operations to complete, with "getLastError".
                 res = primary.getDB('test').runCommand({
@@ -565,7 +588,6 @@ var Cluster = function(options) {
                 });
                 assert.commandWorked(res, phase + ', error awaiting replication');
             }
-
         });
     };
 

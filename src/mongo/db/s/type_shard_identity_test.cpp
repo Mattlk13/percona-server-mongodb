@@ -29,16 +29,13 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/db/s/type_shard_identity.h"
-
 #include "mongo/base/status_with.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/s/type_shard_identity.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
 namespace {
-
-using std::string;
 
 TEST(ShardIdentityType, RoundTrip) {
     auto clusterId(OID::gen());
@@ -46,9 +43,7 @@ TEST(ShardIdentityType, RoundTrip) {
                     << "shardIdentity"
                     << "shardName"
                     << "s1"
-                    << "clusterId"
-                    << clusterId
-                    << "configsvrConnectionString"
+                    << "clusterId" << clusterId << "configsvrConnectionString"
                     << "test/a:123");
 
     auto result = ShardIdentityType::fromShardIdentityDocument(doc);
@@ -67,8 +62,7 @@ TEST(ShardIdentityType, ParseMissingId) {
                     << "test/a:123"
                     << "shardName"
                     << "s1"
-                    << "clusterId"
-                    << OID::gen());
+                    << "clusterId" << OID::gen());
 
     auto result = ShardIdentityType::fromShardIdentityDocument(doc);
     ASSERT_NOT_OK(result.getStatus());
@@ -79,8 +73,7 @@ TEST(ShardIdentityType, ParseMissingConfigsvrConnString) {
                     << "shardIdentity"
                     << "shardName"
                     << "s1"
-                    << "clusterId"
-                    << OID::gen());
+                    << "clusterId" << OID::gen());
 
     auto result = ShardIdentityType::fromShardIdentityDocument(doc);
     ASSERT_NOT_OK(result.getStatus());
@@ -91,8 +84,7 @@ TEST(ShardIdentityType, ParseMissingShardName) {
                     << "shardIdentity"
                     << "configsvrConnectionString"
                     << "test/a:123"
-                    << "clusterId"
-                    << OID::gen());
+                    << "clusterId" << OID::gen());
 
     auto result = ShardIdentityType::fromShardIdentityDocument(doc);
     ASSERT_NOT_OK(result.getStatus());
@@ -118,8 +110,7 @@ TEST(ShardIdentityType, InvalidConnectionString) {
                     << "test/,,,"
                     << "shardName"
                     << "s1"
-                    << "clusterId"
-                    << clusterId);
+                    << "clusterId" << clusterId);
 
     ASSERT_EQ(ErrorCodes::FailedToParse,
               ShardIdentityType::fromShardIdentityDocument(doc).getStatus());
@@ -133,8 +124,7 @@ TEST(ShardIdentityType, NonReplSetConnectionString) {
                     << "local:123"
                     << "shardName"
                     << "s1"
-                    << "clusterId"
-                    << clusterId);
+                    << "clusterId" << clusterId);
 
     ASSERT_EQ(ErrorCodes::UnsupportedFormat,
               ShardIdentityType::fromShardIdentityDocument(doc).getStatus());
@@ -147,5 +137,5 @@ TEST(ShardIdentityType, CreateUpdateObject) {
     ASSERT_BSONOBJ_EQ(expectedObj, updateObj);
 }
 
+}  // namespace
 }  // namespace mongo
-}  // unnamed namespace

@@ -27,13 +27,12 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kAccessControl
-
 #include "mongo/db/auth/sasl_options.h"
 #include "mongo/db/auth/sasl_options_gen.h"
 
+#include <boost/algorithm/string.hpp>
+
 #include "mongo/base/status.h"
-#include "mongo/util/log.h"
 #include "mongo/util/net/socket_utils.h"
 #include "mongo/util/options_parser/startup_option_init.h"
 #include "mongo/util/options_parser/startup_options.h"
@@ -81,11 +80,16 @@ Status storeSASLOptions(const moe::Environment& params) {
     if (saslGlobalParams.serviceName.empty())
         saslGlobalParams.serviceName = "mongodb";
 
+    // Strip white space for authentication mechanisms
+    for (auto& mechanism : saslGlobalParams.authenticationMechanisms) {
+        boost::trim(mechanism);
+    }
+
     return Status::OK();
 }
 
 MONGO_INITIALIZER_GENERAL(StoreSASLOptions, ("CoreOptions_Store"), ("EndStartupOptionStorage"))
-(InitializerContext* const context) {
-    return storeSASLOptions(moe::startupOptionsParsed);
+(InitializerContext*) {
+    uassertStatusOK(storeSASLOptions(moe::startupOptionsParsed));
 }
-}
+}  // namespace mongo

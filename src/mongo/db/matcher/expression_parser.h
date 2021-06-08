@@ -29,6 +29,8 @@
 
 #pragma once
 
+#include <functional>
+
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
 #include "mongo/db/matcher/expression.h"
@@ -41,7 +43,6 @@
 #include "mongo/db/matcher/schema/expression_internal_schema_allowed_properties.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
-#include "mongo/stdx/functional.h"
 
 namespace mongo {
 
@@ -61,6 +62,10 @@ enum class PathAcceptingKeyword {
     GREATER_THAN,
     GREATER_THAN_OR_EQUAL,
     INTERNAL_EXPR_EQ,
+    INTERNAL_EXPR_GT,
+    INTERNAL_EXPR_GTE,
+    INTERNAL_EXPR_LT,
+    INTERNAL_EXPR_LTE,
     INTERNAL_SCHEMA_ALL_ELEM_MATCH_FROM_INDEX,
     INTERNAL_SCHEMA_BIN_DATA_ENCRYPTED_TYPE,
     INTERNAL_SCHEMA_BIN_DATA_SUBTYPE,
@@ -98,18 +103,18 @@ public:
         kJavascript = 1 << 2,
         kExpr = 1 << 3,
         kJSONSchema = 1 << 4,
+        kEncryptKeywords = 1 << 5,
     };
     using AllowedFeatureSet = unsigned long long;
     static constexpr AllowedFeatureSet kBanAllSpecialFeatures = 0;
     static constexpr AllowedFeatureSet kAllowAllSpecialFeatures =
         std::numeric_limits<unsigned long long>::max();
     static constexpr AllowedFeatureSet kDefaultSpecialFeatures =
-        AllowedFeatures::kExpr | AllowedFeatures::kJSONSchema;
+        AllowedFeatures::kExpr | AllowedFeatures::kJSONSchema | AllowedFeatures::kEncryptKeywords;
 
     /**
      * Parses PathAcceptingKeyword from 'typeElem'. Returns 'defaultKeyword' if 'typeElem'
-     * doesn't represent a known type, or represents PathAcceptingKeyword::EQUALITY which is not
-     * handled by this parser (see SERVER-19565).
+     * doesn't represent a known type.
      */
     static boost::optional<PathAcceptingKeyword> parsePathAcceptingKeyword(
         BSONElement typeElem, boost::optional<PathAcceptingKeyword> defaultKeyword = boost::none);
@@ -119,6 +124,16 @@ public:
      * The tree has views (BSONElement) into 'obj'.
      */
     static StatusWithMatchExpression parse(
+        const BSONObj& obj,
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        const ExtensionsCallback& extensionsCallback = ExtensionsCallbackNoop(),
+        AllowedFeatureSet allowedFeatures = kDefaultSpecialFeatures);
+
+    /**
+     * Parse the given MatchExpression and normalize the resulting tree by optimizing and then
+     * sorting it. Throws if the given BSONObj fails to parse.
+     */
+    static std::unique_ptr<MatchExpression> parseAndNormalize(
         const BSONObj& obj,
         const boost::intrusive_ptr<ExpressionContext>& expCtx,
         const ExtensionsCallback& extensionsCallback = ExtensionsCallbackNoop(),

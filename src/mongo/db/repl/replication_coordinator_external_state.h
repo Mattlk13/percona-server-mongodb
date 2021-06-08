@@ -31,12 +31,12 @@
 
 #include <boost/optional.hpp>
 #include <cstddef>
+#include <functional>
 
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/repl/member_state.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/executor/task_executor.h"
-#include "mongo/stdx/functional.h"
 #include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/time_support.h"
 
@@ -77,7 +77,7 @@ public:
      *
      * NOTE: Only starts threads if they are not already started,
      */
-    virtual void startThreads(const ReplSettings& settings) = 0;
+    virtual void startThreads() = 0;
 
     /**
      * Returns true if an incomplete initial sync is detected.
@@ -91,20 +91,25 @@ public:
                                              ReplicationCoordinator* replCoord) = 0;
 
     /**
-     * Stops the data replication threads = bgsync, applier, reporter.
-     */
-    virtual void stopDataReplication(OperationContext* opCtx) = 0;
-
-    /**
      * Performs any necessary external state specific shutdown tasks, such as cleaning up
      * the threads it started.
      */
     virtual void shutdown(OperationContext* opCtx) = 0;
 
     /**
+     * Clears appliedThrough to indicate that the dataset is consistent with top of the
+     * oplog on shutdown.
+     * This should be called after calling shutdown() and should be called holding RSTL
+     * in mode X to make sure that that are no active readers while executing this method
+     * as this does perform timestamped minvalid writes at lastAppliedTimestamp.
+     */
+    virtual void clearAppliedThroughIfCleanShutdown(OperationContext* opCtx) = 0;
+
+    /**
      * Returns task executor for scheduling tasks to be run asynchronously.
      */
     virtual executor::TaskExecutor* getTaskExecutor() const = 0;
+    virtual std::shared_ptr<executor::TaskExecutor> getSharedTaskExecutor() const = 0;
 
     /**
      * Returns shared db worker thread pool for collection cloning.
@@ -138,11 +143,11 @@ public:
     virtual OpTime onTransitionToPrimary(OperationContext* opCtx) = 0;
 
     /**
-     * Simple wrapper around SyncSourceFeedback::forwardSlaveProgress.  Signals to the
+     * Simple wrapper around SyncSourceFeedback::forwardSecondaryProgress.  Signals to the
      * SyncSourceFeedback thread that it needs to wake up and send a replSetUpdatePosition
      * command upstream.
      */
-    virtual void forwardSlaveProgress() = 0;
+    virtual void forwardSecondaryProgress() = 0;
 
     /**
      * Returns true if "host" is one of the network identities of this node.
@@ -155,9 +160,17 @@ public:
     virtual StatusWith<BSONObj> loadLocalConfigDocument(OperationContext* opCtx) = 0;
 
     /**
-     * Stores the replica set config document in local storage, or returns an error.
+     * Stores the replica set config document in local storage and writes a no-op in the oplog, or
+     * returns an error.
      */
-    virtual Status storeLocalConfigDocument(OperationContext* opCtx, const BSONObj& config) = 0;
+    virtual Status storeLocalConfigDocument(OperationContext* opCtx,
+                                            const BSONObj& config,
+                                            bool writeOplog) = 0;
+
+    /**
+     * Creates the collection for "lastVote" documents and initializes it, or returns an error.
+     */
+    virtual Status createLocalLastVoteCollection(OperationContext* opCtx) = 0;
 
     /**
      * Gets the replica set lastVote document from local storage, or returns an error.
@@ -205,11 +218,10 @@ public:
     virtual void closeConnections() = 0;
 
     /**
-     * Resets any active sharding metadata on this server and stops any sharding-related threads
-     * (such as the balancer). It is called after stepDown to ensure that if the node becomes
-     * primary again in the future it will recover its state from a clean slate.
+     * Called after this node has stepped down. This includes stepDowns caused by rollback or node
+     * removal, so this function must also be able to handle those situations.
      */
-    virtual void shardingOnStepDownHook() = 0;
+    virtual void onStepDownHook() = 0;
 
     /**
      * Notifies the bgsync and syncSourceFeedback threads to choose a new sync source.
@@ -227,9 +239,14 @@ public:
     virtual void startProducerIfStopped() = 0;
 
     /**
-     * Drops all snapshots and clears the "committed" snapshot.
+     * True if we have discovered that no sync source's oplog overlaps with ours.
      */
-    virtual void dropAllSnapshots() = 0;
+    virtual bool tooStale() = 0;
+
+    /**
+     * Clears the "committed" snapshot.
+     */
+    virtual void clearCommittedSnapshot() = 0;
 
     /**
      * Updates the committed snapshot to the newCommitPoint, and deletes older snapshots.
@@ -239,11 +256,11 @@ public:
     virtual void updateCommittedSnapshot(const OpTime& newCommitPoint) = 0;
 
     /**
-     * Updates the local snapshot to a consistent point for secondary reads.
+     * Updates the lastApplied snapshot to a consistent point for secondary reads.
      *
-     * It is illegal to call with a optime that does not name an existing snapshot.
+     * It is illegal to call with a non-existent optime.
      */
-    virtual void updateLocalSnapshot(const OpTime& optime) = 0;
+    virtual void updateLastAppliedSnapshot(const OpTime& optime) = 0;
 
     /**
      * Returns whether or not the SnapshotThread is active.

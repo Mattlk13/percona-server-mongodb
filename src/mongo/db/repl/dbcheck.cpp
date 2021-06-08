@@ -31,7 +31,6 @@
 
 #include "mongo/bson/simple_bsonelement_comparator.h"
 #include "mongo/db/catalog/collection_catalog.h"
-#include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/health_log.h"
@@ -41,10 +40,10 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/dbcheck.h"
-#include "mongo/db/repl/dbcheck.h"
 #include "mongo/db/repl/dbcheck_gen.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/optime.h"
+#include "mongo/db/storage/durable_catalog.h"
 
 namespace mongo {
 
@@ -122,7 +121,7 @@ std::unique_ptr<HealthLogEntry> dbCheckHealthLogEntry(const NamespaceString& nss
                                                       const std::string& msg,
                                                       OplogEntriesEnum operation,
                                                       const BSONObj& data) {
-    auto entry = stdx::make_unique<HealthLogEntry>();
+    auto entry = std::make_unique<HealthLogEntry>();
     entry->setNss(nss);
     entry->setTimestamp(Date_t::now());
     entry->setSeverity(severity);
@@ -132,7 +131,7 @@ std::unique_ptr<HealthLogEntry> dbCheckHealthLogEntry(const NamespaceString& nss
     entry->setData(data);
     return entry;
 }
-}
+}  // namespace
 
 /**
  * Get an error message if the check fails.
@@ -161,14 +160,9 @@ std::unique_ptr<HealthLogEntry> dbCheckBatchEntry(const NamespaceString& nss,
                                                   const repl::OpTime& optime) {
     auto hashes = expectedFound(expectedHash, foundHash);
 
-    auto data =
-        BSON("success" << true << "count" << count << "bytes" << bytes << "md5" << hashes.second
-                       << "minKey"
-                       << minKey.elem()
-                       << "maxKey"
-                       << maxKey.elem()
-                       << "optime"
-                       << optime);
+    auto data = BSON("success" << true << "count" << count << "bytes" << bytes << "md5"
+                               << hashes.second << "minKey" << minKey.elem() << "maxKey"
+                               << maxKey.elem() << "optime" << optime);
 
     auto severity = hashes.first ? SeverityEnum::Info : SeverityEnum::Error;
     std::string msg =
@@ -178,7 +172,7 @@ std::unique_ptr<HealthLogEntry> dbCheckBatchEntry(const NamespaceString& nss,
 }
 
 DbCheckHasher::DbCheckHasher(OperationContext* opCtx,
-                             Collection* collection,
+                             const CollectionPtr& collection,
                              const BSONKey& start,
                              const BSONKey& end,
                              int64_t maxCount,
@@ -195,12 +189,12 @@ DbCheckHasher::DbCheckHasher(OperationContext* opCtx,
 
     // Set up a simple index scan on that.
     _exec = InternalPlanner::indexScan(opCtx,
-                                       collection,
+                                       &collection,
                                        desc,
                                        start.obj(),
                                        end.obj(),
                                        BoundInclusion::kIncludeEndKeyOnly,
-                                       PlanExecutor::NO_YIELD,
+                                       PlanYieldPolicy::YieldPolicy::NO_YIELD,
                                        InternalPlanner::FORWARD,
                                        InternalPlanner::IXSCAN_FETCH);
 }
@@ -239,26 +233,23 @@ std::string hashCollectionInfo(const DbCheckCollectionInformation& info) {
 }
 
 std::pair<boost::optional<UUID>, boost::optional<UUID>> getPrevAndNextUUIDs(
-    OperationContext* opCtx, Collection* collection) {
-    const CollectionCatalog& catalog = CollectionCatalog::get(opCtx);
-    const UUID uuid = *collection->uuid();
+    OperationContext* opCtx, const CollectionPtr& collection) {
+    auto catalog = CollectionCatalog::get(opCtx);
+    const UUID uuid = collection->uuid();
 
     std::vector<CollectionUUID> collectionUUIDs =
-        catalog.getAllCollectionUUIDsFromDb(collection->ns().db());
+        catalog->getAllCollectionUUIDsFromDb(collection->ns().db());
     auto uuidIt = std::find(collectionUUIDs.begin(), collectionUUIDs.end(), uuid);
     invariant(uuidIt != collectionUUIDs.end());
-
-    auto prevIt = std::prev(uuidIt);
-    auto nextIt = std::next(uuidIt);
 
     boost::optional<UUID> prevUUID;
     boost::optional<UUID> nextUUID;
 
-    if (prevIt != collectionUUIDs.end()) {
-        prevUUID = *prevIt;
+    if (uuidIt != collectionUUIDs.begin()) {
+        prevUUID = *std::prev(uuidIt);
     }
 
-    if (nextIt != collectionUUIDs.end()) {
+    if (auto nextIt = std::next(uuidIt); nextIt != collectionUUIDs.end()) {
         nextUUID = *nextIt;
     }
 
@@ -284,19 +275,9 @@ std::unique_ptr<HealthLogEntry> dbCheckCollectionEntry(const NamespaceString& ns
     std::string msg =
         "dbCheck collection " + (match ? std::string("consistent") : std::string("inconsistent"));
     auto data = BSON("success" << true << "uuid" << uuid.toString() << "found" << true << "name"
-                               << names.second
-                               << "prev"
-                               << prevs.second
-                               << "next"
-                               << nexts.second
-                               << "indexes"
-                               << indices.second
-                               << "options"
-                               << options.second
-                               << "md5"
-                               << md5s.second
-                               << "optime"
-                               << optime);
+                               << names.second << "prev" << prevs.second << "next" << nexts.second
+                               << "indexes" << indices.second << "options" << options.second
+                               << "md5" << md5s.second << "optime" << optime);
 
     return dbCheckHealthLogEntry(nss, severity, msg, OplogEntriesEnum::Collection, data);
 }
@@ -369,30 +350,30 @@ bool DbCheckHasher::_canHash(const BSONObj& obj) {
     return true;
 }
 
-std::vector<BSONObj> collectionIndexInfo(OperationContext* opCtx, Collection* collection) {
+std::vector<BSONObj> collectionIndexInfo(OperationContext* opCtx, const CollectionPtr& collection) {
     std::vector<BSONObj> result;
     std::vector<std::string> names;
 
     // List the indices,
-    const auto* cce = collection->getCatalogEntry();
-    invariant(cce);
-
-    cce->getAllIndexes(opCtx, &names);
+    auto durableCatalog = DurableCatalog::get(opCtx);
+    durableCatalog->getAllIndexes(opCtx, collection->getCatalogId(), &names);
 
     // and get the info for each one.
     for (const auto& name : names) {
-        result.push_back(cce->getIndexSpec(opCtx, name));
+        result.push_back(durableCatalog->getIndexSpec(opCtx, collection->getCatalogId(), name));
     }
 
-    auto comp = stdx::make_unique<SimpleBSONObjComparator>();
+    auto comp = std::make_unique<SimpleBSONObjComparator>();
 
     std::sort(result.begin(), result.end(), SimpleBSONObjComparator::LessThan());
 
     return result;
 }
 
-BSONObj collectionOptions(OperationContext* opCtx, Collection* collection) {
-    return collection->getCatalogEntry()->getCollectionOptions(opCtx).toBSON();
+BSONObj collectionOptions(OperationContext* opCtx, const CollectionPtr& collection) {
+    return DurableCatalog::get(opCtx)
+        ->getCollectionOptions(opCtx, collection->getCatalogId())
+        .toBSON();
 }
 
 AutoGetDbForDbCheck::AutoGetDbForDbCheck(OperationContext* opCtx, const NamespaceString& nss)
@@ -404,7 +385,9 @@ AutoGetCollectionForDbCheck::AutoGetCollectionForDbCheck(OperationContext* opCtx
     : _agd(opCtx, nss), _collLock(opCtx, nss, MODE_S) {
     std::string msg;
 
-    _collection = _agd.getDb() ? _agd.getDb()->getCollection(opCtx, nss) : nullptr;
+    _collection = _agd.getDb()
+        ? CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss)
+        : nullptr;
 
     // If the collection gets deleted after the check is launched, record that in the health log.
     if (!_collection) {
@@ -424,8 +407,7 @@ namespace {
 Status dbCheckBatchOnSecondary(OperationContext* opCtx,
                                const repl::OpTime& optime,
                                const DbCheckOplogBatch& entry) {
-    AutoGetCollectionForDbCheck agc(opCtx, entry.getNss(), entry.getType());
-    Collection* collection = agc.getCollection();
+    AutoGetCollectionForDbCheck collection(opCtx, entry.getNss(), entry.getType());
     std::string msg = "replication consistency check";
 
     if (!collection) {
@@ -436,7 +418,7 @@ Status dbCheckBatchOnSecondary(OperationContext* opCtx,
     Status status = Status::OK();
     boost::optional<DbCheckHasher> hasher;
     try {
-        hasher.emplace(opCtx, collection, entry.getMinKey(), entry.getMaxKey());
+        hasher.emplace(opCtx, collection.getCollection(), entry.getMinKey(), entry.getMaxKey());
     } catch (const DBException& exception) {
         auto logEntry = dbCheckErrorHealthLogEntry(
             entry.getNss(), msg, OplogEntriesEnum::Batch, exception.toStatus());
@@ -479,7 +461,7 @@ Status dbCheckDatabaseOnSecondary(OperationContext* opCtx,
                                   const DbCheckOplogCollection& entry) {
     // dbCheckCollectionResult-specific stuff.
     auto uuid = uassertStatusOK(UUID::parse(entry.getUuid().toString()));
-    auto collection = CollectionCatalog::get(opCtx).lookupCollectionByUUID(uuid);
+    auto collection = CollectionCatalog::get(opCtx)->lookupCollectionByUUID(opCtx, uuid);
 
     if (!collection) {
         Status status(ErrorCodes::NamespaceNotFound, "Could not find collection for dbCheck");
@@ -522,32 +504,32 @@ Status dbCheckDatabaseOnSecondary(OperationContext* opCtx,
 
     return Status::OK();
 }
-}
+}  // namespace
 
 namespace repl {
 
 /*
- * The corresponding command run on the secondary.
+ * The corresponding command run during command application.
  */
 Status dbCheckOplogCommand(OperationContext* opCtx,
-                           const char* ns,
-                           const BSONElement& ui,
-                           BSONObj& cmd,
-                           const repl::OpTime& optime,
                            const repl::OplogEntry& entry,
-                           OplogApplication::Mode mode,
-                           boost::optional<Timestamp> stableTimestampForRecovery) {
+                           OplogApplication::Mode mode) {
+    const auto& cmd = entry.getObject();
+    OpTime opTime;
+    if (!opCtx->writesAreReplicated()) {
+        opTime = entry.getOpTime();
+    }
     auto type = OplogEntries_parse(IDLParserErrorContext("type"), cmd.getStringField("type"));
     IDLParserErrorContext ctx("o");
 
     switch (type) {
         case OplogEntriesEnum::Batch: {
             auto invocation = DbCheckOplogBatch::parse(ctx, cmd);
-            return dbCheckBatchOnSecondary(opCtx, optime, invocation);
+            return dbCheckBatchOnSecondary(opCtx, opTime, invocation);
         }
         case OplogEntriesEnum::Collection: {
             auto invocation = DbCheckOplogCollection::parse(ctx, cmd);
-            return dbCheckDatabaseOnSecondary(opCtx, optime, invocation);
+            return dbCheckDatabaseOnSecondary(opCtx, opTime, invocation);
         }
     }
 

@@ -41,12 +41,18 @@ class Timestamp;
 namespace rpc {
 class ReplSetMetadata;
 class OplogQueryMetadata;
-}
+}  // namespace rpc
 
 namespace repl {
 
 class OpTime;
 struct SyncSourceResolverResponse;
+
+enum class ChangeSyncSourceAction {
+    kContinueSyncing,
+    kStopSyncingAndDropLastBatch,
+    kStopSyncingAndEnqueueLastBatch
+};
 
 /**
  * Manage list of viable and blocked sync sources that we can replicate from.
@@ -60,9 +66,9 @@ public:
     virtual ~SyncSourceSelector() = default;
 
     /**
-     * Clears the list of sync sources we have blacklisted.
+     * Clears the list of sync sources we have denylisted.
      */
-    virtual void clearSyncSourceBlacklist() = 0;
+    virtual void clearSyncSourceDenylist() = 0;
 
     /**
      * Chooses a viable sync source, or, if none available, returns empty HostAndPort.
@@ -70,9 +76,9 @@ public:
     virtual HostAndPort chooseNewSyncSource(const OpTime& lastOpTimeFetched) = 0;
 
     /**
-     * Blacklists choosing 'host' as a sync source until time 'until'.
+     * Denylists choosing 'host' as a sync source until time 'until'.
      */
-    virtual void blacklistSyncSource(const HostAndPort& host, Date_t until) = 0;
+    virtual void denylistSyncSource(const HostAndPort& host, Date_t until) = 0;
 
     /**
      * Determines if a new sync source should be chosen, if a better candidate sync source is
@@ -82,15 +88,13 @@ public:
      * If we are running in ProtocolVersion 1, our current sync source is not primary, has no sync
      * source and only has data up to "myLastOpTime", returns true.
      *
-     * "now" is used to skip over currently blacklisted sync sources.
-     *
-     * OplogQueryMetadata is optional for compatibility with 3.4 servers that do not know to
-     * send OplogQueryMetadata.
-     * TODO (SERVER-27668): Make OplogQueryMetadata non-optional in mongodb 3.8.
+     * "now" is used to skip over currently denylisted sync sources.
      */
-    virtual bool shouldChangeSyncSource(const HostAndPort& currentSource,
-                                        const rpc::ReplSetMetadata& replMetadata,
-                                        boost::optional<rpc::OplogQueryMetadata> oqMetadata) = 0;
+    virtual ChangeSyncSourceAction shouldChangeSyncSource(const HostAndPort& currentSource,
+                                                          const rpc::ReplSetMetadata& replMetadata,
+                                                          const rpc::OplogQueryMetadata& oqMetadata,
+                                                          const OpTime& previousOpTimeFetched,
+                                                          const OpTime& lastOpTimeFetched) = 0;
 };
 
 }  // namespace repl

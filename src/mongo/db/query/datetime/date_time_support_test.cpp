@@ -29,7 +29,9 @@
 
 #include "mongo/platform/basic.h"
 
+#include <limits>
 #include <sstream>
+#include <timelib.h>
 
 #include "mongo/db/query/datetime/date_time_support.h"
 #include "mongo/unittest/unittest.h"
@@ -387,12 +389,16 @@ TEST(NewYorkTimeBeforeEpoch, DoesComputeISOWeek) {
 TEST(UTCTimeBeforeEpoch, DoesFormatDate) {
     // Tuesday, Dec 30, 1969 13:42:23:211
     auto date = Date_t::fromMillisSinceEpoch(-123456789LL);
-    ASSERT_EQ(TimeZoneDatabase::utcZone().formatDate("%Y/%m/%d %H:%M:%S:%L, dayOfYear: %j, "
-                                                     "dayOfWeek: %w, week: %U, isoYear: %G, "
-                                                     "isoWeek: %V, isoDayOfWeek: %u, percent: %%",
-                                                     date),
-              "1969/12/30 13:42:23:211, dayOfYear: 364, dayOfWeek: 3, week: 52, isoYear: 1970, "
-              "isoWeek: 01, isoDayOfWeek: 2, percent: %");
+    auto result = TimeZoneDatabase::utcZone().formatDate(
+        "%Y/%m/%d %H:%M:%S:%L, dayOfYear: %j, "
+        "dayOfWeek: %w, week: %U, isoYear: %G, "
+        "isoWeek: %V, isoDayOfWeek: %u, percent: %%",
+        date);
+    ASSERT_OK(result);
+    ASSERT_EQ(
+        "1969/12/30 13:42:23:211, dayOfYear: 364, dayOfWeek: 3, week: 52, isoYear: 1970, "
+        "isoWeek: 01, isoDayOfWeek: 2, percent: %",
+        result.getValue());
 }
 
 TEST(NewYorkTimeBeforeEpoch, DoesFormatDate) {
@@ -400,23 +406,28 @@ TEST(NewYorkTimeBeforeEpoch, DoesFormatDate) {
 
     // Tuesday, Dec 30, 1969 13:42:23:211
     auto date = Date_t::fromMillisSinceEpoch(-123456789LL);
-    ASSERT_EQ(newYorkZone.formatDate("%Y/%m/%d %H:%M:%S:%L, dayOfYear: %j, "
-                                     "dayOfWeek: %w, week: %U, isoYear: %G, "
-                                     "isoWeek: %V, isoDayOfWeek: %u, percent: %%",
-                                     date),
-              "1969/12/30 08:42:23:211, dayOfYear: 364, dayOfWeek: 3, week: 52, isoYear: 1970, "
-              "isoWeek: 01, isoDayOfWeek: 2, percent: %");
+    auto result = newYorkZone.formatDate(
+        "%Y/%m/%d %H:%M:%S:%L, dayOfYear: %j, "
+        "dayOfWeek: %w, week: %U, isoYear: %G, "
+        "isoWeek: %V, isoDayOfWeek: %u, percent: %%",
+        date);
+    ASSERT_OK(result);
+    ASSERT_EQ(
+        "1969/12/30 08:42:23:211, dayOfYear: 364, dayOfWeek: 3, week: 52, isoYear: 1970, "
+        "isoWeek: 01, isoDayOfWeek: 2, percent: %",
+        result.getValue());
 }
 
 TEST(UTCTimeBeforeEpoch, DoesOutputFormatDate) {
     // Tuesday, Dec 30, 1969 13:42:23:211
     auto date = Date_t::fromMillisSinceEpoch(-123456789LL);
     std::ostringstream os;
-    TimeZoneDatabase::utcZone().outputDateWithFormat(os,
-                                                     "%Y/%m/%d %H:%M:%S:%L, dayOfYear: %j, "
-                                                     "dayOfWeek: %w, week: %U, isoYear: %G, "
-                                                     "isoWeek: %V, isoDayOfWeek: %u, percent: %%",
-                                                     date);
+    ASSERT_OK(TimeZoneDatabase::utcZone().outputDateWithFormat(
+        os,
+        "%Y/%m/%d %H:%M:%S:%L, dayOfYear: %j, "
+        "dayOfWeek: %w, week: %U, isoYear: %G, "
+        "isoWeek: %V, isoDayOfWeek: %u, percent: %%",
+        date));
     ASSERT_EQ(os.str(),
               "1969/12/30 13:42:23:211, dayOfYear: 364, dayOfWeek: 3, week: 52, isoYear: 1970, "
               "isoWeek: 01, isoDayOfWeek: 2, percent: %");
@@ -428,11 +439,11 @@ TEST(NewYorkTimeBeforeEpoch, DoesOutputFormatDate) {
     // Tuesday, Dec 30, 1969 13:42:23:211
     auto date = Date_t::fromMillisSinceEpoch(-123456789LL);
     std::ostringstream os;
-    newYorkZone.outputDateWithFormat(os,
-                                     "%Y/%m/%d %H:%M:%S:%L, dayOfYear: %j, "
-                                     "dayOfWeek: %w, week: %U, isoYear: %G, "
-                                     "isoWeek: %V, isoDayOfWeek: %u, percent: %%",
-                                     date);
+    ASSERT_OK(newYorkZone.outputDateWithFormat(os,
+                                               "%Y/%m/%d %H:%M:%S:%L, dayOfYear: %j, "
+                                               "dayOfWeek: %w, week: %U, isoYear: %G, "
+                                               "isoWeek: %V, isoDayOfWeek: %u, percent: %%",
+                                               date));
     ASSERT_EQ(os.str(),
               "1969/12/30 08:42:23:211, dayOfYear: 364, dayOfWeek: 3, week: 52, isoYear: 1970, "
               "isoWeek: 01, isoDayOfWeek: 2, percent: %");
@@ -567,12 +578,16 @@ TEST(NewYorkTimeAtEpoch, DoesComputeISOWeek) {
 TEST(UTCTimeAtEpoch, DoesFormatDate) {
     // Thu, Jan 1, 1970 00:00:00:000
     auto date = Date_t::fromMillisSinceEpoch(0);
-    ASSERT_EQ(TimeZoneDatabase::utcZone().formatDate("%Y/%m/%d %H:%M:%S:%L, dayOfYear: %j, "
-                                                     "dayOfWeek: %w, week: %U, isoYear: %G, "
-                                                     "isoWeek: %V, isoDayOfWeek: %u, percent: %%",
-                                                     date),
-              "1970/01/01 00:00:00:000, dayOfYear: 001, dayOfWeek: 5, week: 00, isoYear: 1970, "
-              "isoWeek: 01, isoDayOfWeek: 4, percent: %");
+    auto result = TimeZoneDatabase::utcZone().formatDate(
+        "%Y/%m/%d %H:%M:%S:%L, dayOfYear: %j, "
+        "dayOfWeek: %w, week: %U, isoYear: %G, "
+        "isoWeek: %V, isoDayOfWeek: %u, percent: %%",
+        date);
+    ASSERT_OK(result);
+    ASSERT_EQ(
+        "1970/01/01 00:00:00:000, dayOfYear: 001, dayOfWeek: 5, week: 00, isoYear: 1970, "
+        "isoWeek: 01, isoDayOfWeek: 4, percent: %",
+        result.getValue());
 }
 
 TEST(NewYorkTimeAtEpoch, DoesFormatDate) {
@@ -580,22 +595,27 @@ TEST(NewYorkTimeAtEpoch, DoesFormatDate) {
 
     // Thu, Jan 1, 1970 00:00:00:000Z
     auto date = Date_t::fromMillisSinceEpoch(0);
-    ASSERT_EQ(newYorkZone.formatDate("%Y/%m/%d %H:%M:%S:%L, dayOfYear: %j, "
-                                     "dayOfWeek: %w, week: %U, isoYear: %G, "
-                                     "isoWeek: %V, isoDayOfWeek: %u, percent: %%",
-                                     date),
-              "1969/12/31 19:00:00:000, dayOfYear: 365, dayOfWeek: 4, week: 52, isoYear: 1970, "
-              "isoWeek: 01, isoDayOfWeek: 3, percent: %");
+    auto result = newYorkZone.formatDate(
+        "%Y/%m/%d %H:%M:%S:%L, dayOfYear: %j, "
+        "dayOfWeek: %w, week: %U, isoYear: %G, "
+        "isoWeek: %V, isoDayOfWeek: %u, percent: %%",
+        date);
+    ASSERT_OK(result);
+    ASSERT_EQ(
+        "1969/12/31 19:00:00:000, dayOfYear: 365, dayOfWeek: 4, week: 52, isoYear: 1970, "
+        "isoWeek: 01, isoDayOfWeek: 3, percent: %",
+        result.getValue());
 }
 
 TEST(UTCTimeAtEpoch, DoesOutputFormatDate) {
     auto date = Date_t::fromMillisSinceEpoch(0);
     std::ostringstream os;
-    TimeZoneDatabase::utcZone().outputDateWithFormat(os,
-                                                     "%Y/%m/%d %H:%M:%S:%L, dayOfYear: %j, "
-                                                     "dayOfWeek: %w, week: %U, isoYear: %G, "
-                                                     "isoWeek: %V, isoDayOfWeek: %u, percent: %%",
-                                                     date);
+    ASSERT_OK(TimeZoneDatabase::utcZone().outputDateWithFormat(
+        os,
+        "%Y/%m/%d %H:%M:%S:%L, dayOfYear: %j, "
+        "dayOfWeek: %w, week: %U, isoYear: %G, "
+        "isoWeek: %V, isoDayOfWeek: %u, percent: %%",
+        date));
     ASSERT_EQ(os.str(),
               "1970/01/01 00:00:00:000, dayOfYear: 001, dayOfWeek: 5, week: 00, isoYear: 1970, "
               "isoWeek: 01, isoDayOfWeek: 4, percent: %");
@@ -605,11 +625,11 @@ TEST(NewYorkTimeAtEpoch, DoesOutputFormatDate) {
     auto newYorkZone = kDefaultTimeZoneDatabase.getTimeZone("America/New_York");
     auto date = Date_t::fromMillisSinceEpoch(0);
     std::ostringstream os;
-    newYorkZone.outputDateWithFormat(os,
-                                     "%Y/%m/%d %H:%M:%S:%L, dayOfYear: %j, "
-                                     "dayOfWeek: %w, week: %U, isoYear: %G, "
-                                     "isoWeek: %V, isoDayOfWeek: %u, percent: %%",
-                                     date);
+    ASSERT_OK(newYorkZone.outputDateWithFormat(os,
+                                               "%Y/%m/%d %H:%M:%S:%L, dayOfYear: %j, "
+                                               "dayOfWeek: %w, week: %U, isoYear: %G, "
+                                               "isoWeek: %V, isoDayOfWeek: %u, percent: %%",
+                                               date));
     ASSERT_EQ(os.str(),
               "1969/12/31 19:00:00:000, dayOfYear: 365, dayOfWeek: 4, week: 52, isoYear: 1970, "
               "isoWeek: 01, isoDayOfWeek: 3, percent: %");
@@ -879,47 +899,60 @@ TEST(NewYorkTimeAfterEpoch, DoesComputeISOWeek) {
 TEST(UTCTimeAfterEpoch, DoesFormatDate) {
     // Tue, Jun 6, 2017 19:38:43:234.
     auto date = Date_t::fromMillisSinceEpoch(1496777923234LL);
-    ASSERT_EQ(TimeZoneDatabase::utcZone().formatDate("%Y/%m/%d %H:%M:%S:%L, dayOfYear: %j, "
-                                                     "dayOfWeek: %w, week: %U, isoYear: %G, "
-                                                     "isoWeek: %V, isoDayOfWeek: %u, percent: %%",
-                                                     date),
-              "2017/06/06 19:38:43:234, dayOfYear: 157, dayOfWeek: 3, week: 23, isoYear: 2017, "
-              "isoWeek: 23, isoDayOfWeek: 2, percent: %");
+    auto result = TimeZoneDatabase::utcZone().formatDate(
+        "%Y/%m/%d %H:%M:%S:%L, dayOfYear: %j, "
+        "dayOfWeek: %w, week: %U, isoYear: %G, "
+        "isoWeek: %V, isoDayOfWeek: %u, percent: %%",
+        date);
+    ASSERT_OK(result);
+    ASSERT_EQ(
+        "2017/06/06 19:38:43:234, dayOfYear: 157, dayOfWeek: 3, week: 23, isoYear: 2017, "
+        "isoWeek: 23, isoDayOfWeek: 2, percent: %",
+        result.getValue());
 }
 
 TEST(NewYorkTimeAfterEpoch, DoesFormatDate) {
     // 2017-06-06T19:38:43:234Z (Tuesday).
     auto date = Date_t::fromMillisSinceEpoch(1496777923234LL);
     auto newYorkZone = kDefaultTimeZoneDatabase.getTimeZone("America/New_York");
-    ASSERT_EQ(newYorkZone.formatDate("%Y/%m/%d %H:%M:%S:%L, dayOfYear: %j, "
-                                     "dayOfWeek: %w, week: %U, isoYear: %G, "
-                                     "isoWeek: %V, isoDayOfWeek: %u, percent: %%",
-                                     date),
-              "2017/06/06 15:38:43:234, dayOfYear: 157, dayOfWeek: 3, week: 23, isoYear: 2017, "
-              "isoWeek: 23, isoDayOfWeek: 2, percent: %");
+    auto result = newYorkZone.formatDate(
+        "%Y/%m/%d %H:%M:%S:%L, dayOfYear: %j, "
+        "dayOfWeek: %w, week: %U, isoYear: %G, "
+        "isoWeek: %V, isoDayOfWeek: %u, percent: %%",
+        date);
+    ASSERT_OK(result);
+    ASSERT_EQ(
+        "2017/06/06 15:38:43:234, dayOfYear: 157, dayOfWeek: 3, week: 23, isoYear: 2017, "
+        "isoWeek: 23, isoDayOfWeek: 2, percent: %",
+        result.getValue());
 }
 
 TEST(UTCOffsetAfterEpoch, DoesFormatDate) {
     // 2017-06-06T19:38:43:234Z (Tuesday).
     auto date = Date_t::fromMillisSinceEpoch(1496777923234LL);
     auto offsetSpec = kDefaultTimeZoneDatabase.getTimeZone("+02:30");
-    ASSERT_EQ(offsetSpec.formatDate("%Y/%m/%d %H:%M:%S:%L, dayOfYear: %j, "
-                                    "dayOfWeek: %w, week: %U, isoYear: %G, "
-                                    "isoWeek: %V, isoDayOfWeek: %u, percent: %%",
-                                    date),
-              "2017/06/06 22:08:43:234, dayOfYear: 157, dayOfWeek: 3, week: 23, isoYear: 2017, "
-              "isoWeek: 23, isoDayOfWeek: 2, percent: %");
+    auto result = offsetSpec.formatDate(
+        "%Y/%m/%d %H:%M:%S:%L, dayOfYear: %j, "
+        "dayOfWeek: %w, week: %U, isoYear: %G, "
+        "isoWeek: %V, isoDayOfWeek: %u, percent: %%",
+        date);
+    ASSERT_OK(result);
+    ASSERT_EQ(
+        "2017/06/06 22:08:43:234, dayOfYear: 157, dayOfWeek: 3, week: 23, isoYear: 2017, "
+        "isoWeek: 23, isoDayOfWeek: 2, percent: %",
+        result.getValue());
 }
 
 TEST(UTCTimeAfterEpoch, DoesOutputFormatDate) {
     // Tue, Jun 6, 2017 19:38:43:234.
     auto date = Date_t::fromMillisSinceEpoch(1496777923234LL);
     std::ostringstream os;
-    TimeZoneDatabase::utcZone().outputDateWithFormat(os,
-                                                     "%Y/%m/%d %H:%M:%S:%L, dayOfYear: %j, "
-                                                     "dayOfWeek: %w, week: %U, isoYear: %G, "
-                                                     "isoWeek: %V, isoDayOfWeek: %u, percent: %%",
-                                                     date);
+    ASSERT_OK(TimeZoneDatabase::utcZone().outputDateWithFormat(
+        os,
+        "%Y/%m/%d %H:%M:%S:%L, dayOfYear: %j, "
+        "dayOfWeek: %w, week: %U, isoYear: %G, "
+        "isoWeek: %V, isoDayOfWeek: %u, percent: %%",
+        date));
     ASSERT_EQ(os.str(),
               "2017/06/06 19:38:43:234, dayOfYear: 157, dayOfWeek: 3, week: 23, isoYear: 2017, "
               "isoWeek: 23, isoDayOfWeek: 2, percent: %");
@@ -930,11 +963,11 @@ TEST(NewYorkTimeAfterEpoch, DoesOutputFormatDate) {
     auto date = Date_t::fromMillisSinceEpoch(1496777923234LL);
     std::ostringstream os;
     auto newYorkZone = kDefaultTimeZoneDatabase.getTimeZone("America/New_York");
-    newYorkZone.outputDateWithFormat(os,
-                                     "%Y/%m/%d %H:%M:%S:%L, dayOfYear: %j, "
-                                     "dayOfWeek: %w, week: %U, isoYear: %G, "
-                                     "isoWeek: %V, isoDayOfWeek: %u, percent: %%",
-                                     date);
+    ASSERT_OK(newYorkZone.outputDateWithFormat(os,
+                                               "%Y/%m/%d %H:%M:%S:%L, dayOfYear: %j, "
+                                               "dayOfWeek: %w, week: %U, isoYear: %G, "
+                                               "isoWeek: %V, isoDayOfWeek: %u, percent: %%",
+                                               date));
     ASSERT_EQ(os.str(),
               "2017/06/06 15:38:43:234, dayOfYear: 157, dayOfWeek: 3, week: 23, isoYear: 2017, "
               "isoWeek: 23, isoDayOfWeek: 2, percent: %");
@@ -965,37 +998,42 @@ TEST(DateFormat, ThrowsUserExceptionIfGivenUnmatchedPercent) {
                        18535);
 }
 
-TEST(DateFormat, ThrowsUserExceptionIfGivenDateBeforeYear0) {
+TEST(DateFormat, ProducesNonOKStatusGivenDateBeforeYear0) {
     const long long kMillisPerYear = 31556926000;
 
-    ASSERT_THROWS_CODE(TimeZoneDatabase::utcZone().formatDate(
-                           "%Y", Date_t::fromMillisSinceEpoch(-(kMillisPerYear * 1971))),
-                       AssertionException,
-                       18537);
+    ASSERT_EQ(18537,
+              TimeZoneDatabase::utcZone()
+                  .formatDate("%Y", Date_t::fromMillisSinceEpoch(-(kMillisPerYear * 1971)))
+                  .getStatus()
+                  .code());
 
-    ASSERT_THROWS_CODE(TimeZoneDatabase::utcZone().formatDate(
-                           "%G", Date_t::fromMillisSinceEpoch(-(kMillisPerYear * 1971))),
-                       AssertionException,
-                       18537);
+    ASSERT_EQ(18537,
+              TimeZoneDatabase::utcZone()
+                  .formatDate("%G", Date_t::fromMillisSinceEpoch(-(kMillisPerYear * 1971)))
+                  .getStatus()
+                  .code());
 
-    ASSERT_EQ("0000",
-              TimeZoneDatabase::utcZone().formatDate(
-                  "%Y", Date_t::fromMillisSinceEpoch(-(kMillisPerYear * 1970))));
+    auto result = TimeZoneDatabase::utcZone().formatDate(
+        "%Y", Date_t::fromMillisSinceEpoch(-(kMillisPerYear * 1970)));
+    ASSERT_OK(result);
+    ASSERT_EQ("0000", result.getValue());
 }
 
-TEST(DateFormat, ThrowsUserExceptionIfGivenDateAfterYear9999) {
-    ASSERT_THROWS_CODE(
-        TimeZoneDatabase::utcZone().formatDate("%Y", Date_t::max()), AssertionException, 18537);
+TEST(DateFormat, ProducesNonOKStatusIfGivenDateAfterYear9999) {
+    ASSERT_EQ(18537,
+              TimeZoneDatabase::utcZone().formatDate("%Y", Date_t::max()).getStatus().code());
 
-    ASSERT_THROWS_CODE(
-        TimeZoneDatabase::utcZone().formatDate("%G", Date_t::max()), AssertionException, 18537);
+    ASSERT_EQ(18537,
+              TimeZoneDatabase::utcZone().formatDate("%G", Date_t::max()).getStatus().code());
 }
 
 TEST(DateFromString, CorrectlyParsesStringThatMatchesFormat) {
     auto input = "2017-07-04T10:56:02Z";
     auto format = "%Y-%m-%dT%H:%M:%SZ"_sd;
     auto date = kDefaultTimeZoneDatabase.fromString(input, kDefaultTimeZone, format);
-    ASSERT_EQ(TimeZoneDatabase::utcZone().formatDate(format, date), input);
+    auto result = TimeZoneDatabase::utcZone().formatDate(format, date);
+    ASSERT_OK(result);
+    ASSERT_EQ(input, result.getValue());
 }
 
 TEST(DateFromString, RejectsStringWithInvalidYearFormat) {
@@ -1099,5 +1137,1525 @@ TEST(DateFromString, EmptyFormatStringThrowsForAllInputs) {
                        ErrorCodes::ConversionFailure);
 }
 
+TEST(DayOfWeek, WeekNumber) {
+    long long year = 2019;
+    long long week = 1;
+    long long day = 1;
+    long long hour = 0;
+    long long minute = 0;
+    long long second = 0;
+    long long millisecond = 0;
+
+    Date_t baseline = kDefaultTimeZone.createFromIso8601DateParts(
+        year, week, day, hour, minute, second, millisecond);
+
+    long long weekDurationInMillis = 7 * 24 * 60 * 60 * 1000;
+
+    for (int weekIt = -10000; weekIt < 10000; weekIt++) {
+        // Calculate a date using the ISO 8601 week-numbered year method.
+        Date_t dateFromIso8601 = kDefaultTimeZone.createFromIso8601DateParts(
+            year, weekIt, day, hour, minute, second, millisecond);
+
+        // Calculate the same date by adding 'weekDurationInMillis' to 'baseline' for each week past
+        // the baseline date.
+        Date_t dateFromArithmetic = baseline + Milliseconds(weekDurationInMillis * (weekIt - 1));
+
+        // The two methods should produce the same time.
+        ASSERT_EQ(dateFromIso8601, dateFromArithmetic);
+    }
+}
+
+TEST(DayOfWeek, DayNumber) {
+    long long year = 2019;
+    long long week = 34;
+    long long day = 1;
+    long long hour = 0;
+    long long minute = 0;
+    long long second = 0;
+    long long millisecond = 0;
+
+    Date_t baseline = kDefaultTimeZone.createFromIso8601DateParts(
+        year, week, day, hour, minute, second, millisecond);
+
+    long long dayDurationInMillis = 24 * 60 * 60 * 1000;
+
+    for (int dayIt = -10000; dayIt < 10000; dayIt++) {
+        // Calculate a date using the ISO 8601 week-numbered year method.
+        Date_t dateFromIso8601 = kDefaultTimeZone.createFromIso8601DateParts(
+            year, week, dayIt, hour, minute, second, millisecond);
+
+        // Calculate the same date by adding 'dayDurationInMillis' to 'baseline' for each day past
+        // the baseline date.
+        Date_t dateFromArithmetic = baseline + Milliseconds(dayDurationInMillis * (dayIt - 1));
+
+        // The two methods should produce the same time.
+        ASSERT_EQ(dateFromIso8601, dateFromArithmetic);
+    }
+}
+
+std::vector<const TimeZone*> setupTestTimezones() {
+    static const std::vector<TimeZone> kAllTimezones = [&]() {
+        std::vector<TimeZone> timezones{};
+        for (auto&& timeZoneId : kDefaultTimeZoneDatabase.getTimeZoneStrings()) {
+            timezones.push_back(kDefaultTimeZoneDatabase.getTimeZone(timeZoneId));
+        }
+        timezones.push_back(kDefaultTimeZoneDatabase.getTimeZone("-10:00"));
+        return timezones;
+    }();
+    std::vector<const TimeZone*> timezones{};
+    for (auto&& timezone : kAllTimezones) {
+        timezones.push_back(&timezone);
+    }
+    return timezones;
+}
+
+// Time zones for testing.
+const TimeZone kNewYorkTimeZone = kDefaultTimeZoneDatabase.getTimeZone("America/New_York");
+const TimeZone kAustraliaEuclaTimeZone =
+    kDefaultTimeZoneDatabase.getTimeZone("Australia/Eucla");  // UTC offset +08:45.
+const TimeZone kEuropeSofiaTimeZone = kDefaultTimeZoneDatabase.getTimeZone("Europe/Sofia");
+const TimeZone kAustraliaSydneyTimeZone =
+    kDefaultTimeZoneDatabase.getTimeZone("Australia/Sydney");  // UTC offset +11:00.
+const TimeZone kUTCMinus10TimeZone =
+    kDefaultTimeZoneDatabase.getTimeZone("-10:00");  // UTC offset -10:00.
+const std::vector<const TimeZone*> kTimezones{&kDefaultTimeZone,
+                                              &kNewYorkTimeZone,
+                                              &kAustraliaEuclaTimeZone,
+                                              &kEuropeSofiaTimeZone,
+                                              &kAustraliaSydneyTimeZone,
+                                              &kUTCMinus10TimeZone};
+const std::vector<const TimeZone*> kAllTimezones{setupTestTimezones()};
+
+// Verifies 'dateDiff()' with TimeUnit::year.
+TEST(DateDiff, Year) {
+    ASSERT_EQ(0,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2000, 12, 31, 23, 59, 59, 500),
+                       kNewYorkTimeZone.createFromDateParts(2000, 12, 31, 23, 59, 59, 999),
+                       TimeUnit::year,
+                       kNewYorkTimeZone));
+    ASSERT_EQ(1,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2000, 12, 31, 23, 59, 59, 500),
+                       kNewYorkTimeZone.createFromDateParts(2001, 1, 1, 0, 0, 0, 0),
+                       TimeUnit::year,
+                       kNewYorkTimeZone));
+    ASSERT_EQ(-1,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2001, 1, 1, 0, 0, 0, 0),
+                       kNewYorkTimeZone.createFromDateParts(2000, 12, 31, 23, 59, 59, 500),
+                       TimeUnit::year,
+                       kNewYorkTimeZone));
+    ASSERT_EQ(999,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(1002, 1, 1, 0, 0, 0, 0),
+                       kNewYorkTimeZone.createFromDateParts(2001, 1, 1, 0, 0, 0, 0),
+                       TimeUnit::year,
+                       kNewYorkTimeZone));
+}
+
+// Verifies 'dateDiff()' with TimeUnit::month.
+TEST(DateDiff, Month) {
+    ASSERT_EQ(0,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2020, 2, 28, 23, 59, 59, 500),
+                       kNewYorkTimeZone.createFromDateParts(2020, 2, 29, 23, 59, 59, 999),
+                       TimeUnit::month,
+                       kNewYorkTimeZone));
+    ASSERT_EQ(1,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2020, 2, 29, 23, 59, 59, 999),
+                       kNewYorkTimeZone.createFromDateParts(2020, 3, 1, 0, 0, 0, 0),
+                       TimeUnit::month,
+                       kNewYorkTimeZone));
+    ASSERT_EQ(-14,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2010, 2, 28, 23, 59, 59, 999),
+                       kNewYorkTimeZone.createFromDateParts(2008, 12, 31, 23, 59, 59, 500),
+                       TimeUnit::month,
+                       kNewYorkTimeZone));
+    ASSERT_EQ(1500 * 12,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(520, 3, 1, 0, 0, 0, 0),
+                       kNewYorkTimeZone.createFromDateParts(2020, 3, 1, 0, 0, 0, 0),
+                       TimeUnit::month,
+                       kNewYorkTimeZone));
+}
+
+// Verifies 'dateDiff()' with TimeUnit::quarter.
+TEST(DateDiff, Quarter) {
+    ASSERT_EQ(0,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2020, 1, 1, 0, 0, 0, 0),
+                       kNewYorkTimeZone.createFromDateParts(2020, 3, 31, 23, 59, 59, 999),
+                       TimeUnit::quarter,
+                       kNewYorkTimeZone));
+    ASSERT_EQ(1,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2020, 1, 1, 0, 0, 0, 0),
+                       kNewYorkTimeZone.createFromDateParts(2020, 4, 1, 0, 0, 0, 0),
+                       TimeUnit::quarter,
+                       kNewYorkTimeZone));
+    ASSERT_EQ(-2001,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2000, 12, 31, 23, 59, 59, 500),
+                       kNewYorkTimeZone.createFromDateParts(1500, 9, 30, 23, 59, 59, 999),
+                       TimeUnit::quarter,
+                       kNewYorkTimeZone));
+}
+
+// Verifies 'dateDiff()' with TimeUnit::week.
+TEST(DateDiff, Week) {
+    // Cases when the first day of the week is Monday.
+    ASSERT_EQ(1,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2020, 11, 2, 0, 0, 0, 0),
+                       kNewYorkTimeZone.createFromDateParts(2020, 11, 9, 0, 0, 0, 0),
+                       TimeUnit::week,
+                       kNewYorkTimeZone,
+                       DayOfWeek::monday));
+    ASSERT_EQ(1,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2020, 11, 2, 0, 0, 0, 0),
+                       kNewYorkTimeZone.createFromDateParts(2020, 11, 15, 0, 0, 0, 0),
+                       TimeUnit::week,
+                       kNewYorkTimeZone,
+                       DayOfWeek::monday));
+    ASSERT_EQ(0,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2020, 11, 2, 0, 0, 0, 0),
+                       kNewYorkTimeZone.createFromDateParts(2020, 11, 8, 0, 0, 0, 0),
+                       TimeUnit::week,
+                       kNewYorkTimeZone,
+                       DayOfWeek::monday));
+    ASSERT_EQ(0,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2020, 11, 2, 0, 0, 0, 0),
+                       kNewYorkTimeZone.createFromDateParts(2020, 11, 2, 0, 0, 0, 0),
+                       TimeUnit::week,
+                       kNewYorkTimeZone,
+                       DayOfWeek::monday));
+    ASSERT_EQ(0,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2020, 11, 2, 0, 0, 0, 0),
+                       kNewYorkTimeZone.createFromDateParts(2020, 11, 3, 0, 0, 0, 0),
+                       TimeUnit::week,
+                       kNewYorkTimeZone,
+                       DayOfWeek::monday));
+    ASSERT_EQ(1,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2020, 11, 8, 0, 0, 0, 0),
+                       kNewYorkTimeZone.createFromDateParts(2020, 11, 9, 0, 0, 0, 0),
+                       TimeUnit::week,
+                       kNewYorkTimeZone,
+                       DayOfWeek::monday));
+    ASSERT_EQ(1,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2020, 11, 8, 0, 0, 0, 0),
+                       kNewYorkTimeZone.createFromDateParts(2020, 11, 15, 0, 0, 0, 0),
+                       TimeUnit::week,
+                       kNewYorkTimeZone,
+                       DayOfWeek::monday));
+    ASSERT_EQ(-5,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2020, 11, 10, 0, 0, 0, 0),
+                       kNewYorkTimeZone.createFromDateParts(2020, 10, 8, 0, 0, 0, 0),
+                       TimeUnit::week,
+                       kNewYorkTimeZone,
+                       DayOfWeek::monday));
+
+    // Cases when the first day of the week is not Monday.
+    ASSERT_EQ(1,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2020, 11, 13, 0, 0, 0, 0),  // Friday.
+                       kNewYorkTimeZone.createFromDateParts(2020, 11, 15, 0, 0, 0, 0),  // Sunday.
+                       TimeUnit::week,
+                       kNewYorkTimeZone,
+                       DayOfWeek::sunday));
+    ASSERT_EQ(0,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2020, 11, 13, 0, 0, 0, 0),  // Friday.
+                       kNewYorkTimeZone.createFromDateParts(2020, 11, 14, 0, 0, 0, 0),  // Saturday.
+                       TimeUnit::week,
+                       kNewYorkTimeZone,
+                       DayOfWeek::sunday));
+    ASSERT_EQ(1,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2020, 11, 8, 0, 0, 0, 0),   // Sunday.
+                       kNewYorkTimeZone.createFromDateParts(2020, 11, 15, 0, 0, 0, 0),  // Sunday.
+                       TimeUnit::week,
+                       kNewYorkTimeZone,
+                       DayOfWeek::sunday));
+    ASSERT_EQ(2,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2020, 11, 7, 0, 0, 0, 0),   // Saturday.
+                       kNewYorkTimeZone.createFromDateParts(2020, 11, 15, 0, 0, 0, 0),  // Sunday.
+                       TimeUnit::week,
+                       kNewYorkTimeZone,
+                       DayOfWeek::sunday));
+    ASSERT_EQ(0,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2020, 11, 4, 0, 0, 0, 0),  // Wednesday.
+                       kNewYorkTimeZone.createFromDateParts(2020, 11, 10, 0, 0, 0, 0),  // Tuesday.
+                       TimeUnit::week,
+                       kNewYorkTimeZone,
+                       DayOfWeek::wednesday));
+}
+
+// Verifies 'dateDiff()' with TimeUnit::day.
+TEST(DateDiff, Day) {
+    ASSERT_EQ(0,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2020, 11, 8, 0, 0, 0, 0),
+                       kNewYorkTimeZone.createFromDateParts(2020, 11, 8, 23, 59, 59, 999),
+                       TimeUnit::day,
+                       kNewYorkTimeZone));
+    ASSERT_EQ(1,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2020, 11, 8, 0, 0, 0, 0),
+                       kNewYorkTimeZone.createFromDateParts(2020, 11, 9, 0, 0, 0, 0),
+                       TimeUnit::day,
+                       kNewYorkTimeZone));
+    ASSERT_EQ(-1,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2020, 11, 9, 0, 0, 0, 0),
+                       kNewYorkTimeZone.createFromDateParts(2020, 11, 8, 23, 59, 59, 999),
+                       TimeUnit::day,
+                       kNewYorkTimeZone));
+
+    // Verifies number of days in a year calculation.
+    ASSERT_EQ(369,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(1999, 12, 30, 0, 0, 0, 0),
+                       kNewYorkTimeZone.createFromDateParts(2001, 1, 2, 0, 0, 0, 0),
+                       TimeUnit::day,
+                       kNewYorkTimeZone));
+    ASSERT_EQ(6575,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(1583, 1, 1, 0, 0, 0, 0),
+                       kNewYorkTimeZone.createFromDateParts(1601, 1, 1, 0, 0, 0, 0),
+                       TimeUnit::day,
+                       kNewYorkTimeZone));
+    ASSERT_EQ(-6575,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(1601, 1, 1, 0, 0, 0, 0),
+                       kNewYorkTimeZone.createFromDateParts(1583, 1, 1, 0, 0, 0, 0),
+                       TimeUnit::day,
+                       kNewYorkTimeZone));
+    ASSERT_EQ(29,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2004, 2, 10, 0, 0, 0, 0),
+                       kNewYorkTimeZone.createFromDateParts(2004, 3, 10, 0, 0, 0, 0),
+                       TimeUnit::day,
+                       kNewYorkTimeZone));
+    ASSERT_EQ(28,
+              dateDiff(kAustraliaEuclaTimeZone.createFromDateParts(2005, 2, 10, 0, 0, 0, 0),
+                       kAustraliaEuclaTimeZone.createFromDateParts(2005, 3, 10, 0, 0, 0, 0),
+                       TimeUnit::day,
+                       kAustraliaEuclaTimeZone));
+
+    // Use timelib_day_of_year as an oracle to verify day calculations.
+    for (int year = -1000; year < 3000; ++year) {
+        int expectedNumberOfDays = timelib_day_of_year(year, 12, 31) + 1;
+        ASSERT_EQ(expectedNumberOfDays,
+                  dateDiff(kNewYorkTimeZone.createFromDateParts(year, 2, 3, 0, 0, 0, 0),
+                           kNewYorkTimeZone.createFromDateParts(year + 1, 2, 3, 0, 0, 0, 0),
+                           TimeUnit::day,
+                           kNewYorkTimeZone));
+    }
+}
+
+// Verifies 'dateDiff()' with TimeUnit::hour.
+TEST(DateDiff, Hour) {
+    ASSERT_EQ(0,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2020, 11, 8, 1, 0, 0, 0),
+                       kNewYorkTimeZone.createFromDateParts(2020, 11, 8, 1, 59, 59, 999),
+                       TimeUnit::hour,
+                       kNewYorkTimeZone));
+    ASSERT_EQ(1,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2020, 11, 8, 1, 59, 59, 999),
+                       kNewYorkTimeZone.createFromDateParts(2020, 11, 8, 2, 0, 0, 0),
+                       TimeUnit::hour,
+                       kNewYorkTimeZone));
+    ASSERT_EQ(-25,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2020, 11, 10, 0, 0, 0, 0),
+                       kNewYorkTimeZone.createFromDateParts(2020, 11, 8, 23, 59, 59, 999),
+                       TimeUnit::hour,
+                       kNewYorkTimeZone));
+
+    // Hour difference calculation in UTC offset +08:45 time zone.
+    ASSERT_EQ(
+        1,
+        dateDiff(
+            kAustraliaEuclaTimeZone.createFromDateParts(2020, 11, 10, 20, 55, 0, 0) /*UTC 12:10*/,
+            kAustraliaEuclaTimeZone.createFromDateParts(2020, 11, 10, 21, 5, 0, 0) /*UTC 12:20*/,
+            TimeUnit::hour,
+            kAustraliaEuclaTimeZone));
+
+    // Test of transition from DST to standard time.
+    ASSERT_EQ(1,
+              dateDiff(kDefaultTimeZone.createFromDateParts(
+                           2020, 11, 1, 5, 0, 0, 0) /* America/New_York 1:00AM EDT (UTC-4)*/,
+                       kDefaultTimeZone.createFromDateParts(
+                           2020, 11, 1, 6, 0, 0, 0) /* America/New_York 1:00AM EST (UTC-5)*/,
+                       TimeUnit::hour,
+                       kNewYorkTimeZone));
+    ASSERT_EQ(-1,
+              dateDiff(kDefaultTimeZone.createFromDateParts(
+                           2020, 11, 1, 6, 0, 0, 0) /* America/New_York 1:00AM EST (UTC-5)*/,
+                       kDefaultTimeZone.createFromDateParts(
+                           2020, 11, 1, 5, 0, 0, 0) /* America/New_York 1:00AM EDT (UTC-4)*/,
+                       TimeUnit::hour,
+                       kNewYorkTimeZone));
+
+    // Test of transition from standard time to DST.
+    ASSERT_EQ(1,
+              dateDiff(kDefaultTimeZone.createFromDateParts(
+                           2020, 3, 8, 6, 45, 0, 0) /* America/New_York 1:45AM EST (UTC-5)*/,
+                       kDefaultTimeZone.createFromDateParts(
+                           2020, 3, 8, 7, 0, 0, 0) /* America/New_York 3:00AM EDT (UTC-4)*/,
+                       TimeUnit::hour,
+                       kNewYorkTimeZone));
+    ASSERT_EQ(-1,
+              dateDiff(kDefaultTimeZone.createFromDateParts(
+                           2020, 3, 8, 7, 0, 0, 0) /* America/New_York 3:00AM EDT (UTC-4)*/,
+                       kDefaultTimeZone.createFromDateParts(
+                           2020, 3, 8, 6, 45, 0, 0) /* America/New_York 1:45AM EST (UTC-5)*/,
+                       TimeUnit::hour,
+                       kNewYorkTimeZone));
+
+    // Longer period test.
+    ASSERT_EQ(17545,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(1999, 1, 1, 0, 0, 0, 0),
+                       kNewYorkTimeZone.createFromDateParts(2001, 1, 1, 1, 0, 0, 0),
+                       TimeUnit::hour,
+                       kNewYorkTimeZone));
+}
+
+// Verifies 'dateDiff()' with TimeUnit::minute.
+TEST(DateDiff, Minute) {
+    ASSERT_EQ(0,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2020, 11, 8, 1, 30, 0, 0),
+                       kNewYorkTimeZone.createFromDateParts(2020, 11, 8, 1, 30, 59, 999),
+                       TimeUnit::minute,
+                       kNewYorkTimeZone));
+    ASSERT_EQ(1,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2020, 11, 8, 1, 30, 59, 999),
+                       kNewYorkTimeZone.createFromDateParts(2020, 11, 8, 1, 31, 0, 0),
+                       TimeUnit::minute,
+                       kNewYorkTimeZone));
+    ASSERT_EQ(-25,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2020, 11, 8, 1, 55, 0, 0),
+                       kNewYorkTimeZone.createFromDateParts(2020, 11, 8, 1, 30, 59, 999),
+                       TimeUnit::minute,
+                       kNewYorkTimeZone));
+    ASSERT_EQ(234047495,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(1585, 11, 8, 1, 55, 0, 0),
+                       kNewYorkTimeZone.createFromDateParts(2030, 11, 8, 1, 30, 59, 999),
+                       TimeUnit::minute,
+                       kNewYorkTimeZone));
+}
+
+// Verifies 'dateDiff()' with TimeUnit::second.
+TEST(DateDiff, Second) {
+    ASSERT_EQ(0,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2020, 11, 8, 1, 30, 15, 0),
+                       kNewYorkTimeZone.createFromDateParts(2020, 11, 8, 1, 30, 15, 999),
+                       TimeUnit::second,
+                       kNewYorkTimeZone));
+    ASSERT_EQ(1,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2020, 11, 8, 1, 30, 15, 999),
+                       kNewYorkTimeZone.createFromDateParts(2020, 11, 8, 1, 30, 16, 0),
+                       TimeUnit::second,
+                       kNewYorkTimeZone));
+    ASSERT_EQ(-2401,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2020, 11, 8, 2, 10, 16, 999),
+                       kNewYorkTimeZone.createFromDateParts(2020, 11, 8, 1, 30, 15, 999),
+                       TimeUnit::second,
+                       kNewYorkTimeZone));
+    ASSERT_EQ(1604971816,
+              dateDiff(kDefaultTimeZone.createFromDateParts(1970, 1, 1, 0, 0, 0, 0),
+                       kDefaultTimeZone.createFromDateParts(2020, 11, 10, 1, 30, 16, 0),
+                       TimeUnit::second,
+                       kNewYorkTimeZone));
+}
+
+// Verifies 'dateDiff()' with TimeUnit::millisecond.
+TEST(DateDiff, Millisecond) {
+    ASSERT_EQ(100,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2020, 11, 8, 1, 30, 15, 0),
+                       kNewYorkTimeZone.createFromDateParts(2020, 11, 8, 1, 30, 15, 100),
+                       TimeUnit::millisecond,
+                       kNewYorkTimeZone));
+    ASSERT_EQ(-1500,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2020, 11, 8, 1, 30, 16, 500),
+                       kNewYorkTimeZone.createFromDateParts(2020, 11, 8, 1, 30, 15, 0),
+                       TimeUnit::millisecond,
+                       kNewYorkTimeZone));
+    ASSERT_EQ(1604971816000,
+              dateDiff(kDefaultTimeZone.createFromDateParts(1970, 1, 1, 0, 0, 0, 0),
+                       kDefaultTimeZone.createFromDateParts(2020, 11, 10, 1, 30, 16, 0),
+                       TimeUnit::millisecond,
+                       kNewYorkTimeZone));
+
+    // Verifies numeric overflow handling.
+    ASSERT_THROWS_CODE(dateDiff(Date_t::fromMillisSinceEpoch(std::numeric_limits<long long>::min()),
+                                Date_t::fromMillisSinceEpoch(std::numeric_limits<long long>::max()),
+                                TimeUnit::millisecond,
+                                kNewYorkTimeZone),
+                       AssertionException,
+                       5166308);
+}
+
+// Verifies 'truncateDate()' with TimeUnit::millisecond.
+TEST(TruncateDate, Millisecond) {
+    for (auto* timezone : kTimezones) {
+        // Value in the middle of a bin above default reference point.
+        ASSERT_EQ(timezone->createFromDateParts(2000, 1, 1, 0, 0, 1, 20),
+                  truncateDate(timezone->createFromDateParts(2000, 1, 1, 0, 0, 2, 0),
+                               TimeUnit::millisecond,
+                               1020,
+                               *timezone));
+
+        // Value at the lower boundary of a bin.
+        ASSERT_EQ(timezone->createFromDateParts(2000, 1, 1, 0, 0, 1, 20),
+                  truncateDate(timezone->createFromDateParts(2000, 1, 1, 0, 0, 1, 20),
+                               TimeUnit::millisecond,
+                               1020,
+                               *timezone));
+
+        // Value at the top of a bin.
+        ASSERT_EQ(timezone->createFromDateParts(2000, 1, 1, 0, 0, 1, 20),
+                  truncateDate(timezone->createFromDateParts(2000, 1, 1, 0, 0, 2, 39),
+                               TimeUnit::millisecond,
+                               1020,
+                               *timezone));
+
+        // Value at the bottom of the next bin.
+        ASSERT_EQ(timezone->createFromDateParts(2000, 1, 1, 0, 0, 2, 40),
+                  truncateDate(timezone->createFromDateParts(2000, 1, 1, 0, 0, 2, 40),
+                               TimeUnit::millisecond,
+                               1020,
+                               *timezone));
+
+        // Value at the top of a bin below default reference point.
+        ASSERT_EQ(timezone->createFromDateParts(1999, 12, 31, 23, 59, 58, 500),
+                  truncateDate(timezone->createFromDateParts(1999, 12, 31, 23, 59, 59, 999),
+                               TimeUnit::millisecond,
+                               1500,
+                               *timezone));
+    }
+}
+
+// Verifies 'truncateDate()' with TimeUnit::second.
+TEST(TruncateDate, Second) {
+    for (auto* timezone : kTimezones) {
+        // Value in the middle of a bin above default reference point.
+        ASSERT_EQ(timezone->createFromDateParts(2000, 1, 1, 0, 0, 5, 0),
+                  truncateDate(timezone->createFromDateParts(2000, 1, 1, 0, 0, 9, 0),
+                               TimeUnit::second,
+                               5,
+                               *timezone));
+
+        // Value at the lower boundary of a bin.
+        ASSERT_EQ(timezone->createFromDateParts(2000, 1, 1, 0, 0, 5, 0),
+                  truncateDate(timezone->createFromDateParts(2000, 1, 1, 0, 0, 5, 0),
+                               TimeUnit::second,
+                               5,
+                               *timezone));
+
+        // Value at the top of a bin.
+        ASSERT_EQ(timezone->createFromDateParts(2000, 1, 1, 0, 0, 5, 0),
+                  truncateDate(timezone->createFromDateParts(2000, 1, 1, 0, 0, 9, 999),
+                               TimeUnit::second,
+                               5,
+                               *timezone));
+
+        // Value at the bottom of the next bin.
+        ASSERT_EQ(timezone->createFromDateParts(2000, 1, 1, 0, 0, 10, 0),
+                  truncateDate(timezone->createFromDateParts(2000, 1, 1, 0, 0, 10, 0),
+                               TimeUnit::second,
+                               5,
+                               *timezone));
+
+        // Value at the top of a bin below default reference point.
+        ASSERT_EQ(timezone->createFromDateParts(1999, 12, 31, 23, 59, 50, 0),
+                  truncateDate(timezone->createFromDateParts(1999, 12, 31, 23, 59, 51, 0),
+                               TimeUnit::second,
+                               5,
+                               *timezone));
+    }
+}
+
+// Verifies 'truncateDate()' with TimeUnit::minute.
+TEST(TruncateDate, Minute) {
+    for (auto* timezone : kTimezones) {
+        // Value in the middle of a bin above default reference point.
+        ASSERT_EQ(timezone->createFromDateParts(2000, 1, 1, 0, 5, 0, 0),
+                  truncateDate(timezone->createFromDateParts(2000, 1, 1, 0, 9, 0, 0),
+                               TimeUnit::minute,
+                               5,
+                               *timezone));
+
+        // Value at the lower boundary of a bin.
+        ASSERT_EQ(timezone->createFromDateParts(2000, 1, 1, 0, 5, 0, 0),
+                  truncateDate(timezone->createFromDateParts(2000, 1, 1, 0, 5, 0, 0),
+                               TimeUnit::minute,
+                               5,
+                               *timezone));
+
+        // Value at the top of a bin.
+        ASSERT_EQ(timezone->createFromDateParts(2000, 1, 1, 0, 5, 0, 0),
+                  truncateDate(timezone->createFromDateParts(2000, 1, 1, 0, 9, 59, 999),
+                               TimeUnit::minute,
+                               5,
+                               *timezone));
+
+        // Value at the bottom of the next bin.
+        ASSERT_EQ(timezone->createFromDateParts(2000, 1, 1, 0, 10, 0, 0),
+                  truncateDate(timezone->createFromDateParts(2000, 1, 1, 0, 10, 10, 0),
+                               TimeUnit::minute,
+                               5,
+                               *timezone));
+
+        // Value at the top of a bin below default reference point.
+        ASSERT_EQ(timezone->createFromDateParts(1999, 12, 31, 23, 50, 0, 0),
+                  truncateDate(timezone->createFromDateParts(1999, 12, 31, 23, 54, 0, 0),
+                               TimeUnit::minute,
+                               5,
+                               *timezone));
+    }
+}
+
+// Verifies 'truncateDate()' with TimeUnit::hour.
+TEST(TruncateDate, Hour) {
+    for (auto* timezone : kTimezones) {
+        // Value in the middle of a bin above default reference point.
+        ASSERT_EQ(timezone->createFromDateParts(2020, 1, 1, 2, 0, 0, 0),
+                  truncateDate(timezone->createFromDateParts(2020, 1, 1, 3, 0, 0, 0),
+                               TimeUnit::hour,
+                               2,
+                               *timezone));
+
+        // Value at the lower boundary of a bin.
+        ASSERT_EQ(timezone->createFromDateParts(2020, 1, 1, 2, 0, 0, 0),
+                  truncateDate(timezone->createFromDateParts(2020, 1, 1, 2, 0, 0, 0),
+                               TimeUnit::hour,
+                               2,
+                               *timezone));
+
+        // Value at the top of a bin.
+        ASSERT_EQ(timezone->createFromDateParts(2020, 1, 1, 2, 0, 0, 0),
+                  truncateDate(timezone->createFromDateParts(2020, 1, 1, 3, 59, 59, 999),
+                               TimeUnit::hour,
+                               2,
+                               *timezone));
+
+        // Value at the bottom of the next bin.
+        ASSERT_EQ(timezone->createFromDateParts(2020, 1, 1, 4, 0, 0, 0),
+                  truncateDate(timezone->createFromDateParts(2020, 1, 1, 4, 0, 0, 0),
+                               TimeUnit::hour,
+                               2,
+                               *timezone));
+
+        // Value at the top of a bin below default reference point.
+        ASSERT_EQ(timezone->createFromDateParts(1999, 12, 31, 22, 0, 0, 0),
+                  truncateDate(timezone->createFromDateParts(1999, 12, 31, 23, 59, 51, 0),
+                               TimeUnit::hour,
+                               2,
+                               *timezone));
+    }
+}
+
+// Verifies 'truncateDate()' with TimeUnit::day.
+TEST(TruncateDate, Day) {
+    for (auto* timezone : kAllTimezones) {
+        // Value in the middle of a bin above default reference point.
+        ASSERT_EQ(timezone->createFromDateParts(2000, 1, 7, 0, 0, 0, 0),
+                  truncateDate(timezone->createFromDateParts(2000, 1, 8, 0, 0, 2, 0),
+                               TimeUnit::day,
+                               2,
+                               *timezone));
+
+        // Value at the lower boundary of a bin.
+        ASSERT_EQ(timezone->createFromDateParts(2000, 1, 9, 0, 0, 0, 0),
+                  truncateDate(timezone->createFromDateParts(2000, 1, 9, 0, 0, 0, 0),
+                               TimeUnit::day,
+                               2,
+                               *timezone));
+
+        // Value at the top of a bin.
+        ASSERT_EQ(timezone->createFromDateParts(2000, 1, 9, 0, 0, 0, 0),
+                  truncateDate(timezone->createFromDateParts(2000, 1, 10, 23, 59, 59, 999),
+                               TimeUnit::day,
+                               2,
+                               *timezone));
+
+        // Value at the top of a bin below default reference point.
+        ASSERT_EQ(timezone->createFromDateParts(1999, 12, 28, 0, 0, 0, 0),
+                  truncateDate(timezone->createFromDateParts(1999, 12, 29, 23, 59, 59, 999),
+                               TimeUnit::day,
+                               2,
+                               *timezone));
+    }
+
+    // Daylight Savings Time tests with America/New_York timezone.
+    // Day before DST is on.
+    ASSERT_EQ(kNewYorkTimeZone.createFromDateParts(2021, 3, 13, 0, 0, 0, 0),
+              truncateDate(kNewYorkTimeZone.createFromDateParts(2021, 3, 13, 4, 0, 0, 0),
+                           TimeUnit::day,
+                           1,
+                           kNewYorkTimeZone));
+
+    // Day when DST is on.
+    ASSERT_EQ(kNewYorkTimeZone.createFromDateParts(2021, 3, 14, 0, 0, 0, 0),
+              truncateDate(kNewYorkTimeZone.createFromDateParts(2021, 3, 14, 4, 0, 0, 0),
+                           TimeUnit::day,
+                           1,
+                           kNewYorkTimeZone));
+
+    // The next day when DST is on.
+    ASSERT_EQ(kNewYorkTimeZone.createFromDateParts(2021, 3, 15, 0, 0, 0, 0),
+              truncateDate(kNewYorkTimeZone.createFromDateParts(2021, 3, 15, 1, 0, 0, 0),
+                           TimeUnit::day,
+                           1,
+                           kNewYorkTimeZone));
+
+    // The last day when DST is on.
+    ASSERT_EQ(kNewYorkTimeZone.createFromDateParts(2021, 11, 7, 0, 0, 0, 0),
+              truncateDate(kNewYorkTimeZone.createFromDateParts(2021, 11, 7, 0, 30, 0, 0),
+                           TimeUnit::day,
+                           1,
+                           kNewYorkTimeZone));
+
+    // The DST is off.
+    ASSERT_EQ(kNewYorkTimeZone.createFromDateParts(2021, 11, 7, 0, 0, 0, 0),
+              truncateDate(kNewYorkTimeZone.createFromDateParts(2021, 11, 7, 2, 0, 0, 0),
+                           TimeUnit::day,
+                           1,
+                           kNewYorkTimeZone));
+
+    // The next day DST is off.
+    ASSERT_EQ(kNewYorkTimeZone.createFromDateParts(2021, 11, 8, 0, 0, 0, 0),
+              truncateDate(kNewYorkTimeZone.createFromDateParts(2021, 11, 8, 2, 0, 0, 0),
+                           TimeUnit::day,
+                           1,
+                           kNewYorkTimeZone));
+
+
+    // Daylight Savings Time tests with Europe/Sofia timezone.
+    // Day before DST is on.
+    ASSERT_EQ(kEuropeSofiaTimeZone.createFromDateParts(2021, 3, 27, 0, 0, 0, 0),
+              truncateDate(kEuropeSofiaTimeZone.createFromDateParts(2021, 3, 27, 22, 0, 0, 0),
+                           TimeUnit::day,
+                           1,
+                           kEuropeSofiaTimeZone));
+
+    // Day when DST is on.
+    ASSERT_EQ(kEuropeSofiaTimeZone.createFromDateParts(2021, 3, 28, 0, 0, 0, 0),
+              truncateDate(kEuropeSofiaTimeZone.createFromDateParts(2021, 3, 28, 4, 0, 0, 0),
+                           TimeUnit::day,
+                           1,
+                           kEuropeSofiaTimeZone));
+
+    // The next day when DST is on.
+    ASSERT_EQ(kEuropeSofiaTimeZone.createFromDateParts(2021, 3, 29, 0, 0, 0, 0),
+              truncateDate(kEuropeSofiaTimeZone.createFromDateParts(2021, 3, 29, 1, 0, 0, 0),
+                           TimeUnit::day,
+                           1,
+                           kEuropeSofiaTimeZone));
+
+    // The last day when DST is on.
+    ASSERT_EQ(kEuropeSofiaTimeZone.createFromDateParts(2021, 10, 31, 0, 0, 0, 0),
+              truncateDate(kEuropeSofiaTimeZone.createFromDateParts(2021, 10, 31, 0, 30, 0, 0),
+                           TimeUnit::day,
+                           1,
+                           kEuropeSofiaTimeZone));
+
+    // The DST is off.
+    ASSERT_EQ(kEuropeSofiaTimeZone.createFromDateParts(2021, 11, 1, 0, 0, 0, 0),
+              truncateDate(kEuropeSofiaTimeZone.createFromDateParts(2021, 11, 1, 0, 0, 0, 1),
+                           TimeUnit::day,
+                           1,
+                           kEuropeSofiaTimeZone));
+}
+
+// Verifies 'truncateDate()' with TimeUnit::week.
+TEST(TruncateDate, Week) {
+    for (auto* timezone : kAllTimezones) {
+        // Value in the middle of a bin above default reference point. The first day of a week is
+        // Wednesday.
+        ASSERT_EQ(timezone->createFromDateParts(2000, 1, 19, 0, 0, 0, 0),
+                  truncateDate(timezone->createFromDateParts(2000, 1, 26, 0, 0, 0, 0),
+                               TimeUnit::week,
+                               2,
+                               *timezone,
+                               DayOfWeek::wednesday));
+
+        // Reference point coincides with start of the week (Saturday).
+        ASSERT_EQ(timezone->createFromDateParts(2000, 1, 1, 0, 0, 0, 0),
+                  truncateDate(timezone->createFromDateParts(2000, 1, 2, 0, 0, 0, 0),
+                               TimeUnit::week,
+                               1,
+                               *timezone,
+                               DayOfWeek::saturday));
+
+        // Value at the lower boundary of a bin. The first day of a week is Monday.
+        ASSERT_EQ(timezone->createFromDateParts(2021, 7, 26, 0, 0, 0, 0),
+                  truncateDate(timezone->createFromDateParts(2021, 7, 26, 0, 0, 0, 0),
+                               TimeUnit::week,
+                               1,
+                               *timezone,
+                               DayOfWeek::monday));
+
+        // Value at the top of a bin. The first day of a week is Monday.
+        ASSERT_EQ(timezone->createFromDateParts(2021, 7, 26, 0, 0, 0, 0),
+                  truncateDate(timezone->createFromDateParts(2021, 8, 1, 23, 59, 59, 999),
+                               TimeUnit::week,
+                               1,
+                               *timezone,
+                               DayOfWeek::monday));
+
+        // Value at the top of a bin below default reference point. The first day of a week is
+        // Monday.
+        ASSERT_EQ(timezone->createFromDateParts(1999, 12, 6, 0, 0, 0, 0),
+                  truncateDate(timezone->createFromDateParts(1999, 12, 19, 23, 59, 59, 999),
+                               TimeUnit::week,
+                               2,
+                               *timezone,
+                               DayOfWeek::monday));
+    }
+}
+
+// Verifies 'truncateDate()' with TimeUnit::month.
+TEST(TruncateDate, Month) {
+    for (auto* timezone : kAllTimezones) {
+        // Value in the middle of a bin above default reference point.
+        ASSERT_EQ(timezone->createFromDateParts(2021, 3, 1, 0, 0, 0, 0),
+                  truncateDate(timezone->createFromDateParts(2021, 4, 1, 0, 0, 0, 0),
+                               TimeUnit::month,
+                               2,
+                               *timezone));
+
+        // Value at the lower boundary of a bin above default reference point.
+        ASSERT_EQ(timezone->createFromDateParts(2021, 3, 1, 0, 0, 0, 0),
+                  truncateDate(timezone->createFromDateParts(2021, 3, 1, 0, 0, 0, 0),
+                               TimeUnit::month,
+                               2,
+                               *timezone));
+
+        // Value at the upper boundary of a bin above default reference point.
+        ASSERT_EQ(timezone->createFromDateParts(2021, 3, 1, 0, 0, 0, 0),
+                  truncateDate(timezone->createFromDateParts(2021, 4, 30, 23, 59, 59, 999),
+                               TimeUnit::month,
+                               2,
+                               *timezone));
+
+        // Value at the lower boundary of the next bin.
+        ASSERT_EQ(timezone->createFromDateParts(2021, 5, 1, 0, 0, 0, 0),
+                  truncateDate(timezone->createFromDateParts(2021, 5, 1, 0, 0, 0, 0),
+                               TimeUnit::month,
+                               2,
+                               *timezone));
+
+        // Value at the lower boundary of a bin.
+        ASSERT_EQ(timezone->createFromDateParts(1900, 1, 1, 0, 0, 0, 0),
+                  truncateDate(timezone->createFromDateParts(1900, 1, 1, 0, 0, 0, 0),
+                               TimeUnit::month,
+                               1,
+                               *timezone));
+
+        // Value at the top of a bin.
+        ASSERT_EQ(timezone->createFromDateParts(1900, 1, 1, 0, 0, 0, 0),
+                  truncateDate(timezone->createFromDateParts(1900, 3, 31, 23, 59, 59, 999),
+                               TimeUnit::month,
+                               3,
+                               *timezone));
+
+        // February is atypical.
+        ASSERT_EQ(timezone->createFromDateParts(2005, 2, 1, 0, 0, 0, 0),
+                  truncateDate(timezone->createFromDateParts(2005, 2, 28, 23, 59, 59, 999),
+                               TimeUnit::month,
+                               1,
+                               *timezone));
+    }
+}
+
+// Verifies 'truncateDate()' with TimeUnit::quarter.
+TEST(TruncateDate, Quarter) {
+    for (auto* timezone : kAllTimezones) {
+        // Value in the middle of a bin above default reference point.
+        ASSERT_EQ(timezone->createFromDateParts(2021, 1, 1, 0, 0, 0, 0),
+                  truncateDate(timezone->createFromDateParts(2021, 5, 1, 0, 0, 0, 0),
+                               TimeUnit::quarter,
+                               2,
+                               *timezone));
+
+        // Value at the lower boundary of a bin above default reference point.
+        ASSERT_EQ(timezone->createFromDateParts(2021, 1, 1, 0, 0, 0, 0),
+                  truncateDate(timezone->createFromDateParts(2021, 1, 1, 0, 0, 0, 0),
+                               TimeUnit::quarter,
+                               2,
+                               *timezone));
+
+        // Value at the upper boundary of a bin above default reference point.
+        ASSERT_EQ(timezone->createFromDateParts(2021, 1, 1, 0, 0, 0, 0),
+                  truncateDate(timezone->createFromDateParts(2021, 6, 30, 23, 59, 59, 999),
+                               TimeUnit::quarter,
+                               2,
+                               *timezone));
+
+        // Value at the lower boundary of the next bin.
+        ASSERT_EQ(timezone->createFromDateParts(2021, 7, 1, 0, 0, 0, 0),
+                  truncateDate(timezone->createFromDateParts(2021, 7, 1, 0, 0, 0, 0),
+                               TimeUnit::quarter,
+                               2,
+                               *timezone));
+
+        // Value at the lower boundary of a bin.
+        ASSERT_EQ(timezone->createFromDateParts(1900, 1, 1, 0, 0, 0, 0),
+                  truncateDate(timezone->createFromDateParts(1900, 1, 1, 0, 0, 0, 0),
+                               TimeUnit::quarter,
+                               1,
+                               *timezone));
+
+        // Value at the top of a bin.
+        ASSERT_EQ(timezone->createFromDateParts(1900, 1, 1, 0, 0, 0, 0),
+                  truncateDate(timezone->createFromDateParts(1900, 3, 31, 23, 59, 59, 999),
+                               TimeUnit::quarter,
+                               1,
+                               *timezone));
+    }
+}
+
+// Verifies 'truncateDate()' with TimeUnit::year.
+TEST(TruncateDate, Year) {
+    for (auto* timezone : kAllTimezones) {
+        // Value in the middle of a bin above default reference point.
+        ASSERT_EQ(timezone->createFromDateParts(2020, 1, 1, 0, 0, 0, 0),
+                  truncateDate(timezone->createFromDateParts(2021, 5, 1, 0, 0, 0, 0),
+                               TimeUnit::year,
+                               2,
+                               *timezone));
+
+        // Value at the lower boundary of a bin above default reference point.
+        ASSERT_EQ(timezone->createFromDateParts(2020, 1, 1, 0, 0, 0, 0),
+                  truncateDate(timezone->createFromDateParts(2020, 1, 1, 0, 0, 0, 0),
+                               TimeUnit::year,
+                               2,
+                               *timezone));
+
+        // Value at the upper boundary of a bin above default reference point.
+        ASSERT_EQ(timezone->createFromDateParts(2020, 1, 1, 0, 0, 0, 0),
+                  truncateDate(timezone->createFromDateParts(2021, 12, 31, 23, 59, 59, 999),
+                               TimeUnit::year,
+                               2,
+                               *timezone));
+
+        // Value at the lower boundary of the next bin.
+        ASSERT_EQ(timezone->createFromDateParts(2022, 1, 1, 0, 0, 0, 0),
+                  truncateDate(timezone->createFromDateParts(2022, 1, 1, 0, 0, 0, 0),
+                               TimeUnit::year,
+                               2,
+                               *timezone));
+
+        // Value at the lower boundary of a bin.
+        ASSERT_EQ(timezone->createFromDateParts(1950, 1, 1, 0, 0, 0, 0),
+                  truncateDate(timezone->createFromDateParts(1950, 1, 1, 0, 0, 0, 0),
+                               TimeUnit::year,
+                               1,
+                               *timezone));
+
+        // Value at the top of a bin.
+        ASSERT_EQ(timezone->createFromDateParts(1950, 1, 1, 0, 0, 0, 0),
+                  truncateDate(timezone->createFromDateParts(1950, 12, 31, 23, 59, 59, 999),
+                               TimeUnit::year,
+                               1,
+                               *timezone));
+    }
+}
+
+// Verifies 'truncateDate()' error handling.
+TEST(TruncateDate, ErrorHandling) {
+    auto* timezone = &kDefaultTimeZone;
+    const auto anyDate = timezone->createFromDateParts(2000, 1, 1, 2, 0, 0, 0);
+    const auto dateBeforeReferencePoint = timezone->createFromDateParts(1980, 1, 1, 0, 0, 0, 0);
+
+    // Verify that binSize > 0 constraint is enforced.
+    ASSERT_THROWS_CODE(
+        truncateDate(anyDate, TimeUnit::day, 0, *timezone), AssertionException, 5439005);
+
+    // Verify millisecond overflow detection.
+    const Date_t dateInLongPast =
+        Date_t::fromMillisSinceEpoch(std::numeric_limits<long long>::min());
+    ASSERT_THROWS_CODE(truncateDate(dateInLongPast, TimeUnit::millisecond, 1, *timezone),
+                       AssertionException,
+                       5439000);
+    ASSERT_THROWS_CODE(
+        truncateDate(Date_t::fromMillisSinceEpoch(std::numeric_limits<long long>::min() / 4 * 3),
+                     TimeUnit::millisecond,
+                     std::numeric_limits<long long>::max() / 5 * 3,
+                     *timezone),
+        AssertionException,
+        5439001);
+
+    // Verify second/minute/hour overflow detection.
+    for (auto timeUnit : {TimeUnit::second, TimeUnit::minute, TimeUnit::hour}) {
+        ASSERT_THROWS_CODE(
+            truncateDate(anyDate, timeUnit, std::numeric_limits<long long>::max() / 64, *timezone),
+            AssertionException,
+            5439002);
+    }
+
+    // Verify day/week/month/quarter/year bin size limits.
+    for (auto timeUnit :
+         {TimeUnit::day, TimeUnit::week, TimeUnit::month, TimeUnit::quarter, TimeUnit::year}) {
+        ASSERT_THROWS_CODE(truncateDate(anyDate, timeUnit, 100'000'000'001ULL, *timezone),
+                           AssertionException,
+                           5439006);
+
+        // Verify computation with large bin size when the result is in the long past succeeds.
+        truncateDate(dateBeforeReferencePoint, timeUnit, 200'000'000ULL, *timezone);
+
+        // Verify computation with large bin size succeeds.
+        ASSERT_EQ(timezone->createFromDateParts(2000, 1, 1, 0, 0, 0, 0),
+                  truncateDate(timezone->createFromDateParts(2000, 1, 1, 12, 0, 0, 0),
+                               timeUnit,
+                               100'000'000'000ULL,
+                               *timezone,
+                               DayOfWeek::saturday));
+    }
+
+    // Verify that out-of-range results are detected.
+    ASSERT_THROWS_CODE(
+        truncateDate(dateBeforeReferencePoint, TimeUnit::year, 1'000'000'000ULL, *timezone),
+        AssertionException,
+        5166406);
+
+    // Verify computation with large bin size when the result is in the long past succeeds.
+    ASSERT_EQ(timezone->createFromDateParts(-200'000'000LL, 1, 1, 0, 0, 0, 0),
+              truncateDate(dateBeforeReferencePoint, TimeUnit::year, 200'002'000ULL, *timezone));
+}
+
+TEST(DateAdd, DateAddYear) {
+    ASSERT_EQ(dateAdd(kDefaultTimeZone.createFromDateParts(2019, 11, 11, 0, 0, 0, 1),
+                      TimeUnit::year,
+                      1,
+                      kDefaultTimeZone),
+              kDefaultTimeZone.createFromDateParts(2020, 11, 11, 0, 0, 0, 1));
+
+    ASSERT_EQ(dateAdd(kDefaultTimeZone.createFromDateParts(2019, 11, 11, 0, 0, 0, 0),
+                      TimeUnit::year,
+                      -1,
+                      kDefaultTimeZone),
+              kDefaultTimeZone.createFromDateParts(2018, 11, 11, 0, 0, 0, 0));
+
+    ASSERT_EQ(dateAdd(kDefaultTimeZone.createFromDateParts(2016, 2, 29, 0, 0, 0, 0),
+                      TimeUnit::year,
+                      2,
+                      kDefaultTimeZone),
+              kDefaultTimeZone.createFromDateParts(2018, 2, 28, 0, 0, 0, 0));
+
+    ASSERT_EQ(dateAdd(kDefaultTimeZone.createFromDateParts(2016, 2, 29, 0, 0, 0, 0),
+                      TimeUnit::year,
+                      -4,
+                      kDefaultTimeZone),
+              kDefaultTimeZone.createFromDateParts(2012, 2, 29, 0, 0, 0, 0));
+}
+
+TEST(DateAdd, DateAddQuarter) {
+    auto startDate = kDefaultTimeZone.createFromDateParts(2020, 1, 1, 0, 0, 0, 3);
+    ASSERT_EQ(dateAdd(startDate, TimeUnit::quarter, 1, kDefaultTimeZone),
+              kDefaultTimeZone.createFromDateParts(2020, 4, 1, 0, 0, 0, 3));
+
+    ASSERT_EQ(dateAdd(startDate, TimeUnit::quarter, -5, kDefaultTimeZone),
+              kDefaultTimeZone.createFromDateParts(2018, 10, 1, 0, 0, 0, 3));
+
+    ASSERT_EQ(dateAdd(kDefaultTimeZone.createFromDateParts(2020, 1, 31, 0, 0, 0, 0),
+                      TimeUnit::quarter,
+                      1,
+                      kDefaultTimeZone),
+              kDefaultTimeZone.createFromDateParts(2020, 4, 30, 0, 0, 0, 0));
+
+    ASSERT_EQ(dateAdd(kDefaultTimeZone.createFromDateParts(2020, 1, 31, 0, 0, 0, 0),
+                      TimeUnit::quarter,
+                      -3,
+                      kDefaultTimeZone),
+              kDefaultTimeZone.createFromDateParts(2019, 4, 30, 0, 0, 0, 0));
+}
+
+TEST(DateAdd, DateAddMonth) {
+    auto utc2020_08_31 = kDefaultTimeZone.createFromDateParts(2020, 8, 31, 10, 5, 0, 5);
+    auto utc2021_04_30 = kDefaultTimeZone.createFromDateParts(2021, 4, 30, 0, 0, 0, 0);
+    auto utc2021_03_01 = kDefaultTimeZone.createFromDateParts(2021, 3, 1, 0, 0, 0, 0);
+
+    ASSERT_EQ(dateAdd(utc2020_08_31, TimeUnit::month, 1, kDefaultTimeZone),
+              kDefaultTimeZone.createFromDateParts(2020, 9, 30, 10, 5, 0, 5));
+
+    ASSERT_EQ(dateAdd(utc2020_08_31, TimeUnit::month, 5, kDefaultTimeZone),
+              kDefaultTimeZone.createFromDateParts(2021, 1, 31, 10, 5, 0, 5));
+
+    ASSERT_EQ(dateAdd(utc2020_08_31, TimeUnit::month, 6, kDefaultTimeZone),
+              kDefaultTimeZone.createFromDateParts(2021, 2, 28, 10, 5, 0, 5));
+
+    ASSERT_EQ(dateAdd(utc2020_08_31, TimeUnit::month, -1, kDefaultTimeZone),
+              kDefaultTimeZone.createFromDateParts(2020, 7, 31, 10, 5, 0, 5));
+
+    ASSERT_EQ(dateAdd(utc2020_08_31, TimeUnit::month, -4, kDefaultTimeZone),
+              kDefaultTimeZone.createFromDateParts(2020, 4, 30, 10, 5, 0, 5));
+
+    ASSERT_EQ(dateAdd(utc2020_08_31, TimeUnit::month, -6, kDefaultTimeZone),
+              kDefaultTimeZone.createFromDateParts(2020, 2, 29, 10, 5, 0, 5));
+
+    ASSERT_EQ(dateAdd(utc2020_08_31, TimeUnit::month, -18, kDefaultTimeZone),
+              kDefaultTimeZone.createFromDateParts(2019, 2, 28, 10, 5, 0, 5));
+
+    ASSERT_EQ(dateAdd(utc2021_04_30, TimeUnit::month, 1, kDefaultTimeZone),
+              kDefaultTimeZone.createFromDateParts(2021, 5, 30, 0, 0, 0, 0));
+
+    ASSERT_EQ(dateAdd(utc2021_04_30, TimeUnit::month, -2, kDefaultTimeZone),
+              kDefaultTimeZone.createFromDateParts(2021, 2, 28, 0, 0, 0, 0));
+
+    ASSERT_EQ(dateAdd(utc2021_03_01, TimeUnit::month, 2, kDefaultTimeZone),
+              kDefaultTimeZone.createFromDateParts(2021, 5, 1, 0, 0, 0, 0));
+
+    ASSERT_EQ(dateAdd(utc2021_03_01, TimeUnit::month, -1, kDefaultTimeZone),
+              kDefaultTimeZone.createFromDateParts(2021, 2, 1, 0, 0, 0, 0));
+}
+
+/**
+ * Tests for day adjustment in a timezone with units of month, quarter or year.
+ */
+TEST(DateAdd, DateAddDayAdjustmentWithTimezone) {
+    struct TestCase {
+        Date_t startDate;
+        TimeUnit unit;
+        long long amount;
+        Date_t expectedDate;
+    };
+
+    auto europeAmsterdamZone = kDefaultTimeZoneDatabase.getTimeZone("Europe/Amsterdam");
+    // Last day of month in Amsterdam zone 2021-05-31T00:30:00.
+    auto ams2021_05_31T00_30 = europeAmsterdamZone.createFromDateParts(2021, 05, 31, 0, 30, 0, 4);
+    // First day in Amsterdam zone, last day in UTC.
+    auto ams2021_02_01 = europeAmsterdamZone.createFromDateParts(2021, 2, 1, 0, 0, 0, 0);
+
+    const std::vector<TestCase> testsAmsterdamZone{
+        {ams2021_05_31T00_30,
+         TimeUnit::month,
+         1,
+         europeAmsterdamZone.createFromDateParts(2021, 06, 30, 0, 30, 0, 4)},
+        {ams2021_05_31T00_30,
+         TimeUnit::month,
+         -1,
+         europeAmsterdamZone.createFromDateParts(2021, 04, 30, 0, 30, 0, 4)},
+        {ams2021_05_31T00_30,
+         TimeUnit::quarter,
+         -1,
+         europeAmsterdamZone.createFromDateParts(2021, 02, 28, 0, 30, 0, 4)},
+        {ams2021_05_31T00_30,
+         TimeUnit::quarter,
+         -5,
+         europeAmsterdamZone.createFromDateParts(2020, 02, 29, 0, 30, 0, 4)},
+        {ams2021_02_01,
+         TimeUnit::month,
+         1,
+         europeAmsterdamZone.createFromDateParts(2021, 3, 1, 0, 0, 0, 0)},
+        {ams2021_02_01,
+         TimeUnit::month,
+         -2,
+         europeAmsterdamZone.createFromDateParts(2020, 12, 1, 0, 0, 0, 0)},
+        {ams2021_02_01,
+         TimeUnit::quarter,
+         1,
+         europeAmsterdamZone.createFromDateParts(2021, 5, 1, 0, 0, 0, 0)},
+    };
+    for (const auto& test : testsAmsterdamZone) {
+        const auto testNumber = &test - &testsAmsterdamZone.front();
+        ASSERT_EQ(dateAdd(test.startDate, test.unit, test.amount, europeAmsterdamZone),
+                  test.expectedDate)
+            << "on test " << testNumber;
+    }
+
+    auto europeSofiaZone = kDefaultTimeZoneDatabase.getTimeZone("Europe/Sofia");
+    // First day in Sofia timezone, last day of month in UTC.
+    auto sofia2021_02_01 = europeSofiaZone.createFromDateParts(2021, 2, 1, 0, 0, 0, 5);
+    auto sofia2021_03_01 = europeSofiaZone.createFromDateParts(2021, 3, 1, 0, 0, 0, 0);
+
+    const std::vector<TestCase> testsSofiaZone{
+        {sofia2021_02_01,
+         TimeUnit::month,
+         1,
+         europeSofiaZone.createFromDateParts(2021, 3, 1, 0, 0, 0, 5)},
+        {sofia2021_02_01,
+         TimeUnit::month,
+         -2,
+         europeSofiaZone.createFromDateParts(2020, 12, 1, 0, 0, 0, 5)},
+        {sofia2021_02_01,
+         TimeUnit::quarter,
+         1,
+         europeSofiaZone.createFromDateParts(2021, 5, 1, 0, 0, 0, 5)},
+        {sofia2021_03_01,
+         TimeUnit::month,
+         1,
+         europeSofiaZone.createFromDateParts(2021, 4, 1, 0, 0, 0, 0)},
+        {sofia2021_03_01,
+         TimeUnit::month,
+         -1,
+         europeSofiaZone.createFromDateParts(2021, 2, 1, 0, 0, 0, 0)},
+        {sofia2021_03_01,
+         TimeUnit::quarter,
+         1,
+         europeSofiaZone.createFromDateParts(2021, 6, 1, 0, 0, 0, 0)}};
+
+    for (const auto& test : testsSofiaZone) {
+        const auto testNumber = &test - &testsSofiaZone.front();
+        ASSERT_EQ(dateAdd(test.startDate, test.unit, test.amount, europeSofiaZone),
+                  test.expectedDate)
+            << "on test " << testNumber;
+    }
+
+    auto newYorkZone = kDefaultTimeZoneDatabase.getTimeZone("America/New_York");
+    auto ny2020_12_30T22 = kDefaultTimeZone.createFromDateParts(2020, 12, 31, 3, 0, 0, 0);
+    auto ny2021_04_30T20 = newYorkZone.createFromDateParts(2021, 4, 30, 20, 0, 0, 6);
+    auto ny2021_03_01 = newYorkZone.createFromDateParts(2021, 3, 1, 0, 0, 0, 0);
+
+    const std::vector<TestCase> testsNYZone{
+        {ny2020_12_30T22,
+         TimeUnit::month,
+         -1,
+         kDefaultTimeZone.createFromDateParts(
+             2020, 12, 1, 3, 0, 0, 0)},  // 2020-11-30T22:00:00 NY zone
+        {ny2020_12_30T22,
+         TimeUnit::month,
+         2,
+         kDefaultTimeZone.createFromDateParts(
+             2021, 3, 1, 3, 0, 0, 0)},  // 2021-02-28T22:00:00 NY zone
+        {ny2020_12_30T22,
+         TimeUnit::quarter,
+         -2,
+         kDefaultTimeZone.createFromDateParts(
+             2020, 7, 1, 2, 0, 0, 0)},  // 2020-06-30T22:00:00 NY zone
+        {ny2020_12_30T22,
+         TimeUnit::month,
+         2,
+         kDefaultTimeZone.createFromDateParts(
+             2021, 3, 1, 3, 0, 0, 0)},  // 2021-02-28T22:00:00 NY zone
+        {ny2021_04_30T20,
+         TimeUnit::month,
+         1,
+         newYorkZone.createFromDateParts(2021, 5, 30, 20, 0, 0, 6)},
+        {ny2021_04_30T20,
+         TimeUnit::month,
+         -2,
+         newYorkZone.createFromDateParts(2021, 2, 28, 20, 0, 0, 6)},
+        {ny2021_03_01, TimeUnit::month, 1, newYorkZone.createFromDateParts(2021, 4, 1, 0, 0, 0, 0)},
+        {ny2021_03_01,
+         TimeUnit::month,
+         -1,
+         newYorkZone.createFromDateParts(2021, 2, 1, 0, 0, 0, 0)},
+        {ny2021_03_01,
+         TimeUnit::quarter,
+         1,
+         newYorkZone.createFromDateParts(2021, 6, 1, 0, 0, 0, 0)},
+    };
+
+    for (const auto& test : testsNYZone) {
+        const auto testNumber = &test - &testsNYZone.front();
+        ASSERT_EQ(dateAdd(test.startDate, test.unit, test.amount, newYorkZone), test.expectedDate)
+            << "on test " << testNumber;
+    }
+
+    auto australiaEuclaZone = kDefaultTimeZoneDatabase.getTimeZone("Australia/Eucla");
+    auto eucla2021_02_01 = australiaEuclaZone.createFromDateParts(2021, 2, 1, 0, 0, 0, 7);
+    auto eucla2021_04_30 = australiaEuclaZone.createFromDateParts(2021, 4, 30, 0, 0, 0, 0);
+    const std::vector<TestCase> testsEuclaZone{
+        {eucla2021_02_01,
+         TimeUnit::month,
+         1,
+         australiaEuclaZone.createFromDateParts(2021, 3, 1, 0, 0, 0, 7)},
+        {eucla2021_02_01,
+         TimeUnit::month,
+         -2,
+         australiaEuclaZone.createFromDateParts(2020, 12, 1, 0, 0, 0, 7)},
+        {eucla2021_02_01,
+         TimeUnit::quarter,
+         1,
+         australiaEuclaZone.createFromDateParts(2021, 5, 1, 0, 0, 0, 7)},
+        {eucla2021_04_30,
+         TimeUnit::month,
+         1,
+         australiaEuclaZone.createFromDateParts(2021, 5, 30, 0, 0, 0, 0)},
+        {eucla2021_04_30,
+         TimeUnit::month,
+         -2,
+         australiaEuclaZone.createFromDateParts(2021, 2, 28, 0, 0, 0, 0)},
+        {eucla2021_04_30,
+         TimeUnit::quarter,
+         1,
+         australiaEuclaZone.createFromDateParts(2021, 7, 30, 0, 0, 0, 0)}};
+
+    for (const auto& test : testsEuclaZone) {
+        const auto testNumber = &test - &testsEuclaZone.front();
+        ASSERT_EQ(dateAdd(test.startDate, test.unit, test.amount, australiaEuclaZone),
+                  test.expectedDate)
+            << "on test " << testNumber;
+    }
+}
+
+TEST(DateAdd, DateAddDay) {
+    auto startDate = kDefaultTimeZone.createFromDateParts(2020, 8, 31, 10, 5, 0, 7);
+    ASSERT_EQ(dateAdd(startDate, TimeUnit::day, 1, kDefaultTimeZone),
+              kDefaultTimeZone.createFromDateParts(2020, 9, 1, 10, 5, 0, 7));
+
+    ASSERT_EQ(dateAdd(startDate, TimeUnit::day, -1, kDefaultTimeZone),
+              kDefaultTimeZone.createFromDateParts(2020, 8, 30, 10, 5, 0, 7));
+
+    ASSERT_EQ(dateAdd(startDate, TimeUnit::day, -366, kDefaultTimeZone),
+              kDefaultTimeZone.createFromDateParts(2019, 8, 31, 10, 5, 0, 7));
+}
+
+TEST(DateAdd, DateAddHour) {
+    struct TestCase {
+        Date_t startDate;
+        long long amount;
+        Date_t expectedDate;
+    };
+
+    auto utcStartDate = kDefaultTimeZone.createFromDateParts(2020, 8, 31, 10, 5, 0, 9);
+
+    std::vector<TestCase> tests{
+        {utcStartDate, 1, kDefaultTimeZone.createFromDateParts(2020, 8, 31, 11, 5, 0, 9)},
+        {utcStartDate, -1, kDefaultTimeZone.createFromDateParts(2020, 8, 31, 9, 5, 0, 9)},
+        {utcStartDate, 168, kDefaultTimeZone.createFromDateParts(2020, 9, 7, 10, 5, 0, 9)},
+    };
+
+    for (auto&& test : tests) {
+        ASSERT_EQ(dateAdd(test.startDate, TimeUnit::hour, test.amount, kDefaultTimeZone),
+                  test.expectedDate);
+    }
+}
+
+TEST(DateAdd, DateAddMinute) {
+    auto startDate = kDefaultTimeZone.createFromDateParts(2020, 12, 31, 23, 55, 15, 8);
+    ASSERT_EQ(dateAdd(startDate, TimeUnit::minute, 1, kDefaultTimeZone),
+              kDefaultTimeZone.createFromDateParts(2020, 12, 31, 23, 56, 15, 8));
+
+    ASSERT_EQ(dateAdd(startDate, TimeUnit::minute, -1, kDefaultTimeZone),
+              kDefaultTimeZone.createFromDateParts(2020, 12, 31, 23, 54, 15, 8));
+
+    ASSERT_EQ(dateAdd(startDate, TimeUnit::minute, 10, kDefaultTimeZone),
+              kDefaultTimeZone.createFromDateParts(2021, 1, 1, 0, 5, 15, 8));
+
+    ASSERT_EQ(dateAdd(startDate, TimeUnit::minute, -1440, kDefaultTimeZone),
+              kDefaultTimeZone.createFromDateParts(2020, 12, 30, 23, 55, 15, 8));
+}
+
+/**
+ * Tests for dateAdd operation in a timezone different from UTC.
+ */
+TEST(DateAdd, DateAddWithTimezoneDST) {
+    struct TestCase {
+        Date_t startDate;
+        TimeUnit unit;
+        long long amount;
+        Date_t expectedDate;
+    };
+
+    auto europeAmsterdamZone = kDefaultTimeZoneDatabase.getTimeZone("Europe/Amsterdam");
+    // The test uses the DST change in Amsterdam zone that happens at 2020-10-25T01:00:00 UTC.
+    // Pick two time instants in UTC just before and after the DST change.
+    auto startDateBeforeDSTChange = kDefaultTimeZone.createFromDateParts(2020, 10, 25, 0, 50, 5, 0);
+    auto startDateAfterDSTChange = kDefaultTimeZone.createFromDateParts(2020, 10, 25, 1, 10, 5, 0);
+
+    std::vector<TestCase> tests{
+        // DST to Standard change in Amsterdam zone that happens at 2020-10-25T01:00:00 UTC.
+        // 2020-10-25T03:00:00 -> 2020-10-25T02:00:00 in Amsterdam.
+        {startDateBeforeDSTChange,
+         TimeUnit::minute,
+         10,
+         kDefaultTimeZone.createFromDateParts(2020, 10, 25, 1, 0, 5, 0)},
+        {startDateBeforeDSTChange,
+         TimeUnit::hour,
+         1,
+         kDefaultTimeZone.createFromDateParts(2020, 10, 25, 1, 50, 5, 0)},
+        {startDateAfterDSTChange,
+         TimeUnit::minute,
+         -20,
+         kDefaultTimeZone.createFromDateParts(2020, 10, 25, 0, 50, 5, 0)},
+        {startDateAfterDSTChange,
+         TimeUnit::hour,
+         -1,
+         kDefaultTimeZone.createFromDateParts(2020, 10, 25, 0, 10, 5, 0)},
+
+        // For units of day or larger, compute DST correction to produce the same local time in
+        // Amsterdam timezone.
+        {europeAmsterdamZone.createFromDateParts(2020, 10, 25, 1, 50, 0, 0),
+         TimeUnit::day,
+         1,
+         europeAmsterdamZone.createFromDateParts(2020, 10, 26, 1, 50, 0, 0)},
+        {europeAmsterdamZone.createFromDateParts(2020, 10, 25, 2, 30, 0, 0),
+         TimeUnit::day,
+         1,
+         europeAmsterdamZone.createFromDateParts(2020, 10, 26, 2, 30, 0, 0)},
+        {europeAmsterdamZone.createFromDateParts(2020, 10, 24, 2, 0, 1, 0),
+         TimeUnit::day,
+         1,
+         // Use UTC since the time is ambiguous in Amsterdam zone.
+         kDefaultTimeZone.createFromDateParts(2020, 10, 25, 0, 0, 1, 0)},
+        {europeAmsterdamZone.createFromDateParts(2020, 10, 24, 3, 0, 1, 0),
+         TimeUnit::day,
+         1,
+         kDefaultTimeZone.createFromDateParts(2020, 10, 25, 2, 0, 1, 0)},
+        {europeAmsterdamZone.createFromDateParts(2020, 10, 24, 3, 0, 1, 0),
+         TimeUnit::day,
+         1,
+         // The same as above in Amsterdam zone.
+         europeAmsterdamZone.createFromDateParts(2020, 10, 25, 3, 0, 1, 0)},
+        {europeAmsterdamZone.createFromDateParts(2020, 10, 25, 3, 30, 0, 0),
+         TimeUnit::day,
+         -1,
+         europeAmsterdamZone.createFromDateParts(2020, 10, 24, 3, 30, 0, 0)},
+        {europeAmsterdamZone.createFromDateParts(2020, 10, 25, 2, 30, 0, 0),
+         TimeUnit::day,
+         -1,
+         europeAmsterdamZone.createFromDateParts(2020, 10, 24, 2, 30, 0, 0)},
+        {europeAmsterdamZone.createFromDateParts(2020, 10, 26, 2, 30, 0, 0),
+         TimeUnit::day,
+         -1,
+         europeAmsterdamZone.createFromDateParts(2020, 10, 25, 2, 30, 0, 0)},
+
+        // Standard to DST change at 2021-03-28T02:00:00 -> 2021-03-28T03:00:00 Amsterdam timezone.
+        {europeAmsterdamZone.createFromDateParts(2021, 3, 28, 1, 20, 0, 0),
+         TimeUnit::day,
+         1,
+         europeAmsterdamZone.createFromDateParts(2021, 3, 29, 1, 20, 0, 0)},
+        {europeAmsterdamZone.createFromDateParts(2021, 3, 27, 2, 20, 0, 0),
+         TimeUnit::day,
+         1,
+         // Computed time falls into the missing hour: forward the clock 1 hour.
+         europeAmsterdamZone.createFromDateParts(2021, 3, 28, 3, 20, 0, 0)},
+        {europeAmsterdamZone.createFromDateParts(2021, 3, 28, 3, 20, 0, 0),
+         TimeUnit::day,
+         -1,
+         europeAmsterdamZone.createFromDateParts(2021, 3, 27, 3, 20, 0, 0)},
+        {europeAmsterdamZone.createFromDateParts(2021, 3, 29, 2, 20, 0, 0),
+         TimeUnit::day,
+         -1,
+         // Computed time falls into the missing hour: forward the clock 1 hour.
+         europeAmsterdamZone.createFromDateParts(2021, 3, 28, 3, 20, 0, 0)},
+        {europeAmsterdamZone.createFromDateParts(2020, 11, 28, 2, 20, 0, 0),
+         TimeUnit::month,
+         4,
+         // Computed time falls into the missing hour: forward the clock 1 hour.
+         europeAmsterdamZone.createFromDateParts(2021, 3, 28, 3, 20, 0, 0)},
+    };
+
+    for (auto&& test : tests) {
+        const auto testNumber = &test - &tests.front();
+        ASSERT_EQ(dateAdd(test.startDate, test.unit, test.amount, europeAmsterdamZone),
+                  test.expectedDate)
+            << " on test " << testNumber << " in Amsterdam timezone.";
+    }
+
+    auto newYorkZone = kDefaultTimeZoneDatabase.getTimeZone("America/New_York");
+    // The following test uses the DST change in New York at 2020-03-08T07:00:00Z.
+    // Pick two time instants in UTC just before and after the DST change.
+    auto startDateInEST = kDefaultTimeZone.createFromDateParts(2020, 3, 8, 6, 50, 0, 0);
+    auto startDateInEDT = kDefaultTimeZone.createFromDateParts(2020, 3, 8, 7, 20, 0, 0);
+
+    std::vector<TestCase> testsNYZone{
+        {startDateInEST,
+         TimeUnit::minute,
+         15,
+         kDefaultTimeZone.createFromDateParts(2020, 3, 8, 7, 5, 0, 0)},
+        {startDateInEST,
+         TimeUnit::hour,
+         1,
+         kDefaultTimeZone.createFromDateParts(2020, 3, 8, 7, 50, 0, 0)},
+        {startDateInEDT,
+         TimeUnit::minute,
+         -25,
+         kDefaultTimeZone.createFromDateParts(2020, 3, 8, 6, 55, 0, 0)},
+        {startDateInEDT,
+         TimeUnit::hour,
+         -1,
+         kDefaultTimeZone.createFromDateParts(2020, 3, 8, 6, 20, 0, 0)},
+        // For units of day or larger, compute DST correction to produce the same local time in New
+        // York timezone.
+
+        // DST to Standard change in New York zone at 2020-11-01T06:00:00 UTC,
+        // 2020-11-01T02:00:00 -> 2020-11-01T01:00:00 New York.
+        {newYorkZone.createFromDateParts(2020, 11, 1, 0, 30, 0, 0),
+         TimeUnit::day,
+         1,
+         newYorkZone.createFromDateParts(2020, 11, 2, 0, 30, 0, 0)},
+        {newYorkZone.createFromDateParts(2020, 11, 1, 1, 30, 0, 0),
+         TimeUnit::day,
+         1,
+         newYorkZone.createFromDateParts(2020, 11, 2, 1, 30, 0, 0)},
+        {newYorkZone.createFromDateParts(2020, 10, 31, 1, 30, 0, 0),
+         TimeUnit::day,
+         1,
+         newYorkZone.createFromDateParts(2020, 11, 1, 1, 30, 0, 0)},
+        {newYorkZone.createFromDateParts(2020, 11, 1, 3, 0, 0, 0),
+         TimeUnit::day,
+         -1,
+         newYorkZone.createFromDateParts(2020, 10, 31, 3, 0, 0, 0)},
+        {newYorkZone.createFromDateParts(2020, 11, 1, 1, 30, 0, 0),
+         TimeUnit::day,
+         -1,
+         newYorkZone.createFromDateParts(2020, 10, 31, 1, 30, 0, 0)},
+        {newYorkZone.createFromDateParts(2020, 11, 2, 1, 30, 0, 0),
+         TimeUnit::day,
+         -1,
+         kDefaultTimeZone.createFromDateParts(2020, 11, 1, 6, 30, 0, 0)},
+
+        // Standard to DST change: 2021-03-14T02:00:00 -> 2021-03-14T03:00:00 New York timezone.
+        {newYorkZone.createFromDateParts(2021, 3, 14, 1, 30, 0, 0),
+         TimeUnit::day,
+         1,
+         newYorkZone.createFromDateParts(2021, 3, 15, 1, 30, 0, 0)},
+        {newYorkZone.createFromDateParts(2021, 3, 13, 2, 20, 0, 0),
+         TimeUnit::day,
+         1,
+         // Computed time falls into the missing hour: forward the clock 1 hour.
+         newYorkZone.createFromDateParts(2021, 3, 14, 3, 20, 0, 0)},
+        {newYorkZone.createFromDateParts(2021, 3, 14, 3, 20, 0, 0),
+         TimeUnit::day,
+         -1,
+         newYorkZone.createFromDateParts(2021, 3, 13, 3, 20, 0, 0)},
+        {newYorkZone.createFromDateParts(2021, 3, 15, 2, 20, 0, 0),
+         TimeUnit::day,
+         -1,
+         // Computed time falls into the missing hour: forward the clock 1 hour.
+         newYorkZone.createFromDateParts(2021, 3, 14, 3, 20, 0, 0)},
+        {newYorkZone.createFromDateParts(2021, 1, 14, 2, 20, 0, 0),
+         TimeUnit::month,
+         2,
+         // Computed time falls into the missing hour: forward the clock 1 hour.
+         newYorkZone.createFromDateParts(2021, 3, 14, 3, 20, 0, 0)},
+    };
+
+    for (auto&& test : testsNYZone) {
+        const auto testNumber = &test - &testsNYZone.front();
+        ASSERT_EQ(dateAdd(test.startDate, test.unit, test.amount, newYorkZone), test.expectedDate)
+            << " on test " << testNumber << " in New York timezone.";
+    }
+}
+
+TEST(DateAdd, DateAddSecond) {
+    auto startDate = kDefaultTimeZone.createFromDateParts(2020, 12, 31, 23, 55, 15, 2);
+    ASSERT_EQ(dateAdd(startDate, TimeUnit::second, 1, kDefaultTimeZone),
+              kDefaultTimeZone.createFromDateParts(2020, 12, 31, 23, 55, 16, 2));
+
+    ASSERT_EQ(dateAdd(startDate, TimeUnit::second, -1, kDefaultTimeZone),
+              kDefaultTimeZone.createFromDateParts(2020, 12, 31, 23, 55, 14, 2));
+
+    ASSERT_EQ(dateAdd(startDate, TimeUnit::second, 300, kDefaultTimeZone),
+              kDefaultTimeZone.createFromDateParts(2021, 1, 1, 0, 0, 15, 2));
+
+    ASSERT_EQ(dateAdd(startDate, TimeUnit::second, -195, kDefaultTimeZone),
+              kDefaultTimeZone.createFromDateParts(2020, 12, 31, 23, 52, 0, 2));
+}
+
+TEST(DateAdd, DateAddMillisecond) {
+    auto startDate = kDefaultTimeZone.createFromDateParts(2020, 12, 31, 23, 59, 15, 1);
+    ASSERT_EQ(dateAdd(startDate, TimeUnit::millisecond, 1, kDefaultTimeZone),
+              kDefaultTimeZone.createFromDateParts(2020, 12, 31, 23, 59, 15, 2));
+
+    ASSERT_EQ(dateAdd(startDate, TimeUnit::millisecond, -2, kDefaultTimeZone),
+              kDefaultTimeZone.createFromDateParts(2020, 12, 31, 23, 59, 14, 999));
+
+    ASSERT_EQ(dateAdd(startDate, TimeUnit::millisecond, 45000, kDefaultTimeZone),
+              kDefaultTimeZone.createFromDateParts(2021, 1, 1, 0, 0, 0, 1));
+
+    ASSERT_EQ(dateAdd(startDate, TimeUnit::millisecond, -1501, kDefaultTimeZone),
+              kDefaultTimeZone.createFromDateParts(2020, 12, 31, 23, 59, 13, 500));
+}
+
+TEST(IsValidDayOfWeek, Basic) {
+    ASSERT(isValidDayOfWeek("monday"));
+    ASSERT(isValidDayOfWeek("tue"));
+    ASSERT(isValidDayOfWeek("Wednesday"));
+    ASSERT(isValidDayOfWeek("FRIDAY"));
+    ASSERT(!isValidDayOfWeek(""));
+    ASSERT(!isValidDayOfWeek("SND"));
+}
+
+TEST(ParseDayOfWeek, Basic) {
+    ASSERT(DayOfWeek::thursday == parseDayOfWeek("thursday"));
+    ASSERT(DayOfWeek::saturday == parseDayOfWeek("SAT"));
+    ASSERT_THROWS_CODE(parseDayOfWeek(""), AssertionException, ErrorCodes::FailedToParse);
+}
 }  // namespace
 }  // namespace mongo

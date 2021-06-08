@@ -27,21 +27,15 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/pipeline/document_source_change_stream_transform.h"
 
-#include "mongo/bson/simple_bsonelement_comparator.h"
-#include "mongo/db/bson/bson_helper.h"
 #include "mongo/db/catalog/collection_catalog.h"
-#include "mongo/db/commands/feature_compatibility_version_documentation.h"
-#include "mongo/db/logical_clock.h"
-#include "mongo/db/pipeline/change_stream_constants.h"
+#include "mongo/db/pipeline/change_stream_document_diff_parser.h"
 #include "mongo/db/pipeline/document_path_support.h"
-#include "mongo/db/pipeline/document_source.h"
-#include "mongo/db/pipeline/document_source_change_stream.h"
 #include "mongo/db/pipeline/document_source_check_resume_token.h"
 #include "mongo/db/pipeline/document_source_limit.h"
 #include "mongo/db/pipeline/document_source_lookup_change_post_image.h"
@@ -49,14 +43,15 @@
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
 #include "mongo/db/pipeline/resume_token.h"
+#include "mongo/db/query/query_feature_flags_gen.h"
 #include "mongo/db/repl/bson_extract_optime.h"
 #include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/repl/oplog_entry_gen.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/transaction_history_iterator.h"
-#include "mongo/s/catalog_cache.h"
-#include "mongo/s/grid.h"
-#include "mongo/util/log.h"
+#include "mongo/db/update/update_oplog_entry_serialization.h"
+#include "mongo/db/update/update_oplog_entry_version.h"
+#include "mongo/db/vector_clock.h"
 
 namespace mongo {
 
@@ -70,35 +65,42 @@ namespace {
 constexpr auto checkValueType = &DocumentSourceChangeStream::checkValueType;
 }  // namespace
 
-boost::intrusive_ptr<DocumentSourceChangeStreamTransform>
-DocumentSourceChangeStreamTransform::create(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx,
-    const ServerGlobalParams::FeatureCompatibility::Version& fcv,
-    BSONObj changeStreamSpec) {
-    return new DocumentSourceChangeStreamTransform(expCtx, fcv, changeStreamSpec);
+REGISTER_INTERNAL_DOCUMENT_SOURCE(
+    _internalChangeStreamTransform,
+    LiteParsedDocumentSourceChangeStreamInternal::parse,
+    DocumentSourceChangeStreamTransform::createFromBson,
+    feature_flags::gFeatureFlagChangeStreamsOptimization.isEnabledAndIgnoreFCV());
+
+intrusive_ptr<DocumentSourceChangeStreamTransform>
+DocumentSourceChangeStreamTransform::createFromBson(
+    BSONElement spec, const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+    uassert(5467601,
+            "the '$_internalChangeStreamTransform' object spec must be an object",
+            spec.type() == BSONType::Object);
+
+    return new DocumentSourceChangeStreamTransform(expCtx, spec.Obj());
 }
 
 DocumentSourceChangeStreamTransform::DocumentSourceChangeStreamTransform(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx,
-    const ServerGlobalParams::FeatureCompatibility::Version& fcv,
-    BSONObj changeStreamSpec)
-    : DocumentSource(expCtx),
-      _changeStreamSpec(changeStreamSpec.getOwned()),
-      _isIndependentOfAnyCollection(expCtx->ns.isCollectionlessAggregateNS()),
-      _fcv(fcv) {
+    const boost::intrusive_ptr<ExpressionContext>& expCtx, BSONObj changeStreamSpec)
+    : DocumentSource(DocumentSourceChangeStreamTransform::kStageName, expCtx),
+      _changeStreamSpec(DocumentSourceChangeStreamSpec::parse(
+          IDLParserErrorContext("$changeStream"), changeStreamSpec)),
+      _isIndependentOfAnyCollection(expCtx->ns.isCollectionlessAggregateNS()) {
 
-    _nsRegex.emplace(DocumentSourceChangeStream::getNsRegexForChangeStream(expCtx->ns));
-
-    auto spec = DocumentSourceChangeStreamSpec::parse(IDLParserErrorContext("$changeStream"),
-                                                      _changeStreamSpec);
+    // If the change stream spec requested a pre-image, make sure that we supply one.
+    _includePreImageOptime =
+        (_changeStreamSpec.getFullDocumentBeforeChange() != FullDocumentBeforeChangeModeEnum::kOff);
 
     // If the change stream spec includes a resumeToken with a shard key, populate the document key
     // cache with the field paths.
-    auto resumeAfter = spec.getResumeAfter();
-    auto startAfter = spec.getStartAfter();
+    auto resumeAfter = _changeStreamSpec.getResumeAfter();
+    auto startAfter = _changeStreamSpec.getStartAfter();
+
+    ResumeToken resumeToken;
     if (resumeAfter || startAfter) {
-        ResumeToken token = resumeAfter ? resumeAfter.get() : startAfter.get();
-        ResumeTokenData tokenData = token.getData();
+        resumeToken = resumeAfter ? resumeAfter.get() : startAfter.get();
+        ResumeTokenData tokenData = resumeToken.getData();
 
         if (!tokenData.documentKey.missing() && tokenData.uuid) {
             std::vector<FieldPath> docKeyFields;
@@ -112,12 +114,38 @@ DocumentSourceChangeStreamTransform::DocumentSourceChangeStreamTransform(
 
             // If the document key from the resume token has more than one field, that means it
             // includes the shard key and thus should never change.
-            auto isFinal = docKey.size() > 1;
+            const bool isFinal = docKeyFields.size() > 1;
 
             _documentKeyCache[tokenData.uuid.get()] =
                 DocumentKeyCacheEntry({docKeyFields, isFinal});
         }
+    } else if (auto startAtOperationTime = _changeStreamSpec.getStartAtOperationTime()) {
+        // TODO SERVER-56669: Move this change to populate resume token in 'ChangeStreamSpec' into
+        // DocumentSourceChangeStream::create().
+        resumeToken = ResumeToken::makeHighWaterMarkToken(*startAtOperationTime);
+    } else {
+        // If we do not have an explicit starting point, we should start from the latest majority
+        // committed operation. If we are on mongoS and do not have a starting point, set it to the
+        // current clusterTime so that all shards start in sync. We always start one tick beyond the
+        // most recent operation, to ensure that the stream does not return it.
+        auto replCoord = repl::ReplicationCoordinator::get(expCtx->opCtx);
+        const auto currentTime = !expCtx->inMongos
+            ? LogicalTime{replCoord->getMyLastAppliedOpTime().getTimestamp()}
+            : [&] {
+                  const auto currentTime = VectorClock::get(expCtx->opCtx)->getTime();
+                  return currentTime.clusterTime();
+              }();
+
+        // If we haven't already populated the initial PBRT, then we are starting from a specific
+        // timestamp rather than a resume token. Initialize the PBRT to a high water mark token.
+        const auto startAtTime = currentTime.addTicks(1).asTimestamp();
+        resumeToken = ResumeToken::makeHighWaterMarkToken(startAtTime);
+
+        // Make sure we update the 'resumeAfter' in the '_changeStreamSpec' so that we serialize the
+        // correct resume token when sending it to the shards.
+        _changeStreamSpec.setResumeAfter(resumeToken);
     }
+    expCtx->initialPostBatchResumeToken = resumeToken.toDocument().toBson();
 }
 
 StageConstraints DocumentSourceChangeStreamTransform::constraints(
@@ -129,6 +157,7 @@ StageConstraints DocumentSourceChangeStreamTransform::constraints(
                                  FacetRequirement::kNotAllowed,
                                  TransactionRequirement::kNotAllowed,
                                  LookupRequirement::kNotAllowed,
+                                 UnionRequirement::kNotAllowed,
                                  ChangeStreamRequirement::kChangeStreamStage);
 
     // This transformation could be part of a 'collectionless' change stream on an entire
@@ -139,29 +168,19 @@ StageConstraints DocumentSourceChangeStreamTransform::constraints(
 
 ResumeTokenData DocumentSourceChangeStreamTransform::getResumeToken(Value ts,
                                                                     Value uuid,
-                                                                    Value documentKey) {
+                                                                    Value documentKey,
+                                                                    Value txnOpIndex) {
     ResumeTokenData resumeTokenData;
-    if (_txnIterator) {
-        // We're in the middle of unwinding an 'applyOps'.
 
-        // Use the clusterTime from the higher level applyOps
-        resumeTokenData.clusterTime = _txnIterator->clusterTime();
-        resumeTokenData.txnOpIndex = _txnIterator->txnOpIndex();
-    } else {
-        resumeTokenData.clusterTime = ts.getTimestamp();
-        resumeTokenData.txnOpIndex = 0;
+    resumeTokenData.clusterTime = ts.getTimestamp();
+    resumeTokenData.documentKey = documentKey;
+
+    if (!uuid.missing()) {
+        resumeTokenData.uuid = uuid.getUuid();
     }
 
-    resumeTokenData.documentKey = documentKey;
-    if (!uuid.missing())
-        resumeTokenData.uuid = uuid.getUuid();
-
-    // If 'needsMerge' is true, 'mergeByPBRT' is false, and FCV is less than 4.2, then we are
-    // running on a sharded cluster that is mid-upgrade, and so we generate v0 resume tokens.
-    // Otherwise, we always generate v1 resume tokens whether the FCV is 4.0 or 4.2.
-    if (pExpCtx->needsMerge && !pExpCtx->mergeByPBRT &&
-        _fcv < ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42) {
-        resumeTokenData.version = 0;
+    if (!txnOpIndex.missing()) {
+        resumeTokenData.txnOpIndex = txnOpIndex.getLong();
     }
 
     return resumeTokenData;
@@ -195,6 +214,7 @@ Document DocumentSourceChangeStreamTransform::applyTransformation(const Document
     Value ns = input[repl::OplogEntry::kNssFieldName];
     checkValueType(ns, repl::OplogEntry::kNssFieldName, BSONType::String);
     Value uuid = input[repl::OplogEntry::kUuidFieldName];
+    Value preImageOpTime = input[repl::OplogEntry::kPreImageOpTimeFieldName];
     std::vector<FieldPath> documentKeyFields;
 
     // Deal with CRUD operations and commands.
@@ -241,7 +261,27 @@ Document DocumentSourceChangeStreamTransform::applyTransformation(const Document
             break;
         }
         case repl::OpTypeEnum::kUpdate: {
-            if (id.missing()) {
+            // The version of oplog entry format. 1 or missing value indicates the old format. 2
+            // indicates the delta oplog entry.
+            Value oplogVersion =
+                input[repl::OplogEntry::kObjectFieldName][kUpdateOplogEntryVersionFieldName];
+            if (!oplogVersion.missing() && oplogVersion.getInt() == 2) {
+                // Parsing the delta oplog entry.
+                operationType = DocumentSourceChangeStream::kUpdateOpType;
+                Value diffObj = input[repl::OplogEntry::kObjectFieldName]
+                                     [update_oplog_entry::kDiffObjectFieldName];
+                checkValueType(diffObj,
+                               repl::OplogEntry::kObjectFieldName + "." +
+                                   update_oplog_entry::kDiffObjectFieldName,
+                               BSONType::Object);
+
+                const auto& deltaDesc =
+                    change_stream_document_diff_parser::parseDiff(diffObj.getDocument().toBson());
+
+                updateDescription = Value(Document{{"updatedFields", deltaDesc.updatedFields},
+                                                   {"removedFields", deltaDesc.removedFields},
+                                                   {"truncatedArrays", deltaDesc.truncatedArrays}});
+            } else if (id.missing()) {
                 operationType = DocumentSourceChangeStream::kUpdateOpType;
                 checkValueType(input[repl::OplogEntry::kObjectFieldName],
                                repl::OplogEntry::kObjectFieldName,
@@ -318,17 +358,25 @@ Document DocumentSourceChangeStreamTransform::applyTransformation(const Document
         invariant(!uuid.missing(), "Saw a CRUD op without a UUID");
     }
 
-    // Note that 'documentKey' and/or 'uuid' might be missing, in which case they will not appear
-    // in the output.
-    auto resumeTokenData = getResumeToken(ts, uuid, documentKey);
-    auto resumeToken = ResumeToken(resumeTokenData).toDocument();
+    // Extract the txnOpIndex field. This will be missing unless we are unwinding a transaction.
+    auto txnOpIndex = input[DocumentSourceChangeStream::kTxnOpIndexField];
 
     // Add some additional fields only relevant to transactions.
-    if (_txnIterator) {
-        doc.addField(DocumentSourceChangeStream::kTxnNumberField,
-                     Value(static_cast<long long>(_txnIterator->txnNumber())));
-        doc.addField(DocumentSourceChangeStream::kLsidField, Value(_txnIterator->lsid()));
+    if (!txnOpIndex.missing()) {
+        auto lsid = input[DocumentSourceChangeStream::kLsidField];
+        checkValueType(lsid, DocumentSourceChangeStream::kLsidField, BSONType::Object);
+
+        auto txnNumber = input[DocumentSourceChangeStream::kTxnNumberField];
+        checkValueType(
+            txnNumber, DocumentSourceChangeStream::kTxnNumberField, BSONType::NumberLong);
+
+        doc.addField(DocumentSourceChangeStream::kTxnNumberField, txnNumber);
+        doc.addField(DocumentSourceChangeStream::kLsidField, lsid);
     }
+
+    // Generate the resume token. Note that only 'ts' is always guaranteed to be present.
+    auto resumeTokenData = getResumeToken(ts, uuid, documentKey, txnOpIndex);
+    auto resumeToken = ResumeToken(resumeTokenData).toDocument();
 
     doc.addField(DocumentSourceChangeStream::kIdField, Value(resumeToken));
     doc.addField(DocumentSourceChangeStream::kOperationTypeField, Value(operationType));
@@ -336,15 +384,8 @@ Document DocumentSourceChangeStreamTransform::applyTransformation(const Document
 
     // We set the resume token as the document's sort key in both the sharded and non-sharded cases,
     // since we will subsequently rely upon it to generate a correct postBatchResumeToken.
-    // TODO SERVER-38539: when returning results for merging, we first check whether 'mergeByPBRT'
-    // has been set. If not, then the request was sent from an older mongoS which cannot merge by
-    // raw resume tokens, and we must use the old sort key format. This check, and the 'mergeByPBRT'
-    // flag, are no longer necessary in 4.4; all change streams will be merged by resume token.
-    if (pExpCtx->needsMerge && !pExpCtx->mergeByPBRT) {
-        doc.setSortKeyMetaField(BSON("" << ts << "" << uuid << "" << documentKey));
-    } else {
-        doc.setSortKeyMetaField(resumeToken.toBson());
-    }
+    const bool isSingleElementKey = true;
+    doc.metadata().setSortKey(Value{resumeToken}, isSingleElementKey);
 
     // "invalidate" and "newShardDetected" entries have fewer fields.
     if (operationType == DocumentSourceChangeStream::kInvalidateOpType ||
@@ -352,42 +393,36 @@ Document DocumentSourceChangeStreamTransform::applyTransformation(const Document
         return doc.freeze();
     }
 
-    doc.addField(DocumentSourceChangeStream::kFullDocumentField, fullDocument);
+    // Add the post-image, pre-image, namespace, documentKey and other fields as appropriate.
+    doc.addField(DocumentSourceChangeStream::kFullDocumentField, std::move(fullDocument));
+    if (_includePreImageOptime) {
+        // Set 'kFullDocumentBeforeChangeField' to the pre-image optime. The DSCSLookupPreImage
+        // stage will replace this optime with the actual pre-image taken from the oplog.
+        doc.addField(DocumentSourceChangeStream::kFullDocumentBeforeChangeField,
+                     std::move(preImageOpTime));
+    }
     doc.addField(DocumentSourceChangeStream::kNamespaceField,
                  operationType == DocumentSourceChangeStream::kDropDatabaseOpType
                      ? Value(Document{{"db", nss.db()}})
                      : Value(Document{{"db", nss.db()}, {"coll", nss.coll()}}));
-    doc.addField(DocumentSourceChangeStream::kDocumentKeyField, documentKey);
+    doc.addField(DocumentSourceChangeStream::kDocumentKeyField, std::move(documentKey));
 
     // Note that 'updateDescription' might be the 'missing' value, in which case it will not be
     // serialized.
-    doc.addField("updateDescription", updateDescription);
+    doc.addField("updateDescription", std::move(updateDescription));
     return doc.freeze();
 }
 
-Value DocumentSourceChangeStreamTransform::serialize(
+Value DocumentSourceChangeStreamTransform::serializeLatest(
     boost::optional<ExplainOptions::Verbosity> explain) const {
-    Document changeStreamOptions(_changeStreamSpec);
-    // If we're on a mongos and no other start time is specified, we want to start at the current
-    // cluster time on the mongos.  This ensures all shards use the same start time.
-    if (pExpCtx->inMongos &&
-        changeStreamOptions[DocumentSourceChangeStreamSpec::kResumeAfterFieldName].missing() &&
-        changeStreamOptions[DocumentSourceChangeStreamSpec::kStartAtOperationTimeFieldName]
-            .missing() &&
-        changeStreamOptions[DocumentSourceChangeStreamSpec::kStartAfterFieldName].missing()) {
-        MutableDocument newChangeStreamOptions(changeStreamOptions);
-
-        // Use the current cluster time plus 1 tick since the oplog query will include all
-        // operations/commands equal to or greater than the 'startAtOperationTime' timestamp. In
-        // particular, avoid including the last operation that went through mongos in an attempt to
-        // match the behavior of a replica set more closely.
-        auto clusterTime = LogicalClock::get(pExpCtx->opCtx)->getClusterTime();
-        clusterTime.addTicks(1);
-        newChangeStreamOptions[DocumentSourceChangeStreamSpec::kStartAtOperationTimeFieldName] =
-            Value(clusterTime.asTimestamp());
-        changeStreamOptions = newChangeStreamOptions.freeze();
+    if (explain) {
+        return Value(Document{{getSourceName(),
+                               Document{{"stage"_sd, "internalTransform"_sd},
+                                        {"options"_sd, _changeStreamSpec.toBSON()}}}});
     }
-    return Value(Document{{getSourceName(), changeStreamOptions}});
+
+    return Value(
+        Document{{DocumentSourceChangeStreamTransform::kStageName, _changeStreamSpec.toBSON()}});
 }
 
 DepsTracker::State DocumentSourceChangeStreamTransform::getDependencies(DepsTracker* deps) const {
@@ -397,6 +432,13 @@ DepsTracker::State DocumentSourceChangeStreamTransform::getDependencies(DepsTrac
     deps->fields.insert(repl::OplogEntry::kUuidFieldName.toString());
     deps->fields.insert(repl::OplogEntry::kObjectFieldName.toString());
     deps->fields.insert(repl::OplogEntry::kObject2FieldName.toString());
+    deps->fields.insert(repl::OplogEntry::kSessionIdFieldName.toString());
+    deps->fields.insert(repl::OplogEntry::kTxnNumberFieldName.toString());
+    deps->fields.insert(DocumentSourceChangeStream::kTxnOpIndexField.toString());
+
+    if (_includePreImageOptime) {
+        deps->fields.insert(repl::OplogEntry::kPreImageOpTimeFieldName.toString());
+    }
     return DepsTracker::State::EXHAUSTIVE_ALL;
 }
 
@@ -405,220 +447,19 @@ DocumentSource::GetModPathsReturn DocumentSourceChangeStreamTransform::getModifi
     return {DocumentSource::GetModPathsReturn::Type::kAllPaths, std::set<string>{}, {}};
 }
 
-DocumentSource::GetNextResult DocumentSourceChangeStreamTransform::getNext() {
-    pExpCtx->checkForInterrupt();
-
+DocumentSource::GetNextResult DocumentSourceChangeStreamTransform::doGetNext() {
     uassert(50988,
             "Illegal attempt to execute an internal change stream stage on mongos. A $changeStream "
             "stage must be the first stage in a pipeline",
             !pExpCtx->inMongos);
 
-    while (1) {
-        // If we're unwinding an 'applyOps' from a transaction, check if there are any documents we
-        // have stored that can be returned.
-        if (_txnIterator) {
-            if (auto next = _txnIterator->getNextTransactionOp(pExpCtx->opCtx)) {
-                return applyTransformation(*next);
-            }
-            _txnIterator = boost::none;
-        }
-
-        // Get the next input document.
-        auto input = pSource->getNext();
-        if (!input.isAdvanced()) {
-            return input;
-        }
-
-        auto doc = input.releaseDocument();
-
-        auto op = doc[repl::OplogEntry::kOpTypeFieldName];
-        auto opType =
-            repl::OpType_parse(IDLParserErrorContext("ChangeStreamEntry.op"), op.getStringData());
-        auto commandVal = doc["o"];
-        if (opType != repl::OpTypeEnum::kCommand ||
-            (commandVal["applyOps"].missing() && commandVal["commitTransaction"].missing())) {
-            // We should never see an "abortTransaction" command at this point.
-            invariant(opType != repl::OpTypeEnum::kCommand ||
-                      commandVal["abortTransaction"].missing());
-
-            // This oplog entry represents a single change. Apply the transform to it and return the
-            // resulting document.
-            return applyTransformation(doc);
-        }
-
-        // The only two commands we will see here are an applyOps or a commit, which both mean we
-        // need to open a "transaction context" representing a group of updates that all occurred at
-        // once as part of a transaction. If we already have a transaction context open, that would
-        // mean we are looking at an applyOps or commit nested within an applyOps, which is not
-        // allowed in the oplog.
-        invariant(!_txnIterator);
-        _txnIterator.emplace(pExpCtx->opCtx, pExpCtx->mongoProcessInterface, doc, *_nsRegex);
-
-        // Once we initialize the transaction iterator, we can loop back to the top in order to call
-        // 'getNextTransactionOp' on it. Note that is possible for the transaction iterator
-        // to be empty of any relevant operations, meaning that this loop may need to execute
-        // multiple times before it encounters a relevant change to return.
-    }
-}
-
-DocumentSourceChangeStreamTransform::TransactionOpIterator::TransactionOpIterator(
-    OperationContext* opCtx,
-    std::shared_ptr<MongoProcessInterface> mongoProcessInterface,
-    const Document& input,
-    const pcrecpp::RE& nsRegex)
-    : _mongoProcessInterface(mongoProcessInterface), _nsRegex(nsRegex) {
-    Value lsidValue = input["lsid"];
-    checkValueType(lsidValue, "lsid", BSONType::Object);
-    _lsid = lsidValue.getDocument();
-
-    Value txnNumberValue = input["txnNumber"];
-    checkValueType(txnNumberValue, "txnNumber", BSONType::NumberLong);
-    _txnNumber = txnNumberValue.getLong();
-
-    // We want to parse the OpTime out of this document using the BSON OpTime parser. Instead of
-    // converting the entire Document back to BSON, we convert only the fields we need.
-    repl::OpTime txnOpTime = repl::OpTime::parse(BSON(repl::OpTime::kTimestampFieldName
-                                                      << input[repl::OpTime::kTimestampFieldName]
-                                                      << repl::OpTime::kTermFieldName
-                                                      << input[repl::OpTime::kTermFieldName]));
-    _clusterTime = txnOpTime.getTimestamp();
-
-    auto commandObj = input["o"].getDocument();
-    Value applyOps = commandObj["applyOps"];
-
-    if (!applyOps.missing()) {
-        // We found an applyOps that implicitly commits a transaction. We include it in the
-        // '_txnOplogEntries' stack of applyOps entries that the change stream should process as
-        // part of this transaction. There may be additional applyOps entries linked through the
-        // 'prevOpTime' field, which will also get added to '_txnOplogEntries' later in this
-        // function. Note that this style of transaction does not have a 'commitTransaction'
-        // command.
-        _txnOplogEntries.push(txnOpTime);
-    } else {
-        // This must be a "commitTransaction" command, which commits a prepared transaction. This
-        // style of transaction does not have an applyOps entry that implicitly commits it, as in
-        // the previous case. We're going to iterate through the other oplog entries in the
-        // transaction, but this entry does not have any updates in it, so we do not include it in
-        // the '_txnOplogEntries' stack.
-        invariant(!commandObj["commitTransaction"].missing());
+    // Get the next input document.
+    auto input = pSource->getNext();
+    if (!input.isAdvanced()) {
+        return input;
     }
 
-    if (BSONType::Object ==
-        input[repl::OplogEntry::kPrevWriteOpTimeInTransactionFieldName].getType()) {
-        // As with the 'txnOpTime' parsing above, we convert a portion of 'input' back to BSON in
-        // order to parse an OpTime, this time from the "prevOpTime" field.
-        repl::OpTime prevOpTime = repl::OpTime::parse(
-            input[repl::OplogEntry::kPrevWriteOpTimeInTransactionFieldName].getDocument().toBson());
-        _collectAllOpTimesFromTransaction(opCtx, prevOpTime);
-    }
-
-    // Pop the first OpTime off the stack and use it to load the first oplog entry into the
-    // '_currentApplyOps' field.
-    invariant(_txnOplogEntries.size() > 0);
-    const auto firstTimestamp = _txnOplogEntries.top();
-    _txnOplogEntries.pop();
-
-    if (firstTimestamp == txnOpTime) {
-        // This transaction consists of only one oplog entry, from which we have already extracted
-        // the "applyOps" array, so there is no need to do any more work.
-        invariant(_txnOplogEntries.size() == 0);
-        _currentApplyOps = std::move(applyOps);
-    } else {
-        // This transaction consists of multiple oplog entries; grab the chronologically first entry
-        // and extract its "applyOps" array.
-        auto firstApplyOpsEntry = _lookUpOplogEntryByOpTime(opCtx, firstTimestamp);
-
-        auto bsonOp = firstApplyOpsEntry.getOperationToApply();
-        invariant(BSONType::Array == bsonOp["applyOps"].type());
-        _currentApplyOps = Value(bsonOp["applyOps"]);
-    }
-
-    checkValueType(_currentApplyOps, "applyOps", BSONType::Array);
-    invariant(_currentApplyOps.getArrayLength() > 0);
-
-    // Initialize iterators at the beginning of the transaction.
-    _currentApplyOpsIt = _currentApplyOps.getArray().begin();
-    _txnOpIndex = 0;
-}
-
-bool DocumentSourceChangeStreamTransform::TransactionOpIterator::_isDocumentRelevant(
-    const Document& d) const {
-    invariant(
-        d["op"].getType() == BSONType::String,
-        str::stream()
-            << "Unexpected format for entry within a transaction oplog entry: 'op' field was type "
-            << typeName(d["op"].getType()));
-    invariant(ValueComparator::kInstance.evaluate(d["op"] != Value("n"_sd)),
-              "Unexpected noop entry within a transaction");
-
-    Value nsField = d["ns"];
-    invariant(!nsField.missing());
-
-    return _nsRegex.PartialMatch(nsField.getString());
-}
-
-boost::optional<Document>
-DocumentSourceChangeStreamTransform::TransactionOpIterator::getNextTransactionOp(
-    OperationContext* opCtx) {
-    while (true) {
-        while (_currentApplyOpsIt != _currentApplyOps.getArray().end()) {
-            Document d = (_currentApplyOpsIt++)->getDocument();
-            ++_txnOpIndex;
-            if (_isDocumentRelevant(d)) {
-                return d;
-            }
-        }
-
-        if (_txnOplogEntries.empty()) {
-            // There are no more operations in this transaction.
-            return boost::none;
-        }
-
-        // We've processed all the operations in the previous applyOps entry, but we have a new one
-        // to process.
-        auto applyOpsEntry = _lookUpOplogEntryByOpTime(opCtx, _txnOplogEntries.top());
-        _txnOplogEntries.pop();
-
-        auto bsonOp = applyOpsEntry.getOperationToApply();
-        invariant(BSONType::Array == bsonOp["applyOps"].type());
-
-        _currentApplyOps = Value(bsonOp["applyOps"]);
-        _currentApplyOpsIt = _currentApplyOps.getArray().begin();
-    }
-}
-
-repl::OplogEntry
-DocumentSourceChangeStreamTransform::TransactionOpIterator::_lookUpOplogEntryByOpTime(
-    OperationContext* opCtx, repl::OpTime lookupTime) const {
-    invariant(!lookupTime.isNull());
-
-    std::unique_ptr<TransactionHistoryIteratorBase> iterator(
-        _mongoProcessInterface->createTransactionHistoryIterator(lookupTime));
-    try {
-        return iterator->next(opCtx);
-    } catch (ExceptionFor<ErrorCodes::IncompleteTransactionHistory>& ex) {
-        ex.addContext(
-            "Oplog no longer has history necessary for $changeStream to observe operations from a "
-            "committed transaction.");
-        uasserted(ErrorCodes::ChangeStreamHistoryLost, ex.reason());
-    }
-}
-
-void DocumentSourceChangeStreamTransform::TransactionOpIterator::_collectAllOpTimesFromTransaction(
-    OperationContext* opCtx, repl::OpTime firstOpTime) {
-    std::unique_ptr<TransactionHistoryIteratorBase> iterator(
-        _mongoProcessInterface->createTransactionHistoryIterator(firstOpTime));
-
-    try {
-        while (iterator->hasNext()) {
-            _txnOplogEntries.push(iterator->nextOpTime(opCtx));
-        }
-    } catch (ExceptionFor<ErrorCodes::IncompleteTransactionHistory>& ex) {
-        ex.addContext(
-            "Oplog no longer has history necessary for $changeStream to observe operations from a "
-            "committed transaction.");
-        uasserted(ErrorCodes::ChangeStreamHistoryLost, ex.reason());
-    }
+    return applyTransformation(input.releaseDocument());
 }
 
 }  // namespace mongo

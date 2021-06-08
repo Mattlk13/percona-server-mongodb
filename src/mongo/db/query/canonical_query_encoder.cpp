@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -38,9 +38,32 @@
 #include "mongo/base/simple_string_data_comparator.h"
 #include "mongo/db/matcher/expression_array.h"
 #include "mongo/db/matcher/expression_geo.h"
-#include "mongo/util/log.h"
+#include "mongo/db/query/projection.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
+
+bool isQueryNegatingEqualToNull(const mongo::MatchExpression* tree) {
+    // If the query predicate is null, do not reuse the plan since empty arrays ([]) are
+    // encoded as 'null' in the index. Thus we cannot safely invert the index bounds since 'null'
+    // has special comparison semantics.
+    if (tree->matchType() != MatchExpression::NOT) {
+        return false;
+    }
+
+    const MatchExpression* child = tree->getChild(0);
+    switch (child->matchType()) {
+        case MatchExpression::EQ:
+        case MatchExpression::GTE:
+        case MatchExpression::LTE:
+            return static_cast<const ComparisonMatchExpression*>(child)->getData().type() ==
+                BSONType::jstNULL;
+
+        default:
+            return false;
+    }
+}
+
 namespace {
 
 // Delimiters for cache key encoding.
@@ -49,6 +72,7 @@ const char kEncodeChildrenEnd = ']';
 const char kEncodeChildrenSeparator = ',';
 const char kEncodeCollationSection = '#';
 const char kEncodeProjectionSection = '|';
+const char kEncodeProjectionRequirementSeparator = '-';
 const char kEncodeRegexFlagsSeparator = '/';
 const char kEncodeSortSection = '~';
 
@@ -65,6 +89,7 @@ void encodeUserString(StringData s, StringBuilder* keyBuilder) {
             case kEncodeChildrenSeparator:
             case kEncodeCollationSection:
             case kEncodeProjectionSection:
+            case kEncodeProjectionRequirementSeparator:
             case kEncodeRegexFlagsSeparator:
             case kEncodeSortSection:
             case '\\':
@@ -166,7 +191,19 @@ const char* encodeMatchType(MatchExpression::MatchType mt) {
             return "xp";
 
         case MatchExpression::INTERNAL_EXPR_EQ:
-            return "ee";
+            return "eeq";
+
+        case MatchExpression::INTERNAL_EXPR_GT:
+            return "egt";
+
+        case MatchExpression::INTERNAL_EXPR_GTE:
+            return "ege";
+
+        case MatchExpression::INTERNAL_EXPR_LT:
+            return "elt";
+
+        case MatchExpression::INTERNAL_EXPR_LTE:
+            return "ele";
 
         case MatchExpression::INTERNAL_SCHEMA_ALL_ELEM_MATCH_FROM_INDEX:
             return "internalSchemaAllElemMatchFromIndex";
@@ -265,8 +302,10 @@ void encodeGeoMatchExpression(const GeoMatchExpression* tree, StringBuilder* key
     } else if (STRICT_SPHERE == geoQuery.getGeometry().getNativeCRS()) {
         *keyBuilder << "ss";
     } else {
-        error() << "unknown CRS type " << (int)geoQuery.getGeometry().getNativeCRS()
-                << " in geometry of type " << geoQuery.getGeometry().getDebugType();
+        LOGV2_ERROR(23849,
+                    "Unknown CRS type in geometry",
+                    "crsType"_attr = (int)geoQuery.getGeometry().getNativeCRS(),
+                    "geometryType"_attr = geoQuery.getGeometry().getDebugType());
         MONGO_UNREACHABLE;
     }
 }
@@ -295,8 +334,9 @@ void encodeGeoNearMatchExpression(const GeoNearMatchExpression* tree, StringBuil
             *keyBuilder << "ss";
             break;
         case UNSET:
-            error() << "unknown CRS type " << (int)nearQuery.centroid->crs
-                    << " in point geometry for near query";
+            LOGV2_ERROR(23850,
+                        "Unknown CRS type in point geometry for near query",
+                        "crsType"_attr = (int)nearQuery.centroid->crs);
             MONGO_UNREACHABLE;
             break;
     }
@@ -304,11 +344,8 @@ void encodeGeoNearMatchExpression(const GeoNearMatchExpression* tree, StringBuil
 
 template <class T>
 char encodeEnum(T val) {
-    static_assert(static_cast<int>(T::kMax) <= 9,
-                  "enum has too many values to encode as a value between '0' and '9'. You must "
-                  "change the encoding scheme");
-    invariant(val <= T::kMax);
-
+    // Ensure val can be encoded as a digit between '0' and '9' inclusive.
+    invariant(static_cast<int>(val) < 10);
     return static_cast<char>(val) + '0';
 }
 
@@ -317,21 +354,21 @@ void encodeCollation(const CollatorInterface* collation, StringBuilder* keyBuild
         return;
     }
 
-    const CollationSpec& spec = collation->getSpec();
+    const Collation& spec = collation->getSpec();
 
     *keyBuilder << kEncodeCollationSection;
-    *keyBuilder << spec.localeID;
-    *keyBuilder << spec.caseLevel;
+    *keyBuilder << spec.getLocale();
+    *keyBuilder << spec.getCaseLevel();
 
     // Ensure that we can encode this value with a single ascii byte '0' through '9'.
-    *keyBuilder << encodeEnum(spec.caseFirst);
-    *keyBuilder << encodeEnum(spec.strength);
-    *keyBuilder << spec.numericOrdering;
+    *keyBuilder << encodeEnum(spec.getCaseFirst());
+    *keyBuilder << encodeEnum(spec.getStrength());
+    *keyBuilder << spec.getNumericOrdering();
 
-    *keyBuilder << encodeEnum(spec.alternate);
-    *keyBuilder << encodeEnum(spec.maxVariable);
-    *keyBuilder << spec.normalization;
-    *keyBuilder << spec.backwards;
+    *keyBuilder << encodeEnum(spec.getAlternate());
+    *keyBuilder << encodeEnum(spec.getMaxVariable());
+    *keyBuilder << spec.getNormalization();
+    *keyBuilder << spec.getBackwards();
 
     // We do not encode 'spec.version' because query shape strings are never persisted, and need
     // not be stable between versions.
@@ -408,6 +445,21 @@ void encodeKeyForMatch(const MatchExpression* tree, StringBuilder* keyBuilder) {
         }
     }
 
+    // If the query predicate is minKey or maxKey it can't use the same plan as other GT/LT
+    // queries. If the index is multikey and the query involves one of these values, it needs
+    // to use INEXACT_FETCH and the bounds can't be inverted. Therefore these need their own
+    // shape.
+    if (tree->isGTMinKey())
+        *keyBuilder << "min";
+    else if (tree->isLTMaxKey())
+        *keyBuilder << "max";
+
+    // If the query predicate involves comparison to null, do not reuse the plan since empty arrays
+    // ([]) are encoded as null in the index. Thus we cannot safely invert the index bounds.
+    if (isQueryNegatingEqualToNull(tree)) {
+        *keyBuilder << "not_eq_null";
+    }
+
     // Traverse child nodes.
     // Enclose children in [].
     if (tree->numChildren() > 0) {
@@ -427,10 +479,9 @@ void encodeKeyForMatch(const MatchExpression* tree, StringBuilder* keyBuilder) {
 }
 
 /**
-* Encodes sort order into cache key.
-* Sort order is normalized because it provided by
-* QueryRequest.
-*/
+ * Encodes sort order into cache key. Sort order is normalized because it provided by
+ * FindCommandRequest.
+ */
 void encodeKeyForSort(const BSONObj& sortObj, StringBuilder* keyBuilder) {
     if (sortObj.isEmpty()) {
         return;
@@ -442,7 +493,7 @@ void encodeKeyForSort(const BSONObj& sortObj, StringBuilder* keyBuilder) {
     while (it.more()) {
         BSONElement elt = it.next();
         // $meta text score
-        if (QueryRequest::isTextScoreMeta(elt)) {
+        if (query_request_helper::isTextScoreMeta(elt)) {
             *keyBuilder << "t";
         }
         // Ascending
@@ -463,51 +514,50 @@ void encodeKeyForSort(const BSONObj& sortObj, StringBuilder* keyBuilder) {
 }
 
 /**
-* Encodes parsed projection into cache key.
-* Does a simple toString() on each projected field
-* in the BSON object.
-* Orders the encoded elements in the projection by field name.
-* This handles all the special projection types ($meta, $elemMatch, etc.)
-*/
-void encodeKeyForProj(const BSONObj& projObj, StringBuilder* keyBuilder) {
-    // Sorts the BSON elements by field name using a map.
-    std::map<StringData, BSONElement> elements;
+ * Encodes projection AST into a cache key.
+ *
+ * For projections which have a finite set of required fields (inclusion-only projections), encodes
+ * those field names in order.
+ *
+ * For projections which require the entire document (exclusion projections, projections with
+ * expressions), the projection section is empty.
+ */
+void encodeKeyForProj(const projection_ast::Projection* proj, StringBuilder* keyBuilder) {
+    if (!proj || proj->requiresDocument()) {
+        // Don't encode anything for the projection section to indicate the entire document is
+        // required.
+        return;
+    }
 
-    BSONObjIterator it(projObj);
-    while (it.more()) {
-        BSONElement elt = it.next();
-        StringData fieldName = elt.fieldNameStringData();
+    std::vector<std::string> requiredFields = proj->getRequiredFields();
 
-        // Internal callers may add $-prefixed fields to the projection. These are not part of a
-        // user query, and therefore are not considered part of the cache key.
-        if (fieldName[0] == '$') {
+    // If the only requirement is that $sortKey be included with some value, we just act as if the
+    // entire document is needed.
+    if (requiredFields.size() == 1 && requiredFields.front() == "$sortKey") {
+        return;
+    }
+
+    // If the projection just re-writes the entire document and has no dependencies on the original
+    // document (e.g. {a: "foo", _id: 0}), then just include the projection delimiter.
+    *keyBuilder << kEncodeProjectionSection;
+
+    // Encode the fields required by the projection in order.
+    std::sort(requiredFields.begin(), requiredFields.end());
+    bool isFirst = true;
+    for (auto&& requiredField : requiredFields) {
+        invariant(!requiredField.empty());
+
+        // Internal callers (e.g, from mongos) may add "$sortKey" to the projection. This is not
+        // part of the user query, and therefore are not considered part of the cache key.
+        if (requiredField == "$sortKey") {
             continue;
         }
 
-        elements[fieldName] = elt;
-    }
-
-    if (!elements.empty()) {
-        *keyBuilder << kEncodeProjectionSection;
-    }
-
-    // Read elements in order of field name
-    for (std::map<StringData, BSONElement>::const_iterator i = elements.begin();
-         i != elements.end();
-         ++i) {
-        const BSONElement& elt = (*i).second;
-
-        if (elt.type() != BSONType::Object) {
-            // For inclusion/exclusion projections, we encode as "i" or "e".
-            *keyBuilder << (elt.trueValue() ? "i" : "e");
-        } else {
-            // For projection operators, we use the verbatim string encoding of the element.
-            encodeUserString(elt.toString(false,   // includeFieldName
-                                          false),  // full
-                             keyBuilder);
+        if (!isFirst) {
+            *keyBuilder << kEncodeProjectionRequirementSeparator;
         }
-
-        encodeUserString(elt.fieldName(), keyBuilder);
+        encodeUserString(requiredField, keyBuilder);
+        isFirst = false;
     }
 }
 }  // namespace
@@ -517,8 +567,8 @@ namespace canonical_query_encoder {
 CanonicalQuery::QueryShapeString encode(const CanonicalQuery& cq) {
     StringBuilder keyBuilder;
     encodeKeyForMatch(cq.root(), &keyBuilder);
-    encodeKeyForSort(cq.getQueryRequest().getSort(), &keyBuilder);
-    encodeKeyForProj(cq.getQueryRequest().getProj(), &keyBuilder);
+    encodeKeyForSort(cq.getFindCommandRequest().getSort(), &keyBuilder);
+    encodeKeyForProj(cq.getProj(), &keyBuilder);
     encodeCollation(cq.getCollator(), &keyBuilder);
 
     return keyBuilder.str();

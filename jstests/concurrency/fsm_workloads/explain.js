@@ -7,9 +7,9 @@
  *
  */
 load('jstests/concurrency/fsm_workload_helpers/server_types.js');  // for isMongod
+load('jstests/libs/analyze_plan.js');
 
 var $config = (function() {
-
     var data = {
         collNotExist: 'donotexist__',
         nInserted: 0,
@@ -27,7 +27,7 @@ var $config = (function() {
     };
 
     function setup(db, collName, cluster) {
-        assertAlways.commandWorked(db[collName].ensureIndex({j: 1}));
+        assertAlways.commandWorked(db[collName].createIndex({j: 1}));
     }
 
     var states = (function() {
@@ -52,17 +52,16 @@ var $config = (function() {
             assertAlways(res.queryPlanner, tojson(res));
             assertAlways(res.queryPlanner.winningPlan, tojson(res));
             if (isMongod(db)) {
-                assertAlways.eq(res.queryPlanner.winningPlan.stage, 'EOF', tojson(res));
+                assertAlways.eq(getWinningPlan(res.queryPlanner).stage, 'EOF', tojson(res));
             } else {
                 // In the sharding case, each shard has a winningPlan
                 res.queryPlanner.winningPlan.shards.forEach(function(shard) {
-                    assertAlways.eq(shard.winningPlan.stage, 'EOF', tojson(res));
+                    assertAlways.eq(getWinningPlan(shard).stage, 'EOF', tojson(res));
                 });
             }
         }
 
         return {insert: insert, explain: explain, explainNonExistentNS: explainNonExistentNS};
-
     })();
 
     var transitions = {

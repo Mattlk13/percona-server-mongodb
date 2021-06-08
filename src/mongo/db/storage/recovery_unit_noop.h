@@ -41,44 +41,34 @@ class OperationContext;
 class RecoveryUnitNoop : public RecoveryUnit {
 public:
     void beginUnitOfWork(OperationContext* opCtx) final {}
-    void commitUnitOfWork() final {
-        for (auto& change : _changes) {
-            try {
-                change->commit(boost::none);
-            } catch (...) {
-                std::terminate();
-            }
-        }
-        _changes.clear();
-    }
-    void abortUnitOfWork() final {
-        for (auto it = _changes.rbegin(); it != _changes.rend(); ++it) {
-            try {
-                (*it)->rollback();
-            } catch (...) {
-                std::terminate();
-            }
-        }
-        _changes.clear();
-    }
 
-    virtual void abandonSnapshot() {}
-
-    virtual bool waitUntilDurable() {
+    bool waitUntilDurable(OperationContext* opCtx) override {
         return true;
     }
 
-    virtual void registerChange(Change* change) {
-        _changes.push_back(std::unique_ptr<Change>(change));
+    void setOrderedCommit(bool orderedCommit) override {}
+
+    void validateInUnitOfWork() const override {}
+
+    bool inActiveTxn() const {
+        return false;
     }
 
-    virtual SnapshotId getSnapshotId() const {
-        return SnapshotId();
+    bool isNoop() const override {
+        return true;
     }
-
-    virtual void setOrderedCommit(bool orderedCommit) {}
 
 private:
+    void doCommitUnitOfWork() final {
+        _executeCommitHandlers(boost::none);
+    }
+
+    void doAbortUnitOfWork() final {
+        _executeRollbackHandlers();
+    }
+
+    virtual void doAbandonSnapshot() {}
+
     std::vector<std::unique_ptr<Change>> _changes;
 };
 

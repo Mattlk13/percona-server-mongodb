@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -35,24 +35,26 @@
 #include <fmt/format.h>
 
 #include "mongo/db/storage/wiredtiger/wiredtiger_begin_transaction_block.h"
+
 #include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
 #include "mongo/util/errno_util.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 using namespace fmt::literals;
 
 WiredTigerBeginTxnBlock::WiredTigerBeginTxnBlock(
     WT_SESSION* session,
-    IgnorePrepared ignorePrepare,
+    PrepareConflictBehavior prepareConflictBehavior,
     RoundUpPreparedTimestamps roundUpPreparedTimestamps,
     RoundUpReadTimestamp roundUpReadTimestamp)
     : _session(session) {
     invariant(!_rollback);
 
     str::stream builder;
-    if (ignorePrepare == IgnorePrepared::kIgnore) {
+    if (prepareConflictBehavior == PrepareConflictBehavior::kIgnoreConflicts) {
         builder << "ignore_prepare=true,";
+    } else if (prepareConflictBehavior == PrepareConflictBehavior::kIgnoreConflictsAllowWrites) {
+        builder << "ignore_prepare=force,";
     }
     if (roundUpPreparedTimestamps == RoundUpPreparedTimestamps::kRound ||
         roundUpReadTimestamp == RoundUpReadTimestamp::kRound) {
@@ -64,6 +66,9 @@ WiredTigerBeginTxnBlock::WiredTigerBeginTxnBlock(
             builder << "read=true";
         }
         builder << "),";
+    }
+    if (roundUpReadTimestamp == RoundUpReadTimestamp::kNoRoundForce) {
+        builder << "read_before_oldest=true,";
     }
 
     const std::string beginTxnConfigString = builder;

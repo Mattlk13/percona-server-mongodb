@@ -15,6 +15,7 @@ executor:
         TestData:
           ignoreCommandsIncompatibleWithInitialSync: true
   hooks:
+  - class: FuzzerRestoreSettings
   - class: BackgroundInitialSync
     n: 1
     shell_options:

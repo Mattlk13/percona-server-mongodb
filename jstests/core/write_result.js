@@ -5,8 +5,9 @@
 // @tags: [
 //   assumes_unsharded_collection,
 //   assumes_write_concern_unchanged,
+//   requires_multi_updates,
 //   requires_non_retryable_writes,
-//   requires_fastcount
+//   requires_fastcount,
 // ]
 
 //
@@ -116,7 +117,7 @@ assert.eq(coll.count(), 1);
 // Update with error
 coll.remove({});
 coll.insert({foo: "bar"});
-printjson(result = coll.update({foo: "bar"}, {$invalid: "expr"}));
+result = coll.update({foo: "bar"}, {_id: /a/});
 assert.eq(result.nUpserted, 0);
 assert.eq(result.nMatched, 0);
 if (coll.getMongo().writeMode() == "commands")
@@ -182,8 +183,8 @@ coll.unsetWriteConcern();
 // NOTE: In a replica set write concern is checked after write
 coll.remove({});
 var wRes = assert.writeError(coll.insert({foo: "bar"}, {writeConcern: {w: "invalid"}}));
-var res = assert.commandWorked(db.isMaster());
-var replSet = res.hasOwnProperty("setName");
+var res = assert.commandWorked(db.hello());
+var replSet = res.hasOwnProperty("$clusterTime");
 if (!replSet && coll.getMongo().writeMode() == "commands")
     assert.eq(coll.count(), 0, "not-replset || command mode");
 else  // compatibility,

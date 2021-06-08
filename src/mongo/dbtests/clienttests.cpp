@@ -40,8 +40,8 @@
 
 namespace ClientTests {
 
-using std::unique_ptr;
 using std::string;
+using std::unique_ptr;
 using std::vector;
 
 class Base {
@@ -62,6 +62,10 @@ public:
         db.dropCollection(_ns);
     }
 
+    const NamespaceString nss() {
+        return NamespaceString(_ns);
+    }
+
     const char* ns() {
         return _ns.c_str();
     }
@@ -78,20 +82,23 @@ public:
         OperationContext& opCtx = *opCtxPtr;
         DBDirectClient db(&opCtx);
 
+        const bool includeBuildUUIDs = false;
+        const int options = 0;
+
         db.insert(ns(), BSON("x" << 2));
-        ASSERT_EQUALS(1u, db.getIndexSpecs(ns()).size());
+        ASSERT_EQUALS(1u, db.getIndexSpecs(nss(), includeBuildUUIDs, options).size());
 
         ASSERT_OK(dbtests::createIndex(&opCtx, ns(), BSON("x" << 1)));
-        ASSERT_EQUALS(2u, db.getIndexSpecs(ns()).size());
+        ASSERT_EQUALS(2u, db.getIndexSpecs(nss(), includeBuildUUIDs, options).size());
 
         db.dropIndex(ns(), BSON("x" << 1));
-        ASSERT_EQUALS(1u, db.getIndexSpecs(ns()).size());
+        ASSERT_EQUALS(1u, db.getIndexSpecs(nss(), includeBuildUUIDs, options).size());
 
         ASSERT_OK(dbtests::createIndex(&opCtx, ns(), BSON("x" << 1)));
-        ASSERT_EQUALS(2u, db.getIndexSpecs(ns()).size());
+        ASSERT_EQUALS(2u, db.getIndexSpecs(nss(), includeBuildUUIDs, options).size());
 
         db.dropIndexes(ns());
-        ASSERT_EQUALS(1u, db.getIndexSpecs(ns()).size());
+        ASSERT_EQUALS(1u, db.getIndexSpecs(nss(), includeBuildUUIDs, options).size());
     }
 };
 
@@ -112,24 +119,27 @@ public:
         db.insert(ns(), BSON("x" << 1 << "y" << 2));
         db.insert(ns(), BSON("x" << 2 << "y" << 2));
 
-        Collection* collection = ctx.getCollection();
+        const auto& collection = ctx.getCollection();
         ASSERT(collection);
-        IndexCatalog* indexCatalog = collection->getIndexCatalog();
+        const IndexCatalog* indexCatalog = collection->getIndexCatalog();
+
+        const bool includeBuildUUIDs = false;
+        const int options = 0;
 
         ASSERT_EQUALS(1, indexCatalog->numIndexesReady(&opCtx));
         // _id index
-        ASSERT_EQUALS(1U, db.getIndexSpecs(ns()).size());
+        ASSERT_EQUALS(1U, db.getIndexSpecs(nss(), includeBuildUUIDs, options).size());
 
         ASSERT_EQUALS(ErrorCodes::DuplicateKey,
                       dbtests::createIndex(&opCtx, ns(), BSON("y" << 1), true));
 
         ASSERT_EQUALS(1, indexCatalog->numIndexesReady(&opCtx));
-        ASSERT_EQUALS(1U, db.getIndexSpecs(ns()).size());
+        ASSERT_EQUALS(1U, db.getIndexSpecs(nss(), includeBuildUUIDs, options).size());
 
         ASSERT_OK(dbtests::createIndex(&opCtx, ns(), BSON("x" << 1), true));
 
         ASSERT_EQUALS(2, indexCatalog->numIndexesReady(&opCtx));
-        ASSERT_EQUALS(2U, db.getIndexSpecs(ns()).size());
+        ASSERT_EQUALS(2U, db.getIndexSpecs(nss(), includeBuildUUIDs, options).size());
     }
 };
 
@@ -222,8 +232,8 @@ class ConnectionStringTests {
 public:
     void run() {
         {
-            ConnectionString s("a/b,c,d", ConnectionString::SET);
-            ASSERT_EQUALS(ConnectionString::SET, s.type());
+            ConnectionString s("a/b,c,d", ConnectionString::ConnectionType::kReplicaSet);
+            ASSERT_EQUALS(ConnectionString::ConnectionType::kReplicaSet, s.type());
             ASSERT_EQUALS("a", s.getSetName());
             vector<HostAndPort> v = s.getServers();
             ASSERT_EQUALS(3U, v.size());
@@ -325,22 +335,6 @@ public:
     }
 };
 
-class CreateHaystackIndex : public Base {
-public:
-    CreateHaystackIndex() : Base("CreateHaystackIndex") {}
-    void run() {
-        const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
-        OperationContext& opCtx = *opCtxPtr;
-        DBDirectClient db(&opCtx);
-
-        db.createIndex(ns(),
-                       IndexSpec()
-                           .addKey("aField", IndexSpec::kIndexTypeGeoHaystack)
-                           .addKey("otherField", IndexSpec::kIndexTypeDescending)
-                           .geoHaystackBucketSize(1.0));
-    }
-};
-
 class Create2DSphereIndex : public Base {
 public:
     Create2DSphereIndex() : Base("Create2DSphereIndex") {}
@@ -382,9 +376,9 @@ public:
     }
 };
 
-class All : public Suite {
+class All : public OldStyleSuiteSpecification {
 public:
-    All() : Suite("client") {}
+    All() : OldStyleSuiteSpecification("client") {}
 
     void setupTests() {
         add<DropIndex>();
@@ -399,12 +393,11 @@ public:
         add<CreateUniqueSparseDropDupsIndexInBackground>();
         add<CreateComplexTextIndex>();
         add<Create2DIndex>();
-        add<CreateHaystackIndex>();
         add<Create2DSphereIndex>();
         add<CreateHashedIndex>();
         add<CreateIndexFailure>();
     }
 };
 
-SuiteInstance<All> all;
-}
+OldStyleSuiteInitializer<All> all;
+}  // namespace ClientTests

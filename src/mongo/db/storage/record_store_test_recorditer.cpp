@@ -42,9 +42,9 @@
 namespace mongo {
 namespace {
 
-using std::unique_ptr;
 using std::string;
 using std::stringstream;
+using std::unique_ptr;
 
 // Insert multiple records and iterate through them in the forward direction.
 // When curr() or getNext() is called on an iterator positioned at EOF,
@@ -83,7 +83,6 @@ TEST(RecordStoreTestHarness, IterateOverMultipleRecords) {
         ASSERT_EQUALS(nToInsert, rs->numRecords(opCtx.get()));
     }
 
-    std::sort(locs, locs + nToInsert);  // inserted records may not be in RecordId order
     {
         ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         auto cursor = rs->getCursor(opCtx.get());
@@ -134,7 +133,6 @@ TEST(RecordStoreTestHarness, IterateOverMultipleRecordsReversed) {
         ASSERT_EQUALS(nToInsert, rs->numRecords(opCtx.get()));
     }
 
-    std::sort(locs, locs + nToInsert);  // inserted records may not be in RecordId order
     {
         ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
 
@@ -185,7 +183,6 @@ TEST(RecordStoreTestHarness, IterateStartFromMiddle) {
         ASSERT_EQUALS(nToInsert, rs->numRecords(opCtx.get()));
     }
 
-    std::sort(locs, locs + nToInsert);  // inserted records may not be in RecordId order
     {
         ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
 
@@ -237,7 +234,6 @@ TEST(RecordStoreTestHarness, IterateStartFromMiddleReversed) {
         ASSERT_EQUALS(nToInsert, rs->numRecords(opCtx.get()));
     }
 
-    std::sort(locs, locs + nToInsert);  // inserted records may not be in RecordId order
     {
         ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
 

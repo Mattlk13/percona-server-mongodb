@@ -30,6 +30,7 @@
 #pragma once
 
 #include "mongo/db/jsobj.h"
+#include "mongo/db/storage/key_string.h"
 #include "mongo/platform/basic.h"
 
 namespace mongo {
@@ -111,6 +112,9 @@ public:
 
     // Append the minimum range of the hash to the builder provided (inclusive)
     void appendHashMin(BSONObjBuilder* builder, const char* fieldName) const;
+    // Append the minimum range of the hash to the KeyString provided (inclusive)
+    void appendHashMin(KeyString::Builder* ks) const;
+    void appendHashMin(KeyString::PooledBuilder* ks) const;
     // Append the maximum range of the hash to the builder provided (inclusive)
     void appendHashMax(BSONObjBuilder* builder, const char* fieldName) const;
 
@@ -176,14 +180,18 @@ public:
         double scaling;
     };
 
-    GeoHashConverter(const Parameters& params);
+    /**
+     * Factory method to return a new instance with status. Uses hashing parameters parsed from a
+     * BSONObj.
+     */
+    static StatusWith<std::unique_ptr<GeoHashConverter>> createFromDoc(const BSONObj& paramDoc);
 
     /**
-     * Returns hashing parameters parsed from a BSONObj
+     * Factory method to return a new instance with status.
      */
-    static Status parseParameters(const BSONObj& paramDoc, Parameters* params);
+    static StatusWith<std::unique_ptr<GeoHashConverter>> createFromParams(const Parameters& params);
 
-    static double calcUnhashToBoxError(const GeoHashConverter::Parameters& params);
+    static double calcUnhashToBoxError(const Parameters& params);
 
     /**
      * Return converter parameterss which can be used to
@@ -254,6 +262,8 @@ public:
     double convertToDoubleHashScale(double in) const;
 
 private:
+    GeoHashConverter(const Parameters& params);
+
     void init();
 
     // Convert from an unsigned in [0, (max-min)*scaling] to [min, max]

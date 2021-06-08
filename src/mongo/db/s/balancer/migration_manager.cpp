@@ -27,13 +27,11 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/s/balancer/migration_manager.h"
-
-#include <memory>
 
 #include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/bson/util/bson_extract.h"
@@ -42,32 +40,24 @@
 #include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/balancer/scoped_migration_request.h"
-#include "mongo/db/s/balancer/type_migration.h"
+#include "mongo/db/s/dist_lock_manager.h"
 #include "mongo/executor/task_executor_pool.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/move_chunk_request.h"
-#include "mongo/util/log.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
+namespace {
 
 using executor::RemoteCommandRequest;
 using executor::RemoteCommandResponse;
-using std::shared_ptr;
-using std::vector;
-using str::stream;
-
-namespace {
 
 const char kChunkTooBig[] = "chunkTooBig";  // TODO: delete in 3.8
-
-const WriteConcernOptions kMajorityWriteConcern(WriteConcernOptions::kMajority,
-                                                WriteConcernOptions::SyncMode::UNSET,
-                                                WriteConcernOptions::kWriteConcernTimeoutMigration);
 
 /**
  * Parses the 'commandResponse' and converts it to a status to use as the outcome of the command.
@@ -91,7 +81,6 @@ Status extractMigrationStatusFromCommandResponse(const BSONObj& commandResponse)
     return commandStatus;
 }
 
-
 /**
  * Returns whether the specified status is an error caused by stepdown of the primary config node
  * currently running the balancer.
@@ -114,48 +103,54 @@ MigrationManager::~MigrationManager() {
 
 MigrationStatuses MigrationManager::executeMigrationsForAutoBalance(
     OperationContext* opCtx,
-    const vector<MigrateInfo>& migrateInfos,
+    const std::vector<MigrateInfo>& migrateInfos,
     uint64_t maxChunkSizeBytes,
     const MigrationSecondaryThrottleOptions& secondaryThrottle,
     bool waitForDelete) {
 
     MigrationStatuses migrationStatuses;
 
-    {
-        std::map<MigrationIdentifier, ScopedMigrationRequest> scopedMigrationRequests;
-        vector<std::pair<shared_ptr<Notification<RemoteCommandResponse>>, MigrateInfo>> responses;
+    ScopedMigrationRequestsMap scopedMigrationRequests;
+    std::vector<std::pair<std::shared_ptr<Notification<RemoteCommandResponse>>, MigrateInfo>>
+        responses;
 
-        for (const auto& migrateInfo : migrateInfos) {
-            // Write a document to the config.migrations collection, in case this migration must be
-            // recovered by the Balancer. Fail if the chunk is already moving.
-            auto statusWithScopedMigrationRequest =
-                ScopedMigrationRequest::writeMigration(opCtx, migrateInfo, waitForDelete);
-            if (!statusWithScopedMigrationRequest.isOK()) {
-                migrationStatuses.emplace(migrateInfo.getName(),
-                                          std::move(statusWithScopedMigrationRequest.getStatus()));
-                continue;
-            }
-            scopedMigrationRequests.emplace(migrateInfo.getName(),
-                                            std::move(statusWithScopedMigrationRequest.getValue()));
+    for (const auto& migrateInfo : migrateInfos) {
+        responses.emplace_back(_schedule(opCtx,
+                                         migrateInfo,
+                                         maxChunkSizeBytes,
+                                         secondaryThrottle,
+                                         waitForDelete,
+                                         &scopedMigrationRequests),
+                               migrateInfo);
+    }
 
-            responses.emplace_back(
-                _schedule(opCtx, migrateInfo, maxChunkSizeBytes, secondaryThrottle, waitForDelete),
-                migrateInfo);
+    // Wait for all the scheduled migrations to complete.
+    for (auto& response : responses) {
+        auto notification = std::move(response.first);
+        auto migrateInfo = std::move(response.second);
+
+        const auto& remoteCommandResponse = notification->get();
+        const auto migrationInfoName = migrateInfo.getName();
+
+        auto it = scopedMigrationRequests.find(migrationInfoName);
+        if (it == scopedMigrationRequests.end()) {
+            invariant(!remoteCommandResponse.status.isOK());
+            migrationStatuses.emplace(migrationInfoName, std::move(remoteCommandResponse.status));
+            continue;
         }
 
-        // Wait for all the scheduled migrations to complete.
-        for (auto& response : responses) {
-            auto notification = std::move(response.first);
-            auto migrateInfo = std::move(response.second);
+        auto statusWithScopedMigrationRequest = std::move(it->second);
 
-            const auto& remoteCommandResponse = notification->get();
-
-            auto it = scopedMigrationRequests.find(migrateInfo.getName());
-            invariant(it != scopedMigrationRequests.end());
-            Status commandStatus =
-                _processRemoteCommandResponse(remoteCommandResponse, &it->second);
-            migrationStatuses.emplace(migrateInfo.getName(), std::move(commandStatus));
+        if (!statusWithScopedMigrationRequest.isOK()) {
+            invariant(!remoteCommandResponse.status.isOK());
+            migrationStatuses.emplace(migrationInfoName,
+                                      std::move(statusWithScopedMigrationRequest.getStatus()));
+            continue;
         }
+
+        Status commandStatus = _processRemoteCommandResponse(
+            remoteCommandResponse, &statusWithScopedMigrationRequest.getValue());
+        migrationStatuses.emplace(migrationInfoName, std::move(commandStatus));
     }
 
     invariant(migrationStatuses.size() == migrateInfos.size());
@@ -169,33 +164,41 @@ Status MigrationManager::executeManualMigration(
     uint64_t maxChunkSizeBytes,
     const MigrationSecondaryThrottleOptions& secondaryThrottle,
     bool waitForDelete) {
+
     _waitForRecovery();
 
-    // Write a document to the config.migrations collection, in case this migration must be
-    // recovered by the Balancer. Fail if the chunk is already moving.
-    auto statusWithScopedMigrationRequest =
-        ScopedMigrationRequest::writeMigration(opCtx, migrateInfo, waitForDelete);
-    if (!statusWithScopedMigrationRequest.isOK()) {
-        return statusWithScopedMigrationRequest.getStatus();
+    ScopedMigrationRequestsMap scopedMigrationRequests;
+
+    RemoteCommandResponse remoteCommandResponse = _schedule(opCtx,
+                                                            migrateInfo,
+                                                            maxChunkSizeBytes,
+                                                            secondaryThrottle,
+                                                            waitForDelete,
+                                                            &scopedMigrationRequests)
+                                                      ->get();
+
+    auto swCM = Grid::get(opCtx)->catalogCache()->getShardedCollectionRoutingInfoWithRefresh(
+        opCtx, migrateInfo.nss);
+    if (!swCM.isOK()) {
+        return swCM.getStatus();
     }
 
-    RemoteCommandResponse remoteCommandResponse =
-        _schedule(opCtx, migrateInfo, maxChunkSizeBytes, secondaryThrottle, waitForDelete)->get();
+    const auto& cm = swCM.getValue();
 
-    auto routingInfoStatus =
-        Grid::get(opCtx)->catalogCache()->getShardedCollectionRoutingInfoWithRefresh(
-            opCtx, migrateInfo.nss);
-    if (!routingInfoStatus.isOK()) {
-        return routingInfoStatus.getStatus();
+    const auto chunk = cm.findIntersectingChunkWithSimpleCollation(migrateInfo.minKey);
+
+    Status commandStatus = remoteCommandResponse.status;
+
+    const auto migrationInfoName = migrateInfo.getName();
+
+    auto it = scopedMigrationRequests.find(migrationInfoName);
+
+    if (it != scopedMigrationRequests.end()) {
+        invariant(scopedMigrationRequests.size() == 1);
+        auto statusWithScopedMigrationRequest = &it->second;
+        commandStatus = _processRemoteCommandResponse(
+            remoteCommandResponse, &statusWithScopedMigrationRequest->getValue());
     }
-
-    auto& routingInfo = routingInfoStatus.getValue();
-
-    const auto chunk =
-        routingInfo.cm()->findIntersectingChunkWithSimpleCollation(migrateInfo.minKey);
-
-    Status commandStatus = _processRemoteCommandResponse(
-        remoteCommandResponse, &statusWithScopedMigrationRequest.getValue());
 
     // Migration calls can be interrupted after the metadata is committed but before the command
     // finishes the waitForDelete stage. Any failovers, therefore, must always cause the moveChunk
@@ -210,7 +213,7 @@ Status MigrationManager::executeManualMigration(
 
 void MigrationManager::startRecoveryAndAcquireDistLocks(OperationContext* opCtx) {
     {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        stdx::lock_guard<Latch> lock(_mutex);
         invariant(_state == State::kStopped);
         invariant(_migrationRecoveryMap.empty());
         _state = State::kRecovering;
@@ -220,8 +223,6 @@ void MigrationManager::startRecoveryAndAcquireDistLocks(OperationContext* opCtx)
         _migrationRecoveryMap.clear();
         _abandonActiveMigrationsAndEnableManager(opCtx);
     });
-
-    auto distLockManager = Grid::get(opCtx)->catalogClient()->getDistLockManager();
 
     // Load the active migrations from the config.migrations collection.
     auto statusWithMigrationsQueryResponse =
@@ -235,9 +236,11 @@ void MigrationManager::startRecoveryAndAcquireDistLocks(OperationContext* opCtx)
             boost::none);
 
     if (!statusWithMigrationsQueryResponse.isOK()) {
-        log() << "Unable to read config.migrations collection documents for balancer migration"
-              << " recovery. Abandoning balancer recovery."
-              << causedBy(redact(statusWithMigrationsQueryResponse.getStatus()));
+        LOGV2(21896,
+              "Unable to read config.migrations collection documents for balancer migration "
+              "recovery. Abandoning balancer recovery: {error}",
+              "Unable to read config.migrations documents for balancer migration recovery",
+              "error"_attr = redact(statusWithMigrationsQueryResponse.getStatus()));
         return;
     }
 
@@ -247,9 +250,12 @@ void MigrationManager::startRecoveryAndAcquireDistLocks(OperationContext* opCtx)
             // The format of this migration document is incorrect. The balancer holds a distlock for
             // this migration, but without parsing the migration document we cannot identify which
             // distlock must be released. So we must release all distlocks.
-            log() << "Unable to parse config.migrations document '" << redact(migration.toString())
-                  << "' for balancer migration recovery. Abandoning balancer recovery."
-                  << causedBy(redact(statusWithMigrationType.getStatus()));
+            LOGV2(21897,
+                  "Unable to parse config.migrations document '{migration}' for balancer"
+                  "migration recovery. Abandoning balancer recovery: {error}",
+                  "Unable to parse config.migrations document for balancer migration recovery",
+                  "migration"_attr = redact(migration.toString()),
+                  "error"_attr = redact(statusWithMigrationType.getStatus()));
             return;
         }
         MigrationType migrateType = std::move(statusWithMigrationType.getValue());
@@ -260,17 +266,20 @@ void MigrationManager::startRecoveryAndAcquireDistLocks(OperationContext* opCtx)
             it = _migrationRecoveryMap.insert(std::make_pair(migrateType.getNss(), list)).first;
 
             // Reacquire the matching distributed lock for this namespace.
-            const std::string whyMessage(stream() << "Migrating chunk(s) in collection "
-                                                  << migrateType.getNss().ns());
+            const std::string whyMessage(str::stream() << "Migrating chunk(s) in collection "
+                                                       << migrateType.getNss().ns());
 
-            auto statusWithDistLockHandle = distLockManager->tryLockWithLocalWriteConcern(
-                opCtx, migrateType.getNss().ns(), whyMessage, _lockSessionID);
-            if (!statusWithDistLockHandle.isOK()) {
-                log() << "Failed to acquire distributed lock for collection '"
-                      << migrateType.getNss().ns()
-                      << "' during balancer recovery of an active migration. Abandoning"
-                      << " balancer recovery."
-                      << causedBy(redact(statusWithDistLockHandle.getStatus()));
+            auto status = DistLockManager::get(opCtx)->tryLockDirectWithLocalWriteConcern(
+                opCtx, migrateType.getNss().ns(), whyMessage);
+            if (!status.isOK()) {
+                LOGV2(21898,
+                      "Failed to acquire distributed lock for collection {namespace} "
+                      "during balancer recovery of an active migration. Abandoning balancer "
+                      "recovery: {error}",
+                      "Failed to acquire distributed lock for collection "
+                      "during balancer recovery of an active migration",
+                      "namespace"_attr = migrateType.getNss().ns(),
+                      "error"_attr = redact(status));
                 return;
             }
         }
@@ -285,7 +294,7 @@ void MigrationManager::finishRecovery(OperationContext* opCtx,
                                       uint64_t maxChunkSizeBytes,
                                       const MigrationSecondaryThrottleOptions& secondaryThrottle) {
     {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        stdx::lock_guard<Latch> lock(_mutex);
         if (_state == State::kStopping) {
             _migrationRecoveryMap.clear();
             return;
@@ -306,28 +315,30 @@ void MigrationManager::finishRecovery(OperationContext* opCtx,
     });
 
     // Schedule recovered migrations.
-    vector<ScopedMigrationRequest> scopedMigrationRequests;
-    vector<shared_ptr<Notification<RemoteCommandResponse>>> responses;
+    std::vector<ScopedMigrationRequest> scopedMigrationRequests;
+    std::vector<std::shared_ptr<Notification<RemoteCommandResponse>>> responses;
 
     for (auto& nssAndMigrateInfos : _migrationRecoveryMap) {
         auto& nss = nssAndMigrateInfos.first;
         auto& migrateInfos = nssAndMigrateInfos.second;
         invariant(!migrateInfos.empty());
 
-        auto routingInfoStatus =
-            Grid::get(opCtx)->catalogCache()->getShardedCollectionRoutingInfoWithRefresh(opCtx,
-                                                                                         nss);
-        if (!routingInfoStatus.isOK()) {
+        auto swCM = Grid::get(opCtx)->catalogCache()->getShardedCollectionRoutingInfoWithRefresh(
+            opCtx, nss);
+        if (!swCM.isOK()) {
             // This shouldn't happen because the collection was intact and sharded when the previous
             // config primary was active and the dist locks have been held by the balancer
             // throughout. Abort migration recovery.
-            log() << "Unable to reload chunk metadata for collection '" << nss
-                  << "' during balancer recovery. Abandoning recovery."
-                  << causedBy(redact(routingInfoStatus.getStatus()));
+            LOGV2(21899,
+                  "Unable to reload chunk metadata for collection {namespace} during balancer "
+                  "recovery. Abandoning recovery: {error}",
+                  "Unable to reload chunk metadata for collection during balancer recovery",
+                  "namespace"_attr = nss,
+                  "error"_attr = redact(swCM.getStatus()));
             return;
         }
 
-        auto& routingInfo = routingInfoStatus.getValue();
+        const auto& cm = swCM.getValue();
 
         int scheduledMigrations = 0;
 
@@ -337,12 +348,19 @@ void MigrationManager::finishRecovery(OperationContext* opCtx,
             auto waitForDelete = migrationType.getWaitForDelete();
             migrateInfos.pop_front();
 
-            const auto chunk =
-                routingInfo.cm()->findIntersectingChunkWithSimpleCollation(migrationInfo.minKey);
+            try {
+                const auto chunk =
+                    cm.findIntersectingChunkWithSimpleCollation(migrationInfo.minKey);
 
-            if (chunk.getShardId() != migrationInfo.from) {
-                // Chunk is no longer on the source shard specified by this migration. Erase the
-                // migration recovery document associated with it.
+                if (chunk.getShardId() != migrationInfo.from) {
+                    // Chunk is no longer on the source shard specified by this migration. Erase the
+                    // migration recovery document associated with it.
+                    ScopedMigrationRequest::createForRecovery(opCtx, nss, migrationInfo.minKey);
+                    continue;
+                }
+            } catch (const ExceptionFor<ErrorCodes::ShardKeyNotFound>&) {
+                // The shard key for the collection has changed.
+                // Abandon this migration and remove the document associated with it.
                 ScopedMigrationRequest::createForRecovery(opCtx, nss, migrationInfo.minKey);
                 continue;
             }
@@ -352,14 +370,17 @@ void MigrationManager::finishRecovery(OperationContext* opCtx,
 
             scheduledMigrations++;
 
-            responses.emplace_back(_schedule(
-                opCtx, migrationInfo, maxChunkSizeBytes, secondaryThrottle, waitForDelete));
+            responses.emplace_back(_schedule(opCtx,
+                                             migrationInfo,
+                                             maxChunkSizeBytes,
+                                             secondaryThrottle,
+                                             waitForDelete,
+                                             nullptr));
         }
 
         // If no migrations were scheduled for this namespace, free the dist lock
         if (!scheduledMigrations) {
-            Grid::get(opCtx)->catalogClient()->getDistLockManager()->unlock(
-                opCtx, _lockSessionID, nss.ns());
+            DistLockManager::get(opCtx)->unlock(opCtx, nss.ns());
         }
     }
 
@@ -367,7 +388,7 @@ void MigrationManager::finishRecovery(OperationContext* opCtx,
     scopedGuard.dismiss();
 
     {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        stdx::lock_guard<Latch> lock(_mutex);
         if (_state == State::kRecovering) {
             _state = State::kEnabled;
             _condVar.notify_all();
@@ -381,16 +402,15 @@ void MigrationManager::finishRecovery(OperationContext* opCtx,
 }
 
 void MigrationManager::interruptAndDisableMigrations() {
-    executor::TaskExecutor* const executor =
-        Grid::get(_serviceContext)->getExecutorPool()->getFixedExecutor();
+    auto executor = Grid::get(_serviceContext)->getExecutorPool()->getFixedExecutor();
 
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    stdx::lock_guard<Latch> lock(_mutex);
     invariant(_state == State::kEnabled || _state == State::kRecovering);
     _state = State::kStopping;
 
     // Interrupt any active migrations with dist lock
     for (auto& cmsEntry : _activeMigrations) {
-        auto& migrations = cmsEntry.second;
+        auto& migrations = cmsEntry.second.migrationsList;
 
         for (auto& migration : migrations) {
             if (migration.callbackHandle) {
@@ -403,7 +423,7 @@ void MigrationManager::interruptAndDisableMigrations() {
 }
 
 void MigrationManager::drainActiveMigrations() {
-    stdx::unique_lock<stdx::mutex> lock(_mutex);
+    stdx::unique_lock<Latch> lock(_mutex);
 
     if (_state == State::kStopped)
         return;
@@ -412,17 +432,18 @@ void MigrationManager::drainActiveMigrations() {
     _state = State::kStopped;
 }
 
-shared_ptr<Notification<RemoteCommandResponse>> MigrationManager::_schedule(
+std::shared_ptr<Notification<RemoteCommandResponse>> MigrationManager::_schedule(
     OperationContext* opCtx,
     const MigrateInfo& migrateInfo,
     uint64_t maxChunkSizeBytes,
     const MigrationSecondaryThrottleOptions& secondaryThrottle,
-    bool waitForDelete) {
+    bool waitForDelete,
+    ScopedMigrationRequestsMap* scopedMigrationRequests) {
     const NamespaceString& nss = migrateInfo.nss;
 
     // Ensure we are not stopped in order to avoid doing the extra work
     {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        stdx::lock_guard<Latch> lock(_mutex);
         if (_state != State::kEnabled && _state != State::kRecovering) {
             return std::make_shared<Notification<RemoteCommandResponse>>(
                 Status(ErrorCodes::BalancerInterrupted,
@@ -456,9 +477,18 @@ shared_ptr<Notification<RemoteCommandResponse>> MigrationManager::_schedule(
         ChunkRange(migrateInfo.minKey, migrateInfo.maxKey),
         maxChunkSizeBytes,
         secondaryThrottle,
-        waitForDelete);
+        waitForDelete,
+        migrateInfo.forceJumbo);
 
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    // Commands sent to shards that accept writeConcern, must always have writeConcern. So if the
+    // MoveChunkRequest didn't add writeConcern (from secondaryThrottle), then we add the implicit
+    // server default writeConcern.
+    if (!builder.hasField(WriteConcernOptions::kWriteConcernField)) {
+        builder.append(WriteConcernOptions::kWriteConcernField,
+                       WriteConcernOptions::kInternalWriteDefault);
+    }
+
+    stdx::lock_guard<Latch> lock(_mutex);
 
     if (_state != State::kEnabled && _state != State::kRecovering) {
         return std::make_shared<Notification<RemoteCommandResponse>>(
@@ -470,7 +500,13 @@ shared_ptr<Notification<RemoteCommandResponse>> MigrationManager::_schedule(
 
     auto retVal = migration.completionNotification;
 
-    _schedule(lock, opCtx, fromHostStatus.getValue(), std::move(migration));
+    _schedule(lock,
+              opCtx,
+              fromHostStatus.getValue(),
+              std::move(migration),
+              migrateInfo,
+              waitForDelete,
+              scopedMigrationRequests);
 
     return retVal;
 }
@@ -478,40 +514,64 @@ shared_ptr<Notification<RemoteCommandResponse>> MigrationManager::_schedule(
 void MigrationManager::_schedule(WithLock lock,
                                  OperationContext* opCtx,
                                  const HostAndPort& targetHost,
-                                 Migration migration) {
-    executor::TaskExecutor* const executor =
-        Grid::get(opCtx)->getExecutorPool()->getFixedExecutor();
+                                 Migration migration,
+                                 const MigrateInfo& migrateInfo,
+                                 bool waitForDelete,
+                                 ScopedMigrationRequestsMap* scopedMigrationRequests) {
+    auto executor = Grid::get(opCtx)->getExecutorPool()->getFixedExecutor();
 
     const NamespaceString nss(migration.nss);
 
     auto it = _activeMigrations.find(nss);
     if (it == _activeMigrations.end()) {
-        const std::string whyMessage(stream() << "Migrating chunk(s) in collection " << nss.ns());
+        const std::string whyMessage(str::stream()
+                                     << "Migrating chunk(s) in collection " << nss.ns());
+
+        // Acquire the local lock for this nss (blocking call)
+        auto scopedLock = DistLockManager::get(opCtx)->lockDirectLocally(
+            opCtx, nss.ns(), DistLockManager::kSingleLockAttemptTimeout);
 
         // Acquire the collection distributed lock (blocking call)
-        auto statusWithDistLockHandle =
-            Grid::get(opCtx)->catalogClient()->getDistLockManager()->lockWithSessionID(
-                opCtx,
-                nss.ns(),
-                whyMessage,
-                _lockSessionID,
-                DistLockManager::kSingleLockAttemptTimeout);
+        auto status = DistLockManager::get(opCtx)->lockDirect(
+            opCtx, nss.ns(), whyMessage, DistLockManager::kSingleLockAttemptTimeout);
 
-        if (!statusWithDistLockHandle.isOK()) {
-            migration.completionNotification->set(statusWithDistLockHandle.getStatus().withContext(
-                stream() << "Could not acquire collection lock for " << nss.ns()
-                         << " to migrate chunks"));
+        if (!status.isOK()) {
+            migration.completionNotification->set(
+                status.withContext(str::stream() << "Could not acquire collection lock for "
+                                                 << nss.ns() << " to migrate chunks"));
             return;
         }
 
-        it = _activeMigrations.insert(std::make_pair(nss, MigrationsList())).first;
+        MigrationsState migrationsState(std::move(scopedLock));
+        it = _activeMigrations.insert(std::make_pair(nss, std::move(migrationsState))).first;
     }
 
-    auto migrations = &it->second;
+    auto migrationRequestStatus = Status::OK();
+
+    if (scopedMigrationRequests) {
+        // Write a document to the config.migrations collection, in case this migration must be
+        // recovered by the Balancer.
+        auto statusWithScopedMigrationRequest =
+            ScopedMigrationRequest::writeMigration(opCtx, migrateInfo, waitForDelete);
+
+        if (!statusWithScopedMigrationRequest.isOK()) {
+            migrationRequestStatus = std::move(statusWithScopedMigrationRequest.getStatus());
+        } else {
+            scopedMigrationRequests->emplace(migrateInfo.getName(),
+                                             std::move(statusWithScopedMigrationRequest));
+        }
+    }
+
+    auto migrations = &it->second.migrationsList;
 
     // Add ourselves to the list of migrations on this collection
     migrations->push_front(std::move(migration));
     auto itMigration = migrations->begin();
+
+    if (!migrationRequestStatus.isOK()) {
+        _complete(lock, opCtx, itMigration, std::move(migrationRequestStatus));
+        return;
+    }
 
     const RemoteCommandRequest remoteRequest(
         targetHost, NamespaceString::kAdminDb.toString(), itMigration->moveChunkCmdObj, opCtx);
@@ -519,12 +579,12 @@ void MigrationManager::_schedule(WithLock lock,
     StatusWith<executor::TaskExecutor::CallbackHandle> callbackHandleWithStatus =
         executor->scheduleRemoteCommand(
             remoteRequest,
-            [ this, service = opCtx->getServiceContext(), itMigration ](
+            [this, service = opCtx->getServiceContext(), itMigration](
                 const executor::TaskExecutor::RemoteCommandCallbackArgs& args) {
                 ThreadClient tc(getThreadName(), service);
                 auto opCtx = cc().makeOperationContext();
 
-                stdx::lock_guard<stdx::mutex> lock(_mutex);
+                stdx::lock_guard<Latch> lock(_mutex);
                 _complete(lock, opCtx.get(), itMigration, args.response);
             });
 
@@ -550,12 +610,11 @@ void MigrationManager::_complete(WithLock lock,
     auto it = _activeMigrations.find(nss);
     invariant(it != _activeMigrations.end());
 
-    auto migrations = &it->second;
+    auto migrations = &it->second.migrationsList;
     migrations->erase(itMigration);
 
     if (migrations->empty()) {
-        Grid::get(opCtx)->catalogClient()->getDistLockManager()->unlock(
-            opCtx, _lockSessionID, nss.ns());
+        DistLockManager::get(opCtx)->unlock(opCtx, nss.ns());
         _activeMigrations.erase(it);
         _checkDrained(lock);
     }
@@ -575,28 +634,27 @@ void MigrationManager::_checkDrained(WithLock) {
 }
 
 void MigrationManager::_waitForRecovery() {
-    stdx::unique_lock<stdx::mutex> lock(_mutex);
+    stdx::unique_lock<Latch> lock(_mutex);
     _condVar.wait(lock, [this] { return _state != State::kRecovering; });
 }
 
 void MigrationManager::_abandonActiveMigrationsAndEnableManager(OperationContext* opCtx) {
-    stdx::unique_lock<stdx::mutex> lock(_mutex);
+    stdx::unique_lock<Latch> lock(_mutex);
     if (_state == State::kStopping) {
         // The balancer was interrupted. Let the next balancer recover the state.
         return;
     }
     invariant(_state == State::kRecovering);
 
-    auto catalogClient = Grid::get(opCtx)->catalogClient();
-
     // Unlock all balancer distlocks we aren't using anymore.
-    auto distLockManager = catalogClient->getDistLockManager();
-    distLockManager->unlockAll(opCtx, distLockManager->getProcessID());
+    DistLockManager::get(opCtx)->unlockAll(opCtx);
 
     // Clear the config.migrations collection so that those chunks can be scheduled for migration
     // again.
-    catalogClient
-        ->removeConfigDocuments(opCtx, MigrationType::ConfigNS, BSONObj(), kMajorityWriteConcern)
+    Grid::get(opCtx)
+        ->catalogClient()
+        ->removeConfigDocuments(
+            opCtx, MigrationType::ConfigNS, BSONObj(), ShardingCatalogClient::kLocalWriteConcern)
         .transitional_ignore();
 
     _state = State::kEnabled;
@@ -607,7 +665,7 @@ Status MigrationManager::_processRemoteCommandResponse(
     const RemoteCommandResponse& remoteCommandResponse,
     ScopedMigrationRequest* scopedMigrationRequest) {
 
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    stdx::lock_guard<Latch> lock(_mutex);
     Status commandStatus(ErrorCodes::InternalError, "Uninitialized value.");
 
     // Check for local errors sending the remote command caused by stepdown.
@@ -615,9 +673,8 @@ Status MigrationManager::_processRemoteCommandResponse(
                                    _state != State::kEnabled && _state != State::kRecovering)) {
         scopedMigrationRequest->keepDocumentOnDestruct();
         return {ErrorCodes::BalancerInterrupted,
-                stream() << "Migration interrupted because the balancer is stopping."
-                         << " Command status: "
-                         << remoteCommandResponse.status.toString()};
+                str::stream() << "Migration interrupted because the balancer is stopping."
+                              << " Command status: " << remoteCommandResponse.status.toString()};
     }
 
     if (!remoteCommandResponse.isOK()) {
@@ -629,8 +686,8 @@ Status MigrationManager::_processRemoteCommandResponse(
 
     if (!Shard::shouldErrorBePropagated(commandStatus.code())) {
         commandStatus = {ErrorCodes::OperationFailed,
-                         stream() << "moveChunk command failed on source shard."
-                                  << causedBy(commandStatus)};
+                         str::stream() << "moveChunk command failed on source shard."
+                                       << causedBy(commandStatus)};
     }
 
     // Any failure to remove the migration document should be because the config server is
@@ -641,10 +698,10 @@ Status MigrationManager::_processRemoteCommandResponse(
     if (!status.isOK()) {
         commandStatus = {
             ErrorCodes::BalancerInterrupted,
-            stream() << "Migration interrupted because the balancer is stopping"
-                     << " and failed to remove the config.migrations document."
-                     << " Command status: "
-                     << (commandStatus.isOK() ? status.toString() : commandStatus.toString())};
+            str::stream() << "Migration interrupted because the balancer is stopping"
+                          << " and failed to remove the config.migrations document."
+                          << " Command status: "
+                          << (commandStatus.isOK() ? status.toString() : commandStatus.toString())};
     }
 
     return commandStatus;
@@ -658,5 +715,8 @@ MigrationManager::Migration::Migration(NamespaceString inNss, BSONObj inMoveChun
 MigrationManager::Migration::~Migration() {
     invariant(completionNotification);
 }
+
+MigrationManager::MigrationsState::MigrationsState(DistLockManager::ScopedLock lock)
+    : lock(std::move(lock)) {}
 
 }  // namespace mongo

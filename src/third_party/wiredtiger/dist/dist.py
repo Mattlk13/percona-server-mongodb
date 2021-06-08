@@ -1,11 +1,11 @@
 from __future__ import print_function
-import filecmp, fnmatch, glob, os, re, shutil
+import filecmp, fnmatch, glob, os, re, shutil, subprocess
 
 # source_files --
 #    Return a list of the WiredTiger source file names.
 def source_files():
     file_re = re.compile(r'^\w')
-    for line in glob.iglob('../src/include/*.[hi]'):
+    for line in glob.iglob('../src/include/*.h'):
         yield line
     for line in open('filelist', 'r'):
         if file_re.match(line):
@@ -18,13 +18,17 @@ def source_files():
 #       Return list of all WiredTiger C source file names.
 def all_c_files():
     file_re = re.compile(r'^\w')
-    for line in glob.iglob('../src/*/*.[ci]'):
+    for line in glob.iglob('../src/*/*.c'):
+        yield line
+    for line in glob.iglob('../src/*/*_inline.h'):
         yield line
     files = list()
     for (dirpath, dirnames, filenames) in os.walk('../test'):
         files += [os.path.join(dirpath, file) for file in filenames]
     for file in files:
-        if fnmatch.fnmatch(file, '*.[ci]'):
+        if fnmatch.fnmatch(file, '*.c'):
+            yield file
+        if fnmatch.fnmatch(file, '*_inline.h'):
             yield file
 
 # all_h_files --
@@ -60,3 +64,9 @@ def compare_srcfile(tmp, src):
         print(('Updating ' + src))
         shutil.copyfile(tmp, src)
     os.remove(tmp)
+
+# format_srcfile --
+#    Format a source file.
+def format_srcfile(src):
+    src = os.path.abspath(src)
+    subprocess.check_call(['./s_clang-format', src])

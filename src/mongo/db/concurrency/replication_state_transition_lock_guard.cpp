@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/platform/basic.h"
 
@@ -48,12 +48,6 @@ ReplicationStateTransitionLockGuard::ReplicationStateTransitionLockGuard(Operati
                                                                          EnqueueOnly)
     : _opCtx(opCtx), _mode(mode) {
     _enqueueLock();
-}
-
-ReplicationStateTransitionLockGuard::ReplicationStateTransitionLockGuard(
-    ReplicationStateTransitionLockGuard&& other)
-    : _opCtx(other._opCtx), _result(other._result) {
-    other._result = LOCK_INVALID;
 }
 
 ReplicationStateTransitionLockGuard::~ReplicationStateTransitionLockGuard() {

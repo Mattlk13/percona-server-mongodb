@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kFTDC
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kFTDC
 
 
 #include "mongo/platform/basic.h"
@@ -35,11 +35,9 @@
 #include "mongo/db/free_mon/free_mon_options.h"
 
 #include "mongo/base/error_codes.h"
-#include "mongo/base/initializer_context.h"
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
-#include "mongo/util/log.h"
 #include "mongo/util/options_parser/startup_option_init.h"
 #include "mongo/util/options_parser/startup_options.h"
 
@@ -93,8 +91,8 @@ Status storeFreeMonitoringOptions(const moe::Environment& params) {
     return Status::OK();
 }
 
-MONGO_STARTUP_OPTIONS_STORE(FreeMonitoringOptions)(InitializerContext* /*unused*/) {
-    return storeFreeMonitoringOptions(moe::startupOptionsParsed);
+MONGO_STARTUP_OPTIONS_STORE(FreeMonitoringOptions)(InitializerContext*) {
+    uassertStatusOK(storeFreeMonitoringOptions(moe::startupOptionsParsed));
 }
 
 }  // namespace

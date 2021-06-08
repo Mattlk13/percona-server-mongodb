@@ -37,9 +37,10 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/cursor_id.h"
 #include "mongo/executor/task_executor.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/s/query/async_results_merger_params_gen.h"
 #include "mongo/s/query/cluster_query_result.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/stdx/future.h"
 #include "mongo/util/concurrency/with_lock.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/time_support.h"
@@ -98,7 +99,7 @@ public:
      * with a new, valid OperationContext before the next use.
      */
     AsyncResultsMerger(OperationContext* opCtx,
-                       executor::TaskExecutor* executor,
+                       std::shared_ptr<executor::TaskExecutor> executor,
                        AsyncResultsMergerParams params);
 
     /**
@@ -210,9 +211,16 @@ public:
      */
     void addNewShardCursors(std::vector<RemoteCursor>&& newCursors);
 
-    std::size_t getNumRemotes() const {
-        return _remotes.size();
-    }
+    /**
+     * Returns true if the cursor was opened with 'allowPartialResults:true' and results are not
+     * available from one or more shards.
+     */
+    bool partialResultsReturned() const;
+
+    /**
+     * Returns the number of remotes involved in this operation.
+     */
+    std::size_t getNumRemotes() const;
 
     /**
      * For sorted tailable cursors, returns the most recent available sort key. This guarantees that
@@ -224,14 +232,11 @@ public:
 
     /**
      * Starts shutting down this ARM by canceling all pending requests and scheduling killCursors
-     * on all of the unexhausted remotes. Returns a handle to an event that is signaled when this
-     * ARM is safe to destroy.
+     * on all of the unexhausted remotes. Returns a 'future' that is signaled when this ARM is safe
+     * to destroy.
      *
-     * If there are no pending requests, schedules killCursors and signals the event immediately.
+     * If there are no pending requests, schedules killCursors and signals the future immediately.
      * Otherwise, the last callback that runs after kill() is called signals the event.
-     *
-     * Returns an invalid handle if the underlying task executor is shutting down. In this case,
-     * killing is considered complete and the ARM may be destroyed immediately.
      *
      * May be called multiple times (idempotent).
      *
@@ -239,7 +244,7 @@ public:
      * currently attached. This is so that a killing thread may call this method with its own
      * operation context.
      */
-    executor::TaskExecutor::EventHandle kill(OperationContext* opCtx);
+    stdx::shared_future<void> kill(OperationContext* opCtx);
 
 private:
     /**
@@ -250,7 +255,8 @@ private:
     struct RemoteCursorData {
         RemoteCursorData(HostAndPort hostAndPort,
                          NamespaceString cursorNss,
-                         CursorId establishedCursorId);
+                         CursorId establishedCursorId,
+                         bool partialResultsReturned);
 
         /**
          * Returns the resolved host and port on which the remote cursor resides.
@@ -274,6 +280,9 @@ private:
         // result with a sort key lower than this.
         boost::optional<BSONObj> promisedMinSortKey;
 
+        // True if this remote is eligible to provide a high water mark sort key; false otherwise.
+        bool eligibleForHighWaterMark = false;
+
         // The cursor id for the remote cursor. If a remote cursor is not yet exhausted, this member
         // will be set to a valid non-zero cursor id. If a remote cursor is now exhausted, this
         // member will be set to zero.
@@ -283,11 +292,16 @@ private:
         // the operation if there is a view.
         NamespaceString cursorNss;
 
-        // The exact host in the shard on which the cursor resides.
+        // The exact host in the shard on which the cursor resides. Can be empty if this merger has
+        // 'allowPartialResults' set to true and initial cursor establishment failed on this shard.
         HostAndPort shardHostAndPort;
 
         // The identity of the shard which the cursor belongs to.
         ShardId shardId;
+
+        // This flag is set if the connection to the remote shard was lost, or never established in
+        // the first place. Only applicable if the 'allowPartialResults' option is enabled.
+        bool partialResultsReturned = false;
 
         // The buffer of results that have been retrieved but not yet returned to the caller.
         std::queue<ClusterQueryResult> docBuffer;
@@ -302,6 +316,9 @@ private:
         // Count of fetched docs during ARM processing of the current batch. Used to reduce the
         // batchSize in getMore when mongod returned less docs than the requested batchSize.
         long long fetchedCount = 0;
+
+        // If set to 'true', the cursor on this shard has been invalidated.
+        bool invalidated = false;
     };
 
     class MergingComparator {
@@ -425,10 +442,16 @@ private:
     bool _haveOutstandingBatchRequests(WithLock);
 
     /**
-     * If a promisedMinSortKey has been obtained from all remotes, returns the lowest such key.
-     * Otherwise, returns an empty BSONObj.
+     * Called internally when attempting to get a new event for the caller to wait on. Throws if
+     * the shard cursor from which the next result is due has already been invalidated.
      */
-    BSONObj _getMinPromisedSortKey(WithLock);
+    void _assertNotInvalidated(WithLock);
+
+    /**
+     * If a promisedMinSortKey has been received from all remotes, returns the lowest such key.
+     * Otherwise, returns boost::none.
+     */
+    boost::optional<MinSortKeyRemoteIdPair> _getMinPromisedSortKey(WithLock);
 
     /**
      * Schedules a getMore on any remote hosts which we need another batch from.
@@ -445,13 +468,27 @@ private:
      */
     void _updateRemoteMetadata(WithLock, size_t remoteIndex, const CursorResponse& response);
 
+    /**
+     * Returns true if the given batch is eligible to provide a high water mark resume token for the
+     * stream, false otherwise.
+     */
+    bool _checkHighWaterMarkEligibility(WithLock,
+                                        BSONObj newMinSortKey,
+                                        const RemoteCursorData& remote,
+                                        const CursorResponse& response);
+
+    /**
+     * Sets the initial value of the high water mark sort key, if applicable.
+     */
+    void _setInitialHighWaterMark();
+
     OperationContext* _opCtx;
-    executor::TaskExecutor* _executor;
+    std::shared_ptr<executor::TaskExecutor> _executor;
     TailableModeEnum _tailableMode;
     AsyncResultsMergerParams _params;
 
     // Must be acquired before accessing any data members (other than _params, which is read-only).
-    mutable stdx::mutex _mutex;
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("AsyncResultsMerger::_mutex");
 
     // Data tracking the state of our communication with each of the remote nodes.
     std::vector<RemoteCursorData> _remotes;
@@ -487,9 +524,28 @@ private:
 
     LifecycleState _lifecycleState = kAlive;
 
-    // Signaled when all outstanding batch request callbacks have run after kill() has been
-    // called. This means that the ARM is safe to delete.
-    executor::TaskExecutor::EventHandle _killCompleteEvent;
+    // Handles the promise/future mechanism used to cleanly shut down the ARM. This avoids race
+    // conditions in cases where the underlying TaskExecutor is simultaneously being torn down.
+    struct KillCompletePromiseFuture {
+        KillCompletePromiseFuture() : _future(_promise.get_future()){};
+
+        // Multiple calls to kill() can be made and each must return a future that will be notified
+        // when the ARM has been cleaned up.
+        stdx::shared_future<void> getFuture() {
+            return _future;
+        }
+
+        // Called by the ARM when all outstanding requests have run. Notifies all threads waiting on
+        // shared futures that the ARM has been cleaned up.
+        void signalFutures() {
+            _promise.set_value();
+        }
+
+    private:
+        stdx::promise<void> _promise;
+        stdx::shared_future<void> _future;
+    };
+    boost::optional<KillCompletePromiseFuture> _killCompleteInfo;
 };
 
 }  // namespace mongo

@@ -36,8 +36,8 @@
 
 namespace mongo {
 
-using std::vector;
 using std::string;
+using std::vector;
 
 namespace {
 
@@ -52,13 +52,21 @@ StringData safeFirstPart(const FieldRef* fieldRef) {
         return fieldRef->getPart(0);
     }
 }
-}
+}  // namespace
 
 bool FieldRefSet::FieldRefPtrLessThan::operator()(const FieldRef* l, const FieldRef* r) const {
     return *l < *r;
 }
 
 FieldRefSet::FieldRefSet() {}
+
+FieldRefSet::FieldRefSet(const std::vector<std::unique_ptr<FieldRef>>& paths) {
+    fillFrom(paths);
+}
+
+FieldRefSet::FieldRefSet(const vector<const FieldRef*>& paths) {
+    _fieldSet.insert(paths.begin(), paths.end());
+}
 
 FieldRefSet::FieldRefSet(const vector<FieldRef*>& paths) {
     fillFrom(paths);
@@ -105,6 +113,19 @@ void FieldRefSet::fillFrom(const std::vector<FieldRef*>& fields) {
     _fieldSet.insert(fields.begin(), fields.end());
 }
 
+void FieldRefSet::fillFrom(const std::vector<std::unique_ptr<FieldRef>>& fields) {
+    dassert(_fieldSet.empty());
+    std::transform(fields.begin(),
+                   fields.end(),
+                   std::inserter(_fieldSet, _fieldSet.begin()),
+                   [](const auto& field) { return field.get(); });
+}
+
+bool FieldRefSet::insertNoConflict(const FieldRef* toInsert) {
+    const FieldRef* conflict;
+    return insert(toInsert, &conflict);
+}
+
 bool FieldRefSet::insert(const FieldRef* toInsert, const FieldRef** conflict) {
     // We can determine if two fields conflict by checking their common prefix.
     //
@@ -139,7 +160,7 @@ bool FieldRefSet::insert(const FieldRef* toInsert, const FieldRef** conflict) {
     }
 
     _fieldSet.insert(it, toInsert);
-    *conflict = NULL;
+    *conflict = nullptr;
     return true;
 }
 

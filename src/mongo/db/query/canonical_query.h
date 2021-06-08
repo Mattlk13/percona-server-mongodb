@@ -31,13 +31,15 @@
 
 
 #include "mongo/base/status.h"
-#include "mongo/db/dbmessage.h"
+#include "mongo/db/cst/c_node.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/extensions_callback_noop.h"
 #include "mongo/db/query/collation/collator_interface.h"
-#include "mongo/db/query/parsed_projection.h"
-#include "mongo/db/query/query_request.h"
+#include "mongo/db/query/projection.h"
+#include "mongo/db/query/projection_policies.h"
+#include "mongo/db/query/query_request_helper.h"
+#include "mongo/db/query/sort_pattern.h"
 
 namespace mongo {
 
@@ -75,11 +77,14 @@ public:
      */
     static StatusWith<std::unique_ptr<CanonicalQuery>> canonicalize(
         OperationContext* opCtx,
-        std::unique_ptr<QueryRequest> qr,
+        std::unique_ptr<FindCommandRequest> findCommand,
+        bool explain = false,
         const boost::intrusive_ptr<ExpressionContext>& expCtx = nullptr,
         const ExtensionsCallback& extensionsCallback = ExtensionsCallbackNoop(),
         MatchExpressionParser::AllowedFeatureSet allowedFeatures =
-            MatchExpressionParser::kDefaultSpecialFeatures);
+            MatchExpressionParser::kDefaultSpecialFeatures,
+        const ProjectionPolicies& projectionPolicies =
+            ProjectionPolicies::findProjectionPolicies());
 
     /**
      * For testing or for internal clients to use.
@@ -101,11 +106,26 @@ public:
      */
     static bool isSimpleIdQuery(const BSONObj& query);
 
-    const NamespaceString& nss() const {
-        return _qr->nss();
+    /**
+     * Validates the match expression 'root' as well as the query specified by 'request', checking
+     * for illegal combinations of operators. Returns a non-OK status if any such illegal
+     * combination is found.
+     *
+     * On success, returns a bitset indicating which types of metadata are *unavailable*. For
+     * example, if 'root' does not contain a $text predicate, then the returned metadata bitset will
+     * indicate that text score metadata is unavailable. This means that if subsequent
+     * $meta:"textScore" expressions are found during analysis of the query, we should raise in an
+     * error.
+     */
+    static StatusWith<QueryMetadataBitSet> isValid(MatchExpression* root,
+                                                   const FindCommandRequest& findCommand);
+
+    const NamespaceString nss() const {
+        invariant(_findCommand->getNamespaceOrUUID().nss());
+        return *_findCommand->getNamespaceOrUUID().nss();
     }
-    const std::string& ns() const {
-        return _qr->nss().ns();
+    const std::string ns() const {
+        return nss().ns();
     }
 
     //
@@ -114,17 +134,44 @@ public:
     MatchExpression* root() const {
         return _root.get();
     }
-    BSONObj getQueryObj() const {
-        return _qr->getFilter();
+    const BSONObj& getQueryObj() const {
+        return _findCommand->getFilter();
     }
-    const QueryRequest& getQueryRequest() const {
-        return *_qr;
+    const FindCommandRequest& getFindCommandRequest() const {
+        return *_findCommand;
     }
-    const ParsedProjection* getProj() const {
-        return _proj.get();
+
+    /**
+     * Returns the projection, or nullptr if none.
+     */
+    const projection_ast::Projection* getProj() const {
+        return _proj.get_ptr();
     }
+
+    projection_ast::Projection* getProj() {
+        return _proj.get_ptr();
+    }
+
+    const boost::optional<SortPattern>& getSortPattern() const {
+        return _sortPattern;
+    }
+
     const CollatorInterface* getCollator() const {
-        return _collator.get();
+        return _expCtx->getCollator();
+    }
+
+    /**
+     * Returns a bitset indicating what metadata has been requested in the query.
+     */
+    const QueryMetadataBitSet& metadataDeps() const {
+        return _metadataDeps;
+    }
+
+    /**
+     * Allows callers to request metadata in addition to that needed as part of the query.
+     */
+    void requestAdditionalMetadata(const QueryMetadataBitSet& additionalDeps) {
+        _metadataDeps |= additionalDeps;
     }
 
     /**
@@ -147,23 +194,6 @@ public:
     std::string toStringShort() const;
 
     /**
-     * Validates match expression, checking for certain
-     * combinations of operators in match expression and
-     * query options in QueryRequest.
-     * Since 'root' is derived from 'filter' in QueryRequest,
-     * 'filter' is not validated.
-     *
-     * TODO: Move this to query_validator.cpp
-     */
-    static Status isValid(MatchExpression* root, const QueryRequest& parsed);
-
-    /**
-     * Traverses expression tree post-order.
-     * Sorts children at each non-leaf node by (MatchType, path(), children, number of children)
-     */
-    static void sortTree(MatchExpression* tree);
-
-    /**
      * Returns a count of 'type' nodes in expression tree.
      */
     static size_t countNodes(const MatchExpression* root, MatchExpression::MatchType type);
@@ -181,29 +211,66 @@ public:
         return _canHaveNoopMatchNodes;
     }
 
+    /**
+     * Return options as a bit vector.
+     */
+    int getOptions() const;
+
+    bool getExplain() const {
+        return _explain;
+    }
+
+    bool getForceClassicEngine() const {
+        return _forceClassicEngine;
+    }
+
+    void setExplain(bool explain) {
+        _explain = explain;
+    }
+
+    auto& getExpCtx() const {
+        return _expCtx;
+    }
+    auto getExpCtxRaw() const {
+        return _expCtx.get();
+    }
+
 private:
     // You must go through canonicalize to create a CanonicalQuery.
     CanonicalQuery() {}
 
     Status init(OperationContext* opCtx,
                 boost::intrusive_ptr<ExpressionContext> expCtx,
-                std::unique_ptr<QueryRequest> qr,
+                std::unique_ptr<FindCommandRequest> findCommand,
                 bool canHaveNoopMatchNodes,
                 std::unique_ptr<MatchExpression> root,
-                std::unique_ptr<CollatorInterface> collator);
+                const ProjectionPolicies& projectionPolicies);
+
+    // Initializes '_sortPattern', adding any metadata dependencies implied by the sort.
+    //
+    // Throws a UserException if the sort is illegal, or if any metadata type in
+    // 'unavailableMetadata' is required.
+    void initSortPattern(QueryMetadataBitSet unavailableMetadata);
 
     boost::intrusive_ptr<ExpressionContext> _expCtx;
 
-    std::unique_ptr<QueryRequest> _qr;
+    std::unique_ptr<FindCommandRequest> _findCommand;
 
-    // _root points into _qr->getFilter()
     std::unique_ptr<MatchExpression> _root;
 
-    std::unique_ptr<ParsedProjection> _proj;
+    boost::optional<projection_ast::Projection> _proj;
 
-    std::unique_ptr<CollatorInterface> _collator;
+    boost::optional<SortPattern> _sortPattern;
+
+    // Keeps track of what metadata has been explicitly requested.
+    QueryMetadataBitSet _metadataDeps;
 
     bool _canHaveNoopMatchNodes = false;
+
+    bool _explain = false;
+
+    // Determines whether the classic engine must be used.
+    bool _forceClassicEngine = false;
 };
 
 }  // namespace mongo

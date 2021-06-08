@@ -58,9 +58,10 @@ public:
 
 protected:
     static constexpr int _key_len{32};
-    unsigned char _masterkey[_key_len];
     const EVP_CIPHER *_cipher{nullptr};
-    int _iv_len;
+    int _iv_len = 0;
+
+    const unsigned char* dbKey(boost::optional<std::string> dbName, unsigned char* buf);
 };
 
 class WiredTigerEncryptionHooksCBC: public WiredTigerEncryptionHooks
@@ -72,14 +73,22 @@ public:
     /**
      * Transform temp data to non-readable form before writing it to disk.
      */
-    virtual Status protectTmpData(
-        const uint8_t* in, size_t inLen, uint8_t* out, size_t outLen, size_t* resultLen) override;
+    virtual Status protectTmpData(const uint8_t* in,
+                                  size_t inLen,
+                                  uint8_t* out,
+                                  size_t outLen,
+                                  size_t* resultLen,
+                                  boost::optional<std::string> dbName) override;
 
     /**
      * Tranforms temp data back to readable form, after reading from disk.
      */
-    virtual Status unprotectTmpData(
-        const uint8_t* in, size_t inLen, uint8_t* out, size_t outLen, size_t* resultLen) override;
+    virtual Status unprotectTmpData(const uint8_t* in,
+                                    size_t inLen,
+                                    uint8_t* out,
+                                    size_t outLen,
+                                    size_t* resultLen,
+                                    boost::optional<std::string> dbName) override;
 
     /**
      * Returns the maximum size addition when doing transforming temp data.
@@ -110,14 +119,22 @@ public:
     /**
      * Transform temp data to non-readable form before writing it to disk.
      */
-    virtual Status protectTmpData(
-        const uint8_t* in, size_t inLen, uint8_t* out, size_t outLen, size_t* resultLen) override;
+    virtual Status protectTmpData(const uint8_t* in,
+                                  size_t inLen,
+                                  uint8_t* out,
+                                  size_t outLen,
+                                  size_t* resultLen,
+                                  boost::optional<std::string> dbName) override;
 
     /**
      * Tranforms temp data back to readable form, after reading from disk.
      */
-    virtual Status unprotectTmpData(
-        const uint8_t* in, size_t inLen, uint8_t* out, size_t outLen, size_t* resultLen) override;
+    virtual Status unprotectTmpData(const uint8_t* in,
+                                    size_t inLen,
+                                    uint8_t* out,
+                                    size_t outLen,
+                                    size_t* resultLen,
+                                    boost::optional<std::string> dbName) override;
 
     /**
      * Returns the maximum size addition when doing transforming temp data.

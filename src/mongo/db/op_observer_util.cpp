@@ -42,21 +42,24 @@ namespace mongo {
  */
 BSONObj makeCollModCmdObj(const BSONObj& collModCmd,
                           const CollectionOptions& oldCollOptions,
-                          boost::optional<TTLCollModInfo> ttlInfo) {
+                          boost::optional<IndexCollModInfo> indexInfo) {
     BSONObjBuilder cmdObjBuilder;
-    std::string ttlIndexFieldName = "index";
+    std::string indexFieldName = "index";
 
     // Add all fields from the original collMod command.
     for (auto elem : collModCmd) {
         // We normalize all TTL collMod oplog entry objects to use the index name, even if the
         // command used an index key pattern.
-        if (elem.fieldNameStringData() == ttlIndexFieldName && ttlInfo) {
-            BSONObjBuilder ttlIndexObjBuilder;
-            ttlIndexObjBuilder.append("name", ttlInfo->indexName);
-            ttlIndexObjBuilder.append("expireAfterSeconds",
-                                      durationCount<Seconds>(ttlInfo->expireAfterSeconds));
+        if (elem.fieldNameStringData() == indexFieldName && indexInfo) {
+            BSONObjBuilder indexObjBuilder;
+            indexObjBuilder.append("name", indexInfo->indexName);
+            if (indexInfo->expireAfterSeconds)
+                indexObjBuilder.append("expireAfterSeconds",
+                                       durationCount<Seconds>(indexInfo->expireAfterSeconds.get()));
+            if (indexInfo->hidden)
+                indexObjBuilder.append("hidden", indexInfo->hidden.get());
 
-            cmdObjBuilder.append(ttlIndexFieldName, ttlIndexObjBuilder.obj());
+            cmdObjBuilder.append(indexFieldName, indexObjBuilder.obj());
         } else {
             cmdObjBuilder.append(elem);
         }
@@ -65,28 +68,4 @@ BSONObj makeCollModCmdObj(const BSONObj& collModCmd,
     return cmdObjBuilder.obj();
 }
 
-BSONObj makeCreateCollCmdObj(const NamespaceString& collectionName,
-                             const CollectionOptions& options,
-                             const BSONObj& idIndex) {
-    BSONObjBuilder b;
-    b.append("create", collectionName.coll().toString());
-    {
-        // Don't store the UUID as part of the options, but instead only at the top level
-        CollectionOptions optionsToStore = options;
-        optionsToStore.uuid.reset();
-        b.appendElements(optionsToStore.toBSON());
-    }
-
-    // Include the full _id index spec in the oplog for index versions >= 2.
-    if (!idIndex.isEmpty()) {
-        auto versionElem = idIndex[IndexDescriptor::kIndexVersionFieldName];
-        invariant(versionElem.isNumber());
-        if (IndexDescriptor::IndexVersion::kV2 <=
-            static_cast<IndexDescriptor::IndexVersion>(versionElem.numberInt())) {
-            b.append("idIndex", idIndex);
-        }
-    }
-
-    return b.obj();
-}
 }  // namespace mongo

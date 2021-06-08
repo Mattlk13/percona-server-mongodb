@@ -35,8 +35,10 @@ imports:
 commands:
     distinct:
         description: "Parser for the 'distinct' command."
-        cpp_name: DistinctCommand
+        command_name: distinct
+        cpp_name: DistinctCommandRequest
         namespace: concatenate_with_db_or_uuid
+        api_version: ""
         strict: true
         fields:
             key:
@@ -50,8 +52,4 @@ commands:
             collation:
                 description: "Optional collation for the command."
                 type: object
-                optional: true
-            comment:
-                description: "Optional comment."
-                type: string
                 optional: true

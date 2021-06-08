@@ -6,11 +6,6 @@ selector:
   exclude_files:
   # Linearizable read concern is not supported for transactions.
   - jstests/core/txns/**/*.js
-  # These tests are not expected to pass with replica-sets:
-  - jstests/core/dbadmin.js
-  - jstests/core/opcounters_write_cmd.js
-  - jstests/core/read_after_optime.js
-  - jstests/core/capped_update.js
   # These tests use benchRun(), which isn't configured to use the overridden writeConcern.
   - jstests/core/bench_test*.js
   - jstests/core/benchrun_pipeline_updates.js # benchRun() used for writes
@@ -20,9 +15,6 @@ selector:
   # The NoOp write from linearizable getMores will cause awaitdata_getmore_cmd.js to loop
   # indefinitely as it tails the oplog.
   - jstests/core/awaitdata_getmore_cmd.js
-  # This test uses a very short timeout for a read that becomes unreliable with read concern
-  # linearizable.
-  - jstests/core/max_time_ms.js
   exclude_with_any_tags:
   ##
   # The next three tags correspond to the special errors thrown by the
@@ -34,6 +26,7 @@ selector:
   - assumes_read_concern_unchanged
   # "Cowardly refusing to override write concern of command: ..."
   - assumes_write_concern_unchanged
+  - assumes_standalone_mongod
 
 executor:
   archive:

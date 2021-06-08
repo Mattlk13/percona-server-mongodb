@@ -99,7 +99,7 @@ private:
     void _clearMovePrimary();
 
     // Protects the state below
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH("ActiveMovePrimariesRegistry::_mutex");
 
     // If there is an active movePrimary operation going on, this field contains the request that
     // initiated it.
@@ -159,4 +159,4 @@ private:
     // This is the future, which will be signaled at the end of a movePrimary command.
     std::shared_ptr<Notification<Status>> _completionNotification;
 };
-}
+}  // namespace mongo

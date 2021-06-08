@@ -27,13 +27,19 @@
  *    it in the license file.
  */
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kFTDC
+
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/timeseries/bucket_catalog.h"
+#include "mongo/db/views/view_catalog.h"
+#include "mongo/logv2/log.h"
 
 #include "mongo/db/stats/storage_stats.h"
 
@@ -41,52 +47,83 @@ namespace mongo {
 
 Status appendCollectionStorageStats(OperationContext* opCtx,
                                     const NamespaceString& nss,
-                                    const BSONObj& param,
+                                    const StorageStatsSpec& storageStatsSpec,
                                     BSONObjBuilder* result) {
-    int scale = 1;
-    if (param["scale"].isNumber()) {
-        scale = param["scale"].numberInt();
-        if (scale < 1) {
-            return {ErrorCodes::BadValue, "scale has to be >= 1"};
+    auto scale = storageStatsSpec.getScale().value_or(1);
+    bool verbose = storageStatsSpec.getVerbose();
+    bool waitForLock = storageStatsSpec.getWaitForLock();
+
+    bool isTimeseries = false;
+    if (auto viewCatalog = DatabaseHolder::get(opCtx)->getViewCatalog(opCtx, nss.db())) {
+        if (auto viewDef = viewCatalog->lookupWithoutValidatingDurableViews(opCtx, nss.ns())) {
+            isTimeseries = viewDef->timeseries();
         }
-    } else if (param["scale"].trueValue()) {
-        return {ErrorCodes::BadValue, "scale has to be a number >= 1"};
     }
 
-    bool verbose = param["verbose"].trueValue();
+    boost::optional<AutoGetCollectionForReadCommand> autoColl;
+    try {
+        autoColl.emplace(opCtx,
+                         isTimeseries ? nss.makeTimeseriesBucketsNamespace() : nss,
+                         AutoGetCollectionViewMode::kViewsForbidden,
+                         waitForLock ? Date_t::max() : Date_t::now());
+    } catch (const ExceptionForCat<ErrorCategory::Interruption>&) {
+        LOGV2_DEBUG(3088801, 2, "Failed to retrieve storage statistics", logAttrs(nss));
+        return Status::OK();
+    }
 
-    AutoGetCollectionForReadCommand ctx(opCtx, nss);
-    Collection* collection = ctx.getCollection();  // Will be set if present
-    if (!ctx.getDb() || !collection) {
+    const auto& collection = autoColl->getCollection();  // Will be set if present
+    if (!autoColl->getDb() || !collection) {
         result->appendNumber("size", 0);
         result->appendNumber("count", 0);
         result->appendNumber("storageSize", 0);
+        result->append("totalSize", 0);
         result->append("nindexes", 0);
         result->appendNumber("totalIndexSize", 0);
         result->append("indexDetails", BSONObj());
         result->append("indexSizes", BSONObj());
         result->append("scaleFactor", scale);
-        std::string errmsg = !(ctx.getDb()) ? "Database [" + nss.db().toString() + "] not found."
-                                            : "Collection [" + nss.toString() + "] not found.";
+        std::string errmsg = !autoColl->getDb()
+            ? "Database [" + nss.db().toString() + "] not found."
+            : "Collection [" + nss.toString() + "] not found.";
         return {ErrorCodes::NamespaceNotFound, errmsg};
     }
 
     long long size = collection->dataSize(opCtx) / scale;
     result->appendNumber("size", size);
+
     long long numRecords = collection->numRecords(opCtx);
-    result->appendNumber("count", numRecords);
+    if (isTimeseries) {
+        BSONObjBuilder bob(result->subobjStart("timeseries"));
+        bob.append("bucketsNs", nss.makeTimeseriesBucketsNamespace().ns());
+        bob.appendNumber("bucketCount", numRecords);
+        if (numRecords) {
+            bob.append("avgBucketSize", collection->averageObjectSize(opCtx));
+        }
+        BucketCatalog::get(opCtx).appendExecutionStats(nss, &bob);
+    } else {
+        result->appendNumber("count", numRecords);
+        if (numRecords) {
+            result->append("avgObjSize", collection->averageObjectSize(opCtx));
+        }
+    }
 
-    if (numRecords)
-        result->append("avgObjSize", collection->averageObjectSize(opCtx));
+    const RecordStore* recordStore = collection->getRecordStore();
+    auto storageSize =
+        static_cast<long long>(recordStore->storageSize(opCtx, result, verbose ? 1 : 0));
+    result->appendNumber("storageSize", storageSize / scale);
+    result->appendNumber("freeStorageSize",
+                         static_cast<long long>(recordStore->freeStorageSize(opCtx)) / scale);
 
-    RecordStore* recordStore = collection->getRecordStore();
-    result->appendNumber(
-        "storageSize",
-        static_cast<long long>(recordStore->storageSize(opCtx, result, verbose ? 1 : 0)) / scale);
+    const bool isCapped = collection->isCapped();
+    result->appendBool("capped", isCapped);
+    if (isCapped) {
+        result->appendNumber("max", collection->getCappedMaxDocs());
+        result->appendNumber("maxSize", collection->getCappedMaxSize() / scale);
+    }
 
     recordStore->appendCustomStats(opCtx, result, scale);
 
-    IndexCatalog* indexCatalog = collection->getIndexCatalog();
+    const IndexCatalog* indexCatalog = collection->getIndexCatalog();
     result->append("nindexes", indexCatalog->numIndexesTotal(opCtx));
 
     BSONObjBuilder indexDetails;
@@ -105,7 +142,14 @@ Status appendCollectionStorageStats(OperationContext* opCtx,
             indexDetails.append(descriptor->indexName(), bob.obj());
         }
 
-        if (!entry->isReady(opCtx)) {
+        // Not all indexes in the collection stats may be visible or consistent with our
+        // snapshot. For this reason, it is unsafe to check `isReady` on the entry, which
+        // asserts that the index's in-memory state is consistent with our snapshot.
+        if (!entry->isPresentInMySnapshot(opCtx)) {
+            continue;
+        }
+
+        if (!entry->isReadyInMySnapshot(opCtx)) {
             indexBuilds.push_back(descriptor->indexName());
         }
     }
@@ -117,6 +161,7 @@ Status appendCollectionStorageStats(OperationContext* opCtx,
     long long indexSize = collection->getIndexSize(opCtx, &indexSizes, scale);
 
     result->appendNumber("totalIndexSize", indexSize / scale);
+    result->appendNumber("totalSize", (storageSize + indexSize) / scale);
     result->append("indexSizes", indexSizes.obj());
     result->append("scaleFactor", scale);
 
@@ -126,15 +171,14 @@ Status appendCollectionStorageStats(OperationContext* opCtx,
 Status appendCollectionRecordCount(OperationContext* opCtx,
                                    const NamespaceString& nss,
                                    BSONObjBuilder* result) {
-    AutoGetCollectionForReadCommand ctx(opCtx, nss);
-    if (!ctx.getDb()) {
-        return {ErrorCodes::BadValue,
+    AutoGetCollectionForReadCommand collection(opCtx, nss);
+    if (!collection.getDb()) {
+        return {ErrorCodes::NamespaceNotFound,
                 str::stream() << "Database [" << nss.db().toString() << "] not found."};
     }
 
-    Collection* collection = ctx.getCollection();
     if (!collection) {
-        return {ErrorCodes::BadValue,
+        return {ErrorCodes::NamespaceNotFound,
                 str::stream() << "Collection [" << nss.toString() << "] not found."};
     }
 

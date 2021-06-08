@@ -31,11 +31,11 @@
 
 #include "mongo/db/pipeline/document_source_unwind.h"
 
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
-#include "mongo/db/pipeline/value.h"
 
 namespace mongo {
 
@@ -160,7 +160,7 @@ DocumentSourceUnwind::DocumentSourceUnwind(const intrusive_ptr<ExpressionContext
                                            const FieldPath& fieldPath,
                                            bool preserveNullAndEmptyArrays,
                                            const boost::optional<FieldPath>& indexPath)
-    : DocumentSource(pExpCtx),
+    : DocumentSource(kStageName, pExpCtx),
       _unwindPath(fieldPath),
       _preserveNullAndEmptyArrays(preserveNullAndEmptyArrays),
       _indexPath(indexPath),
@@ -168,10 +168,11 @@ DocumentSourceUnwind::DocumentSourceUnwind(const intrusive_ptr<ExpressionContext
 
 REGISTER_DOCUMENT_SOURCE(unwind,
                          LiteParsedDocumentSourceDefault::parse,
-                         DocumentSourceUnwind::createFromBson);
+                         DocumentSourceUnwind::createFromBson,
+                         LiteParsedDocumentSource::AllowedWithApiStrict::kAlways);
 
 const char* DocumentSourceUnwind::getSourceName() const {
-    return "$unwind";
+    return kStageName.rawData();
 }
 
 intrusive_ptr<DocumentSourceUnwind> DocumentSourceUnwind::create(
@@ -187,9 +188,7 @@ intrusive_ptr<DocumentSourceUnwind> DocumentSourceUnwind::create(
     return source;
 }
 
-DocumentSource::GetNextResult DocumentSourceUnwind::getNext() {
-    pExpCtx->checkForInterrupt();
-
+DocumentSource::GetNextResult DocumentSourceUnwind::doGetNext() {
     auto nextOut = _unwinder->getNext();
     while (nextOut.isEOF()) {
         // No more elements in array currently being unwound. This will loop if the input
@@ -286,4 +285,4 @@ intrusive_ptr<DocumentSource> DocumentSourceUnwind::createFromBson(
     string pathString(Expression::removeFieldPrefix(prefixedPathString));
     return DocumentSourceUnwind::create(pExpCtx, pathString, preserveNullAndEmptyArrays, indexPath);
 }
-}
+}  // namespace mongo

@@ -31,9 +31,10 @@
 
 #include <memory>
 
+#include "mongo/db/keys_collection_document_gen.h"
 #include "mongo/db/signed_logical_time.h"
 #include "mongo/db/time_proof_service.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 
 namespace mongo {
 
@@ -71,7 +72,7 @@ public:
     SignedLogicalTime signLogicalTime(OperationContext* opCtx, const LogicalTime& newTime);
 
     /**
-     * Returns true if the signature of newTime is valid.
+     * Validates the signature of newTime and returns the resulting status.
      */
     Status validate(OperationContext* opCtx, const SignedLogicalTime& newTime);
 
@@ -109,6 +110,11 @@ public:
     void stopKeyManager();
 
     /**
+     * Load the given external key into the key manager's keys cache.
+     */
+    void cacheExternalKey(ExternalKeysCollectionDocument key);
+
+    /**
      * Reset the key manager cache of keys.
      */
     void resetKeyManagerCache();
@@ -122,8 +128,7 @@ private:
 
     SignedLogicalTime _getProof(const KeysCollectionDocument& keyDoc, LogicalTime newTime);
 
-    stdx::mutex _mutex;            // protects _lastSeenValidTime
-    stdx::mutex _mutexKeyManager;  // protects _keyManager
+    Mutex _mutex = MONGO_MAKE_LATCH("LogicalTimeValidator::_mutex");  // protects _lastSeenValidTime
     SignedLogicalTime _lastSeenValidTime;
     TimeProofService _timeProofService;
     std::shared_ptr<KeysCollectionManager> _keyManager;

@@ -5,29 +5,28 @@
  */
 
 (function() {
-    "use strict";
-    load("jstests/libs/check_log.js");
+"use strict";
 
-    const conn = MongoRunner.runMongod({});
-    const db = conn.getDB("test");
+load("jstests/libs/fail_point_util.js");
 
-    assert.commandWorked(db.runCommand({insert: "a", documents: [{x: 1}]}));
-    assert.commandWorked(db.createView("view", "a", []));
+const conn = MongoRunner.runMongod({});
+const db = conn.getDB("test");
 
-    assert.commandWorked(
-        db.adminCommand({configureFailPoint: "hangDuringDropCollection", mode: "alwaysOn"}));
+assert.commandWorked(db.runCommand({insert: "a", documents: [{x: 1}]}));
+assert.commandWorked(db.createView("view", "a", []));
 
-    // This only holds a database IX lock.
-    const awaitDrop =
-        startParallelShell(() => assert(db.getSiblingDB("test")["view"].drop()), conn.port);
-    checkLog.contains(conn, "hangDuringDropCollection fail point enabled");
+const failPoint = configureFailPoint(db, "hangDuringDropCollection");
 
-    // This takes a database IX lock and should not be blocked.
-    assert.commandWorked(db.runCommand({insert: "a", documents: [{y: 1}]}));
+// This only holds a database IX lock.
+const awaitDrop =
+    startParallelShell(() => assert(db.getSiblingDB("test")["view"].drop()), conn.port);
+failPoint.wait();
 
-    assert.commandWorked(
-        db.adminCommand({configureFailPoint: "hangDuringDropCollection", mode: "off"}));
+// This takes a database IX lock and should not be blocked.
+assert.commandWorked(db.runCommand({insert: "a", documents: [{y: 1}]}));
 
-    awaitDrop();
-    MongoRunner.stopMongod(conn);
+failPoint.off();
+
+awaitDrop();
+MongoRunner.stopMongod(conn);
 })();

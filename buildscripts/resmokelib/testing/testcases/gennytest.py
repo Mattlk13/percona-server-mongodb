@@ -3,10 +3,10 @@
 import os
 import os.path
 
-from . import interface
-from ... import config
-from ... import core
-from ... import utils
+from buildscripts.resmokelib import config
+from buildscripts.resmokelib import core
+from buildscripts.resmokelib import utils
+from buildscripts.resmokelib.testing.testcases import interface
 
 
 class GennyTestCase(interface.ProcessTestCase):
@@ -39,4 +39,5 @@ class GennyTestCase(interface.ProcessTestCase):
         self.genny_options.setdefault("metrics-output-file", output_file)
 
     def _make_process(self):
-        return core.programs.genny_program(self.logger, self.genny_executable, **self.genny_options)
+        return core.programs.genny_program(self.logger, self.fixture.job_num, self._id,
+                                           self.genny_executable, **self.genny_options)

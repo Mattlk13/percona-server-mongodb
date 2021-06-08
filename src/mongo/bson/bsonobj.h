@@ -49,10 +49,15 @@
 #include "mongo/platform/atomic_word.h"
 #include "mongo/util/bufreader.h"
 #include "mongo/util/shared_buffer.h"
+#include "mongo/util/string_map.h"
 
 namespace mongo {
 
+class BSONObjBuilder;
 class BSONObjStlIterator;
+class ExtendedCanonicalV200Generator;
+class ExtendedRelaxedV200Generator;
+class LegacyStrictGenerator;
 
 /**
    C++ representation of a "BSON" object -- that is, an extended JSON-style
@@ -124,14 +129,12 @@ public:
         // Little endian ordering here, but that is ok regardless as BSON is spec'd to be
         // little endian external to the system. (i.e. the rest of the implementation of
         // bson, not this part, fails to support big endian)
-        static const char kEmptyObjectPrototype[] = {/*size*/ kMinBSONLength, 0, 0, 0, /*eoo*/ 0};
-
         _objdata = kEmptyObjectPrototype;
     }
 
     /** Construct a BSONObj from data in the proper format.
      *  Use this constructor when something else owns bsonData's buffer
-    */
+     */
     template <typename Traits = DefaultSizeTrait>
     explicit BSONObj(const char* bsonData, Traits t = Traits{}) {
         init<Traits>(bsonData);
@@ -142,8 +145,8 @@ public:
           _ownedBuffer(std::move(ownedBuffer)) {}
 
     /** Move construct a BSONObj */
-    BSONObj(BSONObj&& other) noexcept : _objdata(std::move(other._objdata)),
-                                        _ownedBuffer(std::move(other._ownedBuffer)) {
+    BSONObj(BSONObj&& other) noexcept
+        : _objdata(std::move(other._objdata)), _ownedBuffer(std::move(other._ownedBuffer)) {
         other._objdata = BSONObj()._objdata;  // To return to an empty state.
         dassert(!other.isOwned());
     }
@@ -240,8 +243,14 @@ public:
     */
     BSONObj getOwned() const;
 
+    /** Returns an owned copy of the given BSON object. */
+    static BSONObj getOwned(const BSONObj& obj);
+
     /** @return a new full (and owned) copy of the object. */
     BSONObj copy() const;
+
+    /** @return a new full (and owned) redacted copy of the object. */
+    BSONObj redact() const;
 
     /** Readable representation of a BSON object in an extended JSON-style notation.
         This is an abbreviated representation which might be used for logging.
@@ -258,17 +267,33 @@ public:
     /** Properly formatted JSON string.
         @param pretty if true we try to add some lf's and indentation
     */
-    std::string jsonString(JsonStringFormat format = Strict,
+    std::string jsonString(JsonStringFormat format = ExtendedCanonicalV2_0_0,
                            int pretty = 0,
-                           bool isArray = false) const;
+                           bool isArray = false,
+                           size_t writeLimit = 0,
+                           BSONObj* outTruncationResult = nullptr) const;
 
-    void jsonStringStream(JsonStringFormat format,
-                          int pretty,
-                          bool isArray,
-                          std::stringstream& s) const;
+    BSONObj jsonStringBuffer(JsonStringFormat format,
+                             int pretty,
+                             bool isArray,
+                             fmt::memory_buffer& buffer,
+                             size_t writeLimit = 0) const;
 
-    /** note: addFields always adds _id even if not specified */
-    int addFields(BSONObj& from, std::set<std::string>& fields); /* returns n added */
+    BSONObj jsonStringGenerator(ExtendedCanonicalV200Generator const& generator,
+                                int pretty,
+                                bool isArray,
+                                fmt::memory_buffer& buffer,
+                                size_t writeLimit = 0) const;
+    BSONObj jsonStringGenerator(ExtendedRelaxedV200Generator const& generator,
+                                int pretty,
+                                bool isArray,
+                                fmt::memory_buffer& buffer,
+                                size_t writeLimit = 0) const;
+    BSONObj jsonStringGenerator(LegacyStrictGenerator const& generator,
+                                int pretty,
+                                bool isArray,
+                                fmt::memory_buffer& buffer,
+                                size_t writeLimit = 0) const;
 
     /**
      * Add specific field to the end of the object if it did not exist, otherwise replace it
@@ -277,10 +302,27 @@ public:
      */
     BSONObj addField(const BSONElement& field) const;
 
+    /**
+     * Merges the specified 'fields' from the 'from' object into the current BSON and returns the
+     * merged object. If the 'fields' is not specified, all the fields from the 'from' object are
+     * merged.
+     *
+     * Note that if the original object already has a particular field, then the field will be
+     * replaced.
+     */
+    BSONObj addFields(const BSONObj& from,
+                      const boost::optional<StringDataSet>& fields = boost::none) const;
+
     /** remove specified field and return a new object with the remaining fields.
         slowish as builds a full new object
      */
     BSONObj removeField(StringData name) const;
+
+    /**
+     * Remove specified fields and return a new object with the remaining fields.
+     */
+    BSONObj removeFields(const std::set<std::string>& fields) const;
+    BSONObj removeFields(const StringDataSet& fields) const;
 
     /** returns # of top level fields in the object
        note: iterates to count the fields
@@ -364,10 +406,12 @@ public:
      *    this.extractFieldsUnDotted({a : 1 , c : 1}) -> {"" : 4 , "" : 6 }
      *    this.extractFieldsUnDotted({b : "blah"}) -> {"" : 5}
      *
-    */
-    BSONObj extractFieldsUnDotted(const BSONObj& pattern) const;
+     */
+    BSONObj extractFieldsUndotted(const BSONObj& pattern) const;
+    void extractFieldsUndotted(BSONObjBuilder* b, const BSONObj& pattern) const;
 
     BSONObj filterFieldsUndotted(const BSONObj& filter, bool inFilter) const;
+    void filterFieldsUndotted(BSONObjBuilder* b, const BSONObj& filter, bool inFilter) const;
 
     BSONElement getFieldUsingIndexNames(StringData fieldName, const BSONObj& indexKey) const;
 
@@ -406,7 +450,12 @@ public:
         return objsize() <= kMinBSONLength;
     }
 
-    void dump() const;
+    /*
+     * Whether this BSONObj is the "empty prototype" special case.
+     */
+    bool isEmptyPrototype() const {
+        return _objdata == kEmptyObjectPrototype;
+    }
 
     /** Alternative output format */
     std::string hexDump() const;
@@ -529,11 +578,14 @@ public:
         passed object. */
     BSONObj replaceFieldNames(const BSONObj& obj) const;
 
+    static BSONObj stripFieldNames(const BSONObj& obj);
+
+    bool hasFieldNames() const;
+
     /**
-     * Returns true if this object is valid according to the specified BSON version, and returns
-     * false otherwise.
+     * Returns true if this object is valid and returns false otherwise.
      */
-    bool valid(BSONVersion version) const;
+    bool valid() const;
 
     /** add all elements of the object to the specified vector */
     void elems(std::vector<BSONElement>&) const;
@@ -579,6 +631,15 @@ public:
     }
 
 private:
+    static constexpr char kEmptyObjectPrototype[] = {/*size*/ kMinBSONLength, 0, 0, 0, /*eoo*/ 0};
+
+    template <typename Generator>
+    BSONObj _jsonStringGenerator(const Generator& g,
+                                 int pretty,
+                                 bool isArray,
+                                 fmt::memory_buffer& buffer,
+                                 size_t writeLimit) const;
+
     void _assertInvalid(int maxSize) const;
 
     template <typename Traits = DefaultSizeTrait>
@@ -587,6 +648,8 @@ private:
         if (!isValid<Traits>())
             _assertInvalid(Traits::MaxSize);
     }
+
+    void _validateUnownedSize(int size) const;
 
     const char* _objdata;
     ConstSharedBuffer _ownedBuffer;
@@ -693,11 +756,11 @@ private:
 class BSONObjIterator {
 public:
     /** Create an iterator for a BSON object.
-    */
+     */
     explicit BSONObjIterator(const BSONObj& jso) {
         int sz = jso.objsize();
         if (MONGO_unlikely(sz == 0)) {
-            _pos = _theend = 0;
+            _pos = _theend = nullptr;
             return;
         }
         _pos = jso.objdata() + 4;
@@ -709,14 +772,33 @@ public:
         _theend = end - 1;
     }
 
+    /*
+     * Advance '_pos' by currentElement.size(). The element passed in must be equivalent to the
+     * current element '_pos' is at.
+     */
+    void advance(const BSONElement& currentElement) {
+        dassert(BSONElement(_pos).size() == currentElement.size());
+        _pos += currentElement.size();
+    }
+
+    /**
+     * Return true if the current element is equal to 'otherElement'.
+     * Do *not* use with moreWithEOO() as the function will return false if the current element and
+     * 'otherElement' are EOO.
+     */
+    bool currentElementBinaryEqual(const BSONElement& otherElement) {
+        auto sz = otherElement.size();
+        return sz <= (_theend - _pos) && memcmp(otherElement.rawdata(), _pos, sz) == 0;
+    }
+
     /** @return true if more elements exist to be enumerated. */
-    bool more() {
+    bool more() const {
         return _pos < _theend;
     }
 
     /** @return true if more elements exist to be enumerated INCLUDING the EOO element which is
      * always at the end. */
-    bool moreWithEOO() {
+    bool moreWithEOO() const {
         return _pos <= _theend;
     }
 
@@ -775,8 +857,14 @@ public:
 
     BSONElement next() {
         verify(_fields);
-        if (_cur < _nfields)
-            return BSONElement(_fields[_cur++]);
+        if (_cur < _nfields) {
+            const auto& element = _fields[_cur++];
+            return BSONElement(element.fieldName.rawData() - 1,  // Include type byte
+                               element.fieldName.size() + 1,     // Add null terminator
+                               element.totalSize,
+                               BSONElement::CachedSizeTag{});
+        }
+
         return BSONElement();
     }
 
@@ -786,7 +874,11 @@ protected:
 
 private:
     const int _nfields;
-    const std::unique_ptr<const char* []> _fields;
+    struct Field {
+        StringData fieldName;
+        int totalSize;
+    };
+    const std::unique_ptr<Field[]> _fields;
     int _cur;
 };
 
@@ -826,7 +918,7 @@ struct DataType::Handler<BSONObj> {
                        const char* ptr,
                        size_t length,
                        size_t* advanced,
-                       std::ptrdiff_t debug_offset) {
+                       std::ptrdiff_t debug_offset) noexcept try {
         auto temp = BSONObj(ptr);
         auto len = temp.objsize();
         if (bson) {
@@ -836,13 +928,15 @@ struct DataType::Handler<BSONObj> {
             *advanced = len;
         }
         return Status::OK();
+    } catch (const DBException& e) {
+        return e.toStatus();
     }
 
     static Status store(const BSONObj& bson,
                         char* ptr,
                         size_t length,
                         size_t* advanced,
-                        std::ptrdiff_t debug_offset);
+                        std::ptrdiff_t debug_offset) noexcept;
 
     static BSONObj defaultConstruct() {
         return BSONObj();

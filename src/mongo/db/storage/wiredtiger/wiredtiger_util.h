@@ -46,23 +46,19 @@ class WiredTigerConfigParser;
 class WiredTigerKVEngine;
 class WiredTigerSession;
 
-inline bool wt_keeptxnopen() {
-    return false;
-}
-
 Status wtRCToStatus_slow(int retCode, const char* prefix);
 
 /**
  * converts wiredtiger return codes to mongodb statuses.
  */
-inline Status wtRCToStatus(int retCode, const char* prefix = NULL) {
+inline Status wtRCToStatus(int retCode, const char* prefix = nullptr) {
     if (MONGO_likely(retCode == 0))
         return Status::OK();
 
     return wtRCToStatus_slow(retCode, prefix);
 }
 
-#define invariantWTOK(expression)                                                       \
+#define MONGO_invariantWTOK_1(expression)                                               \
     do {                                                                                \
         int _invariantWTOK_retCode = expression;                                        \
         if (MONGO_unlikely(_invariantWTOK_retCode != 0)) {                              \
@@ -70,6 +66,21 @@ inline Status wtRCToStatus(int retCode, const char* prefix = NULL) {
                 #expression, wtRCToStatus(_invariantWTOK_retCode), __FILE__, __LINE__); \
         }                                                                               \
     } while (false)
+
+#define MONGO_invariantWTOK_2(expression, contextExpr)                     \
+    do {                                                                   \
+        int _invariantWTOK_retCode = expression;                           \
+        if (MONGO_unlikely(_invariantWTOK_retCode != 0)) {                 \
+            invariantOKFailedWithMsg(#expression,                          \
+                                     wtRCToStatus(_invariantWTOK_retCode), \
+                                     contextExpr,                          \
+                                     __FILE__,                             \
+                                     __LINE__);                            \
+        }                                                                  \
+    } while (false)
+
+#define invariantWTOK(...) \
+    MONGO_expand(MONGO_expand(BOOST_PP_OVERLOAD(MONGO_invariantWTOK_, __VA_ARGS__))(__VA_ARGS__))
 
 struct WiredTigerItem : public WT_ITEM {
     WiredTigerItem(const void* d, size_t s) {
@@ -112,13 +123,17 @@ public:
         _startupSuccessful = true;
     }
 
-private:
-    int suppressibleStartupErrorLog(WT_EVENT_HANDLER* handler,
-                                    WT_SESSION* sesion,
-                                    int errorCode,
-                                    const char* message);
+    bool isWtIncompatible() {
+        return _wtIncompatible;
+    }
 
+    void setWtIncompatible() {
+        _wtIncompatible = true;
+    }
+
+private:
     bool _startupSuccessful = false;
+    bool _wtIncompatible = false;
 };
 
 class WiredTigerUtil {
@@ -154,15 +169,22 @@ public:
                                     const std::vector<std::string>& filter);
 
     /**
+     * Creates an import configuration string suitable for the 'config' parameter in
+     * WT_SESSION::create() given the storage engines metadata retrieved during the export.
+     *
+     * Returns the FailedToParse status if the storage engine metadata object is malformed.
+     */
+    static StatusWith<std::string> generateImportString(const StringData& ident,
+                                                        const BSONObj& storageMetadata);
+
+    /**
      * Appends information about the storage engine's currently available snapshots and the settings
      * that affect that window of maintained history.
      *
      * "snapshot-window-settings" : {
-     *      "total number of cache overflow disk writes",
-     *      "total number of SnapshotTooOld errors",
-     *      "max target available snapshots window size in seconds" : <num>,
-     *      "target available snapshots window size in seconds" : <num>,
-     *      "current available snapshots window size in seconds" : <num>,
+     *      "total number of SnapshotTooOld errors" : <num>,
+     *      "minimum target snapshot window size in seconds" : <num>,
+     *      "current available snapshot window size in seconds" : <num>,
      *      "latest majority snapshot timestamp available" : <num>,
      *      "oldest majority snapshot timestamp available" : <num>
      * }
@@ -172,14 +194,20 @@ public:
                                              BSONObjBuilder* bob);
 
     /**
-     * Gets entire metadata string for collection/index at URI with the provided session.
+     * Gets the creation metadata string for a collection or index at a given URI. Accepts an
+     * OperationContext or session.
+     *
+     * This returns more information, but is slower than getMetadata().
      */
-    static StatusWith<std::string> getMetadataRaw(WT_SESSION* session, StringData uri);
+    static StatusWith<std::string> getMetadataCreate(OperationContext* opCtx, StringData uri);
+    static StatusWith<std::string> getMetadataCreate(WT_SESSION* session, StringData uri);
 
     /**
-     * Gets entire metadata string for collection/index at URI.
+     * Gets the entire metadata string for collection or index at URI. Accepts an OperationContext
+     * or session.
      */
     static StatusWith<std::string> getMetadata(OperationContext* opCtx, StringData uri);
+    static StatusWith<std::string> getMetadata(WT_SESSION* session, StringData uri);
 
     /**
      * Reads app_metadata for collection/index at URI as a BSON document.
@@ -209,33 +237,18 @@ public:
      * Reads individual statistics using URI.
      * List of statistics keys WT_STAT_* can be found in wiredtiger.h.
      */
-    static StatusWith<uint64_t> getStatisticsValue(WT_SESSION* session,
-                                                   const std::string& uri,
-                                                   const std::string& config,
-                                                   int statisticsKey);
-
-    /**
-     * Reads individual statistics using URI and casts to type ResultType.
-     * Caps statistics value at max(ResultType) in case of overflow.
-     */
-    template <typename ResultType>
-    static StatusWith<ResultType> getStatisticsValueAs(WT_SESSION* session,
-                                                       const std::string& uri,
-                                                       const std::string& config,
-                                                       int statisticsKey);
-
-    /**
-     * Reads individual statistics using URI and casts to type ResultType.
-     * Caps statistics value at 'maximumResultType'.
-     */
-    template <typename ResultType>
-    static StatusWith<ResultType> getStatisticsValueAs(WT_SESSION* session,
-                                                       const std::string& uri,
-                                                       const std::string& config,
-                                                       int statisticsKey,
-                                                       ResultType maximumResultType);
+    static StatusWith<int64_t> getStatisticsValue(WT_SESSION* session,
+                                                  const std::string& uri,
+                                                  const std::string& config,
+                                                  int statisticsKey);
 
     static int64_t getIdentSize(WT_SESSION* s, const std::string& uri);
+
+    /**
+     * Returns the bytes available for reuse for an ident. This is the amount of allocated space on
+     * disk that is not storing any data.
+     */
+    static int64_t getIdentReuseSize(WT_SESSION* s, const std::string& uri);
 
 
     /**
@@ -268,7 +281,11 @@ public:
      */
     static int verifyTable(OperationContext* opCtx,
                            const std::string& uri,
-                           std::vector<std::string>* errors = NULL);
+                           std::vector<std::string>* errors = nullptr);
+
+    static void notifyStartupComplete();
+
+    static void resetTableLoggingInfo();
 
     static bool useTableLogging(NamespaceString ns, bool replEnabled);
 
@@ -290,6 +307,18 @@ private:
      */
     template <typename T>
     static T _castStatisticsValue(uint64_t statisticsValue, T maximumResultType);
+
+    static Status _setTableLogging(WT_SESSION* session, const std::string& uri, bool on);
+
+    // Used to keep track of the table logging setting modifications during start up. The mutex must
+    // be held prior to accessing any of the member variables in the struct.
+    static Mutex _tableLoggingInfoMutex;
+    static struct TableLoggingInfo {
+        bool isInitializing = true;
+        bool isFirstTable = true;
+        bool changeTableLogging = false;
+        bool hasPreviouslyIncompleteTableChecks = false;
+    } _tableLoggingInfo;
 };
 
 class WiredTigerConfigParser {
@@ -299,12 +328,12 @@ class WiredTigerConfigParser {
 public:
     WiredTigerConfigParser(StringData config) {
         invariantWTOK(
-            wiredtiger_config_parser_open(NULL, config.rawData(), config.size(), &_parser));
+            wiredtiger_config_parser_open(nullptr, config.rawData(), config.size(), &_parser));
     }
 
     WiredTigerConfigParser(const WT_CONFIG_ITEM& nested) {
         invariant(nested.type == WT_CONFIG_ITEM::WT_CONFIG_ITEM_STRUCT);
-        invariantWTOK(wiredtiger_config_parser_open(NULL, nested.str, nested.len, &_parser));
+        invariantWTOK(wiredtiger_config_parser_open(nullptr, nested.str, nested.len, &_parser));
     }
 
     ~WiredTigerConfigParser() {
@@ -322,31 +351,6 @@ public:
 private:
     WT_CONFIG_PARSER* _parser;
 };
-
-// static
-template <typename ResultType>
-StatusWith<ResultType> WiredTigerUtil::getStatisticsValueAs(WT_SESSION* session,
-                                                            const std::string& uri,
-                                                            const std::string& config,
-                                                            int statisticsKey) {
-    return getStatisticsValueAs<ResultType>(
-        session, uri, config, statisticsKey, std::numeric_limits<ResultType>::max());
-}
-
-// static
-template <typename ResultType>
-StatusWith<ResultType> WiredTigerUtil::getStatisticsValueAs(WT_SESSION* session,
-                                                            const std::string& uri,
-                                                            const std::string& config,
-                                                            int statisticsKey,
-                                                            ResultType maximumResultType) {
-    StatusWith<uint64_t> result = getStatisticsValue(session, uri, config, statisticsKey);
-    if (!result.isOK()) {
-        return StatusWith<ResultType>(result.getStatus());
-    }
-    return StatusWith<ResultType>(
-        _castStatisticsValue<ResultType>(result.getValue(), maximumResultType));
-}
 
 // static
 template <typename ResultType>

@@ -31,18 +31,20 @@
 
 #include "mongo/db/query/plan_cache_indexability.h"
 
+#include <memory>
+
 #include "mongo/base/init.h"
 #include "mongo/base/owned_pointer_vector.h"
+#include "mongo/db/exec/projection_executor_utils.h"
 #include "mongo/db/index/wildcard_key_generator.h"
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/expression_algo.h"
-#include "mongo/db/matcher/expression_internal_expr_eq.h"
+#include "mongo/db/matcher/expression_internal_expr_comparison.h"
 #include "mongo/db/matcher/expression_leaf.h"
 #include "mongo/db/query/collation/collation_index_key.h"
 #include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/query/index_entry.h"
 #include "mongo/db/query/planner_ixselect.h"
-#include "mongo/stdx/memory.h"
 #include <memory>
 
 namespace mongo {
@@ -91,7 +93,7 @@ bool nodeIsConservativelySupportedBySparseIndex(const MatchExpression* me) {
     const bool inElemMatch = false;
     return QueryPlannerIXSelect::nodeIsSupportedBySparseIndex(me, inElemMatch);
 }
-}
+}  // namespace
 
 void PlanCacheIndexabilityState::processSparseIndex(const std::string& indexName,
                                                     const BSONObj& keyPattern) {
@@ -117,7 +119,7 @@ void PlanCacheIndexabilityState::processWildcardIndex(const CoreIndexInfo& cii) 
     invariant(cii.type == IndexType::INDEX_WILDCARD);
 
     _wildcardIndexDiscriminators.emplace_back(
-        cii.wildcardProjection, cii.identifier.catalogName, cii.filterExpr, cii.collator);
+        cii.wildcardProjection->exec(), cii.identifier.catalogName, cii.collator);
 }
 
 void PlanCacheIndexabilityState::processIndexCollation(const std::string& indexName,
@@ -147,7 +149,8 @@ IndexToDiscriminatorMap PlanCacheIndexabilityState::buildWildcardDiscriminators(
 
     IndexToDiscriminatorMap ret;
     for (auto&& wildcardDiscriminator : _wildcardIndexDiscriminators) {
-        if (wildcardDiscriminator.projectionExec->applyProjectionToOneField(path)) {
+        if (projection_executor_utils::applyProjectionToOneField(
+                wildcardDiscriminator.projectionExec, path)) {
             CompositeIndexabilityDiscriminator& cid = ret[wildcardDiscriminator.catalogName];
 
             // We can use these 'shallow' functions because the code building the plan cache key
@@ -156,10 +159,6 @@ IndexToDiscriminatorMap PlanCacheIndexabilityState::buildWildcardDiscriminators(
             cid.addDiscriminator(QueryPlannerIXSelect::nodeIsSupportedByWildcardIndex);
             cid.addDiscriminator(nodeIsConservativelySupportedBySparseIndex);
             cid.addDiscriminator(getCollatedIndexDiscriminator(wildcardDiscriminator.collator));
-            if (wildcardDiscriminator.filterExpr) {
-                cid.addDiscriminator(
-                    getPartialIndexDiscriminator(wildcardDiscriminator.filterExpr));
-            }
         }
     }
     return ret;
@@ -171,19 +170,28 @@ void PlanCacheIndexabilityState::updateDiscriminators(
     _wildcardIndexDiscriminators.clear();
 
     for (const auto& idx : indexCores) {
-        if (idx.type == IndexType::INDEX_WILDCARD) {
-            processWildcardIndex(idx);
-            continue;
-        }
-
-        if (idx.sparse) {
-            processSparseIndex(idx.identifier.catalogName, idx.keyPattern);
-        }
+        // If necessary, add discriminators for the paths mentioned in the partial filter
+        // expression. Unlike most of the discriminator logic, this is shared for wildcard and
+        // non-wildcard indexes.
         if (idx.filterExpr) {
             processPartialIndex(idx.identifier.catalogName, idx.filterExpr);
         }
 
-        processIndexCollation(idx.identifier.catalogName, idx.keyPattern, idx.collator);
+        if (idx.type == IndexType::INDEX_WILDCARD) {
+            // The set of paths for which we should add disciminators for wildcard indexes (outside
+            // of those paths mentioned in the partial filter expression) is not known a priori.
+            // Instead, we just record some information about the wildcard index so that the
+            // discriminators can be constructed on demand at query runtime.
+            processWildcardIndex(idx);
+        } else {
+            // If the index is not wildcard, add discriminators for fields mentioned in the key
+            // pattern.
+            if (idx.sparse) {
+                processSparseIndex(idx.identifier.catalogName, idx.keyPattern);
+            }
+
+            processIndexCollation(idx.identifier.catalogName, idx.keyPattern, idx.collator);
+        }
     }
 }
 

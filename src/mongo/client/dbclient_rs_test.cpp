@@ -44,6 +44,8 @@
 #include "mongo/client/connpool.h"
 #include "mongo/client/dbclient_rs.h"
 #include "mongo/client/replica_set_monitor.h"
+#include "mongo/client/replica_set_monitor_protocol_test_util.h"
+#include "mongo/client/scanning_replica_set_monitor.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/dbtests/mock/mock_conn_registry.h"
 #include "mongo/dbtests/mock/mock_replica_set.h"
@@ -62,8 +64,7 @@ using std::unique_ptr;
 using std::vector;
 
 MONGO_INITIALIZER(DisableReplicaSetMonitorRefreshRetries)(InitializerContext*) {
-    ReplicaSetMonitor::disableRefreshRetries_forTest();
-    return Status::OK();
+    ScanningReplicaSetMonitor::disableRefreshRetries_forTest();
 }
 
 /**
@@ -74,11 +75,29 @@ BSONObj makeMetadata(ReadPreference rp, TagSet tagSet) {
 }
 
 /**
- * Basic fixture with one primary and one secondary.
+ * Ensures a global ServiceContext exists and the ScanningReplicaSetMonitor is used for each test.
  */
-class BasicRS : public unittest::Test {
+class DBClientRSTest : public unittest::Test {
 protected:
     void setUp() {
+        auto serviceContext = ServiceContext::make();
+        setGlobalServiceContext(std::move(serviceContext));
+
+        ReplicaSetMonitorProtocolTestUtil::setRSMProtocol(ReplicaSetMonitorProtocol::kScanning);
+    }
+
+    void tearDown() {
+        ReplicaSetMonitorProtocolTestUtil::resetRSMProtocol();
+    }
+};
+
+/**
+ * Basic fixture with one primary and one secondary.
+ */
+class BasicRS : public DBClientRSTest {
+protected:
+    void setUp() {
+        DBClientRSTest::setUp();
         ReplicaSetMonitor::cleanup();
 
         _replSet.reset(new MockReplicaSet("test", 2));
@@ -86,10 +105,12 @@ protected:
     }
 
     void tearDown() {
-        ReplicaSetMonitor::cleanup();
         _replSet.reset();
 
         mongo::ScopedDbConnection::clearPool();
+
+        ReplicaSetMonitor::shutdown();
+        DBClientRSTest::tearDown();
     }
 
     MockReplicaSet* getReplSet() {
@@ -200,9 +221,10 @@ TEST_F(BasicRS, CommandSecondaryPreferred) {
 /**
  * Setup for 2 member replica set will all of the nodes down.
  */
-class AllNodesDown : public unittest::Test {
+class AllNodesDown : public DBClientRSTest {
 protected:
     void setUp() {
+        DBClientRSTest::setUp();
         ReplicaSetMonitor::cleanup();
 
         _replSet.reset(new MockReplicaSet("test", 2));
@@ -220,6 +242,7 @@ protected:
         _replSet.reset();
 
         mongo::ScopedDbConnection::clearPool();
+        DBClientRSTest::tearDown();
     }
 
     MockReplicaSet* getReplSet() {
@@ -308,9 +331,10 @@ TEST_F(AllNodesDown, CommandNearest) {
 /**
  * Setup for 2 member replica set with the primary down.
  */
-class PrimaryDown : public unittest::Test {
+class PrimaryDown : public DBClientRSTest {
 protected:
     void setUp() {
+        DBClientRSTest::setUp();
         ReplicaSetMonitor::cleanup();
 
         _replSet.reset(new MockReplicaSet("test", 2));
@@ -323,6 +347,7 @@ protected:
         _replSet.reset();
 
         mongo::ScopedDbConnection::clearPool();
+        DBClientRSTest::tearDown();
     }
 
     MockReplicaSet* getReplSet() {
@@ -414,9 +439,10 @@ TEST_F(PrimaryDown, Nearest) {
 /**
  * Setup for 2 member replica set with the secondary down.
  */
-class SecondaryDown : public unittest::Test {
+class SecondaryDown : public DBClientRSTest {
 protected:
     void setUp() {
+        DBClientRSTest::setUp();
         ReplicaSetMonitor::cleanup();
 
         _replSet.reset(new MockReplicaSet("test", 2));
@@ -430,6 +456,7 @@ protected:
         _replSet.reset();
 
         mongo::ScopedDbConnection::clearPool();
+        DBClientRSTest::tearDown();
     }
 
     MockReplicaSet* getReplSet() {
@@ -525,11 +552,13 @@ TEST_F(SecondaryDown, CommandNearest) {
  * Warning: Tests running this fixture cannot be run in parallel with other tests
  * that uses ConnectionString::setConnectionHook
  */
-class TaggedFiveMemberRS : public unittest::Test {
+class TaggedFiveMemberRS : public DBClientRSTest {
 protected:
     void setUp() {
+        DBClientRSTest::setUp();
+
         // Tests for pinning behavior require this.
-        ReplicaSetMonitor::useDeterministicHostSelection = true;
+        ScanningReplicaSetMonitor::useDeterministicHostSelection = true;
 
         // This shuts down the background RSMWatcher thread and prevents it from running. These
         // tests depend on controlling when the RSMs are updated.
@@ -552,11 +581,12 @@ protected:
                 const string host(_replSet->getPrimary());
                 const mongo::repl::MemberConfig* member =
                     oldConfig.findMemberByHostAndPort(HostAndPort(host));
-                membersBuilder.append(
-                    BSON("_id" << member->getId() << "host" << host << "tags" << BSON("dc"
-                                                                                      << "ny"
-                                                                                      << "p"
-                                                                                      << "1")));
+                membersBuilder.append(BSON("_id" << member->getId().getData() << "host" << host
+                                                 << "tags"
+                                                 << BSON("dc"
+                                                         << "ny"
+                                                         << "p"
+                                                         << "1")));
                 _replSet->getNode(host)->insert(IdentityNS, BSON(HostField(host)));
             }
 
@@ -567,13 +597,14 @@ protected:
                 const string host(*secIter);
                 const mongo::repl::MemberConfig* member =
                     oldConfig.findMemberByHostAndPort(HostAndPort(host));
-                membersBuilder.append(
-                    BSON("_id" << member->getId() << "host" << host << "tags" << BSON("dc"
-                                                                                      << "sf"
-                                                                                      << "s"
-                                                                                      << "1"
-                                                                                      << "group"
-                                                                                      << "1")));
+                membersBuilder.append(BSON("_id" << member->getId().getData() << "host" << host
+                                                 << "tags"
+                                                 << BSON("dc"
+                                                         << "sf"
+                                                         << "s"
+                                                         << "1"
+                                                         << "group"
+                                                         << "1")));
                 _replSet->getNode(host)->insert(IdentityNS, BSON(HostField(host)));
             }
 
@@ -582,13 +613,14 @@ protected:
                 const string host(*secIter);
                 const mongo::repl::MemberConfig* member =
                     oldConfig.findMemberByHostAndPort(HostAndPort(host));
-                membersBuilder.append(
-                    BSON("_id" << member->getId() << "host" << host << "tags" << BSON("dc"
-                                                                                      << "ma"
-                                                                                      << "s"
-                                                                                      << "2"
-                                                                                      << "group"
-                                                                                      << "1")));
+                membersBuilder.append(BSON("_id" << member->getId().getData() << "host" << host
+                                                 << "tags"
+                                                 << BSON("dc"
+                                                         << "ma"
+                                                         << "s"
+                                                         << "2"
+                                                         << "group"
+                                                         << "1")));
                 _replSet->getNode(host)->insert(IdentityNS, BSON(HostField(host)));
             }
 
@@ -597,11 +629,12 @@ protected:
                 const string host(*secIter);
                 const mongo::repl::MemberConfig* member =
                     oldConfig.findMemberByHostAndPort(HostAndPort(host));
-                membersBuilder.append(
-                    BSON("_id" << member->getId() << "host" << host << "tags" << BSON("dc"
-                                                                                      << "eu"
-                                                                                      << "s"
-                                                                                      << "3")));
+                membersBuilder.append(BSON("_id" << member->getId().getData() << "host" << host
+                                                 << "tags"
+                                                 << BSON("dc"
+                                                         << "eu"
+                                                         << "s"
+                                                         << "3")));
                 _replSet->getNode(host)->insert(IdentityNS, BSON(HostField(host)));
             }
 
@@ -610,30 +643,31 @@ protected:
                 const string host(*secIter);
                 const mongo::repl::MemberConfig* member =
                     oldConfig.findMemberByHostAndPort(HostAndPort(host));
-                membersBuilder.append(
-                    BSON("_id" << member->getId() << "host" << host << "tags" << BSON("dc"
-                                                                                      << "jp"
-                                                                                      << "s"
-                                                                                      << "4")));
+                membersBuilder.append(BSON("_id" << member->getId().getData() << "host" << host
+                                                 << "tags"
+                                                 << BSON("dc"
+                                                         << "jp"
+                                                         << "s"
+                                                         << "4")));
                 _replSet->getNode(host)->insert(IdentityNS, BSON(HostField(host)));
             }
 
             membersBuilder.done();
-            mongo::repl::ReplSetConfig newConfig;
-            fassert(28569, newConfig.initialize(newConfigBuilder.done()));
+            auto newConfig = mongo::repl::ReplSetConfig::parse(newConfigBuilder.done());
             fassert(28568, newConfig.validate());
             _replSet->setConfig(newConfig);
         }
     }
 
     void tearDown() {
-        ReplicaSetMonitor::useDeterministicHostSelection = false;
+        ScanningReplicaSetMonitor::useDeterministicHostSelection = false;
 
         ConnectionString::setConnectionHook(_originalConnectionHook);
         ReplicaSetMonitor::cleanup();
         _replSet.reset();
 
         mongo::ScopedDbConnection::clearPool();
+        DBClientRSTest::tearDown();
     }
 
     MockReplicaSet* getReplSet() {
@@ -774,20 +808,20 @@ TEST_F(TaggedFiveMemberRS, ConnShouldNotPinIfDiffTag) {
     }
 }
 
-// Note: slaveConn is dangerous and should be deprecated! Also see SERVER-7801.
-TEST_F(TaggedFiveMemberRS, SlaveConnReturnsSecConn) {
+// Note: secondaryConn is dangerous and should be deprecated! Also see SERVER-7801.
+TEST_F(TaggedFiveMemberRS, SecondaryConnReturnsSecConn) {
     MockReplicaSet* replSet = getReplSet();
     vector<HostAndPort> seedList;
     seedList.push_back(HostAndPort(replSet->getPrimary()));
 
     DBClientReplicaSet replConn(replSet->getSetName(), seedList, StringData());
 
-    // Need up-to-date view since slaveConn() uses SecondaryPreferred, and this test assumes it
+    // Need up-to-date view since secondaryConn() uses SecondaryPreferred, and this test assumes it
     // knows about at least one secondary.
     ReplicaSetMonitor::get(replSet->getSetName())->runScanForMockReplicaSet();
 
     string dest;
-    mongo::DBClientConnection& secConn = replConn.slaveConn();
+    mongo::DBClientConnection& secConn = replConn.secondaryConn();
 
     // Note: IdentityNS contains the name of the server.
     unique_ptr<DBClientCursor> cursor = secConn.query(NamespaceString(IdentityNS), Query());

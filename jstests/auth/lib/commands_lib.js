@@ -91,6 +91,8 @@ one argument, the connection object.
 
 */
 
+load("jstests/replsets/libs/tenant_migration_util.js");
+
 // constants
 
 // All roles that are specific to one database will be given only for 'firstDbName'. For example,
@@ -103,6 +105,7 @@ var adminDbName = "admin";
 var authErrCode = 13;
 var commandNotSupportedCode = 115;
 var shard0name = "shard0000";
+const migrationCertificates = TenantMigrationUtil.makeMigrationCertificatesForTest();
 
 // useful shorthand when defining the tests below
 var roles_write =
@@ -192,9 +195,39 @@ var authCommandsLib = {
     /************* TEST CASES ****************/
 
     tests: [
+      {
+        testname: "abortReshardCollection",
+        command: {abortReshardCollection: "test.x"},
+        skipUnlessSharded: true,
+        testcases: [
+            {
+              runOnDb: adminDbName,
+              roles: Object.extend({enableSharding: 1}, roles_clusterManager),
+              privileges:
+              [{resource: {db: "test", collection: "x"}, actions: ["reshardCollection"]}],
+                expectFail: true
+            },
+        ]
+      },
+      {
+        testname: "_configsvrAbortReshardCollection",
+        command: {_configsvrAbortReshardCollection: "test.x"},
+        skipSharded: true,
+        testcases: [
+            {
+              runOnDb: adminDbName,
+              roles: {__system: 1},
+              privileges: [{resource: {cluster: true}, actions: ["internal"]}],
+              expectFail: true
+            },
+            {runOnDb: firstDbName, roles: {}},
+            {runOnDb: secondDbName, roles: {}}
+        ]
+      },
         {
           testname: "abortTxn",
           command: {abortTransaction: 1},
+          // TODO (SERVER-53497): Enable auth testing for abortTransaction and commitTransaction.
           skipSharded: true,
           skipUnlessReplicaSet: true,
           testcases: [
@@ -209,7 +242,7 @@ var authCommandsLib = {
           command: {
               _addShard: 1,
               shardIdentity: {
-                  shardName: "shard0000",
+                  shardName: shard0name,
                   clusterId: ObjectId('5b2031806195dffd744258ee'),
                   configsvrConnectionString: "foobarbaz/host:20022,host:20023,host:20024"
               }
@@ -282,10 +315,10 @@ var authCommandsLib = {
           },
           skipSharded: true,
           setup: function(db) {
-              db.getSisterDB(firstDbName).x.save({});
+              assert.writeOK(db.getSiblingDB(firstDbName).x.save({}));
           },
           teardown: function(db) {
-              db.getSisterDB(firstDbName).x.drop();
+              db.getSiblingDB(firstDbName).x.drop();
           },
           testcases: [
               {
@@ -297,6 +330,7 @@ var authCommandsLib = {
                       actions: ["appendOplogNote"],
                       removeWhenTestingAuthzFailure: false
                     },
+                    {resource: {cluster: true}, actions: ["applyOps"]},
                 ],
               },
           ]
@@ -313,25 +347,20 @@ var authCommandsLib = {
               }]
           },
           skipSharded: true,
-          setup: function(db) {},
           teardown: function(db) {
-              db.getSisterDB(firstDbName).x.drop();
+              db.getSiblingDB(firstDbName).x.drop();
           },
           testcases: [
               {
                 runOnDb: adminDbName,
                 roles: {
-                    readWrite: 1,
-                    dbAdmin: 1,
-                    dbOwner: 1,
-                    readWriteAnyDatabase: 1,
                     dbAdminAnyDatabase: 1,
                     root: 1,
-                    restore: 1,
                     __system: 1
                 },
                 privileges: [
                     {resource: {db: firstDbName, collection: "x"}, actions: ["createCollection"]},
+                    {resource: {cluster: true}, actions: ["applyOps"]},
                 ]
               },
           ]
@@ -350,17 +379,16 @@ var authCommandsLib = {
               }]
           },
           skipSharded: true,
-          setup: function(db) {},
           teardown: function(db) {
-              db.getSisterDB(firstDbName).x.drop();
+              db.getSiblingDB(firstDbName).x.drop();
           },
           testcases: [
               {
                 runOnDb: adminDbName,
-                roles: {root: 1, restore: 1, __system: 1},
+                roles: {__system: 1, root: 1},
                 privileges: [
                     {resource: {db: firstDbName, collection: "x"}, actions: ["createCollection"]},
-                    {resource: {cluster: true}, actions: ["useUUID", "forceUUID"]}
+                    {resource: {cluster: true}, actions: ["useUUID", "forceUUID", "applyOps"]},
                 ]
               },
           ]
@@ -378,9 +406,8 @@ var authCommandsLib = {
               }]
           },
           skipSharded: true,
-          setup: function(db) {},
           teardown: function(db) {
-              db.getSisterDB(firstDbName).x.drop();
+              db.getSiblingDB(firstDbName).x.drop();
           },
           testcases: [{
               expectAuthzFailure: true,
@@ -388,7 +415,7 @@ var authCommandsLib = {
               privileges: [
                   {resource: {db: firstDbName, collection: "x"}, actions: ["createCollection"]},
                   // Do not have forceUUID.
-                  {resource: {cluster: true}, actions: ["useUUID"]}
+                  {resource: {cluster: true}, actions: ["useUUID", "applyOps"]},
               ]
           }]
         },
@@ -405,26 +432,22 @@ var authCommandsLib = {
           },
           skipSharded: true,
           setup: function(db) {
-              db.getSisterDB(firstDbName).x.save({});
+              assert.writeOK(db.getSiblingDB(firstDbName).x.save({}));
           },
           teardown: function(db) {
-              db.getSisterDB(firstDbName).x.drop();
+              db.getSiblingDB(firstDbName).x.drop();
           },
           testcases: [
               {
                 runOnDb: adminDbName,
                 roles: {
-                    readWrite: 1,
-                    dbAdmin: 1,
-                    dbOwner: 1,
-                    readWriteAnyDatabase: 1,
                     dbAdminAnyDatabase: 1,
                     root: 1,
-                    restore: 1,
                     __system: 1
                 },
                 privileges: [
                     {resource: {db: firstDbName, collection: "x"}, actions: ["dropCollection"]},
+                    {resource: {cluster: true}, actions: ["applyOps"]},
                 ]
               },
           ]
@@ -445,8 +468,8 @@ var authCommandsLib = {
           },
           skipSharded: true,
           setup: function(db) {
-              var sibling = db.getSisterDB(firstDbName);
-              sibling.runCommand({create: "x"});
+              var sibling = db.getSiblingDB(firstDbName);
+              assert.commandWorked(sibling.runCommand({create: "x"}));
 
               return {
                   collName: sibling.x.getFullName(),
@@ -454,15 +477,15 @@ var authCommandsLib = {
               };
           },
           teardown: function(db) {
-              db.getSisterDB(firstDbName).x.drop();
+              db.getSiblingDB(firstDbName).x.drop();
           },
           testcases: [
               {
                 runOnDb: adminDbName,
-                roles: {root: 1, restore: 1, __system: 1},
+                roles: {__system: 1, root: 1},
                 privileges: [
                     {resource: {db: firstDbName, collection: "x"}, actions: ["dropCollection"]},
-                    {resource: {cluster: true}, actions: ["useUUID"]}
+                    {resource: {cluster: true}, actions: ["useUUID", "applyOps"]},
                 ]
               },
           ]
@@ -483,8 +506,8 @@ var authCommandsLib = {
           },
           skipSharded: true,
           setup: function(db) {
-              var sibling = db.getSisterDB(firstDbName);
-              sibling.runCommand({create: "x"});
+              var sibling = db.getSiblingDB(firstDbName);
+              assert.commandWorked(sibling.runCommand({create: "x"}));
 
               return {
                   collName: sibling.x.getFullName(),
@@ -492,14 +515,15 @@ var authCommandsLib = {
               };
           },
           teardown: function(db) {
-              db.getSisterDB(firstDbName).x.drop();
+              db.getSiblingDB(firstDbName).x.drop();
           },
           testcases: [
               {
                 expectAuthzFailure: true,
                 runOnDb: adminDbName,
                 privileges: [
-                    {resource: {db: firstDbName, collection: "x"}, actions: ["dropCollection"]}
+                    {resource: {db: firstDbName, collection: "x"}, actions: ["dropCollection"]},
+                    {resource: {cluster: true}, actions: ["applyOps"]},
                     // don't have useUUID privilege.
                 ]
               },
@@ -513,13 +537,13 @@ var authCommandsLib = {
               {
                 runOnDb: adminDbName,
                 privileges: [
-                    {resource: {cluster: true}, actions: ["appendOplogNote"]},
+                    {resource: {cluster: true}, actions: ["appendOplogNote", "applyOps"]},
                 ],
               },
               {
                 runOnDb: firstDbName,
                 privileges: [
-                    {resource: {cluster: true}, actions: ["appendOplogNote"]},
+                    {resource: {cluster: true}, actions: ["appendOplogNote", "applyOps"]},
                 ],
                 expectFailure: true
               }
@@ -541,18 +565,16 @@ var authCommandsLib = {
           },
           skipSharded: true,
           setup: function(db) {
-              db.getSisterDB(firstDbName).x.save({});
-              db.getSisterDB(adminDbName).runCommand({movePrimary: firstDbName, to: shard0name});
-              db.getSisterDB(adminDbName).runCommand({movePrimary: secondDbName, to: shard0name});
+              assert.writeOK(db.getSiblingDB(firstDbName).x.save({}));
           },
           teardown: function(db) {
-              db.getSisterDB(firstDbName).x.drop();
-              db.getSisterDB(secondDbName).y.drop();
+              db.getSiblingDB(firstDbName).x.drop();
+              db.getSiblingDB(secondDbName).y.drop();
           },
           testcases: [
               {
                 runOnDb: adminDbName,
-                roles: {readWriteAnyDatabase: 1, root: 1, __system: 1},
+                roles: {__system: 1, root: 1},
                 privileges: [
                     {
                       resource: {db: firstDbName, collection: "x"},
@@ -561,7 +583,8 @@ var authCommandsLib = {
                     {
                       resource: {db: secondDbName, collection: "y"},
                       actions: ["insert", "createIndex"]
-                    }
+                    },
+                    {resource: {cluster: true}, actions: ["applyOps"]},
                 ]
               },
           ]
@@ -577,17 +600,18 @@ var authCommandsLib = {
           },
           skipSharded: true,
           setup: function(db) {
-              db.getSisterDB(firstDbName).x.save({});
+              assert.writeOK(db.getSiblingDB(firstDbName).x.save({}));
           },
           teardown: function(db) {
-              db.getSisterDB(firstDbName).x.drop();
+              db.getSiblingDB(firstDbName).x.drop();
           },
           testcases: [
               {
                 runOnDb: adminDbName,
-                roles: roles_write,
+                roles: {__system: 1, root: 1},
                 privileges: [
                     {resource: {db: firstDbName, collection: "x"}, actions: ["insert"]},
+                    {resource: {cluster: true}, actions: ["applyOps"]},
                 ],
               },
           ]
@@ -606,8 +630,8 @@ var authCommandsLib = {
           },
           skipSharded: true,
           setup: function(db) {
-              var sibling = db.getSisterDB(firstDbName);
-              sibling.runCommand({create: "x"});
+              var sibling = db.getSiblingDB(firstDbName);
+              assert.commandWorked(sibling.runCommand({create: "x"}));
 
               return {
                   collName: sibling.x.getFullName(),
@@ -615,15 +639,15 @@ var authCommandsLib = {
               };
           },
           teardown: function(db) {
-              db.getSisterDB(firstDbName).x.drop();
+              db.getSiblingDB(firstDbName).x.drop();
           },
           testcases: [
               {
                 runOnDb: adminDbName,
-                roles: {root: 1, restore: 1, __system: 1},
+                roles: {__system: 1, root: 1},
                 privileges: [
                     {resource: {db: firstDbName, collection: "x"}, actions: ["insert"]},
-                    {resource: {cluster: true}, actions: ["useUUID"]}
+                    {resource: {cluster: true}, actions: ["useUUID", "applyOps"]},
                 ],
               },
           ]
@@ -643,8 +667,8 @@ var authCommandsLib = {
           },
           skipSharded: true,
           setup: function(db) {
-              var sibling = db.getSisterDB(firstDbName);
-              sibling.runCommand({create: "x"});
+              var sibling = db.getSiblingDB(firstDbName);
+              assert.commandWorked(sibling.runCommand({create: "x"}));
 
               return {
                   collName: sibling.x.getFullName(),
@@ -652,7 +676,7 @@ var authCommandsLib = {
               };
           },
           teardown: function(db) {
-              db.getSisterDB(firstDbName).x.drop();
+              db.getSiblingDB(firstDbName).x.drop();
           },
           testcases: [
               {
@@ -660,10 +684,10 @@ var authCommandsLib = {
                 // failure.
                 expectFail: true,
                 runOnDb: adminDbName,
-                roles: {root: 1, restore: 1, __system: 1},
+                roles: {__system: 1, root: 1},
                 privileges: [
                     {resource: {db: firstDbName, collection: "x"}, actions: ["insert"]},
-                    {resource: {cluster: true}, actions: ["useUUID"]}
+                    {resource: {cluster: true}, actions: ["useUUID", "applyOps"]},
                 ],
               },
           ]
@@ -682,8 +706,8 @@ var authCommandsLib = {
           },
           skipSharded: true,
           setup: function(db) {
-              var sibling = db.getSisterDB(firstDbName);
-              sibling.runCommand({create: "x"});
+              var sibling = db.getSiblingDB(firstDbName);
+              assert.commandWorked(sibling.runCommand({create: "x"}));
 
               return {
                   collName: sibling.x.getFullName(),
@@ -691,7 +715,7 @@ var authCommandsLib = {
               };
           },
           teardown: function(db) {
-              db.getSisterDB(firstDbName).x.drop();
+              db.getSiblingDB(firstDbName).x.drop();
           },
           testcases: [
               {
@@ -699,6 +723,7 @@ var authCommandsLib = {
                 runOnDb: adminDbName,
                 privileges: [
                     {resource: {db: firstDbName, collection: "x"}, actions: ["insert"]},
+                    {resource: {cluster: true}, actions: ["applyOps"]},
                     // Don't have useUUID privilege.
                 ],
               },
@@ -728,10 +753,10 @@ var authCommandsLib = {
           },
           skipSharded: true,
           setup: function(db) {
-              db.getSisterDB(firstDbName).x.drop();
+              db.getSiblingDB(firstDbName).x.drop();
           },
           teardown: function(db) {
-              db.getSisterDB(firstDbName).x.drop();
+              db.getSiblingDB(firstDbName).x.drop();
           },
           testcases: [
               {
@@ -740,7 +765,7 @@ var authCommandsLib = {
                 runOnDb: adminDbName,
                 privileges: [
                     {resource: {db: firstDbName, collection: "x"}, actions: ["insert"]},
-                    {resource: {cluster: true}, actions: ["useUUID", "forceUUID"]}
+                    {resource: {cluster: true}, actions: ["useUUID", "forceUUID", "applyOps"]},
                     // Require universal privilege set.
                 ],
               },
@@ -761,15 +786,15 @@ var authCommandsLib = {
           },
           skipSharded: true,
           setup: function(db) {
-              db.getSisterDB(firstDbName).x.drop();
-              db.getSisterDB(firstDbName).y.drop();
-              var sibling = db.getSisterDB(firstDbName);
-              sibling.runCommand({create: "x"});
-              sibling.runCommand({create: "y"});
+              db.getSiblingDB(firstDbName).x.drop();
+              db.getSiblingDB(firstDbName).y.drop();
+              var sibling = db.getSiblingDB(firstDbName);
+              assert.commandWorked(sibling.runCommand({create: "x"}));
+              assert.commandWorked(sibling.runCommand({create: "y"}));
               return {x_uuid: getUUIDFromListCollections(sibling, sibling.x.getName())};
           },
           teardown: function(db) {
-              db.getSisterDB(firstDbName).x.drop();
+              db.getSiblingDB(firstDbName).x.drop();
           },
           testcases: [
               {
@@ -780,7 +805,7 @@ var authCommandsLib = {
                       actions: ["createCollection", "insert"]
                     },
                     {resource: {db: firstDbName, collection: "y"}, actions: ["createCollection"]},
-                    {resource: {cluster: true}, actions: ["useUUID", "forceUUID"]}
+                    {resource: {cluster: true}, actions: ["useUUID", "forceUUID", "applyOps"]},
                 ],
               },
           ]
@@ -800,15 +825,15 @@ var authCommandsLib = {
           },
           skipSharded: true,
           setup: function(db) {
-              db.getSisterDB(firstDbName).x.drop();
-              db.getSisterDB(firstDbName).y.drop();
-              var sibling = db.getSisterDB(firstDbName);
-              sibling.runCommand({create: "x"});
-              sibling.runCommand({create: "y"});
+              db.getSiblingDB(firstDbName).x.drop();
+              db.getSiblingDB(firstDbName).y.drop();
+              var sibling = db.getSiblingDB(firstDbName);
+              assert.commandWorked(sibling.runCommand({create: "x"}));
+              assert.commandWorked(sibling.runCommand({create: "y"}));
               return {x_uuid: getUUIDFromListCollections(sibling, sibling.x.getName())};
           },
           teardown: function(db) {
-              db.getSisterDB(firstDbName).x.drop();
+              db.getSiblingDB(firstDbName).x.drop();
           },
           testcases: [
               {
@@ -820,7 +845,7 @@ var authCommandsLib = {
                       resource: {db: firstDbName, collection: "y"},
                       actions: ["createCollection", "insert"]
                     },
-                    {resource: {cluster: true}, actions: ["useUUID", "forceUUID"]}
+                    {resource: {cluster: true}, actions: ["useUUID", "forceUUID", "applyOps"]},
                 ],
               },
           ]
@@ -837,17 +862,18 @@ var authCommandsLib = {
           },
           skipSharded: true,
           setup: function(db) {
-              db.getSisterDB(firstDbName).x.save({_id: 1, data: 1});
+              assert.writeOK(db.getSiblingDB(firstDbName).x.save({_id: 1, data: 1}));
           },
           teardown: function(db) {
-              db.getSisterDB(firstDbName).x.drop();
+              db.getSiblingDB(firstDbName).x.drop();
           },
           testcases: [
               {
                 runOnDb: adminDbName,
-                roles: Object.merge(roles_write, {restore: 0}, true),
+                roles: {__system: 1, root: 1},
                 privileges: [
                     {resource: {db: firstDbName, collection: "x"}, actions: ["update", "insert"]},
+                    {resource: {cluster: true}, actions: ["applyOps"]},
                 ],
               },
           ]
@@ -865,17 +891,18 @@ var authCommandsLib = {
           },
           skipSharded: true,
           setup: function(db) {
-              db.getSisterDB(firstDbName).x.save({_id: 1, data: 1});
+              assert.writeOK(db.getSiblingDB(firstDbName).x.save({_id: 1, data: 1}));
           },
           teardown: function(db) {
-              db.getSisterDB(firstDbName).x.drop();
+              db.getSiblingDB(firstDbName).x.drop();
           },
           testcases: [
               {
                 runOnDb: adminDbName,
-                roles: Object.merge(roles_write, {restore: 0}, true),
+                roles: {__system: 1, root: 1},
                 privileges: [
                     {resource: {db: firstDbName, collection: "x"}, actions: ["update"]},
+                    {resource: {cluster: true}, actions: ["applyOps"]},
                 ],
               },
           ]
@@ -896,8 +923,8 @@ var authCommandsLib = {
           },
           skipSharded: true,
           setup: function(db) {
-              var sibling = db.getSisterDB(firstDbName);
-              sibling.x.save({_id: 1, data: 1});
+              var sibling = db.getSiblingDB(firstDbName);
+              assert.writeOK(sibling.x.save({_id: 1, data: 1}));
 
               return {
                   collName: sibling.x.getFullName(),
@@ -905,15 +932,15 @@ var authCommandsLib = {
               };
           },
           teardown: function(db) {
-              db.getSisterDB(firstDbName).x.drop();
+              db.getSiblingDB(firstDbName).x.drop();
           },
           testcases: [
               {
                 runOnDb: adminDbName,
-                roles: {root: 1, __system: 1},
+                roles: {__system: 1, root: 1},
                 privileges: [
                     {resource: {db: firstDbName, collection: "x"}, actions: ["update"]},
-                    {resource: {cluster: true}, actions: ["useUUID"]}
+                    {resource: {cluster: true}, actions: ["useUUID", "applyOps"]},
                 ],
               },
           ]
@@ -934,8 +961,8 @@ var authCommandsLib = {
           },
           skipSharded: true,
           setup: function(db) {
-              var sibling = db.getSisterDB(firstDbName);
-              sibling.x.save({_id: 1, data: 1});
+              var sibling = db.getSiblingDB(firstDbName);
+              assert.writeOK(sibling.x.save({_id: 1, data: 1}));
 
               return {
                   collName: sibling.x.getFullName(),
@@ -943,7 +970,7 @@ var authCommandsLib = {
               };
           },
           teardown: function(db) {
-              db.getSisterDB(firstDbName).x.drop();
+              db.getSiblingDB(firstDbName).x.drop();
           },
           testcases: [
               {
@@ -951,6 +978,7 @@ var authCommandsLib = {
                 runOnDb: adminDbName,
                 privileges: [
                     {resource: {db: firstDbName, collection: "x"}, actions: ["update"]},
+                    {resource: {cluster: true}, actions: ["applyOps"]},
                 ],
               },
           ]
@@ -960,17 +988,18 @@ var authCommandsLib = {
           command: {applyOps: [{"op": "d", "ns": firstDbName + ".x", "o": {"_id": 1}}]},
           skipSharded: true,
           setup: function(db) {
-              db.getSisterDB(firstDbName).x.save({_id: 1, data: 1});
+              assert.writeOK(db.getSiblingDB(firstDbName).x.save({_id: 1, data: 1}));
           },
           teardown: function(db) {
-              db.getSisterDB(firstDbName).x.drop();
+              db.getSiblingDB(firstDbName).x.drop();
           },
           testcases: [
               {
                 runOnDb: adminDbName,
-                roles: Object.merge(roles_write, {restore: 0}, true),
+                roles: {__system: 1, root: 1},
                 privileges: [
                     {resource: {db: firstDbName, collection: "x"}, actions: ["remove"]},
+                    {resource: {cluster: true}, actions: ["applyOps"]},
                 ],
               },
           ]
@@ -996,7 +1025,7 @@ var authCommandsLib = {
         {
           testname: "aggregate_readonly_views",
           setup: function(db) {
-              db.createView("view", "collection", [{$match: {}}]);
+              assert.commandWorked(db.createView("view", "collection", [{$match: {}}]));
           },
           teardown: function(db) {
               db.view.drop();
@@ -1038,7 +1067,7 @@ var authCommandsLib = {
         {
           testname: "aggregate_explain_views",
           setup: function(db) {
-              db.createView("view", "collection", [{$match: {}}]);
+              assert.commandWorked(db.createView("view", "collection", [{$match: {}}]));
           },
           teardown: function(db) {
               db.view.drop();
@@ -1070,6 +1099,14 @@ var authCommandsLib = {
                   bypassDocumentValidation: args.bypassDocumentValidation,
               };
           },
+          setup: function(db) {
+              assert.commandWorked(db.getSiblingDB(firstDbName).foo.insert({}));
+              assert.commandWorked(db.getSiblingDB(secondDbName).foo.insert({}));
+          },
+          teardown: function(db) {
+              assert.commandWorked(db.getSiblingDB(firstDbName).dropDatabase());
+              assert.commandWorked(db.getSiblingDB(secondDbName).dropDatabase());
+          },
           testcases: [
               {
                 runOnDb: firstDbName,
@@ -1107,39 +1144,64 @@ var authCommandsLib = {
           ]
         },
         {
-          testname: "aggregate_out_replace_collection",
+          testname: "aggregate_out_to_different_db",
           command: function(state, args) {
               return {
                   aggregate: "foo",
-                  pipeline: [{$out: "foo_out"}],
+                  pipeline: [{$out: {db: args.targetDB, coll: "foo_out"}}],
                   cursor: {},
                   bypassDocumentValidation: args.bypassDocumentValidation,
               };
           },
+          setup: function(db) {
+              assert.commandWorked(db.getSiblingDB(firstDbName).foo.insert({}));
+              assert.commandWorked(db.getSiblingDB(secondDbName).foo.insert({}));
+          },
+          teardown: function(db) {
+              assert.commandWorked(db.getSiblingDB(firstDbName).dropDatabase());
+              assert.commandWorked(db.getSiblingDB(secondDbName).dropDatabase());
+          },
           testcases: [
               {
                 runOnDb: firstDbName,
-                commandArgs: {bypassDocumentValidation: false},
+                commandArgs: {targetDB: firstDbName, bypassDocumentValidation: false},
                 roles: {readWrite: 1, readWriteAnyDatabase: 1, dbOwner: 1, root: 1, __system: 1},
                 privileges: [
                     {resource: {db: firstDbName, collection: "foo"}, actions: ["find"]},
-                    {resource: {db: firstDbName, collection: "foo_out"}, actions: ["insert"]},
-                    {resource: {db: firstDbName, collection: "foo_out"}, actions: ["remove"]}
+                    {
+                        resource: {db: firstDbName, collection: "foo_out"},
+                        actions: ["insert", "remove"]
+                    },
                 ]
               },
               {
                 runOnDb: secondDbName,
-                commandArgs: {bypassDocumentValidation: false},
+                commandArgs: {targetDB: secondDbName, bypassDocumentValidation: false},
                 roles: {readWriteAnyDatabase: 1, root: 1, __system: 1},
                 privileges: [
                     {resource: {db: secondDbName, collection: "foo"}, actions: ["find"]},
-                    {resource: {db: secondDbName, collection: "foo_out"}, actions: ["insert"]},
-                    {resource: {db: secondDbName, collection: "foo_out"}, actions: ["remove"]}
+                    {
+                        resource: {db: secondDbName, collection: "foo_out"},
+                        actions: ["insert", "remove"]
+                    },
                 ]
               },
               {
                 runOnDb: firstDbName,
-                commandArgs: {bypassDocumentValidation: true},
+                commandArgs: {targetDB: secondDbName, bypassDocumentValidation: false},
+                roles: {readWriteAnyDatabase: 1, root: 1, __system: 1},
+                privileges: [
+                    {resource: {db: firstDbName, collection: "foo"}, actions: ["find"]},
+                    {
+                        resource: {db: secondDbName, collection: "foo_out"},
+                        actions: ["insert", "remove"]
+                    },
+                ]
+              },
+              // Test for bypassDocumentValidation.
+              {
+                runOnDb: firstDbName,
+                commandArgs: {targetDB: firstDbName, bypassDocumentValidation: true},
                 // Note that the built-in role must have 'bypassDocumentValidation' for this test.
                 roles: {dbOwner: 1, root: 1, __system: 1},
                 privileges: [
@@ -1150,7 +1212,20 @@ var authCommandsLib = {
                     },
                 ]
               },
-              // TODO SERVER-36832: Test with a foreign database.
+              // Test for bypassDocumentValidation to a foreign database.
+              {
+                runOnDb: firstDbName,
+                commandArgs: {targetDB: secondDbName, bypassDocumentValidation: true},
+                // Note that the built-in role must have 'bypassDocumentValidation' for this test.
+                roles: {root: 1, __system: 1},
+                privileges: [
+                    {resource: {db: firstDbName, collection: "foo"}, actions: ["find"]},
+                    {
+                      resource: {db: secondDbName, collection: "foo_out"},
+                      actions: ["insert", "remove", "bypassDocumentValidation"]
+                    },
+                ]
+              },
           ]
         },
         {
@@ -1307,7 +1382,7 @@ var authCommandsLib = {
         {
           testname: "aggregate_readView_writeCollection",
           setup: function(db) {
-              db.createView("view", "collection", [{$match: {}}]);
+              assert.commandWorked(db.createView("view", "collection", [{$match: {}}]));
           },
           teardown: function(db) {
               db.view.drop();
@@ -1337,7 +1412,7 @@ var authCommandsLib = {
         {
           testname: "aggregate_writeView",
           setup: function(db) {
-              db.createView("view", "collection", [{$match: {}}]);
+              assert.commandWorked(db.createView("view", "collection", [{$match: {}}]));
           },
           teardown: function(db) {
               db.view.drop();
@@ -1370,7 +1445,7 @@ var authCommandsLib = {
           testname: "aggregate_indexStats",
           command: {aggregate: "foo", pipeline: [{$indexStats: {}}], cursor: {}},
           setup: function(db) {
-              db.createCollection("foo");
+              assert.commandWorked(db.createCollection("foo"));
           },
           teardown: function(db) {
               db.foo.drop();
@@ -1395,7 +1470,7 @@ var authCommandsLib = {
           command: {aggregate: "foo", pipeline: [{$planCacheStats: {}}], cursor: {}},
           skipSharded: true,
           setup: function(db) {
-              db.createCollection("foo");
+              assert.commandWorked(db.createCollection("foo"));
           },
           teardown: function(db) {
               db.foo.drop();
@@ -1498,8 +1573,8 @@ var authCommandsLib = {
               cursor: {}
           },
           setup: function(db) {
-              db.createCollection("foo");
-              db.createCollection("bar");
+              assert.commandWorked(db.createCollection("foo"));
+              assert.commandWorked(db.createCollection("bar"));
           },
           teardown: function(db) {
               db.foo.drop();
@@ -1538,9 +1613,9 @@ var authCommandsLib = {
               cursor: {}
           },
           setup: function(db) {
-              db.createCollection("foo");
-              db.createCollection("bar");
-              db.createCollection("baz");
+              assert.commandWorked(db.createCollection("foo"));
+              assert.commandWorked(db.createCollection("bar"));
+              assert.commandWorked(db.createCollection("baz"));
           },
           teardown: function(db) {
               db.foo.drop();
@@ -1572,7 +1647,7 @@ var authCommandsLib = {
           testname: "aggregate_lookup_views",
           setup: function(db) {
               db.createView("view", "collection", [{$match: {}}]);
-              db.createCollection("foo");
+              assert.commandWorked(db.createCollection("foo"));
           },
           teardown: function(db) {
               db.view.drop();
@@ -1621,8 +1696,8 @@ var authCommandsLib = {
               cursor: {}
           },
           setup: function(db) {
-              db.createCollection("foo");
-              db.createCollection("bar");
+              assert.commandWorked(db.createCollection("foo"));
+              assert.commandWorked(db.createCollection("bar"));
           },
           teardown: function(db) {
               db.foo.drop();
@@ -1651,7 +1726,7 @@ var authCommandsLib = {
           testname: "aggregate_graphLookup_views",
           setup: function(db) {
               db.createView("view", "collection", [{$match: {}}]);
-              db.createCollection("foo");
+              assert.commandWorked(db.createCollection("foo"));
           },
           teardown: function(db) {
               db.view.drop();
@@ -1694,7 +1769,7 @@ var authCommandsLib = {
           testname: "aggregate_collStats",
           command: {aggregate: "foo", pipeline: [{$collStats: {latencyStats: {}}}], cursor: {}},
           setup: function(db) {
-              db.createCollection("foo");
+              assert.commandWorked(db.createCollection("foo"));
           },
           teardown: function(db) {
               db.foo.drop();
@@ -1737,6 +1812,105 @@ var authCommandsLib = {
           ]
         },
         {
+          testname: "aggregate_collStats_facet",
+          command: {
+              aggregate: "foo",
+              pipeline: [
+                {$collStats: {latencyStats: {}}},
+                {$facet: {matched: [{$match: {a: 1}}]}}
+              ],
+              cursor: {}
+          },
+          setup: function(db) {
+              assert.commandWorked(db.createCollection("foo"));
+          },
+          teardown: function(db) {
+              db.foo.drop();
+          },
+          testcases: [
+              {
+                runOnDb: firstDbName,
+                roles: {
+                    read: 1,
+                    readAnyDatabase: 1,
+                    readWrite: 1,
+                    readWriteAnyDatabase: 1,
+                    dbAdmin: 1,
+                    dbAdminAnyDatabase: 1,
+                    dbOwner: 1,
+                    clusterMonitor: 1,
+                    clusterAdmin: 1,
+                    backup: 1,
+                    root: 1,
+                    __system: 1
+                },
+                privileges:
+                    [{resource: {db: firstDbName, collection: "foo"}, actions: ["collStats"]}]
+              },
+          ]
+        },
+        {
+          testname: "aggregate_collStats_within_lookup",
+          command: {
+              aggregate: "foo",
+              pipeline: [
+                {$lookup: {
+                    from: "lookupColl",
+                    pipeline: [{
+                        $collStats: {latencyStats: {}}
+                    }],
+                    as: "result"
+                }},
+              ],
+              cursor: {}
+          },
+          setup: function(db) {
+              assert.commandWorked(db.createCollection("foo"));
+              assert.commandWorked(db.createCollection("lookupColl"));
+          },
+          teardown: function(db) {
+              db.foo.drop();
+              db.lookupColl.drop();
+          },
+          testcases: [
+              {
+                runOnDb: firstDbName,
+                roles: roles_read,
+                privileges: [
+                    {resource: {db: firstDbName, collection: "lookupColl"}, actions: ["collStats"]},
+                    {resource: {db: firstDbName, collection: "foo"}, actions: ["find"]}
+                ],
+              },
+          ]
+        },
+        {
+          testname: "aggregate_collStats_within_union",
+          command: {
+              aggregate: "foo",
+              pipeline: [
+                {$unionWith: {coll: "unionColl", pipeline: [{$collStats: {latencyStats: {}}}]}},
+              ],
+              cursor: {}
+          },
+          setup: function(db) {
+              assert.commandWorked(db.createCollection("foo"));
+              assert.commandWorked(db.createCollection("unionColl"));
+          },
+          teardown: function(db) {
+              db.foo.drop();
+              db.unionColl.drop();
+          },
+          testcases: [
+              {
+                runOnDb: firstDbName,
+                roles: roles_read,
+                privileges:
+                    [{resource: {db: firstDbName, collection: "unionColl"}, actions: ["collStats"]},
+                    {resource: {db: firstDbName, collection: "foo"}, actions: ["find"]}],
+              },
+          ]
+        },
+        {
           testname: "aggregate_facet",
           command: {
               aggregate: "foo",
@@ -1765,9 +1939,9 @@ var authCommandsLib = {
               cursor: {}
           },
           setup: function(db) {
-              db.createCollection("foo");
-              db.createCollection("bar");
-              db.createCollection("baz");
+              assert.commandWorked(db.createCollection("foo"));
+              assert.commandWorked(db.createCollection("bar"));
+              assert.commandWorked(db.createCollection("baz"));
           },
           teardown: function(db) {
               db.foo.drop();
@@ -1823,11 +1997,11 @@ var authCommandsLib = {
               cursor: {}
           },
           setup: function(db) {
-              db.createCollection("foo");
-              db.createView("view1", "bar", [
+              assert.commandWorked(db.createCollection("foo"));
+              assert.commandWorked(db.createView("view1", "bar", [
                   {$lookup: {from: "qux", localField: "_id", foreignField: "_id", as: "results"}}
-              ]);
-              db.createView("view2", "baz", [{
+              ]));
+              assert.commandWorked((db.createView("view2", "baz", [{
                                 $graphLookup: {
                                     from: "quz",
                                     startWith: [1],
@@ -1835,7 +2009,7 @@ var authCommandsLib = {
                                     connectToField: "_id",
                                     as: "results"
                                 }
-                            }]);
+                            }])));
           },
           teardown: function(db) {
               db.foo.drop();
@@ -1869,7 +2043,7 @@ var authCommandsLib = {
           testname: "aggregate_changeStream_one_collection",
           command: {aggregate: "foo", pipeline: [{$changeStream: {}}], cursor: {}},
           setup: function(db) {
-              db.createCollection("foo");
+              assert.commandWorked(db.createCollection("foo"));
           },
           teardown: function(db) {
               db.foo.drop();
@@ -2034,39 +2208,56 @@ var authCommandsLib = {
           ]
         },
         {
-          testname: "cloneCollection_1",
-          command: {cloneCollection: firstDbName + ".x"},
-          skipSharded: true,
-          testcases: [{
-              runOnDb: firstDbName,
-              roles: roles_write,
-              privileges: [{
-                  resource: {db: firstDbName, collection: "x"},
-                  actions: ["insert", "createIndex"]
-              }],
-              expectFail: true
-          }]
+          testname: "cleanupReshardCollection",
+          command: {cleanupReshardCollection: "test.x"},
+          skipUnlessSharded: true,
+          testcases: [
+              {
+                runOnDb: adminDbName,
+                roles: Object.extend({enableSharding: 1}, roles_clusterManager),
+                privileges:
+                [{resource: {db: "test", collection: "x"}, actions: ["reshardCollection"]}],
+                  expectFail: true
+              },
+          ]
         },
         {
-          testname: "cloneCollection_2",
-          command: {cloneCollection: secondDbName + ".x"},
+          testname: "_configsvrCleanupReshardCollection",
+          command: {_configsvrCleanupReshardCollection: "test.x"},
           skipSharded: true,
-          testcases: [{
-              runOnDb: secondDbName,
-              roles: {readWriteAnyDatabase: 1, restore: 1, root: 1, __system: 1},
-              privileges: [{
-                  resource: {db: secondDbName, collection: "x"},
-                  actions: ["insert", "createIndex"]
-              }],
-              expectFail: true
-          }]
+          testcases: [
+              {
+                runOnDb: adminDbName,
+                roles: {__system: 1},
+                privileges: [{resource: {cluster: true}, actions: ["internal"]}],
+                expectFail: true
+              },
+              {runOnDb: firstDbName, roles: {}},
+              {runOnDb: secondDbName, roles: {}}
+          ]
+        },
+        {
+          testname: "_shardsvrCleanupReshardCollection",
+          command: {_shardsvrCleanupReshardCollection: "test.x", reshardingUUID: UUID()},
+          skipSharded: true,
+          testcases: [
+              {
+                runOnDb: adminDbName,
+                roles: {__system: 1},
+                privileges: [{resource: {cluster: true}, actions: ["internal"]}],
+                expectFail: true
+              },
+              {runOnDb: firstDbName, roles: {}},
+              {runOnDb: secondDbName, roles: {}}
+          ]
         },
         {
           testname: "cloneCollectionAsCapped",
           command: {cloneCollectionAsCapped: "x", toCollection: "y", size: 1000},
           skipSharded: true,
           setup: function(db) {
-              db.x.save({});
+              assert.writeOK(db.x.save({}));
+              db.y.drop();
           },
           teardown: function(db) {
               db.x.drop();
@@ -2101,7 +2292,7 @@ var authCommandsLib = {
           testname: "collMod",
           command: {collMod: "foo"},
           setup: function(db) {
-              db.foo.save({});
+              assert.writeOK(db.foo.save({}));
           },
           teardown: function(db) {
               db.x.drop();
@@ -2124,7 +2315,7 @@ var authCommandsLib = {
         {
           testname: "collMod_views",
           setup: function(db) {
-              db.createView("view", "foo", [{$match: {}}]);
+              assert.commandWorked(db.createView("view", "foo", [{$match: {}}]));
           },
           teardown: function(db) {
               db.view.drop();
@@ -2176,7 +2367,7 @@ var authCommandsLib = {
         {
           testname: "collMod_views_lookup",
           setup: function(db) {
-              db.createView("view", "foo", [{$match: {}}]);
+              assert.commandWorked(db.createView("view", "foo", [{$match: {}}]));
           },
           teardown: function(db) {
               db.view.drop();
@@ -2236,7 +2427,7 @@ var authCommandsLib = {
         {
           testname: "collMod_views_graphLookup",
           setup: function(db) {
-              db.createView("view", "foo", [{$match: {}}]);
+              assert.commandWorked(db.createView("view", "foo", [{$match: {}}]));
           },
           teardown: function(db) {
               db.view.drop();
@@ -2303,7 +2494,7 @@ var authCommandsLib = {
         {
           testname: "collMod_views_facet",
           setup: function(db) {
-              db.createView("view", "foo", []);
+              assert.commandWorked(db.createView("view", "foo", []));
           },
           teardown: function(db) {
               db.view.drop();
@@ -2386,10 +2577,10 @@ var authCommandsLib = {
           testname: "collStats",
           command: {collStats: "bar", scale: 1},
           setup: function(db) {
-              db.bar.save({});
+              assert.writeOK(db.bar.save({}));
           },
           teardown: function(db) {
-              db.dropDatabase();
+              assert.commandWorked(db.dropDatabase());
           },
           testcases: [
               {
@@ -2429,8 +2620,38 @@ var authCommandsLib = {
           ]
         },
         {
+          testname: "commitReshardCollection",
+          command: {commitReshardCollection: "test.x"},
+          skipUnlessSharded: true,
+          testcases: [
+              {
+                runOnDb: adminDbName,
+                roles: Object.extend({enableSharding: 1}, roles_clusterManager),
+                privileges:
+                [{resource: {db: "test", collection: "x"}, actions: ["reshardCollection"]}],
+                  expectFail: true
+              },
+          ]
+        },
+        {
+          testname: "_configsvrCommitReshardCollection",
+          command: {_configsvrCommitReshardCollection: "test.x"},
+          skipSharded: true,
+          testcases: [
+              {
+                runOnDb: adminDbName,
+                roles: {__system: 1},
+                privileges: [{resource: {cluster: true}, actions: ["internal"]}],
+                expectFail: true
+              },
+              {runOnDb: firstDbName, roles: {}},
+              {runOnDb: secondDbName, roles: {}}
+          ]
+        },
+        {
           testname: "commitTxn",
           command: {commitTransaction: 1},
+          // TODO (SERVER-53497): Enable auth testing for abortTransaction and commitTransaction.
           skipSharded: true,
           skipUnlessReplicaSet: true,
           testcases: [
@@ -2445,10 +2666,10 @@ var authCommandsLib = {
           command: {compact: "foo"},
           skipSharded: true,
           setup: function(db) {
-              db.foo.save({});
+              assert.writeOK(db.foo.save({}));
           },
           teardown: function(db) {
-              db.dropDatabase();
+              assert.commandWorked(db.dropDatabase());
           },
           testcases: [
               {
@@ -2509,7 +2730,7 @@ var authCommandsLib = {
           testname: "convertToCapped",
           command: {convertToCapped: "toCapped", size: 1000},
           setup: function(db) {
-              db.toCapped.save({});
+              assert.writeOK(db.toCapped.save({}));
           },
           teardown: function(db) {
               db.toCapped.drop();
@@ -2678,7 +2899,7 @@ var authCommandsLib = {
           },
           skipSharded: true,
           setup: function(db) {
-              db.runCommand({create: "foo"});
+              assert.commandWorked(db.runCommand({create: "foo"}));
 
               return {uuid: getUUIDFromListCollections(db, db.foo.getName())};
           },
@@ -2771,20 +2992,6 @@ var authCommandsLib = {
                 privileges:
                     [{resource: {db: secondDbName, collection: "x"}, actions: ["insert"]}]
               }
-          ]
-        },
-        {
-          testname: "_configsvrCreateCollection",
-          command: {_configsvrCreateCollection: "test.user"},
-          skipSharded: true,
-          expectFail: true,
-          testcases: [
-              {
-                runOnDb: "admin",
-                roles: {__system: 1},
-                privileges: [{resource: {cluster: true}, actions: ["internal"]}],
-                expectFail: true
-              },
           ]
         },
         {
@@ -3096,8 +3303,7 @@ var authCommandsLib = {
         },
         {
           testname: "createIndexes",
-          command:
-              {createIndexes: "x", indexes: [{ns: firstDbName + ".x", key: {a: 1}, name: "a_1"}]},
+          command: {createIndexes: "x", indexes: [{key: {a: 1}, name: "a_1"}]},
           teardown: function(db) {
               db.x.drop();
           },
@@ -3161,6 +3367,12 @@ var authCommandsLib = {
         {
           testname: "dataSize_2",
           command: {dataSize: secondDbName + ".x"},
+          setup: function(db) {
+              assert.writeOK(db.x.insert({}));
+          },
+          teardown: function(db) {
+              db.x.drop();
+          },
           testcases: [{
               runOnDb: secondDbName,
               roles: roles_readAny,
@@ -3248,439 +3460,118 @@ var authCommandsLib = {
           ]
         },
         {
-          testname: "doTxn_precondition",
+          testname: "donorAbortMigration",
           command: {
-              doTxn: [{
-                  "op": "i",
-                  "ns": firstDbName + ".x",
-                  "o": {"_id": ObjectId("57dc3d7da4fce4358afa85b8"), "data": 5}
-              }],
-              preCondition: [{ns: firstDbName + ".x", q: {x: 5}, res: []}],
-              txnNumber: NumberLong(0),
-              lsid: {id: UUID()}
+              donorAbortMigration: 1,
+              migrationId: UUID(),
           },
           skipSharded: true,
-          skipUnlessReplicaSet: true,
-          setup: function(db) {
-              db.getSisterDB(firstDbName).x.save({});
-          },
-          teardown: function(db) {
-              db.getSisterDB(firstDbName).x.drop();
-          },
           testcases: [
               {
-                runOnDb: adminDbName,
-                privileges: [
-                    {resource: {db: firstDbName, collection: "x"}, actions: ["find"]},
-                    {resource: {db: firstDbName, collection: "x"}, actions: ["insert"]},
-                ],
+                  runOnDb: adminDbName,
+                  roles: roles_clusterManager,
+                  privileges: [{resource: {cluster: true}, actions: ["runTenantMigration"]}],
+                  // This is expected to throw NoSuchTenantMigration.
+                  expectFail: true,
               },
+              {runOnDb: firstDbName, roles: {}},
+              {runOnDb: secondDbName, roles: {}}
           ]
         },
         {
-          testname: "doTxn_insert",
+          testname: "donorForgetMigration",
           command: {
-              doTxn: [{
-                  "op": "i",
-                  "ns": firstDbName + ".x",
-                  "o": {"_id": ObjectId("57dc3d7da4fce4358afa85b8"), "data": 5}
-              }],
-              txnNumber: NumberLong(0),
-              lsid: {id: UUID()}
+              donorForgetMigration: 1,
+              migrationId: UUID(),
           },
           skipSharded: true,
-          skipUnlessReplicaSet: true,
-          setup: function(db) {
-              db.getSisterDB(firstDbName).x.save({});
-          },
-          teardown: function(db) {
-              db.getSisterDB(firstDbName).x.drop();
-          },
           testcases: [
               {
-                runOnDb: adminDbName,
-                roles: roles_write,
-                privileges: [
-                    {resource: {db: firstDbName, collection: "x"}, actions: ["insert"]},
-                ],
+                  runOnDb: adminDbName,
+                  roles: roles_clusterManager,
+                  privileges: [{resource: {cluster: true}, actions: ["runTenantMigration"]}],
+                  // This is expected to throw NoSuchTenantMigration.
+                  expectFail: true,
               },
+              {runOnDb: firstDbName, roles: {}},
+              {runOnDb: secondDbName, roles: {}}
           ]
         },
         {
-          testname: "doTxn_insert_UUID",
-          command: function(state) {
-              return {
-                  doTxn: [{
-                      "op": "i",
-                      "ns": state.collName,
-                      "ui": state.uuid,
-                      "o": {"_id": ObjectId("57dc3d7da4fce4358afa85b8"), "data": 5}
-                  }],
-                  txnNumber: NumberLong(0),
-                  lsid: {id: UUID()}
-              };
-          },
-          skipSharded: true,
-          skipUnlessReplicaSet: true,
-          setup: function(db) {
-              var sibling = db.getSisterDB(firstDbName);
-              sibling.runCommand({create: "x"});
-
-              return {
-                  collName: sibling.x.getFullName(),
-                  uuid: getUUIDFromListCollections(sibling, sibling.x.getName())
-              };
-          },
-          teardown: function(db) {
-              db.getSisterDB(firstDbName).x.drop();
-          },
-          testcases: [
-              {
-                runOnDb: adminDbName,
-                roles: {root: 1, restore: 1, __system: 1},
-                privileges: [
-                    {resource: {db: firstDbName, collection: "x"}, actions: ["insert"]},
-                    {resource: {cluster: true}, actions: ["useUUID"]}
-                ],
-              },
-          ]
-        },
-        {
-          testname: "doTxn_insert_with_nonexistent_UUID",
-          command: function(state) {
-              return {
-                  doTxn: [{
-                      "op": "i",
-                      "ns": state.collName,
-                      // Given a nonexistent UUID. The command should fail.
-                      "ui": UUID("71f1d1d7-68ca-493e-a7e9-f03c94e2e960"),
-                      "o": {"_id": ObjectId("57dc3d7da4fce4358afa85b8"), "data": 5}
-                  }],
-                  txnNumber: NumberLong(0),
-                  lsid: {id: UUID()}
-              };
-          },
-          skipSharded: true,
-          skipUnlessReplicaSet: true,
-          setup: function(db) {
-              var sibling = db.getSisterDB(firstDbName);
-              sibling.runCommand({create: "x"});
-
-              return {
-                  collName: sibling.x.getFullName(),
-                  uuid: getUUIDFromListCollections(sibling, sibling.x.getName())
-              };
-          },
-          teardown: function(db) {
-              db.getSisterDB(firstDbName).x.drop();
-          },
-          testcases: [
-              {
-                // It would be an sanity check failure rather than a auth check
-                // failure.
-                expectFail: true,
-                runOnDb: adminDbName,
-                roles: {root: 1, restore: 1, __system: 1},
-                privileges: [
-                    {resource: {db: firstDbName, collection: "x"}, actions: ["insert"]},
-                    {resource: {cluster: true}, actions: ["useUUID"]}
-                ],
-              },
-          ]
-        },
-        {
-          testname: "doTxn_insert_UUID_failure",
-          command: function(state) {
-              return {
-                  doTxn: [{
-                      "op": "i",
-                      "ns": state.collName,
-                      "ui": state.uuid,
-                      "o": {"_id": ObjectId("57dc3d7da4fce4358afa85b8"), "data": 5}
-                  }],
-                  txnNumber: NumberLong(0),
-                  lsid: {id: UUID()}
-              };
-          },
-          skipSharded: true,
-          skipUnlessReplicaSet: true,
-          setup: function(db) {
-              var sibling = db.getSisterDB(firstDbName);
-              sibling.runCommand({create: "x"});
-
-              return {
-                  collName: sibling.x.getFullName(),
-                  uuid: getUUIDFromListCollections(sibling, sibling.x.getName())
-              };
-          },
-          teardown: function(db) {
-              db.getSisterDB(firstDbName).x.drop();
-          },
-          testcases: [
-              {
-                expectAuthzFailure: true,
-                runOnDb: adminDbName,
-                privileges: [
-                    {resource: {db: firstDbName, collection: "x"}, actions: ["insert"]},
-                    // Don't have useUUID privilege.
-                ],
-              },
-          ]
-        },
-        {
-          testname: "doTxn_insert_UUID_with_wrong_ns",
-          command: function(state) {
-              return {
-                  doTxn: [{
-                      "op": "i",
-                      "ns":
-                          firstDbName + ".y",  // Specify wrong name but correct uuid. Should work.
-                      "ui": state.x_uuid,      // The insert should on x
-                      "o": {"_id": ObjectId("57dc3d7da4fce4358afa85b8"), "data": 5}
-                  }],
-                  txnNumber: NumberLong(0),
-                  lsid: {id: UUID()}
-              };
-          },
-          skipSharded: true,
-          skipUnlessReplicaSet: true,
-          setup: function(db) {
-              db.getSisterDB(firstDbName).x.drop();
-              db.getSisterDB(firstDbName).y.drop();
-              var sibling = db.getSisterDB(firstDbName);
-              sibling.runCommand({create: "x"});
-              sibling.runCommand({create: "y"});
-              return {x_uuid: getUUIDFromListCollections(sibling, sibling.x.getName())};
-          },
-          teardown: function(db) {
-              db.getSisterDB(firstDbName).x.drop();
-          },
-          testcases: [
-              {
-                runOnDb: adminDbName,
-                privileges: [
-                    {
-                      resource: {db: firstDbName, collection: "x"},
-                      actions: ["createCollection", "insert"]
-                    },
-                    {resource: {db: firstDbName, collection: "y"}, actions: ["createCollection"]},
-                    {resource: {cluster: true}, actions: ["useUUID", "forceUUID"]}
-                ],
-              },
-          ]
-        },
-        {
-          testname: "doTxn_insert_UUID_with_wrong_ns_failure",
-          command: function(state) {
-              return {
-                  doTxn: [{
-                      "op": "i",
-                      "ns":
-                          firstDbName + ".y",  // Specify wrong name but correct uuid. Should work.
-                      "ui": state.x_uuid,      // The insert should on x
-                      "o": {"_id": ObjectId("57dc3d7da4fce4358afa85b8"), "data": 5}
-                  }],
-                  txnNumber: NumberLong(0),
-                  lsid: {id: UUID()}
-              };
-          },
-          skipSharded: true,
-          skipUnlessReplicaSet: true,
-          setup: function(db) {
-              db.getSisterDB(firstDbName).x.drop();
-              db.getSisterDB(firstDbName).y.drop();
-              var sibling = db.getSisterDB(firstDbName);
-              sibling.runCommand({create: "x"});
-              sibling.runCommand({create: "y"});
-              return {x_uuid: getUUIDFromListCollections(sibling, sibling.x.getName())};
-          },
-          teardown: function(db) {
-              db.getSisterDB(firstDbName).x.drop();
-          },
-          testcases: [
-              {
-                expectAuthzFailure: true,
-                runOnDb: adminDbName,
-                privileges: [
-                    {resource: {db: firstDbName, collection: "x"}, actions: ["createCollection"]},
-                    {
-                      resource: {db: firstDbName, collection: "y"},
-                      actions: ["createCollection", "insert"]
-                    },
-                    {resource: {cluster: true}, actions: ["useUUID", "forceUUID"]}
-                ],
-              },
-          ]
-        },
-        {
-          testname: "doTxn_upsert",
+          testname: "donorStartMigration",
           command: {
-              doTxn: [{
-                  "op": "u",
-                  "ns": firstDbName + ".x",
-                  "o2": {"_id": 1},
-                  "o": {"_id": 1, "data": 8}
-              }],
-              txnNumber: NumberLong(0),
-              lsid: {id: UUID()}
+              donorStartMigration: 1,
+              tenantId: "testTenantId",
+              migrationId: UUID(),
+              recipientConnectionString: "recipient-rs/localhost:1234",
+              readPreference: {mode: "primary"},
+              donorCertificateForRecipient: migrationCertificates.donorCertificateForRecipient,
+              recipientCertificateForDonor: migrationCertificates.recipientCertificateForDonor,
           },
           skipSharded: true,
-          skipUnlessReplicaSet: true,
-          setup: function(db) {
-              db.getSisterDB(firstDbName).x.save({_id: 1, data: 1});
-          },
-          teardown: function(db) {
-              db.getSisterDB(firstDbName).x.drop();
-          },
           testcases: [
               {
-                runOnDb: adminDbName,
-                roles: Object.merge(roles_write, {restore: 0}, true),
-                privileges: [
-                    {resource: {db: firstDbName, collection: "x"}, actions: ["update", "insert"]},
-                ],
+                  runOnDb: adminDbName,
+                  roles: roles_clusterManager,
+                  privileges: [{resource: {cluster: true}, actions: ["runTenantMigration"]}],
+                  // Cannot start tenant migration on a standalone mongod.
+                  expectFail: true
               },
+              {runOnDb: firstDbName, roles: {}},
+              {runOnDb: secondDbName, roles: {}}
           ]
         },
         {
-          testname: "doTxn_update",
+          testname: "recipientSyncData",
           command: {
-              doTxn: [{
-                  "op": "u",
-                  "ns": firstDbName + ".x",
-                  "o2": {"_id": 1},
-                  "o": {"_id": 1, "data": 8}
-              }],
-              txnNumber: NumberLong(0),
-              lsid: {id: UUID()}
+              recipientSyncData: 1,
+              migrationId: UUID(),
+              donorConnectionString: "donor-rs/localhost:1234",
+              tenantId: "testTenantId",
+              readPreference: {mode: "primary"},
+              startMigrationDonorTimestamp: Timestamp(1, 1),
+              recipientCertificateForDonor: migrationCertificates.recipientCertificateForDonor,
           },
           skipSharded: true,
-          skipUnlessReplicaSet: true,
-          setup: function(db) {
-              db.getSisterDB(firstDbName).x.save({_id: 1, data: 1});
-          },
-          teardown: function(db) {
-              db.getSisterDB(firstDbName).x.drop();
-          },
           testcases: [
               {
-                runOnDb: adminDbName,
-                roles: Object.merge(roles_write, {restore: 0}, true),
-                privileges: [
-                    {resource: {db: firstDbName, collection: "x"}, actions: ["update"]},
-                ],
+                  runOnDb: adminDbName,
+                  roles: roles_clusterManager,
+                  privileges: [{resource: {cluster: true}, actions: ["runTenantMigration"]}],
+                  // Cannot start tenant migration on a standalone mongod.
+                  expectFail: true,
               },
+              {runOnDb: firstDbName, roles: {}},
+              {runOnDb: secondDbName, roles: {}}
           ]
         },
         {
-          testname: "doTxn_update_UUID",
-          command: function(state) {
-              return {
-                  doTxn: [{
-                      "op": "u",
-                      "ns": state.collName,
-                      "ui": state.uuid,
-                      "o2": {"_id": 1},
-                      "o": {"_id": 1, "data": 8}
-                  }],
-                  txnNumber: NumberLong(0),
-                  lsid: {id: UUID()}
-              };
-          },
-          skipSharded: true,
-          skipUnlessReplicaSet: true,
-          setup: function(db) {
-              var sibling = db.getSisterDB(firstDbName);
-              sibling.x.save({_id: 1, data: 1});
-
-              return {
-                  collName: sibling.x.getFullName(),
-                  uuid: getUUIDFromListCollections(sibling, sibling.x.getName())
-              };
-          },
-          teardown: function(db) {
-              db.getSisterDB(firstDbName).x.drop();
-          },
-          testcases: [
-              {
-                runOnDb: adminDbName,
-                roles: {root: 1, __system: 1},
-                privileges: [
-                    {resource: {db: firstDbName, collection: "x"}, actions: ["update"]},
-                    {resource: {cluster: true}, actions: ["useUUID"]}
-                ],
-              },
-          ]
-        },
-        {
-          testname: "doTxn_update_UUID_failure",
-          command: function(state) {
-              return {
-                  doTxn: [{
-                      "op": "u",
-                      "ns": state.collName,
-                      "ui": state.uuid,
-                      "o2": {"_id": 1},
-                      "o": {"_id": 1, "data": 8}
-                  }],
-                  txnNumber: NumberLong(0),
-                  lsid: {id: UUID()}
-              };
-          },
-          skipSharded: true,
-          skipUnlessReplicaSet: true,
-          setup: function(db) {
-              var sibling = db.getSisterDB(firstDbName);
-              sibling.x.save({_id: 1, data: 1});
-
-              return {
-                  collName: sibling.x.getFullName(),
-                  uuid: getUUIDFromListCollections(sibling, sibling.x.getName())
-              };
-          },
-          teardown: function(db) {
-              db.getSisterDB(firstDbName).x.drop();
-          },
-          testcases: [
-              {
-                expectAuthzFailure: true,
-                runOnDb: adminDbName,
-                privileges: [
-                    {resource: {db: firstDbName, collection: "x"}, actions: ["update"]},
-                ],
-              },
-          ]
-        },
-        {
-          testname: "doTxn_delete",
+          testname: "recipientForgetMigration",
           command: {
-              doTxn: [{"op": "d", "ns": firstDbName + ".x", "o": {"_id": 1}}],
-              txnNumber: NumberLong(0),
-              lsid: {id: UUID()}
+              recipientForgetMigration: 1,
+              migrationId: UUID(),
+              donorConnectionString: "donor-rs/localhost:1234",
+              tenantId: "testTenantId",
+              readPreference: {mode: "primary"},
           },
           skipSharded: true,
-          skipUnlessReplicaSet: true,
-          setup: function(db) {
-              db.getSisterDB(firstDbName).x.save({_id: 1, data: 1});
-          },
-          teardown: function(db) {
-              db.getSisterDB(firstDbName).x.drop();
-          },
           testcases: [
               {
-                runOnDb: adminDbName,
-                roles: Object.merge(roles_write, {restore: 0}, true),
-                privileges: [
-                    {resource: {db: firstDbName, collection: "x"}, actions: ["remove"]},
-                ],
+                  runOnDb: adminDbName,
+                  roles: roles_clusterManager,
+                  privileges: [{resource: {cluster: true}, actions: ["runTenantMigration"]}],
+                  // This is expected to fail with InvalidOptions without cluster certificate.
+                  expectFail: true,
               },
+              {runOnDb: firstDbName, roles: {}},
+              {runOnDb: secondDbName, roles: {}}
           ]
         },
         {
           testname: "drop",
           command: {drop: "x"},
           setup: function(db) {
-              db.x.save({});
+              assert.writeOK(db.x.save({}));
           },
           testcases: [
               {
@@ -3702,7 +3593,11 @@ var authCommandsLib = {
         {
           testname: "drop_views",
           setup: function(db) {
-              db.createView("view", "collection", [{$match: {}}]);
+              db.view.drop();
+              assert.commandWorked(db.createView("view", "collection", [{$match: {}}]));
+          },
+          teardown: function(db) {
+              db.view.drop();
           },
           command: {drop: "view"},
           testcases: [
@@ -3728,10 +3623,10 @@ var authCommandsLib = {
           testname: "dropDatabase",
           command: {dropDatabase: 1},
           setup: function(db) {
-              db.x.save({});
+              assert.writeOK(db.x.save({}));
           },
           teardown: function(db) {
-              db.x.save({});
+              assert.writeOK(db.x.save({}));
           },
           testcases: [
               {
@@ -3801,8 +3696,8 @@ var authCommandsLib = {
           command: {filemd5: 1, root: "fs"},
           setup: function(db) {
               db.fs.chunks.drop();
-              db.fs.chunks.insert({files_id: 1, n: 0, data: new BinData(0, "test")});
-              db.fs.chunks.ensureIndex({files_id: 1, n: 1});
+              assert.writeOK(db.fs.chunks.insert({files_id: 1, n: 0, data: new BinData(0, "test")}));
+              assert.commandWorked(db.fs.chunks.createIndex({files_id: 1, n: 1}));
           },
           teardown: function(db) {
               db.fs.chunks.drop();
@@ -3942,15 +3837,8 @@ var authCommandsLib = {
           testcases: [
               {
                 runOnDb: "local",
-                roles: {
-                    "clusterAdmin": 1,
-                    "clusterMonitor": 1,
-                    "readLocal": 1,
-                    "readWriteLocal": 1,
-                    "backup": 1,
-                    "root": 1,
-                    "__system": 1
-                },
+                roles:
+                    {"clusterAdmin": 1, "clusterMonitor": 1, "backup": 1, "root": 1, "__system": 1},
                 privileges:
                     [{resource: {db: "local", collection: "replset.election"}, actions: ["find"]}]
               },
@@ -3963,15 +3851,8 @@ var authCommandsLib = {
           testcases: [
               {
                 runOnDb: "local",
-                roles: {
-                    "clusterAdmin": 1,
-                    "clusterMonitor": 1,
-                    "readLocal": 1,
-                    "readWriteLocal": 1,
-                    "backup": 1,
-                    "root": 1,
-                    "__system": 1
-                },
+                roles:
+                    {"clusterAdmin": 1, "clusterMonitor": 1, "backup": 1, "root": 1, "__system": 1},
                 privileges:
                     [{resource: {db: "local", collection: "replset.minvalid"}, actions: ["find"]}]
               },
@@ -4021,7 +3902,7 @@ var authCommandsLib = {
         {
           testname: "find_views",
           setup: function(db) {
-              db.createView("view", "collection", [{$match: {}}]);
+              assert.commandWorked(db.createView("view", "collection", [{$match: {}}]));
           },
           teardown: function(db) {
               db.view.drop();
@@ -4065,7 +3946,7 @@ var authCommandsLib = {
           },
           skipSharded: true,
           setup: function(db) {
-              db.runCommand({create: "foo"});
+              assert.commandWorked(db.runCommand({create: "foo"}));
 
               return {uuid: getUUIDFromListCollections(db, db.foo.getName())};
           },
@@ -4088,7 +3969,7 @@ var authCommandsLib = {
           command: {findAndModify: "x", query: {_id: "abc"}, update: {$inc: {n: 1}}},
           setup: function(db) {
               db.x.drop();
-              db.x.save({_id: "abc", n: 0});
+              assert.writeOK(db.x.save({_id: "abc", n: 0}));
           },
           teardown: function(db) {
               db.x.drop();
@@ -4153,31 +4034,6 @@ var authCommandsLib = {
           ]
         },
         {
-          testname: "geoSearch",
-          command: {geoSearch: "x", near: [50, 50], maxDistance: 6, limit: 1, search: {}},
-          skipSharded: true,
-          setup: function(db) {
-              db.x.drop();
-              db.x.save({loc: {long: 50, lat: 50}});
-              db.x.ensureIndex({loc: "geoHaystack", type: 1}, {bucketSize: 1});
-          },
-          teardown: function(db) {
-              db.x.drop();
-          },
-          testcases: [
-              {
-                runOnDb: firstDbName,
-                roles: roles_read,
-                privileges: [{resource: {db: firstDbName, collection: "x"}, actions: ["find"]}]
-              },
-              {
-                runOnDb: secondDbName,
-                roles: roles_readAny,
-                privileges: [{resource: {db: secondDbName, collection: "x"}, actions: ["find"]}]
-              }
-          ]
-        },
-        {
           testname: "getCmdLineOpts",
           command: {getCmdLineOpts: 1},
           testcases: [
@@ -4205,6 +4061,20 @@ var authCommandsLib = {
               {runOnDb: firstDbName, roles: {}},
               {runOnDb: secondDbName, roles: {}}
           ]
+        },
+        {
+            testname: "getDefaultRWConcern",
+            command: {getDefaultRWConcern: 1},
+            testcases: [
+                {
+                    runOnDb: adminDbName,
+                    roles: Object.merge(roles_monitoring, roles_clusterManager),
+                    privileges: [{resource: {cluster: true}, actions: ["getDefaultRWConcern"]}],
+                    expectFail: true,  // Will fail on standalone servers.
+                },
+                {runOnDb: firstDbName, roles: {}},
+                {runOnDb: secondDbName, roles: {}}
+            ]
         },
         {
           testname: "getDiagnosticData",
@@ -4398,7 +4268,7 @@ var authCommandsLib = {
           command: {insert: "oplog.$main", documents: [{ts: Timestamp()}]},
           skipSharded: true,
           setup: function(db) {
-              db.createCollection("oplog.$main", {capped: true, size: 10000});
+              assert.commandWorked(db.createCollection("oplog.$main", {capped: true, size: 10000}));
           },
           teardown: function(db) {
               db.oplog.$main.drop();
@@ -4419,10 +4289,22 @@ var authCommandsLib = {
           command: {insert: "oplog.rs", documents: [{ts: Timestamp()}]},
           skipSharded: true,
           setup: function(db) {
-              db.createCollection("oplog.rs", {capped: true, size: 10000});
+              load("jstests/libs/storage_engine_utils.js");
+              if (!db.getCollectionNames().includes("oplog.rs")) {
+                  assert.commandWorked(
+                      db.runCommand({create: "oplog.rs", capped: true, size: 10000}));
+              } else {
+                  if (storageEngineIsWiredTigerOrInMemory()) {
+                      assert.commandWorked(db.adminCommand({replSetResizeOplog: 1, size: 10000}));
+                  } else {
+                      assert.commandWorked(db.runCommand({drop: "oplog.rs"}));
+                      assert.commandWorked(
+                          db.runCommand({create: "oplog.rs", capped: true, size: 10000}));
+                  }
+              }
           },
           teardown: function(db) {
-              db.oplog.rs.drop();
+              assert.commandWorked(db.oplog.rs.runCommand('emptycapped'));
           },
           testcases: [
               {
@@ -4448,14 +4330,8 @@ var authCommandsLib = {
           skipSharded: true,
           testcases: [{
               runOnDb: "local",
-              roles: {
-                  "clusterAdmin": 1,
-                  "clusterManager": 1,
-                  "readWriteLocal": 1,
-                  "root": 1,
-                  "__system": 1,
-                  "restore": 1
-              },
+              roles:
+                  {"clusterAdmin": 1, "clusterManager": 1, "root": 1, "__system": 1, "restore": 1},
               privileges:
                   [{resource: {db: "local", collection: "replset.election"}, actions: ["insert"]}],
           }
@@ -4468,14 +4344,8 @@ var authCommandsLib = {
           skipSharded: true,
           testcases: [{
               runOnDb: "local",
-              roles: {
-                  "clusterAdmin": 1,
-                  "clusterManager": 1,
-                  "readWriteLocal": 1,
-                  "root": 1,
-                  "__system": 1,
-                  "restore": 1
-              },
+              roles:
+                  {"clusterAdmin": 1, "clusterManager": 1, "root": 1, "__system": 1, "restore": 1},
               privileges:
                   [{resource: {db: "local", collection: "replset.minvalid"}, actions: ["insert"]}],
           }
@@ -4484,10 +4354,14 @@ var authCommandsLib = {
         },
         {
           testname: "insert_system_users",
-          command: {insert: "system.users", documents: [{data: 5}]},
+          command: {insert: "system.users", documents: [{user: "unique", db: "test"}]},
           setup: function(db) {
               // Ensure unique indexes consistently cause insertion failure
-              db.system.users.insert({data: 5});
+              db.system.users.remove({user: "unique", db: "test"});
+              assert.writeOK(db.system.users.insert({user: "unique", db: "test"}));
+          },
+          teardown: function(db) {
+              db.system.users.remove({user: "unique", db: "test"});
           },
           testcases: [
               {
@@ -4628,14 +4502,14 @@ var authCommandsLib = {
           testname: "killAllSessionsByPattern",
           command: {killAllSessionsByPattern: []},
           testcases: [
-              {runOnDb: adminDbName, roles: roles_hostManager},
+              {runOnDb: adminDbName, roles: roles_hostManager, expectFail: true},
           ]
         },
         {
           testname: "listCommands",
           command: {listCommands: 1},
           testcases: [
-              {runOnDb: adminDbName, roles: roles_all, privileges: []},
+              {runOnDb: adminDbName, roles: roles_all, privileges: [], expectFail: true},
               {runOnDb: firstDbName, roles: roles_all, privileges: []},
               {runOnDb: secondDbName, roles: roles_all, privileges: []}
           ]
@@ -4657,8 +4531,8 @@ var authCommandsLib = {
           testname: "listCollections",
           command: {listCollections: 1},
           setup: function(db) {
-              db.x.insert({_id: 5});
-              db.y.insert({_id: 6});
+              assert.writeOK(db.x.insert({_id: 5}));
+              assert.writeOK(db.y.insert({_id: 6}));
           },
           teardown: function(db) {
               db.x.drop();
@@ -4687,8 +4561,8 @@ var authCommandsLib = {
           testname: "listOwnCollections",
           command: {listCollections: 1, nameOnly: true, authorizedCollections: true},
           setup: function(db) {
-              db.x.insert({_id: 5});
-              db.y.insert({_id: 6});
+              assert.writeOK(db.x.insert({_id: 5}));
+              assert.writeOK(db.y.insert({_id: 6}));
           },
           teardown: function(db) {
               db.x.drop();
@@ -4752,8 +4626,8 @@ var authCommandsLib = {
           testname: "listIndexes",
           command: {listIndexes: "x"},
           setup: function(db) {
-              db.x.insert({_id: 5});
-              db.x.insert({_id: 6});
+              assert.writeOK(db.x.insert({_id: 5}));
+              assert.writeOK(db.x.insert({_id: 6}));
           },
           teardown: function(db) {
               db.x.drop();
@@ -4783,8 +4657,8 @@ var authCommandsLib = {
           },
           skipSharded: true,
           setup: function(db) {
-              db.x.insert({_id: 5});
-              db.x.insert({_id: 6});
+              assert.writeOK(db.x.insert({_id: 5}));
+              assert.writeOK(db.x.insert({_id: 6}));
 
               return {uuid: getUUIDFromListCollections(db, db.x.getName())};
           },
@@ -4841,8 +4715,8 @@ var authCommandsLib = {
               out: {inline: 1}
           },
           setup: function(db) {
-              db.x.insert({groupby: 1, n: 5});
-              db.x.insert({groupby: 1, n: 6});
+              assert.writeOK(db.x.insert({groupby: 1, n: 5}));
+              assert.writeOK(db.x.insert({groupby: 1, n: 6}));
           },
           teardown: function(db) {
               db.x.drop();
@@ -4873,8 +4747,8 @@ var authCommandsLib = {
               out: "mr_out"
           },
           setup: function(db) {
-              db.x.insert({groupby: 1, n: 5});
-              db.x.insert({groupby: 1, n: 6});
+              assert.writeOK(db.x.insert({groupby: 1, n: 5}));
+              assert.writeOK(db.x.insert({groupby: 1, n: 6}));
           },
           teardown: function(db) {
               db.x.drop();
@@ -4999,7 +4873,7 @@ var authCommandsLib = {
           command: {planCacheClearFilters: "x"},
           skipSharded: true,
           setup: function(db) {
-              db.x.save({});
+              assert.writeOK(db.x.save({}));
           },
           teardown: function(db) {
               db.x.drop();
@@ -5024,36 +4898,11 @@ var authCommandsLib = {
           ]
         },
         {
-          testname: "planCacheRead",
-          command: {planCacheListQueryShapes: "x"},
-          skipSharded: true,
-          setup: function(db) {
-              db.x.save({});
-          },
-          teardown: function(db) {
-              db.x.drop();
-          },
-          testcases: [
-              {
-                runOnDb: firstDbName,
-                roles: roles_readDbAdmin,
-                privileges:
-                    [{resource: {db: firstDbName, collection: "x"}, actions: ["planCacheRead"]}],
-              },
-              {
-                runOnDb: secondDbName,
-                roles: roles_readDbAdminAny,
-                privileges:
-                    [{resource: {db: secondDbName, collection: "x"}, actions: ["planCacheRead"]}],
-              },
-          ]
-        },
-        {
           testname: "planCacheWrite",
           command: {planCacheClear: "x"},
           skipSharded: true,
           setup: function(db) {
-              db.x.save({});
+              assert.writeOK(db.x.save({}));
           },
           teardown: function(db) {
               db.x.drop();
@@ -5174,7 +5023,7 @@ var authCommandsLib = {
               },
               {
                 runOnDb: firstDbName,
-                roles: {},
+                roles: roles_dbAdmin,
               }
           ]
         },
@@ -5200,19 +5049,66 @@ var authCommandsLib = {
               },
               {
                 runOnDb: firstDbName,
-                roles: {},
+                roles: {
+                    backup: 1,
+                    dbAdmin: 1,
+                    dbAdminAnyDatabase: 1,
+                    dbOwner: 1,
+                    clusterMonitor: 1,
+                    clusterAdmin: 1,
+                    root: 1,
+                    __system: 1
+                },
+                privileges: [{
+                    resource: {db: firstDbName, collection: "system.profile"},
+                    actions: ["find"]
+                }]
               }
+          ]
+        },
+        {
+          testname: "refineCollectionShardKey",
+          command: {refineCollectionShardKey: "test.x", key: {aKey: 1}},
+          skipUnlessSharded: true,
+          testcases: [
+              {
+                runOnDb: adminDbName,
+                roles: Object.extend({enableSharding: 1}, roles_clusterManager),
+                privileges: [{
+                    resource: {db: "test", collection: "x"},
+                    actions: ["refineCollectionShardKey"]
+                }],
+                expectFail: true
+              },
+              {runOnDb: firstDbName, roles: {}},
+              {runOnDb: secondDbName, roles: {}}
+          ]
+        },
+        {
+          testname: "_configsvrRefineCollectionShardKey",
+          command:
+            {_configsvrRefineCollectionShardKey: "test.x", key: {aKey: 1}, epoch: ObjectId()},
+          skipSharded: true,
+          testcases: [
+              {
+                runOnDb: adminDbName,
+                roles: {__system: 1},
+                privileges: [{resource: {cluster: true}, actions: ["internal"]}],
+                expectFail: true
+              },
+              {runOnDb: firstDbName, roles: {}},
+              {runOnDb: secondDbName, roles: {}}
           ]
         },
         {
           testname: "renameCollection_sameDb",
           command: {renameCollection: firstDbName + ".x", to: firstDbName + ".y", dropTarget: true},
           setup: function(db) {
-              db.getSisterDB(firstDbName).x.save({});
+              assert.writeOK(db.getSiblingDB(firstDbName).x.save({}));
           },
           teardown: function(db) {
-              db.getSisterDB(firstDbName).x.drop();
-              db.getSisterDB(firstDbName).y.drop();
+              db.getSiblingDB(firstDbName).x.drop();
+              db.getSiblingDB(firstDbName).y.drop();
           },
           testcases: [
               {
@@ -5236,11 +5132,11 @@ var authCommandsLib = {
           testname: "renameCollection_sameDb_failure",
           command: {renameCollection: firstDbName + ".x", to: firstDbName + ".y"},
           setup: function(db) {
-              db.getSisterDB(firstDbName).x.save({});
+              assert.writeOK(db.getSiblingDB(firstDbName).x.save({}));
           },
           teardown: function(db) {
-              db.getSisterDB(firstDbName).x.drop();
-              db.getSisterDB(firstDbName).y.drop();
+              db.getSiblingDB(firstDbName).x.drop();
+              db.getSiblingDB(firstDbName).y.drop();
           },
           testcases: [
               {
@@ -5259,14 +5155,24 @@ var authCommandsLib = {
         {
           testname: "renameCollection_twoDbs",
           command: {renameCollection: firstDbName + ".x", to: secondDbName + ".y"},
+          skipSharded: true,
           setup: function(db) {
-              db.getSisterDB(firstDbName).x.save({});
-              db.getSisterDB(adminDbName).runCommand({movePrimary: firstDbName, to: shard0name});
-              db.getSisterDB(adminDbName).runCommand({movePrimary: secondDbName, to: shard0name});
+            assert.writeOK(db.getSiblingDB(firstDbName).x.save({}));
+            assert.writeOK(db.getSiblingDB(secondDbName).y.save({}));
+            db.getSiblingDB(secondDbName).y.drop();
+            // Running movePrimary is necessary on mongos, but doesn't exist on non-sharded
+            // systems.
+            if (db.getMongo().isMongos()) {
+              const shardId = assert.commandWorked(db.getSiblingDB(adminDbName).runCommand({listShards: 1})).shards[0]['_id'];
+              assert.commandWorked(
+                db.getSiblingDB(adminDbName).runCommand({movePrimary: firstDbName, to: shardId}));
+              assert.commandWorked(
+                db.getSiblingDB(adminDbName).runCommand({movePrimary: secondDbName, to: shardId}));
+              }
           },
           teardown: function(db) {
-              db.getSisterDB(firstDbName).x.drop();
-              db.getSisterDB(secondDbName).y.drop();
+              db.getSiblingDB(firstDbName).x.drop();
+              db.getSiblingDB(secondDbName).y.drop();
           },
           testcases: [
               {
@@ -5292,7 +5198,7 @@ var authCommandsLib = {
           command: {reIndex: "x"},
           skipSharded: true,
           setup: function(db) {
-              db.x.save({});
+              assert.writeOK(db.x.save({}));
           },
           teardown: function(db) {
               db.x.drop();
@@ -5494,12 +5400,49 @@ var authCommandsLib = {
           ]
         },
         {
-          testname: "resetError",
-          command: {resetError: 1},
+          testname: "reshardCollection",
+          command: {reshardCollection: "test.x", key: {_id: 1}},
+          skipUnlessSharded: true,
           testcases: [
-              {runOnDb: adminDbName, roles: roles_all, privileges: []},
-              {runOnDb: firstDbName, roles: roles_all, privileges: []},
-              {runOnDb: secondDbName, roles: roles_all, privileges: []}
+              {
+                runOnDb: adminDbName,
+                roles: Object.extend({enableSharding: 1}, roles_clusterManager),
+                privileges:
+                    [{resource: {db: "test", collection: "x"}, actions: ["reshardCollection"]}],
+                expectFail: true
+              },
+              {runOnDb: firstDbName, roles: {}},
+              {runOnDb: secondDbName, roles: {}}
+          ]
+        },
+
+        {
+          testname: "_configsvrReshardCollection",
+          command:
+            {_configsvrReshardCollection: "test.x", key: {_id: 1}},
+          skipSharded: true,
+          testcases: [
+              {
+                runOnDb: adminDbName,
+                roles: {__system: 1},
+                privileges: [{resource: {cluster: true}, actions: ["internal"]}],
+                expectFail: true
+              },
+              {runOnDb: firstDbName, roles: {}},
+              {runOnDb: secondDbName, roles: {}}
+          ]
+        },
+        {
+          testname: "rotateCertificates",
+          command: {rotateCertificates: 1},
+          testcases: [
+              {
+                runOnDb: adminDbName,
+                roles: roles_hostManager,
+                privileges: [{resource: {cluster: true}, actions: ["rotateCertificates"]}]
+              },
+              {runOnDb: firstDbName, roles: {}},
+              {runOnDb: secondDbName, roles: {}}
           ]
         },
         {
@@ -5524,8 +5467,26 @@ var authCommandsLib = {
           ]
         },
         {
+            testname: "setDefaultRWConcern",
+            command: {
+                setDefaultRWConcern: 1,
+                defaultReadConcern: {level: "local"},
+                defaultWriteConcern: {w: 1},
+            },
+            testcases: [
+                {
+                    runOnDb: adminDbName,
+                    roles: roles_clusterManager,
+                    privileges: [{resource: {cluster: true}, actions: ["setDefaultRWConcern"]}],
+                    expectFail: true,  // Will fail on standalone servers.
+                },
+                {runOnDb: firstDbName, roles: {}},
+                {runOnDb: secondDbName, roles: {}}
+            ]
+        },
+        {
           testname: "setFeatureCompatibilityVersion",
-          command: {setFeatureCompatibilityVersion: "x"},
+          command: {setFeatureCompatibilityVersion: latestFCV},
           testcases: [
               {
                 runOnDb: adminDbName,
@@ -5599,7 +5560,10 @@ var authCommandsLib = {
         {
           testname: "shutdown",
           command: {shutdown: 1},
-          testcases: [{runOnDb: firstDbName, roles: {}}, {runOnDb: secondDbName, roles: {}}]
+          testcases: [
+              {runOnDb: firstDbName, roles: {}, expectFail: true},
+              {runOnDb: secondDbName, roles: {}}
+          ]
         },
         {
           testname: "split",
@@ -5660,8 +5624,8 @@ var authCommandsLib = {
                     testname: "storageDetails",
                     command: {storageDetails: "x", analyze: "diskStorage"},
                     skipSharded: true,
-                    setup: function (db) { db.x.save( {} ); },
-                    teardown: function (db) { db.x.drop(); },
+                    setup: function (db) { assert.writeOK(db.x.save( {} )); },
+                    teardown: function (db) { assert(db.x.drop()); },
                     testcases: [
                         {
                             runOnDb: firstDbName,
@@ -5696,58 +5660,15 @@ var authCommandsLib = {
           ]
         },
         {
-          testname: "touch",
-          command: {touch: "x", data: true, index: false},
-          skipSharded: true,
-          setup: function(db) {
-              db.x.save({});
-          },
-          teardown: function(db) {
-              db.x.drop();
-          },
-          testcases: [
-              {
-                runOnDb: adminDbName,
-                roles: roles_hostManager,
-                privileges: [{resource: {cluster: true}, actions: ["touch"]}]
-              },
-              {
-                runOnDb: firstDbName,
-                roles: roles_hostManager,
-                privileges: [{resource: {cluster: true}, actions: ["touch"]}]
-              },
-              {
-                runOnDb: secondDbName,
-                roles: roles_hostManager,
-                privileges: [{resource: {cluster: true}, actions: ["touch"]}]
-              }
-          ]
-        },
-        {
-          testname: "unsetSharding",
-          command: {unsetSharding: "x"},
-          skipSharded: true,
-          testcases: [
-              {
-                runOnDb: adminDbName,
-                roles: {__system: 1},
-                privileges: [{resource: {cluster: true}, actions: ["internal"]}],
-                expectFail: true
-              },
-              {runOnDb: firstDbName, roles: {}},
-              {runOnDb: secondDbName, roles: {}}
-          ]
-        },
-        {
           testname: "updateRole_authenticationRestrictions",
           command: {updateRole: "testRole", authenticationRestrictions: []},
           setup: function(db) {
-              db.runCommand({
+              assert.commandWorked(db.runCommand({
                   createRole: "testRole",
                   roles: [],
                   privileges: [],
                   authenticationRestrictions: [{clientSource: ["127.0.0.1"]}]
-              });
+              }));
           },
           teardown: function(db) {
               db.runCommand({dropRole: "testRole"});
@@ -5782,15 +5703,15 @@ var authCommandsLib = {
           testname: "updateUser_authenticationRestrictions",
           command: {updateUser: "testUser", authenticationRestrictions: []},
           setup: function(db) {
-              db.runCommand({
+              assert.commandWorked(db.runCommand({
                   createUser: "testUser",
                   pwd: "test",
                   roles: [],
                   authenticationRestrictions: [{clientSource: ["127.0.0.1"]}]
-              });
+              }));
           },
           teardown: function(db) {
-              db.runCommand({dropUser: "testUser"});
+              assert.commandWorked(db.runCommand({dropUser: "testUser"}));
           },
           testcases: [
               {
@@ -5815,7 +5736,7 @@ var authCommandsLib = {
           testname: "validate",
           command: {validate: "x"},
           setup: function(db) {
-              db.x.save({});
+              assert.writeOK(db.x.save({}));
           },
           teardown: function(db) {
               db.x.drop();
@@ -5865,8 +5786,18 @@ var authCommandsLib = {
           testcases: [
               {
                 runOnDb: adminDbName,
-                roles: roles_clusterManager,
                 privileges: [{resource: {db: 'config', collection: 'shards'}, actions: ['update']}],
+                expectFail: true, // shard0name doesn't exist
+              },
+              {
+                runOnDb: adminDbName,
+                roles: roles_clusterManager,
+                expectFail: true, // shard0name doesn't exist
+              },
+              {
+                runOnDb: adminDbName,
+                privileges: [{resource: {cluster: true}, actions: ["enableSharding"]}],
+                expectFail: true, // shard0name doesn't exist
               },
           ]
         },
@@ -5885,11 +5816,21 @@ var authCommandsLib = {
           testcases: [
               {
                 runOnDb: adminDbName,
-                roles: roles_clusterManager,
                 privileges: [
                     {resource: {db: 'config', collection: 'shards'}, actions: ['update']},
                     {resource: {db: 'config', collection: 'tags'}, actions: ['find']}
                 ],
+                expectFail: true, // shard0name doesn't exist
+              },
+              {
+                runOnDb: adminDbName,
+                roles: roles_clusterManager,
+                expectFail: true, // shard0name doesn't exist
+              },
+              {
+                runOnDb: adminDbName,
+                privileges: [{resource: {cluster: true}, actions: ["enableSharding"]}],
+                expectFail: true, // shard0name doesn't exist
               },
           ]
         },
@@ -5908,7 +5849,6 @@ var authCommandsLib = {
           testcases: [
               {
                 runOnDb: adminDbName,
-                roles: roles_clusterManager,
                 privileges: [
                     {resource: {db: 'config', collection: 'shards'}, actions: ['find']},
                     {
@@ -5917,6 +5857,16 @@ var authCommandsLib = {
                     },
                 ],
                 expectFail: true
+              },
+              {
+                runOnDb: adminDbName,
+                roles: roles_clusterManager,
+                expectFail: true,
+              },
+              {
+                runOnDb: adminDbName,
+                privileges: [{resource: {cluster: true}, actions: ["enableSharding"]}],
+                expectFail: true,
               },
           ]
         },
@@ -5981,21 +5931,22 @@ var authCommandsLib = {
           }
         },
         {
-          testname: "aggregate_$searchBeta",
+          testname: "aggregate_$search",
           command: {
               aggregate: "foo",
               cursor: {},
               pipeline: [{
-                  $searchBeta: {
+                  $search: {
                       // empty query
                   }
               }]
           },
           skipSharded: false,
+          skipTest: (conn) => true, // TODO SERVER-54877 re-enable this test case
           // Only enterprise knows of this aggregation stage.
-          skipTest:
-              (conn) =>
-                  !conn.getDB("admin").runCommand({buildInfo: 1}).modules.includes("enterprise"),
+          //skipTest:
+          //    (conn) =>
+          //        !conn.getDB("admin").runCommand({buildInfo: 1}).modules.includes("enterprise"),
           testcases: [
               {
                 runOnDb: firstDbName,
@@ -6010,13 +5961,13 @@ var authCommandsLib = {
               }
           ],
           setup: function(db) {
-              // Configure the $searchBeta stage to always return EOF so we can avoid the hassle
+              // Configure the $search stage to always return EOF so we can avoid the hassle
               // of giving mongod a host and port for mongot.
-              const cmd = {configureFailPoint: "searchBetaReturnEofImmediately", mode: "alwaysOn"};
+              const cmd = {configureFailPoint: "searchReturnEofImmediately", mode: "alwaysOn"};
               FixtureHelpers.runCommandOnEachPrimary({db: db.getSiblingDB("admin"), cmdObj: cmd});
           },
           teardown: function(db) {
-              const cmd = {configureFailPoint: "searchBetaReturnEofImmediately", mode: "off"};
+              const cmd = {configureFailPoint: "searchReturnEofImmediately", mode: "off"};
               FixtureHelpers.runCommandOnEachPrimary({db: db.getSiblingDB("admin"), cmdObj: cmd});
           }
         },
@@ -6039,9 +5990,249 @@ var authCommandsLib = {
               {runOnDb: adminDbName, roles: roles_hostManager},
           ],
           setup: function(db) {
-              db.runCommand({startRecordingTraffic: 1, filename: "notARealPath"});
-          }
+              db.runCommand({stopRecordingTraffic: 1});
+              assert.commandWorked(db.runCommand({startRecordingTraffic: 1, filename: "notARealPath"}));
+          },
+          teardown: function(db) {
+            db.runCommand({stopRecordingTraffic: 1});
+          },
         },
+        {
+          testname: "clearJumboFlag",
+          command: {clearJumboFlag: "test.x"},
+          skipUnlessSharded: true,
+          testcases: [
+              {
+                runOnDb: adminDbName,
+                roles: roles_clusterManager,
+                privileges: [{resource: {db: "test", collection: "x"}, actions: ["clearJumboFlag"]}],
+                expectFail: true
+              },
+              {runOnDb: firstDbName, roles: {}},
+              {runOnDb: secondDbName, roles: {}}
+          ]
+        },
+        {
+          testname: "_configsvrClearJumboFlag",
+          command: {_configsvrClearJumboFlag: "x.y", epoch: ObjectId(), minKey: {x: 0}, maxKey: {x: 10}},
+          skipSharded: true,
+          expectFail: true,
+          testcases: [
+              {
+                runOnDb: adminDbName,
+                roles: {__system: 1},
+                privileges: [{resource: {cluster: true}, actions: ["internal"]}],
+                expectFail: true
+              },
+          ]
+        },
+        {
+          testname: "balancerCollectionStatus",
+          command: {shardCollection: "test.x"},
+          skipUnlessSharded: true,
+          testcases: [
+              {
+                runOnDb: adminDbName,
+                roles: Object.extend({enableSharding: 1}, roles_clusterManager),
+                privileges:
+                    [{resource: {db: "test", collection: "x"}, actions: ["enableSharding"]}],
+                expectFail: true
+              },
+              {runOnDb: firstDbName, roles: {}},
+              {runOnDb: secondDbName, roles: {}}
+          ]
+        },
+        {
+          testname: "aggregate_union_with_basic",
+          command: {
+              aggregate: "baseColl",
+              pipeline: [{$unionWith: "unionColl"}],
+              cursor: {}
+          },
+          setup: function(db) {
+              assert.commandWorked(db.createCollection("baseColl"));
+              assert.commandWorked(db.createCollection("unionColl"));
+          },
+          teardown: function(db) {
+              db.baseColl.drop();
+              db.unionColl.drop();
+          },
+          testcases: [
+              // Missing required privileges on base collection.
+              {
+                runOnDb: firstDbName,
+                roles: roles_read,
+                privileges: [
+                    {resource: {db: firstDbName, collection: "unionColl"}, actions: ["find"]}
+                ],
+                expectAuthzFailure: true,
+              },
+              // Missing required privileges on nested collection.
+              {
+                runOnDb: firstDbName,
+                roles: roles_read,
+                privileges: [
+                    {resource: {db: firstDbName, collection: "baseColl"}, actions: ["find"]},
+                ],
+                expectAuthzFailure: true,
+              },
+              // All required privileges.
+              {
+                runOnDb: firstDbName,
+                roles: roles_read,
+                privileges: [
+                    {resource: {db: firstDbName, collection: "baseColl"}, actions: ["find"]},
+                    {resource: {db: firstDbName, collection: "unionColl"}, actions: ["find"]},
+                ],
+              },
+          ]
+        },
+        {
+          testname: "aggregate_union_with_sub_pipeline",
+          command: {
+              aggregate: "baseColl",
+              pipeline: [{$unionWith: {coll: "unionColl", pipeline: [
+                {$lookup: {from: "lookupColl", localField: "_id", foreignField: "_id", as: "results"}}]
+              }}],
+              cursor: {}
+          },
+          setup: function(db) {
+              assert.commandWorked(db.createCollection("baseColl"));
+              assert.commandWorked(db.createCollection("unionColl"));
+              assert.commandWorked(db.createCollection("lookupColl"));
+          },
+          teardown: function(db) {
+              db.baseColl.drop();
+              db.unionColl.drop();
+              db.lookupColl.drop();
+          },
+          testcases: [
+              // Missing required privileges on nested collection.
+              {
+                runOnDb: firstDbName,
+                roles: roles_read,
+                privileges: [
+                    {resource: {db: firstDbName, collection: "baseColl"}, actions: ["find"]},
+                ],
+                expectAuthzFailure: true,
+              },
+              {
+                runOnDb: firstDbName,
+                roles: roles_read,
+                privileges: [
+                    {resource: {db: firstDbName, collection: "baseColl"}, actions: ["find"]},
+                    {resource: {db: firstDbName, collection: "unionColl"}, actions: ["find"]},
+                ],
+                expectAuthzFailure: true,
+              },
+              // All required privileges.
+              {
+                runOnDb: firstDbName,
+                roles: roles_read,
+                privileges: [
+                    {resource: {db: firstDbName, collection: "baseColl"}, actions: ["find"]},
+                    {resource: {db: firstDbName, collection: "unionColl"}, actions: ["find"]},
+                    {resource: {db: firstDbName, collection: "lookupColl"}, actions: ["find"]},
+                ],
+              },
+          ]
+        },
+        {
+          testname: "aggregate_operation_metrics",
+          command: {
+              aggregate: 1,
+              pipeline: [{$operationMetrics: {}}],
+              cursor: {}
+          },
+          testcases: [
+              {
+                runOnDb: adminDbName,
+                roles: roles_monitoring,
+                privileges: [
+                    {resource: {cluster: true}, actions: ["operationMetrics"]},
+                ],
+              },
+              {
+                runOnDb: firstDbName,
+                roles: roles_monitoring,
+                privileges: [
+                    {resource: {cluster: true}, actions: ["operationMetrics"]},
+                ],
+                expectFail: true,
+              },
+            ]
+        },
+        {
+          testname: "validate_db_metadata_command_specific_db",
+          command: {
+              validateDBMetadata: 1,
+              db: secondDbName,
+              collection: "test",
+              apiParameters: {version: "1", strict: true}
+          },
+          setup: function(db) {
+              assert.commandWorked(db.getSiblingDB(firstDbName).createCollection("test"));
+              assert.commandWorked(db.getSiblingDB(secondDbName).createCollection("test"));
+              assert.commandWorked(db.getSiblingDB("ThirdDB").createCollection("test"));
+          },
+          teardown: function(db) {
+              assert.commandWorked(db.getSiblingDB(firstDbName).dropDatabase());
+              assert.commandWorked(db.getSiblingDB(secondDbName).dropDatabase());
+              assert.commandWorked(db.getSiblingDB("ThirdDB").dropDatabase());
+          },
+          testcases: [
+              {
+                  runOnDb: secondDbName,
+                  privileges: [{resource: {db: secondDbName, collection: ""}, actions: ["validate"]}]
+              },
+              {
+                  // Need to only have permission on secondDbName to be able to the command against
+                  // the db.
+                  runOnDb: firstDbName,
+                  privileges: [{resource: {db: secondDbName, collection: ""}, actions: ["validate"]}],
+              },
+              {
+                  runOnDb: firstDbName,
+                  privileges: [
+                      {resource: {db: firstDbName, collection: ""}, actions: ["validate"]}
+                  ],
+                  expectAuthzFailure: true
+              },
+          ]
+      },
+      {
+          testname: "validate_db_metadata_command_all_dbs",
+          command: {validateDBMetadata: 1, apiParameters: {version: "1", strict: true}},
+          setup: function(db) {
+              assert.commandWorked(db.getSiblingDB(firstDbName).createCollection("test"));
+              assert.commandWorked(db.getSiblingDB(secondDbName).createCollection("test"));
+          },
+          teardown: function(db) {
+              assert.commandWorked(db.getSiblingDB(firstDbName).dropDatabase());
+              assert.commandWorked(db.getSiblingDB(secondDbName).dropDatabase());
+          },
+          testcases: [
+              {
+                  // Since the command didn't specify a 'db', it validates all dbs and hence require
+                  // permission to run on all dbs.
+                  runOnDb: secondDbName,
+                  privileges: [{resource: {db: "", collection: ""}, actions: ["validate"]}],
+              },
+              {
+                  // An exhaustive list on all databases is still not good enough for running to
+                  // command on all dbs.
+                  runOnDb: secondDbName,
+                  privileges: [
+                      {resource: {db: "admin", collection: ""}, actions: ["validate"]},
+                      {resource: {db: "config", collection: ""}, actions: ["validate"]},
+                      {resource: {db: "local", collection: ""}, actions: ["validate"]},
+                      {resource: {db: firstDbName, collection: ""}, actions: ["validate"]},
+                      {resource: {db: secondDbName, collection: ""}, actions: ["validate"]}
+                  ],
+                  expectAuthzFailure: true
+              },
+          ]
+      },
     ],
 
     /************* SHARED TEST LOGIC ****************/

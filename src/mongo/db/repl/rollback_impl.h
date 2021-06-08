@@ -29,13 +29,14 @@
 
 #pragma once
 
+#include <functional>
+
 #include "mongo/base/status_with.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/repl/roll_back_local_operations.h"
 #include "mongo/db/repl/rollback.h"
 #include "mongo/db/repl/storage_interface.h"
-#include "mongo/stdx/functional.h"
 
 namespace mongo {
 
@@ -101,9 +102,9 @@ struct RollbackStats {
     boost::optional<Date_t> lastLocalWallClockTime;
 
     /**
-     * The wall clock time at the common point, if known.
+     * The wall clock time of the first operation after the common point, if known.
      */
-    boost::optional<Date_t> commonPointWallClockTime;
+    boost::optional<Date_t> firstOpWallClockTimeAfterCommonPoint;
 };
 
 /**
@@ -284,7 +285,7 @@ public:
     virtual const std::vector<BSONObj>& docsDeletedForNamespace_forTest(UUID uuid) const& {
         MONGO_UNREACHABLE;
     }
-    void docsDeletedForNamespace_forTest(UUID)&& = delete;
+    void docsDeletedForNamespace_forTest(UUID) && = delete;
 
 protected:
     /**
@@ -341,11 +342,10 @@ private:
     Status _checkAgainstTimeLimit(RollBackLocalOperations::RollbackCommonPoint commonPoint);
 
     /**
-     * Finds the timestamp of the record after the common point to put into the oplog truncate
-     * after point.
+     * Kills all user operations currently being performed. Since this node is a secondary, these
+     * operations are all reads.
      */
-    Timestamp _findTruncateTimestamp(
-        OperationContext* opCtx, RollBackLocalOperations::RollbackCommonPoint commonPoint) const;
+    void _killAllUserOperations(OperationContext* opCtx);
 
     /**
      * Uses the ReplicationCoordinator to transition the current member state to ROLLBACK.
@@ -357,20 +357,31 @@ private:
     Status _transitionToRollback(OperationContext* opCtx);
 
     /**
-     * Waits for any in-progress background index builds to complete. We do this before beginning
+     * Stops any active index builds and waits for them to complete. We do this before beginning
      * the rollback process to prevent any issues surrounding index builds pausing/resuming around a
      * call to 'recoverToStableTimestamp'. It's not clear that an index build, resumed in this way,
      * that continues until completion, would be consistent with the collection data. Waiting for
      * all background index builds to complete is a conservative approach, to avoid any of these
      * potential issues.
      */
-    Status _awaitBgIndexCompletion(OperationContext* opCtx);
+    void _stopAndWaitForIndexBuilds(OperationContext* opCtx);
+
+    /**
+     * Performs a forward scan of the oplog starting at 'stableTimestamp', exclusive. For every
+     * retryable write oplog entry that has a 'prevOpTime' <= 'stableTimestamp', update the
+     * transactions table with the appropriate information to detail the last executed operation. We
+     * do this because derived updates to the transactions table can be coalesced into one
+     * operation, and so certain session entry updates may not exist when restoring to the
+     * 'stableTimestamp'.
+     */
+    void _restoreTxnsTableEntryFromRetryableWrites(OperationContext* opCtx,
+                                                   Timestamp stableTimestamp);
 
     /**
      * Recovers to the stable timestamp while holding the global exclusive lock.
      * Returns the stable timestamp that the storage engine recovered to.
      */
-    StatusWith<Timestamp> _recoverToStableTimestamp(OperationContext* opCtx);
+    Timestamp _recoverToStableTimestamp(OperationContext* opCtx);
 
     /**
      * Process a single oplog entry that is getting rolled back and update the necessary rollback
@@ -392,10 +403,10 @@ private:
     Status _findRecordStoreCounts(OperationContext* opCtx);
 
     /**
-     * Executes the critical section in rollback, defined as the window between aborting and
-     * reconstructing prepared transactions.
+     * Executes the phase of rollback between aborting and reconstructing prepared transactions. We
+     * cannot safely recover if we fail during this phase.
      */
-    Status _runRollbackCriticalSection(
+    void _runPhaseFromAbortToReconstructPreparedTxns(
         OperationContext* opCtx, RollBackLocalOperations::RollbackCommonPoint commonPoint) noexcept;
 
     /**
@@ -448,7 +459,7 @@ private:
     void _resetDropPendingState(OperationContext* opCtx);
 
     // Guards access to member variables.
-    mutable stdx::mutex _mutex;  // (S)
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("RollbackImpl::_mutex");  // (S)
 
     // Set to true when RollbackImpl should shut down.
     bool _inShutdown = false;  // (M)
@@ -485,7 +496,7 @@ private:
     stdx::unordered_map<UUID, long long, UUID::Hash> _countDiffs;  // (N)
 
     // Maintains counts and namespaces of drop-pending collections.
-    using PendingDropInfo = struct {
+    struct PendingDropInfo {
         long long count = 0;
         NamespaceString nss;
     };

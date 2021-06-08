@@ -29,47 +29,31 @@
 
 #pragma once
 
+#include <functional>
 #include <vector>
 
 #include "mongo/db/record_id.h"
+#include "mongo/db/storage/ephemeral_for_test/ephemeral_for_test_kv_engine.h"
+#include "mongo/db/storage/ephemeral_for_test/ephemeral_for_test_radix_store.h"
 #include "mongo/db/storage/recovery_unit.h"
-#include "mongo/stdx/functional.h"
 
 namespace mongo {
+namespace ephemeral_for_test {
 
-class SortedDataInterface;
-
-class EphemeralForTestRecoveryUnit : public RecoveryUnit {
+class RecoveryUnit : public ::mongo::RecoveryUnit {
 public:
-    EphemeralForTestRecoveryUnit(stdx::function<void()> cb = nullptr)
-        : _waitUntilDurableCallback(cb) {}
+    RecoveryUnit(KVEngine* parentKVEngine, std::function<void()> cb = nullptr);
+    ~RecoveryUnit();
 
-    void beginUnitOfWork(OperationContext* opCtx) final{};
-    void commitUnitOfWork() final;
-    void abortUnitOfWork() final;
+    void beginUnitOfWork(OperationContext* opCtx) override final;
 
-    virtual bool waitUntilDurable() {
-        if (_waitUntilDurableCallback) {
-            _waitUntilDurableCallback();
-        }
-        return true;
-    }
+    virtual bool waitUntilDurable(OperationContext* opCtx) override;
 
-    virtual void abandonSnapshot() {}
+    virtual void setOrderedCommit(bool orderedCommit) override;
 
-    Status obtainMajorityCommittedSnapshot() final;
+    Status majorityCommittedSnapshotAvailable() const final;
 
-    virtual void registerChange(Change* change) {
-        _changes.push_back(ChangePtr(change));
-    }
-
-    virtual SnapshotId getSnapshotId() const {
-        return SnapshotId();
-    }
-
-    virtual void setOrderedCommit(bool orderedCommit) {}
-
-    virtual void prepareUnitOfWork() override {}
+    void prepareUnitOfWork() override;
 
     virtual void setPrepareTimestamp(Timestamp ts) override {
         _prepareTimestamp = ts;
@@ -91,15 +75,67 @@ public:
         _commitTimestamp = Timestamp::min();
     }
 
-private:
-    typedef std::shared_ptr<Change> ChangePtr;
-    typedef std::vector<ChangePtr> Changes;
+    Status setTimestamp(Timestamp timestamp) override;
 
-    Changes _changes;
-    stdx::function<void()> _waitUntilDurableCallback;
+    bool isTimestamped() const override {
+        return _isTimestamped;
+    }
+
+    void setTimestampReadSource(ReadSource readSource,
+                                boost::optional<Timestamp> provided) override;
+
+    ReadSource getTimestampReadSource() const override;
+
+    // Ephemeral for test specific function declarations below.
+    StringStore* getHead() {
+        forkIfNeeded();
+        return &_workingCopy;
+    }
+
+    inline void makeDirty() {
+        _dirty = true;
+    }
+
+    /**
+     * Checks if there already exists a current working copy and merge base; if not fetches
+     * one and creates them.
+     */
+    bool forkIfNeeded();
+
+    static RecoveryUnit* get(OperationContext* opCtx);
+
+private:
+    void doCommitUnitOfWork() override final;
+
+    void doAbortUnitOfWork() override final;
+
+    void doAbandonSnapshot() override final;
+
+    void _abort();
+
+    void _setMergeNull();
+
+    std::function<void()> _waitUntilDurableCallback;
+    // Official master is kept by KVEngine
+    KVEngine* _KVEngine;
+    // We need _mergeBase to be a shared_ptr to hold references in KVEngine::_availableHistory.
+    // _mergeBase will be initialized in forkIfNeeded().
+    std::shared_ptr<StringStore> _mergeBase;
+    // We need _workingCopy to be a unique copy, not a shared_ptr.
+    StringStore _workingCopy;
+
+    bool _forked = false;
+    bool _dirty = false;  // Whether or not we have written to this _workingCopy.
 
     Timestamp _prepareTimestamp = Timestamp::min();
     Timestamp _commitTimestamp = Timestamp::min();
+
+    bool _isTimestamped = false;
+
+    // Specifies which external source to use when setting read timestamps on transactions.
+    ReadSource _timestampReadSource = ReadSource::kNoTimestamp;
+    boost::optional<Timestamp> _readAtTimestamp = boost::none;
 };
 
+}  // namespace ephemeral_for_test
 }  // namespace mongo

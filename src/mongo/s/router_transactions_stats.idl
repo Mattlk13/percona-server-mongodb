@@ -47,6 +47,9 @@ structs:
       successful:
         type: long
         default: 0
+      successfulDurationMicros:
+        type: long
+        default: 0
 
   CommitTypes:
     description: "Contains metrics for each type of commit"
@@ -69,6 +72,15 @@ structs:
                   command on mongos with information about sharded transactions"
     strict: true
     fields:
+      currentOpen:
+        type: long
+        default: 0
+      currentActive:
+        type: long
+        default: 0
+      currentInactive:
+        type: long
+        default: 0
       totalStarted:
         type: long
         default: 0
@@ -78,6 +90,8 @@ structs:
       totalAborted:
         type: long
         default: 0
+      abortCause:
+        type: object
       totalContactedParticipants:
         type: long
         default: 0

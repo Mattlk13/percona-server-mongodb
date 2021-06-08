@@ -1,7 +1,7 @@
 // Cannot implicitly shard accessed collections because of following errmsg: A single
 // update/delete on a sharded collection must contain an exact match on _id or contain the shard
 // key.
-// @tags: [assumes_unsharded_collection, requires_non_retryable_writes]
+// @tags: [assumes_unsharded_collection, requires_multi_updates, requires_non_retryable_writes]
 
 var collectionName = "bulk_api_ordered";
 var coll = db.getCollection(collectionName);
@@ -80,7 +80,7 @@ var executeTests = function() {
 
     // Create unique index
     coll.remove({});
-    coll.ensureIndex({a: 1}, {unique: true});
+    coll.createIndex({a: 1}, {unique: true});
 
     /**
      * Single error ordered bulk operation
@@ -118,7 +118,7 @@ var executeTests = function() {
     // Create unique index
     coll.dropIndexes();
     coll.remove({});
-    coll.ensureIndex({a: 1}, {unique: true});
+    coll.createIndex({a: 1}, {unique: true});
 
     /**
      * Multiple error ordered bulk operation
@@ -152,7 +152,7 @@ var executeTests = function() {
     // Create unique index
     coll.dropIndexes();
     coll.remove({});
-    coll.ensureIndex({a: 1}, {unique: true});
+    coll.createIndex({a: 1}, {unique: true});
 };
 
 var buildVersion = parseInt(db.runCommand({buildInfo: 1}).versionArray.slice(0, 3).join(""), 10);

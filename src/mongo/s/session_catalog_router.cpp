@@ -27,13 +27,14 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/s/session_catalog_router.h"
 
 #include "mongo/db/sessions_collection.h"
+#include "mongo/s/transaction_router.h"
 
 namespace mongo {
 
@@ -53,7 +54,7 @@ int RouterSessionCatalog::reapSessionsOlderThan(OperationContext* opCtx,
         });
 
     // From the passed-in sessions, find the ones which are actually expired/removed
-    auto expiredSessionIds = uassertStatusOK(sessionsCollection.findRemovedSessions(opCtx, lsids));
+    auto expiredSessionIds = sessionsCollection.findRemovedSessions(opCtx, lsids);
 
     // Remove the session ids from the in-memory catalog
     int numReaped = 0;
@@ -68,8 +69,10 @@ int RouterSessionCatalog::reapSessionsOlderThan(OperationContext* opCtx,
 }
 
 RouterOperationContextSession::RouterOperationContextSession(OperationContext* opCtx)
-    : _operationContextSession(opCtx) {}
+    : _opCtx(opCtx), _operationContextSession(opCtx) {}
 
-RouterOperationContextSession::~RouterOperationContextSession() = default;
+RouterOperationContextSession::~RouterOperationContextSession() {
+    TransactionRouter::get(_opCtx).stash(_opCtx);
+};
 
 }  // namespace mongo

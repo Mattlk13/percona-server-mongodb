@@ -101,7 +101,7 @@ BSONObj buildCommand() {
                   << "Bar"));
     a.done();
 
-    cursorBuilder.appendIntOrLL("id", 1);
+    cursorBuilder.appendNumber("id", 1);
     cursorBuilder.append("ns", "test.$cmd.blah");
     commandReplyBob.append("cursor", cursorBuilder.done());
     return commandReplyBob.obj();
@@ -164,6 +164,22 @@ TEST(OpMsgReplyBuilder, CommandError) {
     }());
 
     ASSERT_BSONOBJ_EQ(parsed.getCommandReply(), body);
+}
+
+TEST(OpMsgReplyBuilder, MessageOverBSONSizeLimit) {
+    rpc::OpMsgReplyBuilder r;
+    std::string bigStr(1024 * 1024 * 16, 'a');
+
+    {
+        // 'builder' is an unowned BSONObjBuilder and thus does none of its own size checking,
+        // allowing us to grow the OpMsgReplyBuilder past the bson object size limit.
+        auto builder = r.getBodyBuilder();
+        for (auto i = 0; i < 2; i++) {
+            builder.append("field" + std::to_string(i), bigStr);
+        }
+    }
+
+    ASSERT_THROWS_CODE(r.done(), DBException, ErrorCodes::BSONObjectTooLarge);
 }
 
 template <typename T>

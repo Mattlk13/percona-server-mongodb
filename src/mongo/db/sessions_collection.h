@@ -29,8 +29,9 @@
 
 #pragma once
 
+#include <functional>
+
 #include "mongo/db/logical_session_id.h"
-#include "mongo/stdx/functional.h"
 
 namespace mongo {
 
@@ -50,39 +51,40 @@ public:
     virtual ~SessionsCollection();
 
     /**
-     * Ensures that the sessions collection exists and has the proper indexes.
+     * Ensures that the sessions collection exists and has the proper indexes. Implementations of
+     * this method must support multiple concurrent invocations.
      */
-    virtual Status setupSessionsCollection(OperationContext* opCtx) = 0;
+    virtual void setupSessionsCollection(OperationContext* opCtx) = 0;
 
     /**
      * Checks if the sessions collection exists and has the proper indexes.
      */
-    virtual Status checkSessionsCollectionExists(OperationContext* opCtx) = 0;
+    virtual void checkSessionsCollectionExists(OperationContext* opCtx) = 0;
 
     /**
-     * Updates the last-use times on the given sessions to be greater than
-     * or equal to the given time. Returns an error if a networking issue occurred.
+     * Updates the last-use times on the given sessions to be greater than or equal to the given
+     * time. Throws an exception if a networking issue occurred.
      */
-    virtual Status refreshSessions(OperationContext* opCtx,
-                                   const LogicalSessionRecordSet& sessions) = 0;
+    virtual void refreshSessions(OperationContext* opCtx,
+                                 const LogicalSessionRecordSet& sessions) = 0;
 
     /**
      * Removes the authoritative records for the specified sessions.
      *
-     * Implementations should perform authentication checks to ensure that
-     * session records may only be removed if their owner is logged in.
+     * Implementations should perform authentication checks to ensure that session records may only
+     * be removed if their owner is logged in.
      *
-     * Returns an error if the removal fails, for example from a network error.
+     * Throws an exception if the removal fails, for example from a network error.
      */
-    virtual Status removeRecords(OperationContext* opCtx, const LogicalSessionIdSet& sessions) = 0;
+    virtual void removeRecords(OperationContext* opCtx, const LogicalSessionIdSet& sessions) = 0;
 
     /**
-     * Checks a set of lsids and returns the set that no longer exists
+     * Checks a set of lsids and returns the set that no longer exists.
      *
-     * Returns an error if the fetch cannot occur, for example from a network error.
+     * Throws an exception if the fetch cannot occur, for example from a network error.
      */
-    virtual StatusWith<LogicalSessionIdSet> findRemovedSessions(
-        OperationContext* opCtx, const LogicalSessionIdSet& sessions) = 0;
+    virtual LogicalSessionIdSet findRemovedSessions(OperationContext* opCtx,
+                                                    const LogicalSessionIdSet& sessions) = 0;
 
     /**
      * Generates a createIndexes command for the sessions collection TTL index.
@@ -97,38 +99,35 @@ public:
 protected:
     SessionsCollection();
 
-    /**
-     * Makes a send function for the given client.
-     */
-    using SendBatchFn = stdx::function<Status(BSONObj batch)>;
+    using SendBatchFn = std::function<void(BSONObj batch)>;
     static SendBatchFn makeSendFnForCommand(const NamespaceString& ns, DBClientBase* client);
     static SendBatchFn makeSendFnForBatchWrite(const NamespaceString& ns, DBClientBase* client);
 
-    using FindBatchFn = stdx::function<StatusWith<BSONObj>(BSONObj batch)>;
+    using FindBatchFn = std::function<BSONObj(BSONObj batch)>;
     static FindBatchFn makeFindFnForCommand(const NamespaceString& ns, DBClientBase* client);
 
     /**
      * Formats and sends batches of refreshes for the given set of sessions.
      */
-    Status doRefresh(const NamespaceString& ns,
-                     const std::vector<LogicalSessionRecord>& sessions,
-                     SendBatchFn send);
+    void _doRefresh(const NamespaceString& ns,
+                    const std::vector<LogicalSessionRecord>& sessions,
+                    SendBatchFn send);
 
     /**
      * Formats and sends batches of deletes for the given set of sessions.
      */
-    Status doRemove(const NamespaceString& ns,
-                    const std::vector<LogicalSessionId>& sessions,
-                    SendBatchFn send);
+    void _doRemove(const NamespaceString& ns,
+                   const std::vector<LogicalSessionId>& sessions,
+                   SendBatchFn send);
 
     /**
      * Returns those lsids from the input 'sessions' array which are not present in the sessions
      * collection (essentially performs an inner join of 'sessions' against the sessions
      * collection).
      */
-    StatusWith<LogicalSessionIdSet> doFindRemoved(const NamespaceString& ns,
-                                                  const std::vector<LogicalSessionId>& sessions,
-                                                  FindBatchFn send);
+    LogicalSessionIdSet _doFindRemoved(const NamespaceString& ns,
+                                       const std::vector<LogicalSessionId>& sessions,
+                                       FindBatchFn send);
 };
 
 }  // namespace mongo

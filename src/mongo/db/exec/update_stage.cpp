@@ -27,47 +27,46 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kWrite
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kWrite
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/exec/update_stage.h"
 
 #include <algorithm>
+#include <memory>
 
 #include "mongo/base/status_with.h"
 #include "mongo/bson/bson_comparator_interface_base.h"
 #include "mongo/bson/mutable/algorithm.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
-#include "mongo/db/curop_failpoint_helpers.h"
 #include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/exec/write_stage_common.h"
 #include "mongo/db/op_observer.h"
+#include "mongo/db/query/collection_query_info.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/operation_sharding_state.h"
+#include "mongo/db/s/resharding_util.h"
+#include "mongo/db/s/sharding_state.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/duplicate_key_error_info.h"
 #include "mongo/db/update/path_support.h"
 #include "mongo/db/update/storage_validation.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/shard_key_pattern.h"
 #include "mongo/s/would_change_owning_shard_exception.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
-#include "mongo/util/transitional_tools_do_not_use/vector_spooling.h"
 
 namespace mongo {
 
-MONGO_FAIL_POINT_DEFINE(hangBeforeUpsertPerformsInsert);
 MONGO_FAIL_POINT_DEFINE(hangBeforeThrowWouldChangeOwningShard);
 
 using std::string;
 using std::unique_ptr;
 using std::vector;
-using stdx::make_unique;
 
 namespace mb = mutablebson;
 
@@ -76,57 +75,10 @@ namespace {
 const char idFieldName[] = "_id";
 const FieldRef idFieldRef(idFieldName);
 
-Status ensureIdFieldIsFirst(mb::Document* doc) {
-    mb::Element idElem = mb::findFirstChildNamed(doc->root(), idFieldName);
-
-    if (!idElem.ok()) {
-        return {ErrorCodes::InvalidIdField, "_id field is missing"};
-    }
-
-    if (idElem.leftSibling().ok()) {
-        // Move '_id' to be the first element
-        Status s = idElem.remove();
-        if (!s.isOK())
-            return s;
-        s = doc->root().pushFront(idElem);
-        if (!s.isOK())
-            return s;
-    }
-
-    return Status::OK();
-}
-
 void addObjectIDIdField(mb::Document* doc) {
     const auto idElem = doc->makeElementNewOID(idFieldName);
-    if (!idElem.ok())
-        uasserted(17268, "Could not create new ObjectId '_id' field.");
-
+    uassert(17268, "Could not create new ObjectId '_id' field.", idElem.ok());
     uassertStatusOK(doc->root().pushFront(idElem));
-}
-
-/**
- * Uasserts if any of the paths in 'requiredPaths' are not present in 'document', or if they are
- * arrays or array descendants.
- */
-void assertRequiredPathsPresent(const mb::Document& document, const FieldRefSet& requiredPaths) {
-    for (const auto& path : requiredPaths) {
-        auto elem = document.root();
-        for (size_t i = 0; i < (*path).numParts(); ++i) {
-            elem = elem[(*path).getPart(i)];
-            uassert(ErrorCodes::NoSuchKey,
-                    str::stream() << "After applying the update, the new document was missing the "
-                                     "required field '"
-                                  << (*path).dottedField()
-                                  << "'",
-                    elem.ok());
-            uassert(
-                ErrorCodes::NotSingleValueField,
-                str::stream() << "After applying the update to the document, the required field '"
-                              << (*path).dottedField()
-                              << "' was found to be an array or array descendant.",
-                elem.getType() != BSONType::Array);
-        }
-    }
 }
 
 /**
@@ -155,44 +107,44 @@ CollectionUpdateArgs::StoreDocOption getStoreDocMode(const UpdateRequest& update
 }
 }  // namespace
 
-const char* UpdateStage::kStageType = "UPDATE";
-
-const UpdateStats UpdateStage::kEmptyUpdateStats;
-
-UpdateStage::UpdateStage(OperationContext* opCtx,
+// Public constructor.
+UpdateStage::UpdateStage(ExpressionContext* expCtx,
                          const UpdateStageParams& params,
                          WorkingSet* ws,
-                         Collection* collection,
+                         const CollectionPtr& collection,
                          PlanStage* child)
-    : RequiresMutableCollectionStage(kStageType, opCtx, collection),
+    : UpdateStage(expCtx, params, ws, collection) {
+    // We should never reach here if the request is an upsert.
+    invariant(!_params.request->isUpsert());
+    _children.emplace_back(child);
+}
+
+// Protected constructor.
+UpdateStage::UpdateStage(ExpressionContext* expCtx,
+                         const UpdateStageParams& params,
+                         WorkingSet* ws,
+                         const CollectionPtr& collection)
+    : RequiresMutableCollectionStage(kStageType.rawData(), expCtx, collection),
       _params(params),
       _ws(ws),
+      _doc(params.driver->getDocument()),
       _idRetrying(WorkingSet::INVALID_ID),
       _idReturning(WorkingSet::INVALID_ID),
-      _updatedRecordIds(params.request->isMulti() ? new RecordIdSet() : NULL),
-      _doc(params.driver->getDocument()) {
-    _children.emplace_back(child);
+      _updatedRecordIds(params.request->isMulti() ? new RecordIdSet() : nullptr) {
 
     // Should the modifiers validate their embedded docs via storage_validation::storageValid()?
     // Only user updates should be checked. Any system or replication stuff should pass through.
-    // Config db docs also do not get checked.
     const auto request = _params.request;
-    _enforceOkForStorage =
-        !(request->isFromOplogApplication() || request->getNamespaceString().isConfigDB() ||
-          request->isFromMigration());
 
-    // We should only check for an update to the shard key if the update is coming from a user and
-    // the request is versioned.
-    _shouldCheckForShardKeyUpdate =
-        !(request->isFromOplogApplication() || request->getNamespaceString().isConfigDB() ||
-          request->isFromMigration()) &&
-        OperationShardingState::isOperationVersioned(opCtx);
+    _isUserInitiatedWrite = opCtx()->writesAreReplicated() &&
+        !(request->isFromOplogApplication() ||
+          params.driver->type() == UpdateDriver::UpdateType::kDelta || request->isFromMigration());
 
     _specificStats.isModUpdate = params.driver->type() == UpdateDriver::UpdateType::kOperator;
 }
 
 BSONObj UpdateStage::transformAndUpdate(const Snapshotted<BSONObj>& oldObj, RecordId& recordId) {
-    const UpdateRequest* request = _params.request;
+    const UpdateRequest* const request = _params.request;
     UpdateDriver* driver = _params.driver;
     CanonicalQuery* cq = _params.canonicalQuery;
 
@@ -214,30 +166,27 @@ BSONObj UpdateStage::transformAndUpdate(const Snapshotted<BSONObj>& oldObj, Reco
 
     bool docWasModified = false;
 
-    const auto isFCV42 = serverGlobalParams.featureCompatibility.isVersionInitialized() &&
-        serverGlobalParams.featureCompatibility.getVersion() ==
-            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42;
-
-    auto* const css = CollectionShardingState::get(getOpCtx(), collection()->ns());
-    auto metadata = css->getCurrentMetadata();
     Status status = Status::OK();
-    const bool validateForStorage = getOpCtx()->writesAreReplicated() && _enforceOkForStorage;
     const bool isInsert = false;
     FieldRefSet immutablePaths;
-    if (getOpCtx()->writesAreReplicated() && !request->isFromMigration()) {
-        if (metadata->isSharded() &&
-            (!OperationShardingState::isOperationVersioned(getOpCtx()) || !isFCV42)) {
-            auto& immutablePathsVector = metadata->getKeyPatternFields();
-            immutablePaths.fillFrom(
-                transitional_tools_do_not_use::unspool_vector(immutablePathsVector));
+
+    if (_isUserInitiatedWrite) {
+        // Documents coming directly from users should be validated for storage. It is safe to
+        // access the CollectionShardingState in this write context and to throw SSV if the sharding
+        // metadata has not been initialized.
+        const auto collDesc = CollectionShardingState::get(opCtx(), collection()->ns())
+                                  ->getCollectionDescription(opCtx());
+        if (collDesc.isSharded() && !OperationShardingState::isOperationVersioned(opCtx())) {
+            immutablePaths.fillFrom(collDesc.getKeyPatternFields());
         }
         immutablePaths.keepShortest(&idFieldRef);
     }
     if (!driver->needMatchDetails()) {
         // If we don't need match details, avoid doing the rematch
-        status = driver->update(StringData(),
+        status = driver->update(opCtx(),
+                                StringData(),
                                 &_doc,
-                                validateForStorage,
+                                _isUserInitiatedWrite,
                                 immutablePaths,
                                 isInsert,
                                 &logObj,
@@ -254,9 +203,10 @@ BSONObj UpdateStage::transformAndUpdate(const Snapshotted<BSONObj>& oldObj, Reco
         if (matchDetails.hasElemMatchKey())
             matchedField = matchDetails.elemMatchKey();
 
-        status = driver->update(matchedField,
+        status = driver->update(opCtx(),
+                                matchedField,
                                 &_doc,
-                                validateForStorage,
+                                _isUserInitiatedWrite,
                                 immutablePaths,
                                 isInsert,
                                 &logObj,
@@ -271,19 +221,11 @@ BSONObj UpdateStage::transformAndUpdate(const Snapshotted<BSONObj>& oldObj, Reco
     // neither grow nor shrink).
     const auto createIdField = !collection()->isCapped();
 
-    // Ensure if _id exists it is first
-    status = ensureIdFieldIsFirst(&_doc);
-    if (status.code() == ErrorCodes::InvalidIdField) {
-        // Create ObjectId _id field if we are doing that
-        if (createIdField) {
-            addObjectIDIdField(&_doc);
-        }
-    } else {
-        uassertStatusOK(status);
-    }
+    // Ensure _id is first if it exists, and generate a new OID if appropriate.
+    _ensureIdFieldIsFirst(&_doc, createIdField);
 
     // See if the changes were applied in place
-    const char* source = NULL;
+    const char* source = nullptr;
     const bool inPlace = _doc.getInPlaceUpdates(&_damages, &source);
 
     if (inPlace && _damages.empty()) {
@@ -303,39 +245,49 @@ BSONObj UpdateStage::transformAndUpdate(const Snapshotted<BSONObj>& oldObj, Reco
         RecordId newRecordId;
         CollectionUpdateArgs args;
 
-        if (!request->isExplain()) {
-            args.stmtId = request->getStmtId();
+        if (!request->explain()) {
+            args.stmtIds = request->getStmtIds();
             args.update = logObj;
-            args.criteria = metadata->extractDocumentKey(newObj);
+            if (_isUserInitiatedWrite) {
+                args.criteria = CollectionShardingState::get(opCtx(), collection()->ns())
+                                    ->getCollectionDescription(opCtx())
+                                    .extractDocumentKey(newObj);
+            } else {
+                const auto docId = newObj[idFieldName];
+                args.criteria = docId ? docId.wrap() : newObj;
+            }
             uassert(16980,
                     "Multi-update operations require all documents to have an '_id' field",
                     !request->isMulti() || args.criteria.hasField("_id"_sd));
-            args.fromMigrate = request->isFromMigration();
             args.storeDocOption = getStoreDocMode(*request);
             if (args.storeDocOption == CollectionUpdateArgs::StoreDocOption::PreImage) {
                 args.preImageDoc = oldObj.value().getOwned();
             }
         }
 
+        // Ensure we set the type correctly
+        if (request->isFromMigration()) {
+            args.source = OperationSource::kFromMigrate;
+        } else if (request->isTimeseries()) {
+            args.source = OperationSource::kTimeseries;
+        }
+
         if (inPlace) {
-            if (!request->isExplain()) {
+            if (!request->explain()) {
                 newObj = oldObj.value();
                 const RecordData oldRec(oldObj.value().objdata(), oldObj.value().objsize());
 
                 Snapshotted<RecordData> snap(oldObj.snapshotId(), oldRec);
 
-                if (isFCV42 && metadata->isSharded() && _shouldCheckForShardKeyUpdate) {
-                    bool changesShardKeyOnSameNode =
-                        checkUpdateChangesShardKeyFields(metadata, oldObj);
-                    if (changesShardKeyOnSameNode && !args.preImageDoc) {
-                        args.preImageDoc = oldObj.value().getOwned();
-                    }
+                if (_isUserInitiatedWrite &&
+                    checkUpdateChangesShardKeyFields(boost::none, oldObj) && !args.preImageDoc) {
+                    args.preImageDoc = oldObj.value().getOwned();
                 }
 
-                WriteUnitOfWork wunit(getOpCtx());
+                WriteUnitOfWork wunit(opCtx());
                 StatusWith<RecordData> newRecStatus = collection()->updateDocumentWithDamages(
-                    getOpCtx(), recordId, std::move(snap), source, _damages, &args);
-                invariant(oldObj.snapshotId() == getOpCtx()->recoveryUnit()->getSnapshotId());
+                    opCtx(), recordId, std::move(snap), source, _damages, &args);
+                invariant(oldObj.snapshotId() == opCtx()->recoveryUnit()->getSnapshotId());
                 wunit.commit();
 
                 newObj = uassertStatusOK(std::move(newRecStatus)).releaseToBson();
@@ -351,24 +303,21 @@ BSONObj UpdateStage::transformAndUpdate(const Snapshotted<BSONObj>& oldObj, Reco
                                   << BSONObjMaxUserSize,
                     newObj.objsize() <= BSONObjMaxUserSize);
 
-            if (!request->isExplain()) {
-                if (isFCV42 && metadata->isSharded() && _shouldCheckForShardKeyUpdate) {
-                    bool changesShardKeyOnSameNode =
-                        checkUpdateChangesShardKeyFields(metadata, oldObj);
-                    if (changesShardKeyOnSameNode && !args.preImageDoc) {
-                        args.preImageDoc = oldObj.value().getOwned();
-                    }
+            if (!request->explain()) {
+                if (_isUserInitiatedWrite && checkUpdateChangesShardKeyFields(newObj, oldObj) &&
+                    !args.preImageDoc) {
+                    args.preImageDoc = oldObj.value().getOwned();
                 }
 
-                WriteUnitOfWork wunit(getOpCtx());
-                newRecordId = collection()->updateDocument(getOpCtx(),
+                WriteUnitOfWork wunit(opCtx());
+                newRecordId = collection()->updateDocument(opCtx(),
                                                            recordId,
                                                            oldObj,
                                                            newObj,
                                                            driver->modsAffectIndices(),
                                                            _params.opDebug,
                                                            &args);
-                invariant(oldObj.snapshotId() == getOpCtx()->recoveryUnit()->getSnapshotId());
+                invariant(oldObj.snapshotId() == opCtx()->recoveryUnit()->getSnapshotId());
                 wunit.commit();
             }
         }
@@ -388,304 +337,37 @@ BSONObj UpdateStage::transformAndUpdate(const Snapshotted<BSONObj>& oldObj, Reco
 
     // Only record doc modifications if they wrote (exclude no-ops). Explains get
     // recorded as if they wrote.
-    if (docWasModified || request->isExplain()) {
+    if (docWasModified || request->explain()) {
         _specificStats.nModified++;
     }
 
     return newObj;
 }
 
-BSONObj UpdateStage::applyUpdateOpsForInsert(OperationContext* opCtx,
-                                             const CanonicalQuery* cq,
-                                             const BSONObj& query,
-                                             UpdateDriver* driver,
-                                             mutablebson::Document* doc,
-                                             bool isInternalRequest,
-                                             const NamespaceString& ns,
-                                             bool enforceOkForStorage,
-                                             UpdateStats* stats) {
-    // Since this is an insert (no docs found and upsert:true), we will be logging it
-    // as an insert in the oplog. We don't need the driver's help to build the
-    // oplog record, then. We also set the context of the update driver to the INSERT_CONTEXT.
-    // Some mods may only work in that context (e.g. $setOnInsert).
-    driver->setLogOp(false);
-
-    auto* const css = CollectionShardingState::get(opCtx, ns);
-    auto metadata = css->getCurrentMetadata();
-
-    const auto isFCV42 = serverGlobalParams.featureCompatibility.isVersionInitialized() &&
-        serverGlobalParams.featureCompatibility.getVersion() ==
-            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42;
-
-    FieldRefSet immutablePaths;
-    if (metadata->isSharded() &&
-        (!OperationShardingState::isOperationVersioned(opCtx) || !isFCV42)) {
-        auto& immutablePathsVector = metadata->getKeyPatternFields();
-        immutablePaths.fillFrom(
-            transitional_tools_do_not_use::unspool_vector(immutablePathsVector));
-    }
-    immutablePaths.keepShortest(&idFieldRef);
-
-    if (cq) {
-        FieldRefSet requiredPaths;
-        if (metadata->isSharded()) {
-            const auto& shardKeyPathsVector = metadata->getKeyPatternFields();
-            requiredPaths.fillFrom(
-                transitional_tools_do_not_use::unspool_vector(shardKeyPathsVector));
+void UpdateStage::_assertPathsNotArray(const mb::Document& document, const FieldRefSet& paths) {
+    for (const auto& path : paths) {
+        auto elem = document.root();
+        // If any path component does not exist, we stop checking for arrays along the path.
+        for (size_t i = 0; elem.ok() && i < (*path).numParts(); ++i) {
+            elem = elem[(*path).getPart(i)];
+            uassert(ErrorCodes::NotSingleValueField,
+                    str::stream() << "After applying the update to the document, the field '"
+                                  << (*path).dottedField()
+                                  << "' was found to be an array or array descendant.",
+                    !elem.ok() || elem.getType() != BSONType::Array);
         }
-        requiredPaths.keepShortest(&idFieldRef);
-        uassertStatusOK(driver->populateDocumentWithQueryFields(*cq, requiredPaths, *doc));
-    } else {
-        fassert(17354, CanonicalQuery::isSimpleIdQuery(query));
-        BSONElement idElt = query[idFieldName];
-        fassert(17352, doc->root().appendElement(idElt));
     }
-
-    // Apply the update modifications here. Do not validate for storage, since we will validate the
-    // entire document after the update. However, we ensure that no immutable fields are updated.
-    const bool validateForStorage = false;
-    const bool isInsert = true;
-    if (isInternalRequest) {
-        immutablePaths.clear();
-    }
-    Status updateStatus =
-        driver->update(StringData(), doc, validateForStorage, immutablePaths, isInsert);
-    if (!updateStatus.isOK()) {
-        uasserted(16836, updateStatus.reason());
-    }
-
-    // Ensure _id exists and is first
-    auto idAndFirstStatus = ensureIdFieldIsFirst(doc);
-    if (idAndFirstStatus.code() == ErrorCodes::InvalidIdField) {  // _id field is missing
-        addObjectIDIdField(doc);
-    } else {
-        uassertStatusOK(idAndFirstStatus);
-    }
-
-    // Validate that the object replacement or modifiers resulted in a document
-    // that contains all the required keys and can be stored if it isn't coming
-    // from a migration or via replication.
-    if (!isInternalRequest) {
-        if (enforceOkForStorage) {
-            storage_validation::storageValid(*doc);
-        }
-        FieldRefSet requiredPaths;
-        if (metadata->isSharded()) {
-            const auto& shardKeyPathsVector = metadata->getKeyPatternFields();
-            requiredPaths.fillFrom(
-                transitional_tools_do_not_use::unspool_vector(shardKeyPathsVector));
-        }
-        requiredPaths.keepShortest(&idFieldRef);
-        assertRequiredPathsPresent(*doc, requiredPaths);
-    }
-
-    BSONObj newObj = doc->getObject();
-    if (newObj.objsize() > BSONObjMaxUserSize) {
-        uasserted(17420,
-                  str::stream() << "Document to upsert is larger than " << BSONObjMaxUserSize);
-    }
-
-    return newObj;
 }
 
-bool UpdateStage::matchContainsOnlyAndedEqualityNodes(const MatchExpression& root) {
-    if (root.matchType() == MatchExpression::EQ) {
-        return true;
-    }
-
-    if (root.matchType() == MatchExpression::AND) {
-        for (size_t i = 0; i < root.numChildren(); ++i) {
-            if (root.getChild(i)->matchType() != MatchExpression::EQ) {
-                return false;
-            }
-        }
-
-        return true;
-    }
-
-    return false;
-}
-
-bool UpdateStage::shouldRetryDuplicateKeyException(const ParsedUpdate& parsedUpdate,
-                                                   const DuplicateKeyErrorInfo& errorInfo) {
-    invariant(parsedUpdate.hasParsedQuery());
-
-    const auto updateRequest = parsedUpdate.getRequest();
-
-    // In order to be retryable, the update must be an upsert with multi:false.
-    if (!updateRequest->isUpsert() || updateRequest->isMulti()) {
-        return false;
-    }
-
-    auto matchExpr = parsedUpdate.getParsedQuery()->root();
-    invariant(matchExpr);
-
-    // In order to be retryable, the update query must contain no expressions other than AND and EQ.
-    if (!matchContainsOnlyAndedEqualityNodes(*matchExpr)) {
-        return false;
-    }
-
-    // In order to be retryable, the update equality field paths must be identical to the unique
-    // index key field paths. Also, the values that triggered the DuplicateKey error must match the
-    // values used in the upsert query predicate.
-    pathsupport::EqualityMatches equalities;
-    auto status = pathsupport::extractEqualityMatches(*matchExpr, &equalities);
-    if (!status.isOK()) {
-        return false;
-    }
-
-    auto keyPattern = errorInfo.getKeyPattern();
-    if (equalities.size() != static_cast<size_t>(keyPattern.nFields())) {
-        return false;
-    }
-
-    auto keyValue = errorInfo.getDuplicatedKeyValue();
-
-    BSONObjIterator keyPatternIter(keyPattern);
-    BSONObjIterator keyValueIter(keyValue);
-    while (keyPatternIter.more() && keyValueIter.more()) {
-        auto keyPatternElem = keyPatternIter.next();
-        auto keyValueElem = keyValueIter.next();
-
-        auto keyName = keyPatternElem.fieldNameStringData();
-        if (!equalities.count(keyName)) {
-            return false;
-        }
-
-        // Comparison which obeys field ordering but ignores field name.
-        BSONElementComparator cmp{BSONElementComparator::FieldNamesMode::kIgnore, nullptr};
-        if (cmp.evaluate(equalities[keyName]->getData() != keyValueElem)) {
-            return false;
-        }
-    }
-    invariant(!keyPatternIter.more());
-    invariant(!keyValueIter.more());
-
-    return true;
-}
-
-void UpdateStage::doInsert() {
-    _specificStats.inserted = true;
-
-    const UpdateRequest* request = _params.request;
-    bool isInternalRequest = !getOpCtx()->writesAreReplicated() || request->isFromMigration();
-
-    // Reset the document we will be writing to.
-    _doc.reset();
-
-    BSONObj newObj = applyUpdateOpsForInsert(getOpCtx(),
-                                             _params.canonicalQuery,
-                                             request->getQuery(),
-                                             _params.driver,
-                                             &_doc,
-                                             isInternalRequest,
-                                             request->getNamespaceString(),
-                                             _enforceOkForStorage,
-                                             &_specificStats);
-
-    _specificStats.objInserted = newObj;
-
-    // If this is an explain, bail out now without doing the insert.
-    if (request->isExplain()) {
-        return;
-    }
-
-    // If in FCV 4.2 and this collection is sharded, check if the doc we plan to insert belongs to
-    // this shard. MongoS uses the query field to target a shard, and it is possible the shard key
-    // fields in the 'q' field belong to this shard, but those in the 'u' field do not. In this case
-    // we need to throw so that MongoS can target the insert to the correct shard.
-    if (_shouldCheckForShardKeyUpdate) {
-        const auto isFCV42 = serverGlobalParams.featureCompatibility.isVersionInitialized() &&
-            serverGlobalParams.featureCompatibility.getVersion() ==
-                ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42;
-        auto* const css = CollectionShardingState::get(getOpCtx(), collection()->ns());
-        const auto& metadata = css->getCurrentMetadata();
-
-        if (isFCV42 && metadata->isSharded()) {
-            const ShardKeyPattern shardKeyPattern(metadata->getKeyPattern());
-            auto newShardKey = shardKeyPattern.extractShardKeyFromDoc(newObj);
-
-            if (!metadata->keyBelongsToMe(newShardKey)) {
-                // An attempt to upsert a document with a shard key value that belongs on another
-                // shard must either be a retryable write or inside a transaction.
-                uassert(ErrorCodes::IllegalOperation,
-                        "The upsert document could not be inserted onto the shard targeted by the "
-                        "query, since its shard key belongs on a different shard. Cross-shard "
-                        "upserts are only allowed when running in a transaction or with "
-                        "retryWrites: true.",
-                        getOpCtx()->getTxnNumber());
-                uasserted(
-                    WouldChangeOwningShardInfo(request->getQuery(), newObj, true /* upsert */),
-                    "The document we are inserting belongs on a different shard");
-            }
-        }
-    }
-
-    if (MONGO_FAIL_POINT(hangBeforeUpsertPerformsInsert)) {
-        CurOpFailpointHelpers::waitWhileFailPointEnabled(
-            &hangBeforeUpsertPerformsInsert, getOpCtx(), "hangBeforeUpsertPerformsInsert");
-    }
-
-    writeConflictRetry(getOpCtx(), "upsert", collection()->ns().ns(), [&] {
-        WriteUnitOfWork wunit(getOpCtx());
-        uassertStatusOK(collection()->insertDocument(getOpCtx(),
-                                                     InsertStatement(request->getStmtId(), newObj),
-                                                     _params.opDebug,
-                                                     request->isFromMigration()));
-
-        // Technically, we should save/restore state here, but since we are going to return
-        // immediately after, it would just be wasted work.
-        wunit.commit();
-    });
-}
-
-bool UpdateStage::doneUpdating() {
+bool UpdateStage::isEOF() {
     // We're done updating if either the child has no more results to give us, or we've
     // already gotten a result back and we're not a multi-update.
     return _idRetrying == WorkingSet::INVALID_ID && _idReturning == WorkingSet::INVALID_ID &&
         (child()->isEOF() || (_specificStats.nMatched > 0 && !_params.request->isMulti()));
 }
 
-bool UpdateStage::needInsert() {
-    // We need to insert if
-    //  1) we haven't inserted already,
-    //  2) the child stage returned zero matches, and
-    //  3) the user asked for an upsert.
-    return !_specificStats.inserted && _specificStats.nMatched == 0 && _params.request->isUpsert();
-}
-
-bool UpdateStage::isEOF() {
-    return doneUpdating() && !needInsert();
-}
-
 PlanStage::StageState UpdateStage::doWork(WorkingSetID* out) {
     if (isEOF()) {
-        return PlanStage::IS_EOF;
-    }
-
-    if (doneUpdating()) {
-        // Even if we're done updating, we may have some inserting left to do.
-        if (needInsert()) {
-
-            doInsert();
-
-            invariant(isEOF());
-            if (_params.request->shouldReturnNewDocs()) {
-                // Want to return the document we just inserted, create it as a WorkingSetMember
-                // so that we can return it.
-                BSONObj newObj = _specificStats.objInserted;
-                *out = _ws->allocate();
-                WorkingSetMember* member = _ws->get(*out);
-                member->obj = Snapshotted<BSONObj>(getOpCtx()->recoveryUnit()->getSnapshotId(),
-                                                   newObj.getOwned());
-                member->transitionToOwnedObj();
-                return PlanStage::ADVANCED;
-            }
-        }
-
-        // At this point either we're done updating and there was no insert to do,
-        // or we're done updating and we're done inserting. Either way, we're EOF.
-        invariant(isEOF());
         return PlanStage::IS_EOF;
     }
 
@@ -743,7 +425,7 @@ PlanStage::StageState UpdateStage::doWork(WorkingSetID* out) {
         bool docStillMatches;
         try {
             docStillMatches = write_stage_common::ensureStillMatches(
-                collection(), getOpCtx(), _ws, id, _params.canonicalQuery);
+                collection(), opCtx(), _ws, id, _params.canonicalQuery);
         } catch (const WriteConflictException&) {
             // There was a problem trying to detect if the document still exists, so retry.
             memberFreer.dismiss();
@@ -763,8 +445,7 @@ PlanStage::StageState UpdateStage::doWork(WorkingSetID* out) {
         // is allowed to free the memory.
         member->makeObjOwnedIfNeeded();
 
-        // Save state before making changes
-        WorkingSetCommon::prepareForSnapshotChange(_ws);
+        // Save state before making changes.
         try {
             child()->saveState();
         } catch (const WriteConflictException&) {
@@ -773,14 +454,15 @@ PlanStage::StageState UpdateStage::doWork(WorkingSetID* out) {
 
         // If we care about the pre-updated version of the doc, save it out here.
         BSONObj oldObj;
+        SnapshotId oldSnapshot = member->doc.snapshotId();
         if (_params.request->shouldReturnOldDocs()) {
-            oldObj = member->obj.value().getOwned();
+            oldObj = member->doc.value().toBson().getOwned();
         }
 
         BSONObj newObj;
         try {
             // Do the update, get us the new version of the doc.
-            newObj = transformAndUpdate(member->obj, recordId);
+            newObj = transformAndUpdate({oldSnapshot, member->doc.value().toBson()}, recordId);
         } catch (const WriteConflictException&) {
             memberFreer.dismiss();  // Keep this member around so we can retry updating it.
             return prepareToRetryWSM(id, out);
@@ -789,11 +471,10 @@ PlanStage::StageState UpdateStage::doWork(WorkingSetID* out) {
         // Set member's obj to be the doc we want to return.
         if (_params.request->shouldReturnAnyDocs()) {
             if (_params.request->shouldReturnNewDocs()) {
-                member->obj = Snapshotted<BSONObj>(getOpCtx()->recoveryUnit()->getSnapshotId(),
-                                                   newObj.getOwned());
+                member->resetDocument(opCtx()->recoveryUnit()->getSnapshotId(), newObj.getOwned());
             } else {
                 invariant(_params.request->shouldReturnOldDocs());
-                member->obj.setValue(oldObj);
+                member->resetDocument(oldSnapshot, oldObj);
             }
             member->recordId = RecordId();
             member->transitionToOwnedObj();
@@ -807,7 +488,7 @@ PlanStage::StageState UpdateStage::doWork(WorkingSetID* out) {
         // As restoreState may restore (recreate) cursors, make sure to restore the
         // state outside of the WritUnitOfWork.
         try {
-            child()->restoreState();
+            child()->restoreState(&collection());
         } catch (const WriteConflictException&) {
             // Note we don't need to retry updating anything in this case since the update
             // already was committed. However, we still need to return the updated document
@@ -835,20 +516,8 @@ PlanStage::StageState UpdateStage::doWork(WorkingSetID* out) {
 
         return PlanStage::NEED_TIME;
     } else if (PlanStage::IS_EOF == status) {
-        // The child is out of results, but we might not be done yet because we still might
-        // have to do an insert.
-        return PlanStage::NEED_TIME;
-    } else if (PlanStage::FAILURE == status) {
-        *out = id;
-        // If a stage fails, it may create a status WSM to indicate why it failed, in which case
-        // 'id' is valid.  If ID is invalid, we create our own error message.
-        if (WorkingSet::INVALID_ID == id) {
-            const std::string errmsg = "update stage failed to read in results from child";
-            *out = WorkingSetCommon::allocateStatusMember(
-                _ws, Status(ErrorCodes::InternalError, errmsg));
-            return PlanStage::FAILURE;
-        }
-        return status;
+        // The child is out of results, and therefore so are we.
+        return PlanStage::IS_EOF;
     } else if (PlanStage::NEED_YIELD == status) {
         *out = id;
     }
@@ -856,13 +525,26 @@ PlanStage::StageState UpdateStage::doWork(WorkingSetID* out) {
     return status;
 }
 
+void UpdateStage::_ensureIdFieldIsFirst(mb::Document* doc, bool generateOIDIfMissing) {
+    mb::Element idElem = mb::findFirstChildNamed(doc->root(), idFieldName);
+
+    // If the document has no _id and the caller has requested that we generate one, do so.
+    if (!idElem.ok() && generateOIDIfMissing) {
+        addObjectIDIdField(doc);
+    } else if (idElem.ok() && idElem.leftSibling().ok()) {
+        // If the document does have an _id but it is not the first element, move it to the front.
+        uassertStatusOK(idElem.remove());
+        uassertStatusOK(doc->root().pushFront(idElem));
+    }
+}
+
 void UpdateStage::doRestoreStateRequiresCollection() {
     const UpdateRequest& request = *_params.request;
     const NamespaceString& nsString(request.getNamespaceString());
 
     // We may have stepped down during the yield.
-    bool userInitiatedWritesAndNotPrimary = getOpCtx()->writesAreReplicated() &&
-        !repl::ReplicationCoordinator::get(getOpCtx())->canAcceptWritesFor(getOpCtx(), nsString);
+    bool userInitiatedWritesAndNotPrimary = opCtx()->writesAreReplicated() &&
+        !repl::ReplicationCoordinator::get(opCtx())->canAcceptWritesFor(opCtx(), nsString);
 
     if (userInitiatedWritesAndNotPrimary) {
         uasserted(ErrorCodes::PrimarySteppedDown,
@@ -872,14 +554,14 @@ void UpdateStage::doRestoreStateRequiresCollection() {
 
     // The set of indices may have changed during yield. Make sure that the update driver has up to
     // date index information.
-    const auto& updateIndexData = collection()->infoCache()->getIndexKeys(getOpCtx());
+    const auto& updateIndexData = CollectionQueryInfo::get(collection()).getIndexKeys(opCtx());
     _params.driver->refreshIndexKeys(&updateIndexData);
 }
 
 unique_ptr<PlanStageStats> UpdateStage::getStats() {
     _commonStats.isEOF = isEOF();
-    unique_ptr<PlanStageStats> ret = make_unique<PlanStageStats>(_commonStats, STAGE_UPDATE);
-    ret->specific = make_unique<UpdateStats>(_specificStats);
+    unique_ptr<PlanStageStats> ret = std::make_unique<PlanStageStats>(_commonStats, STAGE_UPDATE);
+    ret->specific = std::make_unique<UpdateStats>(_specificStats);
     ret->children.emplace_back(child()->getStats());
     return ret;
 }
@@ -888,80 +570,23 @@ const SpecificStats* UpdateStage::getSpecificStats() const {
     return &_specificStats;
 }
 
-const UpdateStats* UpdateStage::getUpdateStats(const PlanExecutor* exec) {
-    invariant(exec->getRootStage()->isEOF());
-
-    // If we're updating a non-existent collection, then the delete plan may have an EOF as the root
-    // stage.
-    if (exec->getRootStage()->stageType() == STAGE_EOF) {
-        return &kEmptyUpdateStats;
-    }
-
-    // If the collection exists, then we expect the root of the plan tree to either be an update
-    // stage, or (for findAndModify) a projection stage wrapping an update stage.
-    switch (exec->getRootStage()->stageType()) {
-        case StageType::STAGE_PROJECTION_DEFAULT:
-        case StageType::STAGE_PROJECTION_COVERED:
-        case StageType::STAGE_PROJECTION_SIMPLE: {
-            invariant(exec->getRootStage()->getChildren().size() == 1U);
-            invariant(StageType::STAGE_UPDATE == exec->getRootStage()->child()->stageType());
-            const SpecificStats* stats = exec->getRootStage()->child()->getSpecificStats();
-            return static_cast<const UpdateStats*>(stats);
-        }
-        default:
-            invariant(StageType::STAGE_UPDATE == exec->getRootStage()->stageType());
-            return static_cast<const UpdateStats*>(exec->getRootStage()->getSpecificStats());
-    }
-}
-
-void UpdateStage::recordUpdateStatsInOpDebug(const UpdateStats* updateStats, OpDebug* opDebug) {
-    invariant(opDebug);
-    opDebug->additiveMetrics.nMatched = updateStats->nMatched;
-    opDebug->additiveMetrics.nModified = updateStats->nModified;
-    opDebug->upsert = updateStats->inserted;
-}
-
-UpdateResult UpdateStage::makeUpdateResult(const UpdateStats* updateStats) {
-    return UpdateResult(updateStats->nMatched > 0 /* Did we update at least one obj? */,
-                        updateStats->isModUpdate /* Is this a $mod update? */,
-                        updateStats->nModified /* number of modified docs, no no-ops */,
-                        updateStats->nMatched /* # of docs matched/updated, even no-ops */,
-                        updateStats->objInserted);
-};
-
 PlanStage::StageState UpdateStage::prepareToRetryWSM(WorkingSetID idToRetry, WorkingSetID* out) {
     _idRetrying = idToRetry;
     *out = WorkingSet::INVALID_ID;
     return NEED_YIELD;
 }
 
-bool UpdateStage::checkUpdateChangesShardKeyFields(ScopedCollectionMetadata metadata,
-                                                   const Snapshotted<BSONObj>& oldObj) {
-    auto newObj = _doc.getObject();
-    const ShardKeyPattern shardKeyPattern(metadata->getKeyPattern());
-    auto oldShardKey = shardKeyPattern.extractShardKeyFromDoc(oldObj.value());
-    auto newShardKey = shardKeyPattern.extractShardKeyFromDoc(newObj);
 
-    // If the shard key fields remain unchanged by this update or if this document is an orphan and
-    // so does not belong to this shard, we can skip the rest of the checks.
-    if ((newShardKey.woCompare(oldShardKey) == 0) || !metadata->keyBelongsToMe(oldShardKey)) {
-        return false;
-    }
-
-    FieldRefSet shardKeyPaths;
-    const auto& shardKeyPathsVector = metadata->getKeyPatternFields();
-    shardKeyPaths.fillFrom(transitional_tools_do_not_use::unspool_vector(shardKeyPathsVector));
-
-    // Assert that the updated doc has all shard key fields and none are arrays or array
-    // descendants.
-    assertRequiredPathsPresent(_doc, shardKeyPaths);
-
-    // We do not allow modifying shard key value without specifying the full shard key in the query.
+void UpdateStage::_checkRestrictionsOnUpdatingShardKeyAreNotViolated(
+    const ScopedCollectionDescription& collDesc, const FieldRefSet& shardKeyPaths) {
+    // We do not allow modifying either the current shard key value or new shard key value (if
+    // resharding) without specifying the full current shard key in the query.
     // If the query is a simple equality match on _id, then '_params.canonicalQuery' will be null.
     // But if we are here, we already know that the shard key is not _id, since we have an assertion
     // earlier for requests that try to modify the immutable _id field. So it is safe to uassert if
     // '_params.canonicalQuery' is null OR if the query does not include equality matches on all
     // shard key fields.
+    const auto& shardKeyPathsVector = collDesc.getKeyPatternFields();
     pathsupport::EqualityMatches equalities;
     uassert(31025,
             "Shard key update is not allowed without specifying the full shard key in the query",
@@ -982,13 +607,96 @@ bool UpdateStage::checkUpdateChangesShardKeyFields(ScopedCollectionMetadata meta
     uassert(ErrorCodes::IllegalOperation,
             "Must run update to shard key field in a multi-statement transaction or with "
             "retryWrites: true.",
-            getOpCtx()->getTxnNumber() || !getOpCtx()->writesAreReplicated());
+            opCtx()->getTxnNumber() || !opCtx()->writesAreReplicated());
+}
 
-    if (!metadata->keyBelongsToMe(newShardKey)) {
-        if (MONGO_FAIL_POINT(hangBeforeThrowWouldChangeOwningShard)) {
-            log() << "Hit hangBeforeThrowWouldChangeOwningShard failpoint";
-            MONGO_FAIL_POINT_PAUSE_WHILE_SET_OR_INTERRUPTED(getOpCtx(),
-                                                            hangBeforeThrowWouldChangeOwningShard);
+
+bool UpdateStage::wasReshardingKeyUpdated(CollectionShardingState* css,
+                                          const ScopedCollectionDescription& collDesc,
+                                          const BSONObj& newObj,
+                                          const Snapshotted<BSONObj>& oldObj) {
+    auto reshardingKeyPattern = collDesc.getReshardingKeyIfShouldForwardOps();
+    if (!reshardingKeyPattern)
+        return false;
+
+    auto oldShardKey = reshardingKeyPattern->extractShardKeyFromDoc(oldObj.value());
+    auto newShardKey = reshardingKeyPattern->extractShardKeyFromDoc(newObj);
+
+    if (newShardKey.binaryEqual(oldShardKey))
+        return false;
+
+    FieldRefSet shardKeyPaths(collDesc.getKeyPatternFields());
+    _checkRestrictionsOnUpdatingShardKeyAreNotViolated(collDesc, shardKeyPaths);
+
+    auto oldRecipShard =
+        getDestinedRecipient(opCtx(), collection()->ns(), oldObj.value(), css, collDesc);
+    auto newRecipShard = getDestinedRecipient(opCtx(), collection()->ns(), newObj, css, collDesc);
+
+    uassert(WouldChangeOwningShardInfo(oldObj.value(), newObj, false /* upsert */),
+            "This update would cause the doc to change owning shards under the new shard key",
+            oldRecipShard == newRecipShard);
+
+    return true;
+}
+
+bool UpdateStage::checkUpdateChangesShardKeyFields(const boost::optional<BSONObj>& newObjCopy,
+                                                   const Snapshotted<BSONObj>& oldObj) {
+    auto* const css = CollectionShardingState::get(opCtx(), collection()->ns());
+    const auto collDesc = css->getCollectionDescription(opCtx());
+
+    // Calling mutablebson::Document::getObject() renders a full copy of the updated document. This
+    // can be expensive for larger documents, so we skip calling it when the collection isn't even
+    // sharded.
+    if (!collDesc.isSharded()) {
+        return false;
+    }
+
+    const auto& newObj = newObjCopy ? *newObjCopy : _doc.getObject();
+
+    // It is possible that both the existing and new shard keys are being updated, so we do not want
+    // to short-circuit checking whether either is being modified.
+    const auto existingShardKeyUpdated = wasExistingShardKeyUpdated(css, collDesc, newObj, oldObj);
+    const auto reshardingKeyUpdated = wasReshardingKeyUpdated(css, collDesc, newObj, oldObj);
+
+    return existingShardKeyUpdated || reshardingKeyUpdated;
+}
+
+bool UpdateStage::wasExistingShardKeyUpdated(CollectionShardingState* css,
+                                             const ScopedCollectionDescription& collDesc,
+                                             const BSONObj& newObj,
+                                             const Snapshotted<BSONObj>& oldObj) {
+    const ShardKeyPattern shardKeyPattern(collDesc.getKeyPattern());
+    auto oldShardKey = shardKeyPattern.extractShardKeyFromDoc(oldObj.value());
+    auto newShardKey = shardKeyPattern.extractShardKeyFromDoc(newObj);
+
+    // If the shard key fields remain unchanged by this update we can skip the rest of the checks.
+    // Using BSONObj::binaryEqual() still allows a missing shard key field to be filled in with an
+    // explicit null value.
+    if (newShardKey.binaryEqual(oldShardKey)) {
+        return false;
+    }
+
+    FieldRefSet shardKeyPaths(collDesc.getKeyPatternFields());
+
+    // Assert that the updated doc has no arrays or array descendants for the shard key fields.
+    _assertPathsNotArray(_doc, shardKeyPaths);
+
+    _checkRestrictionsOnUpdatingShardKeyAreNotViolated(collDesc, shardKeyPaths);
+
+    // At this point we already asserted that the complete shardKey have been specified in the
+    // query, this implies that mongos is not doing a broadcast update and that it attached a
+    // shardVersion to the command. Thus it is safe to call getOwnershipFilter
+    const auto collFilter = css->getOwnershipFilter(
+        opCtx(), CollectionShardingState::OrphanCleanupPolicy::kAllowOrphanCleanup);
+
+    // If the shard key of an orphan document is allowed to change, and the document is allowed to
+    // become owned by the shard, the global uniqueness assumption for _id values would be violated.
+    invariant(collFilter.keyBelongsToMe(oldShardKey));
+
+    if (!collFilter.keyBelongsToMe(newShardKey)) {
+        if (MONGO_unlikely(hangBeforeThrowWouldChangeOwningShard.shouldFail())) {
+            LOGV2(20605, "Hit hangBeforeThrowWouldChangeOwningShard failpoint");
+            hangBeforeThrowWouldChangeOwningShard.pauseWhileSet(opCtx());
         }
 
         uasserted(WouldChangeOwningShardInfo(oldObj.value(), newObj, false /* upsert */),

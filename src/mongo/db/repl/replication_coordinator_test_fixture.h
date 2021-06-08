@@ -32,6 +32,7 @@
 #include <string>
 
 #include "mongo/db/client.h"
+#include "mongo/db/read_write_concern_defaults_cache_lookup_mock.h"
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_impl.h"
@@ -52,7 +53,6 @@ class ReplicationCoordinatorExternalStateMock;
 class ReplicationCoordinatorImpl;
 class StorageInterfaceMock;
 class TopologyCoordinator;
-class UpdatePositionArgs;
 
 using executor::NetworkInterfaceMock;
 
@@ -76,6 +76,20 @@ public:
      * Adds { protocolVersion: 0 or 1 } to the config.
      */
     static BSONObj addProtocolVersion(const BSONObj& configDoc, int protocolVersion);
+
+    /**
+     * Helpers to construct a config.
+     */
+    static BSONObj member(int id, std::string host, int votes = 1) {
+        return BSON("_id" << id << "host" << host << "votes" << votes << "priority" << votes);
+    }
+
+    static BSONObj configWithMembers(int version, long long term, BSONArray members) {
+        return BSON("_id"
+                    << "mySet"
+                    << "protocolVersion" << 1 << "version" << version << "term" << term << "members"
+                    << members);
+    }
 
 protected:
     ReplCoordTest();
@@ -106,52 +120,44 @@ protected:
         return _repl.get();
     }
 
-    Status updatePositionArgsInitialize(UpdatePositionArgs& args,
-                                        const BSONObj& argsObj,
-                                        bool requireWallTime = true) {
-        return args.initialize(argsObj, requireWallTime);
-    }
-
-    StatusWith<rpc::ReplSetMetadata> replReadFromMetadata(const BSONObj& doc,
-                                                          bool requireWallTime = true) {
-        return rpc::ReplSetMetadata::readFromMetadata(doc, requireWallTime);
-    }
-
-    void replCoordSetMyLastAppliedOpTime(const OpTime& opTime, Date_t wallTime = Date_t::min()) {
-        if (wallTime == Date_t::min()) {
+    void replCoordSetMyLastAppliedOpTime(const OpTime& opTime, Date_t wallTime = Date_t()) {
+        if (wallTime == Date_t()) {
             wallTime = Date_t() + Seconds(opTime.getSecs());
         }
         getReplCoord()->setMyLastAppliedOpTimeAndWallTime({opTime, wallTime});
     }
 
-    void replCoordSetMyLastAppliedOpTimeForward(const OpTime& opTime,
-                                                ReplicationCoordinator::DataConsistency consistency,
-                                                Date_t wallTime = Date_t::min()) {
-        if (wallTime == Date_t::min()) {
+    void replCoordSetMyLastAppliedOpTimeForward(const OpTime& opTime, Date_t wallTime = Date_t()) {
+        if (wallTime == Date_t()) {
             wallTime = Date_t() + Seconds(opTime.getSecs());
         }
-        getReplCoord()->setMyLastAppliedOpTimeAndWallTimeForward({opTime, wallTime}, consistency);
+        getReplCoord()->setMyLastAppliedOpTimeAndWallTimeForward({opTime, wallTime});
     }
 
-    void replCoordSetMyLastDurableOpTime(const OpTime& opTime, Date_t wallTime = Date_t::min()) {
-        if (wallTime == Date_t::min()) {
+    void replCoordSetMyLastDurableOpTime(const OpTime& opTime, Date_t wallTime = Date_t()) {
+        if (wallTime == Date_t()) {
             wallTime = Date_t() + Seconds(opTime.getSecs());
         }
         getReplCoord()->setMyLastDurableOpTimeAndWallTime({opTime, wallTime});
     }
 
-    void replCoordSetMyLastDurableOpTimeForward(const OpTime& opTime,
-                                                Date_t wallTime = Date_t::min()) {
-        if (wallTime == Date_t::min()) {
+    void replCoordSetMyLastDurableOpTimeForward(const OpTime& opTime, Date_t wallTime = Date_t()) {
+        if (wallTime == Date_t()) {
             wallTime = Date_t() + Seconds(opTime.getSecs());
         }
         getReplCoord()->setMyLastDurableOpTimeAndWallTimeForward({opTime, wallTime});
     }
 
+    void replCoordSetMyLastAppliedAndDurableOpTime(const OpTime& opTime,
+                                                   Date_t wallTime = Date_t()) {
+        replCoordSetMyLastAppliedOpTime(opTime, wallTime);
+        replCoordSetMyLastDurableOpTime(opTime, wallTime);
+    }
+
     void replCoordAdvanceCommitPoint(const OpTime& opTime,
-                                     Date_t wallTime = Date_t::min(),
+                                     Date_t wallTime = Date_t(),
                                      bool fromSyncSource = false) {
-        if (wallTime == Date_t::min()) {
+        if (wallTime == Date_t()) {
             wallTime = Date_t() + Seconds(opTime.getSecs());
         }
         getReplCoord()->advanceCommitPoint({opTime, wallTime}, fromSyncSource);
@@ -246,7 +252,7 @@ protected:
      * Applicable to protocol version 1 only.
      */
     void simulateSuccessfulDryRun(
-        stdx::function<void(const executor::RemoteCommandRequest& request)> onDryRunRequest);
+        std::function<void(const executor::RemoteCommandRequest& request)> onDryRunRequest);
     void simulateSuccessfulDryRun();
 
     /**
@@ -274,7 +280,8 @@ protected:
      * Same as simulateSuccessfulV1ElectionAt, but stops short of signaling drain completion,
      * so the node stays in drain mode.
      */
-    void simulateSuccessfulV1ElectionWithoutExitingDrainMode(Date_t electionTime);
+    void simulateSuccessfulV1ElectionWithoutExitingDrainMode(Date_t electionTime,
+                                                             OperationContext* opCtx);
 
     /**
      * Transition the ReplicationCoordinator from drain mode to being fully primary/master.
@@ -328,6 +335,8 @@ private:
 
     ReplSettings _settings;
     bool _callShutdown = false;
+
+    ReadWriteConcernDefaultsLookupMock _lookupMock;
 };
 
 }  // namespace repl

@@ -29,37 +29,42 @@
 
 #pragma once
 
-#include <boost/shared_array.hpp>
+#include <atomic>
 #include <map>
 
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/storage/capped_callback.h"
+#include "mongo/db/storage/ephemeral_for_test/ephemeral_for_test_radix_store.h"
+#include "mongo/db/storage/ephemeral_for_test/ephemeral_for_test_visibility_manager.h"
 #include "mongo/db/storage/record_store.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/platform/mutex.h"
 
 namespace mongo {
+namespace ephemeral_for_test {
 
 /**
  * A RecordStore that stores all data in-memory.
- *
- * @param cappedMaxSize - required if isCapped. limit uses dataSize() in this impl.
  */
-class EphemeralForTestRecordStore : public RecordStore {
+class RecordStore final : public ::mongo::RecordStore {
 public:
-    explicit EphemeralForTestRecordStore(StringData ns,
-                                         std::shared_ptr<void>* dataInOut,
-                                         bool isCapped = false,
-                                         int64_t cappedMaxSize = -1,
-                                         int64_t cappedMaxDocs = -1,
-                                         CappedCallback* cappedCallback = nullptr);
+    explicit RecordStore(StringData ns,
+                         StringData ident,
+                         bool isCapped = false,
+                         CappedCallback* cappedCallback = nullptr,
+                         VisibilityManager* visibilityManager = nullptr);
+    ~RecordStore() = default;
 
     virtual const char* name() const;
-
-    const std::string& getIdent() const override {
-        return ns();
+    virtual KeyFormat keyFormat() const {
+        return KeyFormat::Long;
     }
-
-    virtual RecordData dataFor(OperationContext* opCtx, const RecordId& loc) const;
+    virtual long long dataSize(OperationContext* opCtx) const;
+    virtual long long numRecords(OperationContext* opCtx) const;
+    virtual void setCappedCallback(CappedCallback*);
+    virtual int64_t storageSize(OperationContext* opCtx,
+                                BSONObjBuilder* extraInfo = nullptr,
+                                int infoLevel = 0) const;
 
     virtual bool findRecord(OperationContext* opCtx, const RecordId& loc, RecordData* rd) const;
 
@@ -68,12 +73,6 @@ public:
     virtual Status insertRecords(OperationContext* opCtx,
                                  std::vector<Record>* inOutRecords,
                                  const std::vector<Timestamp>& timestamps);
-
-    virtual Status insertRecordsWithDocWriter(OperationContext* opCtx,
-                                              const DocWriter* const* docs,
-                                              const Timestamp*,
-                                              size_t nDocs,
-                                              RecordId* idsOut);
 
     virtual Status updateRecord(OperationContext* opCtx,
                                 const RecordId& oldLocation,
@@ -88,107 +87,132 @@ public:
                                                      const char* damageSource,
                                                      const mutablebson::DamageVector& damages);
 
+    Status oplogDiskLocRegister(OperationContext* opCtx,
+                                const Timestamp& opTime,
+                                bool orderedCommit) override;
+
     std::unique_ptr<SeekableRecordCursor> getCursor(OperationContext* opCtx,
                                                     bool forward) const final;
 
     virtual Status truncate(OperationContext* opCtx);
+    StatusWith<int64_t> truncateWithoutUpdatingCount(RecoveryUnit* ru);
 
     virtual void cappedTruncateAfter(OperationContext* opCtx, RecordId end, bool inclusive);
 
     virtual void appendCustomStats(OperationContext* opCtx,
                                    BSONObjBuilder* result,
-                                   double scale) const;
+                                   double scale) const {}
 
-    virtual Status touch(OperationContext* opCtx, BSONObjBuilder* output) const;
-
-    virtual int64_t storageSize(OperationContext* opCtx,
-                                BSONObjBuilder* extraInfo = NULL,
-                                int infoLevel = 0) const;
-
-    virtual long long dataSize(OperationContext* opCtx) const {
-        return _data->dataSize;
-    }
-
-    virtual long long numRecords(OperationContext* opCtx) const {
-        return _data->records.size();
-    }
-
-    virtual boost::optional<RecordId> oplogStartHack(OperationContext* opCtx,
-                                                     const RecordId& startingPosition) const;
-
-    void waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx) const override {}
+    void waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx) const override;
 
     virtual void updateStatsAfterRepair(OperationContext* opCtx,
                                         long long numRecords,
-                                        long long dataSize) {
-        invariant(_data->records.size() == size_t(numRecords));
-        _data->dataSize = dataSize;
-    }
-
-protected:
-    struct EphemeralForTestRecord {
-        EphemeralForTestRecord() : size(0) {}
-        EphemeralForTestRecord(int size) : size(size), data(new char[size]) {}
-
-        RecordData toRecordData() const {
-            return RecordData(data.get(), size);
-        }
-
-        int size;
-        boost::shared_array<char> data;
-    };
-
-    virtual const EphemeralForTestRecord* recordFor(const RecordId& loc) const;
-    virtual EphemeralForTestRecord* recordFor(const RecordId& loc);
-
-public:
-    //
-    // Not in RecordStore interface
-    //
-
-    typedef std::map<RecordId, EphemeralForTestRecord> Records;
-
-    bool isCapped() const {
-        return _isCapped;
-    }
-    void setCappedCallback(CappedCallback* cb) {
-        _cappedCallback = cb;
-    }
+                                        long long dataSize);
 
 private:
-    class InsertChange;
-    class RemoveChange;
-    class TruncateChange;
+    friend class VisibilityManagerChange;
 
-    class Cursor;
-    class ReverseCursor;
+    void _initHighestIdIfNeeded(OperationContext* opCtx);
 
-    StatusWith<RecordId> extractAndCheckLocForOplog(const char* data, int len) const;
+    /**
+     * This gets the next (guaranteed) unique record id.
+     */
+    int64_t _nextRecordId(OperationContext* opCtx);
 
-    RecordId allocateLoc();
-    bool cappedAndNeedDelete_inlock(OperationContext* opCtx) const;
-    void cappedDeleteAsNeeded_inlock(OperationContext* opCtx);
-    void deleteRecord_inlock(OperationContext* opCtx, const RecordId& dl);
-
-    // TODO figure out a proper solution to metadata
     const bool _isCapped;
-    const int64_t _cappedMaxSize;
-    const int64_t _cappedMaxDocs;
+
+    StringData _ident;
+
+    std::string _prefix;
+    std::string _postfix;
+
+    mutable Mutex _cappedCallbackMutex =
+        MONGO_MAKE_LATCH("RecordStore::_cappedCallbackMutex");  // Guards _cappedCallback
     CappedCallback* _cappedCallback;
 
-    // This is the "persistent" data.
-    struct Data {
-        Data(StringData ns, bool isOplog)
-            : dataSize(0), recordsMutex(), nextId(1), isOplog(isOplog) {}
+    mutable Mutex _cappedDeleterMutex = MONGO_MAKE_LATCH("RecordStore::_cappedDeleterMutex");
 
-        int64_t dataSize;
-        stdx::recursive_mutex recordsMutex;
-        Records records;
-        int64_t nextId;
-        const bool isOplog;
+    mutable Mutex _initHighestIdMutex = MONGO_MAKE_LATCH("RecordStore::_initHighestIdMutex");
+    AtomicWord<long long> _highestRecordId{0};
+    AtomicWord<long long> _numRecords{0};
+    AtomicWord<long long> _dataSize{0};
+
+    std::string generateKey(const uint8_t* key, size_t key_len) const;
+
+    bool _isOplog;
+    VisibilityManager* _visibilityManager;
+
+    /**
+     * Automatically adjust the record count and data size based on the size in change of the
+     * underlying radix store during the life time of the SizeAdjuster.
+     */
+    friend class SizeAdjuster;
+    class SizeAdjuster {
+    public:
+        SizeAdjuster(OperationContext* opCtx, RecordStore* rs);
+        ~SizeAdjuster();
+
+    private:
+        OperationContext* const _opCtx;
+        RecordStore* const _rs;
+        const StringStore* _workingCopy;
+        const int64_t _origNumRecords;
+        const int64_t _origDataSize;
     };
 
-    Data* const _data;
+    class Cursor final : public SeekableRecordCursor {
+        OperationContext* opCtx;
+        const RecordStore& _rs;
+        StringStore::const_iterator it;
+        boost::optional<std::string> _savedPosition;
+        bool _needFirstSeek = true;
+        bool _lastMoveWasRestore = false;
+        VisibilityManager* _visibilityManager;
+        RecordId _oplogVisibility;
+
+    public:
+        Cursor(OperationContext* opCtx,
+               const RecordStore& rs,
+               VisibilityManager* visibilityManager);
+        boost::optional<Record> next() final;
+        boost::optional<Record> seekExact(const RecordId& id) final override;
+        boost::optional<Record> seekNear(const RecordId& id) final override;
+        void save() final;
+        void saveUnpositioned() final override;
+        bool restore() final;
+        void detachFromOperationContext() final;
+        void reattachToOperationContext(OperationContext* opCtx) final;
+
+    private:
+        bool inPrefix(const std::string& key_string);
+    };
+
+    class ReverseCursor final : public SeekableRecordCursor {
+        OperationContext* opCtx;
+        const RecordStore& _rs;
+        StringStore::const_reverse_iterator it;
+        boost::optional<std::string> _savedPosition;
+        bool _needFirstSeek = true;
+        bool _lastMoveWasRestore = false;
+        VisibilityManager* _visibilityManager;
+
+    public:
+        ReverseCursor(OperationContext* opCtx,
+                      const RecordStore& rs,
+                      VisibilityManager* visibilityManager);
+        boost::optional<Record> next() final;
+        boost::optional<Record> seekExact(const RecordId& id) final override;
+        boost::optional<Record> seekNear(const RecordId& id) final override;
+        void save() final;
+        void saveUnpositioned() final override;
+        bool restore() final;
+        void detachFromOperationContext() final;
+        void reattachToOperationContext(OperationContext* opCtx) final;
+
+    private:
+        bool inPrefix(const std::string& key_string);
+    };
 };
 
+}  // namespace ephemeral_for_test
 }  // namespace mongo

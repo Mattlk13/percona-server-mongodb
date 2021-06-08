@@ -31,34 +31,34 @@
 
 #include "mongo/db/exec/fetch.h"
 
+#include <memory>
+
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/exec/filter.h"
 #include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set_common.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
 
 using std::unique_ptr;
 using std::vector;
-using stdx::make_unique;
 
 // static
 const char* FetchStage::kStageType = "FETCH";
 
-FetchStage::FetchStage(OperationContext* opCtx,
+FetchStage::FetchStage(ExpressionContext* expCtx,
                        WorkingSet* ws,
-                       PlanStage* child,
+                       std::unique_ptr<PlanStage> child,
                        const MatchExpression* filter,
-                       const Collection* collection)
-    : RequiresCollectionStage(kStageType, opCtx, collection),
+                       const CollectionPtr& collection)
+    : RequiresCollectionStage(kStageType, expCtx, collection),
       _ws(ws),
-      _filter(filter),
+      _filter((filter && !filter->isTriviallyTrue()) ? filter : nullptr),
       _idRetrying(WorkingSet::INVALID_ID) {
-    _children.emplace_back(child);
+    _children.emplace_back(std::move(child));
 }
 
 FetchStage::~FetchStage() {}
@@ -101,9 +101,9 @@ PlanStage::StageState FetchStage::doWork(WorkingSetID* out) {
 
             try {
                 if (!_cursor)
-                    _cursor = collection()->getCursor(getOpCtx());
+                    _cursor = collection()->getCursor(opCtx());
 
-                if (!WorkingSetCommon::fetch(getOpCtx(), _ws, id, _cursor)) {
+                if (!WorkingSetCommon::fetch(opCtx(), _ws, id, _cursor.get(), collection()->ns())) {
                     _ws->free(id);
                     return NEED_TIME;
                 }
@@ -118,12 +118,6 @@ PlanStage::StageState FetchStage::doWork(WorkingSetID* out) {
         }
 
         return returnIfMatches(member, id, out);
-    } else if (PlanStage::FAILURE == status) {
-        // The stage which produces a failure is responsible for allocating a working set member
-        // with error details.
-        invariant(WorkingSet::INVALID_ID != id);
-        *out = id;
-        return status;
     } else if (PlanStage::NEED_YIELD == status) {
         *out = id;
     }
@@ -151,7 +145,7 @@ void FetchStage::doDetachFromOperationContext() {
 
 void FetchStage::doReattachToOperationContext() {
     if (_cursor)
-        _cursor->reattachToOperationContext(getOpCtx());
+        _cursor->reattachToOperationContext(opCtx());
 }
 
 PlanStage::StageState FetchStage::returnIfMatches(WorkingSetMember* member,
@@ -186,14 +180,14 @@ unique_ptr<PlanStageStats> FetchStage::getStats() {
     _commonStats.isEOF = isEOF();
 
     // Add a BSON representation of the filter to the stats tree, if there is one.
-    if (NULL != _filter) {
+    if (nullptr != _filter) {
         BSONObjBuilder bob;
         _filter->serialize(&bob);
         _commonStats.filter = bob.obj();
     }
 
-    unique_ptr<PlanStageStats> ret = make_unique<PlanStageStats>(_commonStats, STAGE_FETCH);
-    ret->specific = make_unique<FetchStats>(_specificStats);
+    unique_ptr<PlanStageStats> ret = std::make_unique<PlanStageStats>(_commonStats, STAGE_FETCH);
+    ret->specific = std::make_unique<FetchStats>(_specificStats);
     ret->children.emplace_back(child()->getStats());
     return ret;
 }

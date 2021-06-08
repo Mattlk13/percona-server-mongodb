@@ -38,8 +38,8 @@
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/storage/engine_extension.h"
-#include "mongo/db/storage/kv/kv_prefix.h"
 #include "mongo/db/storage/record_store.h"
+#include "mongo/db/storage/sorted_data_interface.h"
 #include "mongo/db/storage/storage_engine.h"
 
 namespace mongo {
@@ -48,14 +48,25 @@ class IndexDescriptor;
 class JournalListener;
 class OperationContext;
 class RecoveryUnit;
-class SortedDataInterface;
 class SnapshotManager;
 
 class KVEngine : public percona::EngineExtension {
 public:
-    virtual RecoveryUnit* newRecoveryUnit() = 0;
+    /**
+     * During the startup process, the storage engine is one of the first components to be started
+     * up and fully initialized. But that fully initialized storage engine may not be recognized as
+     * the end for the remaining storage startup tasks that still need to be performed.
+     *
+     * For example, after the storage engine has been fully initialized, we need to access it in
+     * order to set up all of the collections and indexes based on the metadata, or perform some
+     * corrective measures on the data files, etc.
+     *
+     * When all of the storage startup tasks are completed as a whole, then this function is called
+     * by the external force managing the startup process.
+     */
+    virtual void notifyStartupComplete() {}
 
-    // ---------
+    virtual RecoveryUnit* newRecoveryUnit() = 0;
 
     /**
      * Requesting multiple copies for the same ns/ident is a rules violation; Calling on a
@@ -71,47 +82,15 @@ public:
                                                         StringData ident,
                                                         const CollectionOptions& options) = 0;
 
-    /**
-     * Get a RecordStore that may share an underlying table with other RecordStores. 'prefix' is
-     * guaranteed to be 'KVPrefix::kNotPrefixed' when 'groupCollections' is not enabled.
-     *
-     * @param prefix dictates the value keys for the RecordStore should be prefixed with to
-     *        distinguish between RecordStores sharing an underlying table. A value of
-     *        `KVPrefix::kNotPrefixed` guarantees the index is the sole resident of the table.
-     */
-    virtual std::unique_ptr<RecordStore> getGroupedRecordStore(OperationContext* opCtx,
-                                                               StringData ns,
-                                                               StringData ident,
-                                                               const CollectionOptions& options,
-                                                               KVPrefix prefix) {
-        invariant(prefix == KVPrefix::kNotPrefixed);
-        return getRecordStore(opCtx, ns, ident, options);
-    }
-
-    virtual SortedDataInterface* getSortedDataInterface(OperationContext* opCtx,
-                                                        StringData ident,
-                                                        const IndexDescriptor* desc) = 0;
-
-    /**
-     * Get a SortedDataInterface that may share an underlying table with other
-     * SortedDataInterface. 'prefix' is guaranteed to be 'KVPrefix::kNotPrefixed' when
-     * 'groupCollections' is not enabled.
-     *
-     * @param prefix dictates the value keys for the index should be prefixed with to distinguish
-     *        between indexes sharing an underlying table. A value of `KVPrefix::kNotPrefixed`
-     *        guarantees the index is the sole resident of the table.
-     */
-    virtual SortedDataInterface* getGroupedSortedDataInterface(OperationContext* opCtx,
-                                                               StringData ident,
-                                                               const IndexDescriptor* desc,
-                                                               KVPrefix prefix) {
-        invariant(prefix == KVPrefix::kNotPrefixed);
-        return getSortedDataInterface(opCtx, ident, desc);
-    }
+    virtual std::unique_ptr<SortedDataInterface> getSortedDataInterface(
+        OperationContext* opCtx,
+        const CollectionOptions& collOptions,
+        StringData ident,
+        const IndexDescriptor* desc) = 0;
 
     /**
      * The create and drop methods on KVEngine are not transactional. Transactional semantics
-     * are provided by the KVStorageEngine code that calls these. For example, drop will be
+     * are provided by the StorageEngine code that calls these. For example, drop will be
      * called if a create is rolled back. A higher-level drop operation will only propagate to a
      * drop call on the KVEngine once the WUOW commits. Therefore drops will never be rolled
      * back and it is safe to immediately reclaim storage.
@@ -125,46 +104,31 @@ public:
                                                                   StringData ident) = 0;
 
     /**
-     * Create a RecordStore that MongoDB considers eligible to share space in an underlying table
-     * with other RecordStores. 'prefix' is guaranteed to be 'KVPrefix::kNotPrefixed' when
-     * 'groupCollections' is not enabled.
-     *
-     * @param prefix signals whether the RecordStore may be shared by an underlying table. A
-     *        prefix of `KVPrefix::kNotPrefixed` must remain isolated in its own table. Otherwise
-     *        the storage engine implementation ultimately chooses which RecordStores share a
-     *        table. Sharing RecordStores belonging to different databases within the same table
-     *        is forbidden.
+     * Similar to createRecordStore but this imports from an existing table with the provided ident
+     * instead of creating a new one.
      */
-    virtual Status createGroupedRecordStore(OperationContext* opCtx,
-                                            StringData ns,
-                                            StringData ident,
-                                            const CollectionOptions& options,
-                                            KVPrefix prefix) {
-        invariant(prefix == KVPrefix::kNotPrefixed);
-        return createRecordStore(opCtx, ns, ident, options);
+    virtual Status importRecordStore(OperationContext* opCtx,
+                                     StringData ident,
+                                     const BSONObj& storageMetadata) {
+        MONGO_UNREACHABLE;
     }
 
     virtual Status createSortedDataInterface(OperationContext* opCtx,
+                                             const CollectionOptions& collOptions,
                                              StringData ident,
                                              const IndexDescriptor* desc) = 0;
 
     /**
-     * Create a SortedDataInterface that MongoDB considers eligible to share space in an
-     * underlying table with other SortedDataInterfaces. 'prefix' is guaranteed to be
-     * 'KVPrefix::kNotPrefixed' when 'groupCollections' is not enabled.
-     *
-     * @param prefix signals whether the SortedDataInterface (index) may be shared by an
-     *        underlying table. A prefix of `KVPrefix::kNotPrefixed` must remain isolated in its own
-     *        table. Otherwise the storage engine implementation ultimately chooses which indexes
-     *        share a table. Sharing indexes belonging to different databases is forbidden.
+     * Similar to createSortedDataInterface but this imports from an existing table with the
+     * provided ident instead of creating a new one.
      */
-    virtual Status createGroupedSortedDataInterface(OperationContext* opCtx,
-                                                    StringData ident,
-                                                    const IndexDescriptor* desc,
-                                                    KVPrefix prefix) {
-        invariant(prefix == KVPrefix::kNotPrefixed);
-        return createSortedDataInterface(opCtx, ident, desc);
+    virtual Status importSortedDataInterface(OperationContext* opCtx,
+                                             StringData ident,
+                                             const BSONObj& storageMetadata) {
+        MONGO_UNREACHABLE;
     }
+
+    virtual Status dropSortedDataInterface(OperationContext* opCtx, StringData ident) = 0;
 
     virtual int64_t getIdentSize(OperationContext* opCtx, StringData ident) = 0;
 
@@ -174,7 +138,21 @@ public:
      */
     virtual Status repairIdent(OperationContext* opCtx, StringData ident) = 0;
 
-    virtual Status dropIdent(OperationContext* opCtx, StringData ident) = 0;
+    /**
+     * Removes any knowledge of the ident from the storage engines metadata which includes removing
+     * the underlying files belonging to the ident. If the storage engine is unable to process the
+     * removal immediately, we enqueue it to be removed at a later time. If a callback is specified,
+     * it will be run upon the drop if this function returns an OK status.
+     */
+    virtual Status dropIdent(RecoveryUnit* ru,
+                             StringData ident,
+                             StorageEngine::DropIdentCallback&& onDrop = nullptr) = 0;
+
+    /**
+     * Removes any knowledge of the ident from the storage engines metadata without removing the
+     * underlying files belonging to the ident.
+     */
+    virtual void dropIdentForImport(OperationContext* opCtx, StringData ident) = 0;
 
     /**
      * Attempts to locate and recover a file that is "orphaned" from the storage engine's metadata,
@@ -197,15 +175,10 @@ public:
         return status;
     }
 
-
-    virtual void alterIdentMetadata(OperationContext* opCtx,
-                                    StringData ident,
-                                    const IndexDescriptor* desc){};
-
-    // optional
-    virtual int flushAllFiles(OperationContext* opCtx, bool sync) {
-        return 0;
-    }
+    /**
+     * See StorageEngine::flushAllFiles for details
+     */
+    virtual void flushAllFiles(OperationContext* opCtx, bool callerHoldsReadLock) {}
 
     /**
      * See StorageEngine::beginBackup for details
@@ -222,7 +195,12 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    virtual StatusWith<std::vector<std::string>> beginNonBlockingBackup(OperationContext* opCtx) {
+    virtual Status disableIncrementalBackup(OperationContext* opCtx) {
+        MONGO_UNREACHABLE;
+    }
+
+    virtual StatusWith<std::unique_ptr<StorageEngine::StreamingCursor>> beginNonBlockingBackup(
+        OperationContext* opCtx, const StorageEngine::BackupOptions& options) {
         return Status(ErrorCodes::CommandNotSupported,
                       "The current storage engine doesn't support backup mode");
     }
@@ -236,6 +214,8 @@ public:
                       "The current storage engine doesn't support backup mode");
     }
 
+    virtual void checkpoint() {}
+
     virtual bool isDurable() const = 0;
 
     /**
@@ -247,20 +227,16 @@ public:
     /**
      * This must not change over the lifetime of the engine.
      */
-    virtual bool supportsDocLocking() const = 0;
-
-    /**
-     * This must not change over the lifetime of the engine.
-     */
-    virtual bool supportsDBLocking() const {
+    virtual bool supportsCappedCollections() const {
         return true;
     }
 
     /**
-     * This must not change over the lifetime of the engine.
+     * Returns true if the storage engine supports collections clustered on _id. That is,
+     * collections will use _id values as their RecordId and do not need a separate _id index.
      */
-    virtual bool supportsCappedCollections() const {
-        return true;
+    virtual bool supportsClusteredIdIndex() const {
+        return false;
     }
 
     /**
@@ -317,6 +293,13 @@ public:
     virtual void setInitialDataTimestamp(Timestamp initialDataTimestamp) {}
 
     /**
+     * See `StorageEngine::getInitialDataTimestamp`
+     */
+    virtual Timestamp getInitialDataTimestamp() const {
+        return Timestamp();
+    }
+
+    /**
      * See `StorageEngine::setOldestTimestampFromStable`
      */
     virtual void setOldestTimestampFromStable() {}
@@ -331,18 +314,6 @@ public:
      * See `StorageEngine::setOldestTimestamp`
      */
     virtual void setOldestTimestamp(Timestamp newOldestTimestamp, bool force) {}
-
-    /**
-     * See 'StorageEngine::getCacheOverflowTableInsertCount'
-     */
-    virtual int64_t getCacheOverflowTableInsertCount(OperationContext* opCtx) const {
-        return 0;
-    }
-
-    /**
-     * See 'StorageEngine::setCacheOverflowTableInsertCountForTest()'
-     */
-    virtual void setCacheOverflowTableInsertCountForTest(int insertCount) {}
 
     /**
      * See `StorageEngine::supportsRecoverToStableTimestamp`
@@ -380,14 +351,9 @@ public:
     }
 
     /**
-     * See `StorageEngine::getAllCommittedTimestamp`
+     * See `StorageEngine::getAllDurableTimestamp`
      */
-    virtual Timestamp getAllCommittedTimestamp() const = 0;
-
-    /**
-     * See `StorageEngine::getOldestOpenReadTimestamp`
-     */
-    virtual Timestamp getOldestOpenReadTimestamp() const = 0;
+    virtual Timestamp getAllDurableTimestamp() const = 0;
 
     /**
      * See `StorageEngine::getOplogNeededForCrashRecovery`
@@ -406,9 +372,11 @@ public:
     }
 
     /**
-     * See `StorageEngine::replicationBatchIsComplete()`
+     * See `StorageEngine::supportsOplogStones`
      */
-    virtual void replicationBatchIsComplete() const {};
+    virtual bool supportsOplogStones() const {
+        return false;
+    }
 
     /**
      * Methods to access the storage engine's timestamps.
@@ -417,13 +385,27 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    virtual Timestamp getOldestTimestamp() const {
-        MONGO_UNREACHABLE;
-    }
+    virtual Timestamp getOldestTimestamp() const = 0;
 
     virtual Timestamp getStableTimestamp() const {
         MONGO_UNREACHABLE;
     }
+
+    virtual StatusWith<Timestamp> pinOldestTimestamp(OperationContext* opCtx,
+                                                     const std::string& requestingServiceName,
+                                                     Timestamp requestedTimestamp,
+                                                     bool roundUpIfTooOld) {
+        MONGO_UNREACHABLE;
+    }
+
+    virtual void unpinOldestTimestamp(const std::string& requestingServiceName) {
+        MONGO_UNREACHABLE
+    }
+
+    /**
+     * See `StorageEngine::setPinnedOplogTimestamp`
+     */
+    virtual void setPinnedOplogTimestamp(const Timestamp& pinnedTimestamp) = 0;
 
     /**
      * The destructor will never be called from mongod, but may be called from tests.
@@ -431,11 +413,5 @@ public:
      * cleanShutdown() hasn't been called.
      */
     virtual ~KVEngine() {}
-
-protected:
-    /**
-     * The default capped size (in bytes) for capped collections, unless overridden.
-     */
-    const int64_t kDefaultCappedSizeBytes = 4096;
 };
-}
+}  // namespace mongo

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -43,15 +43,15 @@
 #include "mongo/db/keypattern.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/query/internal_plans.h"
-#include "mongo/db/s/collection_metadata.h"
-#include "mongo/db/s/collection_sharding_state.h"
+#include "mongo/db/s/collection_sharding_runtime.h"
+#include "mongo/db/s/dist_lock_manager.h"
 #include "mongo/db/s/shard_filtering_metadata_refresh.h"
 #include "mongo/db/s/sharding_state.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/split_chunk_request_type.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
@@ -59,7 +59,7 @@ namespace {
 const ReadPreferenceSetting kPrimaryOnlyReadPreference{ReadPreference::PrimaryOnly};
 
 bool checkIfSingleDoc(OperationContext* opCtx,
-                      Collection* collection,
+                      const CollectionPtr& collection,
                       const IndexDescriptor* idx,
                       const ChunkType* chunk) {
     KeyPattern kp(idx->keyPattern());
@@ -67,17 +67,17 @@ bool checkIfSingleDoc(OperationContext* opCtx,
     BSONObj newmax = Helpers::toKeyFormat(kp.extendRangeBound(chunk->getMax(), true));
 
     auto exec = InternalPlanner::indexScan(opCtx,
-                                           collection,
+                                           &collection,
                                            idx,
                                            newmin,
                                            newmax,
                                            BoundInclusion::kIncludeStartKeyOnly,
-                                           PlanExecutor::NO_YIELD);
+                                           PlanYieldPolicy::YieldPolicy::NO_YIELD);
     // check if exactly one document found
     PlanExecutor::ExecState state;
     BSONObj obj;
-    if (PlanExecutor::ADVANCED == (state = exec->getNext(&obj, NULL))) {
-        if (PlanExecutor::IS_EOF == (state = exec->getNext(&obj, NULL))) {
+    if (PlanExecutor::ADVANCED == (state = exec->getNext(&obj, nullptr))) {
+        if (PlanExecutor::IS_EOF == (state = exec->getNext(&obj, nullptr))) {
             return true;
         }
     }
@@ -98,14 +98,13 @@ bool checkMetadataForSuccessfulSplitChunk(OperationContext* opCtx,
                                           const OID& epoch,
                                           const ChunkRange& chunkRange,
                                           const std::vector<BSONObj>& splitKeys) {
-    const auto metadataAfterSplit = [&] {
-        AutoGetCollection autoColl(opCtx, nss, MODE_IS);
-        return CollectionShardingState::get(opCtx, nss)->getCurrentMetadata();
-    }();
+    AutoGetCollection autoColl(opCtx, nss, MODE_IS);
+    const auto metadataAfterSplit =
+        CollectionShardingRuntime::get(opCtx, nss)->getCurrentMetadataIfKnown();
 
     uassert(ErrorCodes::StaleEpoch,
             str::stream() << "Collection " << nss.ns() << " changed since split start",
-            metadataAfterSplit->getCollVersion().epoch() == epoch);
+            metadataAfterSplit && metadataAfterSplit->getShardVersion().epoch() == epoch);
 
     auto newChunkBounds(splitKeys);
     auto startKey = chunkRange.getMin();
@@ -134,36 +133,29 @@ StatusWith<boost::optional<ChunkRange>> splitChunk(OperationContext* opCtx,
                                                    const std::vector<BSONObj>& splitKeys,
                                                    const std::string& shardName,
                                                    const OID& expectedCollectionEpoch) {
-    //
-    // TODO(SERVER-25086): Remove distLock acquisition from split chunk
-    //
-    const std::string whyMessage(
-        str::stream() << "splitting chunk " << chunkRange.toString() << " in " << nss.toString());
-    auto scopedDistLock = Grid::get(opCtx)->catalogClient()->getDistLockManager()->lock(
+    const std::string whyMessage(str::stream()
+                                 << "splitting chunk " << redact(chunkRange.toString()) << " in "
+                                 << nss.toString());
+    auto scopedDistLock = DistLockManager::get(opCtx)->lock(
         opCtx, nss.ns(), whyMessage, DistLockManager::kDefaultLockTimeout);
     if (!scopedDistLock.isOK()) {
         return scopedDistLock.getStatus().withContext(
             str::stream() << "could not acquire collection lock for " << nss.toString()
-                          << " to split chunk "
-                          << chunkRange.toString());
+                          << " to split chunk " << chunkRange.toString());
     }
 
-    // If the shard key is hashed, then we must make sure that the split points are of type
-    // NumberLong.
-    if (KeyPattern::isHashedKeyPattern(keyPatternObj)) {
+    // If the shard key is hashed, then we must make sure that the split points are of supported
+    // data types.
+    const auto hashedField = ShardKeyPattern::extractHashedField(keyPatternObj);
+    if (hashedField) {
         for (BSONObj splitKey : splitKeys) {
-            BSONObjIterator it(splitKey);
-            while (it.more()) {
-                BSONElement splitKeyElement = it.next();
-                if (splitKeyElement.type() != NumberLong) {
-                    return {ErrorCodes::CannotSplit,
-                            str::stream() << "splitChunk cannot split chunk "
-                                          << chunkRange.toString()
-                                          << ", split point "
-                                          << splitKeyElement.toString()
-                                          << " must be of type "
-                                             "NumberLong for hashed shard key patterns"};
-                }
+            auto hashedSplitElement = splitKey[hashedField.fieldName()];
+            if (!ShardKeyPattern::isValidHashedValue(hashedSplitElement)) {
+                return {ErrorCodes::CannotSplit,
+                        str::stream() << "splitChunk cannot split chunk " << chunkRange.toString()
+                                      << ", split point " << hashedSplitElement.toString()
+                                      << "Value of type '" << hashedSplitElement.type()
+                                      << "' is not allowed for hashed fields"};
             }
         }
     }
@@ -189,9 +181,22 @@ StatusWith<boost::optional<ChunkRange>> splitChunk(OperationContext* opCtx,
         return cmdResponseStatus.getStatus();
     }
 
+    const Shard::CommandResponse& cmdResponse = cmdResponseStatus.getValue();
+    boost::optional<ChunkVersion> shardVersionReceived = [&]() -> boost::optional<ChunkVersion> {
+        // old versions might not have the shardVersion field
+        if (cmdResponse.response[ChunkVersion::kShardVersionField]) {
+            return uassertStatusOK(ChunkVersion::parseWithField(cmdResponse.response,
+                                                                ChunkVersion::kShardVersionField));
+        }
+        return boost::none;
+    }();
+
+    // Always refresh metadata and provide the chunk version
+    onShardVersionMismatch(opCtx, nss, shardVersionReceived);
+
     // Check commandStatus and writeConcernStatus
-    auto commandStatus = cmdResponseStatus.getValue().commandStatus;
-    auto writeConcernStatus = cmdResponseStatus.getValue().writeConcernStatus;
+    auto commandStatus = cmdResponse.commandStatus;
+    auto writeConcernStatus = cmdResponse.writeConcernStatus;
 
     // Send stale epoch if epoch of request did not match epoch of collection
     if (commandStatus == ErrorCodes::StaleEpoch) {
@@ -199,13 +204,12 @@ StatusWith<boost::optional<ChunkRange>> splitChunk(OperationContext* opCtx,
     }
 
     //
-    // If _configsvrCommitChunkSplit returned an error, refresh and look at the metadata to
+    // If _configsvrCommitChunkSplit returned an error, look at the metadata to
     // determine if the split actually did happen. This can happen if there's a network error
     // getting the response from the first call to _configsvrCommitChunkSplit, but it actually
     // succeeds, thus the automatic retry fails with a precondition violation, for example.
     //
     if (!commandStatus.isOK() || !writeConcernStatus.isOK()) {
-        forceShardFilteringMetadataRefresh(opCtx, nss);
 
         if (checkMetadataForSuccessfulSplitChunk(
                 opCtx, nss, expectedCollectionEpoch, chunkRange, splitKeys)) {
@@ -217,12 +221,12 @@ StatusWith<boost::optional<ChunkRange>> splitChunk(OperationContext* opCtx,
         }
     }
 
-    AutoGetCollection autoColl(opCtx, nss, MODE_IS);
-
-    Collection* const collection = autoColl.getCollection();
+    AutoGetCollection collection(opCtx, nss, MODE_IS);
     if (!collection) {
-        warning() << "will not perform top-chunk checking since " << nss.toString()
-                  << " does not exist after splitting";
+        LOGV2_WARNING(
+            23778,
+            "will not perform top-chunk checking since {nss} does not exist after splitting",
+            "nss"_attr = nss.toString());
         return boost::optional<ChunkRange>(boost::none);
     }
 
@@ -244,13 +248,12 @@ StatusWith<boost::optional<ChunkRange>> splitChunk(OperationContext* opCtx,
 
     KeyPattern shardKeyPattern(keyPatternObj);
     if (shardKeyPattern.globalMax().woCompare(backChunk.getMax()) == 0 &&
-        checkIfSingleDoc(opCtx, collection, idx, &backChunk)) {
+        checkIfSingleDoc(opCtx, collection.getCollection(), idx, &backChunk)) {
         return boost::optional<ChunkRange>(ChunkRange(backChunk.getMin(), backChunk.getMax()));
     } else if (shardKeyPattern.globalMin().woCompare(frontChunk.getMin()) == 0 &&
-               checkIfSingleDoc(opCtx, collection, idx, &frontChunk)) {
+               checkIfSingleDoc(opCtx, collection.getCollection(), idx, &frontChunk)) {
         return boost::optional<ChunkRange>(ChunkRange(frontChunk.getMin(), frontChunk.getMax()));
     }
-
     return boost::optional<ChunkRange>(boost::none);
 }
 

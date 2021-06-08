@@ -34,18 +34,23 @@
 
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/pipeline/aggregation_request.h"
+#include "mongo/db/pipeline/aggregate_command_gen.h"
 #include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/document_source_cursor.h"
 #include "mongo/db/pipeline/document_source_group.h"
+#include "mongo/db/pipeline/document_source_internal_unpack_bucket.h"
+#include "mongo/db/pipeline/document_source_sample.h"
+#include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/query/plan_executor.h"
 
 namespace mongo {
 class Collection;
+class CollectionPtr;
 class DocumentSourceCursor;
 class DocumentSourceMatch;
 class DocumentSourceSort;
 class ExpressionContext;
+class SkipThenLimit;
 class OperationContext;
 class Pipeline;
 struct PlanSummaryStats;
@@ -66,7 +71,7 @@ public:
      * the new stage to the pipeline.
      */
     using AttachExecutorCallback = std::function<void(
-        Collection*, std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>, Pipeline*)>;
+        const CollectionPtr&, std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>, Pipeline*)>;
 
     /**
      * This method looks for early pipeline stages that can be folded into the underlying
@@ -87,9 +92,9 @@ public:
      * 'nullptr'.
      */
     static std::pair<AttachExecutorCallback, std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>>
-    buildInnerQueryExecutor(Collection* collection,
+    buildInnerQueryExecutor(const CollectionPtr& collection,
                             const NamespaceString& nss,
-                            const AggregationRequest* aggRequest,
+                            const AggregateCommandRequest* aggRequest,
                             Pipeline* pipeline);
 
     /**
@@ -100,7 +105,7 @@ public:
      * 'nullptr'.
      */
     static void attachInnerQueryExecutorToPipeline(
-        Collection* collection,
+        const CollectionPtr& collection,
         AttachExecutorCallback attachExecutorCallback,
         std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec,
         Pipeline* pipeline);
@@ -111,17 +116,47 @@ public:
      * used when the executor attachment phase doesn't need to be deferred and the $cursor stage
      * can be created right after buiding the executor.
      */
-    static void buildAndAttachInnerQueryExecutorToPipeline(Collection* collection,
-                                                           const NamespaceString& nss,
-                                                           const AggregationRequest* aggRequest,
-                                                           Pipeline* pipeline);
-
-
-    static std::string getPlanSummaryStr(const Pipeline* pipeline);
-
-    static void getPlanSummaryStats(const Pipeline* pipeline, PlanSummaryStats* statsOut);
+    static void buildAndAttachInnerQueryExecutorToPipeline(
+        const CollectionPtr& collection,
+        const NamespaceString& nss,
+        const AggregateCommandRequest* aggRequest,
+        Pipeline* pipeline);
 
     static Timestamp getLatestOplogTimestamp(const Pipeline* pipeline);
+
+    /**
+     * Retrieves postBatchResumeToken from the 'pipeline' if it is available. Returns an empty
+     * object otherwise.
+     */
+    static BSONObj getPostBatchResumeToken(const Pipeline* pipeline);
+
+    /**
+     * Resolves the collator to either the user-specified collation or, if none was specified, to
+     * the collection-default collation.
+     */
+    static std::pair<std::unique_ptr<CollatorInterface>, ExpressionContext::CollationMatchesDefault>
+    resolveCollator(OperationContext* opCtx,
+                    BSONObj userCollation,
+                    const CollectionPtr& collection) {
+        if (!collection || !collection->getDefaultCollator()) {
+            return {userCollation.isEmpty()
+                        ? nullptr
+                        : uassertStatusOK(CollatorFactoryInterface::get(opCtx->getServiceContext())
+                                              ->makeFromBSON(userCollation)),
+                    ExpressionContext::CollationMatchesDefault::kNoDefault};
+        }
+        if (userCollation.isEmpty()) {
+            return {collection->getDefaultCollator()->clone(),
+                    ExpressionContext::CollationMatchesDefault::kYes};
+        }
+        auto userCollator = uassertStatusOK(
+            CollatorFactoryInterface::get(opCtx->getServiceContext())->makeFromBSON(userCollation));
+        return {
+            std::move(userCollator),
+            CollatorInterface::collatorsMatch(collection->getDefaultCollator(), userCollator.get())
+                ? ExpressionContext::CollationMatchesDefault::kYes
+                : ExpressionContext::CollationMatchesDefault::kNo};
+    }
 
 private:
     PipelineD();  // does not exist:  prevent instantiation
@@ -131,9 +166,9 @@ private:
      * the 'pipeline'.
      */
     static std::pair<AttachExecutorCallback, std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>>
-    buildInnerQueryExecutorGeneric(Collection* collection,
+    buildInnerQueryExecutorGeneric(const CollectionPtr& collection,
                                    const NamespaceString& nss,
-                                   const AggregationRequest* aggRequest,
+                                   const AggregateCommandRequest* aggRequest,
                                    Pipeline* pipeline);
 
     /**
@@ -142,51 +177,49 @@ private:
      * not exist, as the $geoNearCursor requires a 2d or 2dsphere index.
      */
     static std::pair<AttachExecutorCallback, std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>>
-    buildInnerQueryExecutorGeoNear(Collection* collection,
+    buildInnerQueryExecutorGeoNear(const CollectionPtr& collection,
                                    const NamespaceString& nss,
-                                   const AggregationRequest* aggRequest,
+                                   const AggregateCommandRequest* aggRequest,
                                    Pipeline* pipeline);
 
     /**
-     * Creates a PlanExecutor to be used in the initial cursor source. If the query system can use
-     * an index to provide a more efficient sort or projection, the sort and/or projection will be
-     * incorporated into the PlanExecutor.
-     *
-     * 'sortObj' will be set to an empty object if the query system cannot provide a non-blocking
-     * sort, and 'projectionObj' will be set to an empty object if the query system cannot provide a
-     * covered projection.
+     * Build a PlanExecutor and prepare a callback to create a special DocumentSourceSample or a
+     * DocumentSourceInternalUnpackBucket stage that has been rewritten to sample buckets using a
+     * storage engine supplied random cursor if the heuristics used for the optimization allows. If
+     * the optimized $sample plan cannot or should not be produced, returns a null PlanExecutor
+     * pointer.
+     */
+    static std::pair<AttachExecutorCallback, std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>>
+    buildInnerQueryExecutorSample(DocumentSourceSample* sampleStage,
+                                  DocumentSourceInternalUnpackBucket* unpackBucketStage,
+                                  const CollectionPtr& collection,
+                                  Pipeline* pipeline);
+
+    /**
+     * Creates a PlanExecutor to be used in the initial cursor source. This function will try to
+     * push down the $sort, $project, $match and $limit stages into the PlanStage layer whenever
+     * possible. In this case, these stages will be incorporated into the PlanExecutor.
      *
      * Set 'rewrittenGroupStage' when the pipeline uses $match+$sort+$group stages that are
      * compatible with a DISTINCT_SCAN plan that visits the first document in each group
      * (SERVER-9507).
+     *
+     * Sets the 'hasNoRequirements' out-parameter based on whether the dependency set is both finite
+     * and empty. In this case, the query has count semantics.
      */
     static StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> prepareExecutor(
-        OperationContext* opCtx,
-        Collection* collection,
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        const CollectionPtr& collection,
         const NamespaceString& nss,
         Pipeline* pipeline,
-        const boost::intrusive_ptr<ExpressionContext>& expCtx,
-        bool oplogReplay,
         const boost::intrusive_ptr<DocumentSourceSort>& sortStage,
         std::unique_ptr<GroupFromFirstDocumentTransformation> rewrittenGroupStage,
-        const DepsTracker& deps,
+        QueryMetadataBitSet metadataAvailable,
         const BSONObj& queryObj,
-        const AggregationRequest* aggRequest,
+        SkipThenLimit skipThenLimit,
+        const AggregateCommandRequest* aggRequest,
         const MatchExpressionParser::AllowedFeatureSet& matcherFeatures,
-        BSONObj* sortObj,
-        BSONObj* projectionObj);
-
-    /**
-     * Adds 'cursor' to the front of 'pipeline', using 'deps' to inform the cursor of its
-     * dependencies. If specified, 'queryObj', 'sortObj' and 'projectionObj' are passed to the
-     * cursor for explain reporting.
-     */
-    static void addCursorSource(Pipeline* pipeline,
-                                boost::intrusive_ptr<DocumentSourceCursor> cursor,
-                                DepsTracker deps,
-                                const BSONObj& queryObj = BSONObj(),
-                                const BSONObj& sortObj = BSONObj(),
-                                const BSONObj& projectionObj = BSONObj());
+        bool* hasNoRequirements);
 };
 
 }  // namespace mongo

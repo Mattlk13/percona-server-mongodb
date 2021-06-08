@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -39,19 +39,19 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/field_parser.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/shard_util.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
 
 /**
  * Asks the mongod holding this chunk to find a key that approximately divides the specified chunk
- * in two. Throws on error or if the chunk is empty.
+ * in two. Throws on error or if the chunk is indivisible.
  */
 BSONObj selectMedianKey(OperationContext* opCtx,
                         const ShardId& shardId,
@@ -81,7 +81,7 @@ BSONObj selectMedianKey(OperationContext* opCtx,
     }
 
     uasserted(ErrorCodes::CannotSplit,
-              "Unable to find median in chunk, possibly because chunk is empty.");
+              "Unable to find median in chunk because chunk is indivisible.");
 }
 
 class SplitCollectionCmd : public ErrmsgCommandDeprecated {
@@ -130,10 +130,9 @@ public:
                    BSONObjBuilder& result) override {
         const NamespaceString nss(parseNs(dbname, cmdObj));
 
-        auto routingInfo = uassertStatusOK(
+        const auto cm = uassertStatusOK(
             Grid::get(opCtx)->catalogCache()->getShardedCollectionRoutingInfoWithRefresh(opCtx,
                                                                                          nss));
-        const auto cm = routingInfo.cm();
 
         const BSONField<BSONObj> findField("find", BSONObj());
         const BSONField<BSONArray> boundsField("bounds", BSONArray());
@@ -194,28 +193,28 @@ public:
         if (!find.isEmpty()) {
             // find
             BSONObj shardKey =
-                uassertStatusOK(cm->getShardKeyPattern().extractShardKeyFromQuery(opCtx, find));
+                uassertStatusOK(cm.getShardKeyPattern().extractShardKeyFromQuery(opCtx, nss, find));
             if (shardKey.isEmpty()) {
                 errmsg = str::stream() << "no shard key found in chunk query " << find;
                 return false;
             }
 
-            chunk.emplace(cm->findIntersectingChunkWithSimpleCollation(shardKey));
+            chunk.emplace(cm.findIntersectingChunkWithSimpleCollation(shardKey));
         } else if (!bounds.isEmpty()) {
             // bounds
-            if (!cm->getShardKeyPattern().isShardKey(bounds[0].Obj()) ||
-                !cm->getShardKeyPattern().isShardKey(bounds[1].Obj())) {
-                errmsg = str::stream() << "shard key bounds "
-                                       << "[" << bounds[0].Obj() << "," << bounds[1].Obj() << ")"
-                                       << " are not valid for shard key pattern "
-                                       << cm->getShardKeyPattern().toBSON();
+            if (!cm.getShardKeyPattern().isShardKey(bounds[0].Obj()) ||
+                !cm.getShardKeyPattern().isShardKey(bounds[1].Obj())) {
+                errmsg = str::stream()
+                    << "shard key bounds "
+                    << "[" << bounds[0].Obj() << "," << bounds[1].Obj() << ")"
+                    << " are not valid for shard key pattern " << cm.getShardKeyPattern().toBSON();
                 return false;
             }
 
-            BSONObj minKey = cm->getShardKeyPattern().normalizeShardKey(bounds[0].Obj());
-            BSONObj maxKey = cm->getShardKeyPattern().normalizeShardKey(bounds[1].Obj());
+            BSONObj minKey = cm.getShardKeyPattern().normalizeShardKey(bounds[0].Obj());
+            BSONObj maxKey = cm.getShardKeyPattern().normalizeShardKey(bounds[1].Obj());
 
-            chunk.emplace(cm->findIntersectingChunkWithSimpleCollation(minKey));
+            chunk.emplace(cm.findIntersectingChunkWithSimpleCollation(minKey));
 
             if (chunk->getMin().woCompare(minKey) != 0 || chunk->getMax().woCompare(maxKey) != 0) {
                 errmsg = str::stream() << "no chunk found with the shard key bounds "
@@ -224,24 +223,20 @@ public:
             }
         } else {
             // middle
-            if (!cm->getShardKeyPattern().isShardKey(middle)) {
-                errmsg = str::stream() << "new split key " << middle
-                                       << " is not valid for shard key pattern "
-                                       << cm->getShardKeyPattern().toBSON();
+            if (!cm.getShardKeyPattern().isShardKey(middle)) {
+                errmsg = str::stream()
+                    << "new split key " << middle << " is not valid for shard key pattern "
+                    << cm.getShardKeyPattern().toBSON();
                 return false;
             }
 
-            middle = cm->getShardKeyPattern().normalizeShardKey(middle);
-
-            // Check shard key size when manually provided
-            uassertStatusOK(ShardKeyPattern::checkShardKeySize(middle));
-
-            chunk.emplace(cm->findIntersectingChunkWithSimpleCollation(middle));
+            middle = cm.getShardKeyPattern().normalizeShardKey(middle);
+            chunk.emplace(cm.findIntersectingChunkWithSimpleCollation(middle));
 
             if (chunk->getMin().woCompare(middle) == 0 || chunk->getMax().woCompare(middle) == 0) {
-                errmsg = str::stream() << "new split key " << middle
-                                       << " is a boundary key of existing chunk "
-                                       << "[" << chunk->getMin() << "," << chunk->getMax() << ")";
+                errmsg = str::stream()
+                    << "new split key " << middle << " is a boundary key of existing chunk "
+                    << "[" << chunk->getMin() << "," << chunk->getMax() << ")";
                 return false;
             }
         }
@@ -255,26 +250,30 @@ public:
             : selectMedianKey(opCtx,
                               chunk->getShardId(),
                               nss,
-                              cm->getShardKeyPattern(),
+                              cm.getShardKeyPattern(),
                               ChunkRange(chunk->getMin(), chunk->getMax()));
 
-        log() << "Splitting chunk "
-              << redact(ChunkRange(chunk->getMin(), chunk->getMax()).toString())
-              << " in collection " << nss.ns() << " on shard " << chunk->getShardId() << " at key "
-              << redact(splitPoint);
+        LOGV2(22758,
+              "Splitting chunk {chunkRange} in {namespace} on shard {shardId} at key {splitPoint}",
+              "Splitting chunk",
+              "chunkRange"_attr = redact(ChunkRange(chunk->getMin(), chunk->getMax()).toString()),
+              "splitPoint"_attr = redact(splitPoint),
+              "namespace"_attr = nss.ns(),
+              "shardId"_attr = chunk->getShardId());
 
         uassertStatusOK(
             shardutil::splitChunkAtMultiplePoints(opCtx,
                                                   chunk->getShardId(),
                                                   nss,
-                                                  cm->getShardKeyPattern(),
-                                                  cm->getVersion(),
+                                                  cm.getShardKeyPattern(),
+                                                  cm.getVersion(),
                                                   ChunkRange(chunk->getMin(), chunk->getMax()),
                                                   {splitPoint}));
 
-        // This invalidation is only necessary so that auto-split can begin to track statistics for
-        // the chunks produced after the split instead of the single original chunk.
-        Grid::get(opCtx)->catalogCache()->onStaleShardVersion(std::move(routingInfo));
+        Grid::get(opCtx)
+            ->catalogCache()
+            ->invalidateShardOrEntireCollectionEntryForShardedCollection(
+                nss, boost::none, chunk->getShardId());
 
         return true;
     }

@@ -27,16 +27,23 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/stats/counters.h"
 
+#include <fmt/format.h>
+
+#include "mongo/client/authenticate.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
+
+namespace {
+using namespace fmt::literals;
+}
 
 void OpCounters::gotOp(int op, bool isCommand) {
     switch (op) {
@@ -62,7 +69,7 @@ void OpCounters::gotOp(int op, bool isCommand) {
         case opReply:
             break;
         default:
-            log() << "OpCounters::gotOp unknown op: " << op << std::endl;
+            LOGV2(22205, "OpCounters::gotOp unknown op: {op}", "op"_attr = op);
     }
 }
 
@@ -147,16 +154,164 @@ void NetworkCounter::hitLogicalOut(long long bytes) {
     }
 }
 
+void NetworkCounter::incrementNumSlowDNSOperations() {
+    _numSlowDNSOperations.fetchAndAdd(1);
+}
+
+void NetworkCounter::incrementNumSlowSSLOperations() {
+    _numSlowSSLOperations.fetchAndAdd(1);
+}
+
+void NetworkCounter::acceptedTFOIngress() {
+    _tfo.accepted.fetchAndAddRelaxed(1);
+}
+
 void NetworkCounter::append(BSONObjBuilder& b) {
     b.append("bytesIn", static_cast<long long>(_together.logicalBytesIn.loadRelaxed()));
     b.append("bytesOut", static_cast<long long>(_logicalBytesOut.loadRelaxed()));
     b.append("physicalBytesIn", static_cast<long long>(_physicalBytesIn.loadRelaxed()));
     b.append("physicalBytesOut", static_cast<long long>(_physicalBytesOut.loadRelaxed()));
+    b.append("numSlowDNSOperations", static_cast<long long>(_numSlowDNSOperations.loadRelaxed()));
+    b.append("numSlowSSLOperations", static_cast<long long>(_numSlowSSLOperations.loadRelaxed()));
     b.append("numRequests", static_cast<long long>(_together.requests.loadRelaxed()));
+
+    BSONObjBuilder tfo;
+#ifdef __linux__
+    tfo.append("kernelSetting", _tfo.kernelSetting);
+#endif
+    tfo.append("serverSupported", _tfo.kernelSupportServer);
+    tfo.append("clientSupported", _tfo.kernelSupportClient);
+    tfo.append("accepted", _tfo.accepted.loadRelaxed());
+    b.append("tcpFastOpen", tfo.obj());
 }
 
+void AuthCounter::initializeMechanismMap(const std::vector<std::string>& mechanisms) {
+    invariant(_mechanisms.empty());
+
+    const auto addMechanism = [this](const auto& mech) {
+        _mechanisms.emplace(
+            std::piecewise_construct, std::forward_as_tuple(mech), std::forward_as_tuple());
+    };
+
+    for (const auto& mech : mechanisms) {
+        addMechanism(mech);
+    }
+
+    // When clusterAuthMode == `x509` or `sendX509`, we'll use MONGODB-X509 for intra-cluster auth
+    // even if it's not explicitly enabled by authenticationMechanisms.
+    // Ensure it's always included in counts.
+    addMechanism(auth::kMechanismMongoX509.toString());
+
+    // SERVER-46399 Use only configured SASL mechanisms for intra-cluster auth.
+    // It's possible for intracluster auth to use a default fallback mechanism of SCRAM-SHA-1/256
+    // even if it's not configured to do so.
+    // Explicitly add these to the map for now so that they can be incremented if this happens.
+    addMechanism(auth::kMechanismScramSha1.toString());
+    addMechanism(auth::kMechanismScramSha256.toString());
+}
+
+void AuthCounter::incSaslSupportedMechanismsReceived() {
+    _saslSupportedMechanismsReceived.fetchAndAddRelaxed(1);
+}
+
+void AuthCounter::MechanismCounterHandle::incSpeculativeAuthenticateReceived() {
+    _data->speculativeAuthenticate.received.fetchAndAddRelaxed(1);
+}
+
+void AuthCounter::MechanismCounterHandle::incSpeculativeAuthenticateSuccessful() {
+    _data->speculativeAuthenticate.successful.fetchAndAddRelaxed(1);
+}
+
+void AuthCounter::MechanismCounterHandle::incAuthenticateReceived() {
+    _data->authenticate.received.fetchAndAddRelaxed(1);
+}
+
+void AuthCounter::MechanismCounterHandle::incAuthenticateSuccessful() {
+    _data->authenticate.successful.fetchAndAddRelaxed(1);
+}
+
+void AuthCounter::MechanismCounterHandle::incClusterAuthenticateReceived() {
+    _data->clusterAuthenticate.received.fetchAndAddRelaxed(1);
+}
+
+void AuthCounter::MechanismCounterHandle::incClusterAuthenticateSuccessful() {
+    _data->clusterAuthenticate.successful.fetchAndAddRelaxed(1);
+}
+
+auto AuthCounter::getMechanismCounter(StringData mechanism) -> MechanismCounterHandle {
+    auto it = _mechanisms.find(mechanism.rawData());
+    uassert(ErrorCodes::MechanismUnavailable,
+            "Received authentication for mechanism {} which is not enabled"_format(mechanism),
+            it != _mechanisms.end());
+
+    auto& data = it->second;
+    return MechanismCounterHandle(&data);
+}
+
+/**
+ * authentication: {
+ *   "mechanisms": {
+ *     "SCRAM-SHA-256": {
+ *       "speculativeAuthenticate": { received: ###, successful: ### },
+ *       "authenticate": { received: ###, successful: ### },
+ *     },
+ *     "MONGODB-X509": {
+ *       "speculativeAuthenticate": { received: ###, successful: ### },
+ *       "authenticate": { received: ###, successful: ### },
+ *     },
+ *   },
+ * }
+ */
+void AuthCounter::append(BSONObjBuilder* b) {
+    const auto ssmReceived = _saslSupportedMechanismsReceived.load();
+    b->append("saslSupportedMechsReceived", ssmReceived);
+
+    BSONObjBuilder mechsBuilder(b->subobjStart("mechanisms"));
+
+    for (const auto& it : _mechanisms) {
+        BSONObjBuilder mechBuilder(mechsBuilder.subobjStart(it.first));
+
+        {
+            const auto received = it.second.speculativeAuthenticate.received.load();
+            const auto successful = it.second.speculativeAuthenticate.successful.load();
+
+            BSONObjBuilder specAuthBuilder(mechBuilder.subobjStart(auth::kSpeculativeAuthenticate));
+            specAuthBuilder.append("received", received);
+            specAuthBuilder.append("successful", successful);
+            specAuthBuilder.done();
+        }
+
+        {
+            const auto received = it.second.clusterAuthenticate.received.load();
+            const auto successful = it.second.clusterAuthenticate.successful.load();
+
+            BSONObjBuilder clusterAuthBuilder(mechBuilder.subobjStart(auth::kClusterAuthenticate));
+            clusterAuthBuilder.append("received", received);
+            clusterAuthBuilder.append("successful", successful);
+            clusterAuthBuilder.done();
+        }
+
+        {
+            const auto received = it.second.authenticate.received.load();
+            const auto successful = it.second.authenticate.successful.load();
+
+            BSONObjBuilder authBuilder(mechBuilder.subobjStart(auth::kAuthenticateCommand));
+            authBuilder.append("received", received);
+            authBuilder.append("successful", successful);
+            authBuilder.done();
+        }
+
+        mechBuilder.done();
+    }
+
+    mechsBuilder.done();
+}
 
 OpCounters globalOpCounters;
 OpCounters replOpCounters;
 NetworkCounter networkCounter;
-}
+AuthCounter authCounter;
+AggStageCounters aggStageCounters;
+DotsAndDollarsFieldsCounters dotsAndDollarsFieldsCounters;
+OperatorCountersExpressions operatorCountersExpressions;
+}  // namespace mongo

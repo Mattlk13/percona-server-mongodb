@@ -31,6 +31,7 @@
 
 #include "mongo/rpc/legacy_request_builder.h"
 
+#include <memory>
 #include <tuple>
 #include <utility>
 
@@ -39,7 +40,6 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/rpc/message.h"
 #include "mongo/rpc/metadata.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/assert_util.h"
 
 namespace mongo {
@@ -64,7 +64,7 @@ BSONObj downconvertRequestBody(const OpMsgRequest& request, int* queryOptions) {
     if (auto readPref = request.body["$readPreference"]) {
         auto parsed = ReadPreferenceSetting::fromInnerBSON(readPref);
         if (parsed.isOK() && parsed.getValue().canRunOnSecondary()) {
-            *queryOptions |= QueryOption_SlaveOk;
+            *queryOptions |= QueryOption_SecondaryOk;
         }
 
         BSONObjBuilder outer;

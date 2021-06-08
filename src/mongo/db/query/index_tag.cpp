@@ -43,48 +43,68 @@ using TagType = MatchExpression::TagData::Type;
 
 namespace {
 
-bool TagComparison(const MatchExpression* lhs, const MatchExpression* rhs) {
+// Compares 'lhs' for 'rhs', using the tag-based ordering expected by the access planner. Returns a
+// negative number if 'lhs' is smaller than 'rhs', 0 if they are equal, and 1 if 'lhs' is larger.
+int tagComparison(const MatchExpression* lhs, const MatchExpression* rhs) {
     IndexTag* lhsTag = static_cast<IndexTag*>(lhs->getTag());
-    size_t lhsValue = (NULL == lhsTag) ? IndexTag::kNoIndex : lhsTag->index;
-    size_t lhsPos = (NULL == lhsTag) ? IndexTag::kNoIndex : lhsTag->pos;
+    size_t lhsValue = (nullptr == lhsTag) ? IndexTag::kNoIndex : lhsTag->index;
+    size_t lhsPos = (nullptr == lhsTag) ? IndexTag::kNoIndex : lhsTag->pos;
 
     IndexTag* rhsTag = static_cast<IndexTag*>(rhs->getTag());
-    size_t rhsValue = (NULL == rhsTag) ? IndexTag::kNoIndex : rhsTag->index;
-    size_t rhsPos = (NULL == rhsTag) ? IndexTag::kNoIndex : rhsTag->pos;
+    size_t rhsValue = (nullptr == rhsTag) ? IndexTag::kNoIndex : rhsTag->index;
+    size_t rhsPos = (nullptr == rhsTag) ? IndexTag::kNoIndex : rhsTag->pos;
 
     // First, order on indices.
     if (lhsValue != rhsValue) {
         // This relies on kNoIndex being larger than every other possible index.
-        return lhsValue < rhsValue;
+        return lhsValue < rhsValue ? -1 : 1;
     }
 
     // Next, order so that if there's a GEO_NEAR it's first.
     if (MatchExpression::GEO_NEAR == lhs->matchType()) {
-        return true;
+        return -1;
     } else if (MatchExpression::GEO_NEAR == rhs->matchType()) {
-        return false;
+        return 1;
     }
 
     // Ditto text.
     if (MatchExpression::TEXT == lhs->matchType()) {
-        return true;
+        return -1;
     } else if (MatchExpression::TEXT == rhs->matchType()) {
-        return false;
+        return 1;
     }
 
     // Next, order so that the first field of a compound index appears first.
     if (lhsPos != rhsPos) {
-        return lhsPos < rhsPos;
+        return lhsPos < rhsPos ? -1 : 1;
     }
 
     // Next, order on fields.
     int cmp = lhs->path().compare(rhs->path());
     if (0 != cmp) {
-        return 0;
+        return cmp;
     }
 
-    // Finally, order on expression type.
-    return lhs->matchType() < rhs->matchType();
+    // Next, order on expression type.
+    if (lhs->matchType() != rhs->matchType()) {
+        return lhs->matchType() < rhs->matchType() ? -1 : 1;
+    }
+
+    // The 'lhs' and 'rhs' are equal. Break ties by comparing child nodes.
+    const size_t numChildren = std::min(lhs->numChildren(), rhs->numChildren());
+    for (size_t childIdx = 0; childIdx < numChildren; ++childIdx) {
+        int childCompare = tagComparison(lhs->getChild(childIdx), rhs->getChild(childIdx));
+        if (childCompare != 0) {
+            return childCompare;
+        }
+    }
+
+    // If all else is equal, sort whichever node has fewer children first.
+    if (lhs->numChildren() != rhs->numChildren()) {
+        return lhs->numChildren() < rhs->numChildren() ? -1 : 1;
+    }
+
+    return 0;
 }
 
 // Sorts the tree using its IndexTag(s). Nodes that use the same index will sort so that they are
@@ -93,10 +113,11 @@ void sortUsingTags(MatchExpression* tree) {
     for (size_t i = 0; i < tree->numChildren(); ++i) {
         sortUsingTags(tree->getChild(i));
     }
-    std::vector<MatchExpression*>* children = tree->getChildVector();
-    if (NULL != children) {
-        std::sort(children->begin(), children->end(), TagComparison);
-    }
+
+    if (auto&& children = tree->getChildVector())
+        std::stable_sort(children->begin(), children->end(), [](auto&& lhs, auto&& rhs) {
+            return tagComparison(lhs.get(), rhs.get()) < 0;
+        });
 }
 
 // Attaches 'node' to 'target'. If 'target' is an AND, adds 'node' as a child of 'target'.
@@ -117,15 +138,15 @@ void attachNode(MatchExpression* node,
     }
 
     if (MatchExpression::AND == target->matchType()) {
-        AndMatchExpression* andNode = static_cast<AndMatchExpression*>(target);
-        andNode->add(clone.release());
+        auto andNode = static_cast<AndMatchExpression*>(target);
+        andNode->add(std::move(clone));
     } else {
-        std::unique_ptr<AndMatchExpression> andNode = stdx::make_unique<AndMatchExpression>();
-        IndexTag* indexTag = static_cast<IndexTag*>(clone->getTag());
+        auto andNode = std::make_unique<AndMatchExpression>();
+        auto indexTag = static_cast<IndexTag*>(clone->getTag());
         andNode->setTag(new IndexTag(indexTag->index));
-        andNode->add(target);
-        andNode->add(clone.release());
-        targetParent->getChildVector()->operator[](targetPosition) = andNode.release();
+        andNode->add(std::move((*targetParent->getChildVector())[targetPosition]));
+        andNode->add(std::move(clone));
+        targetParent->getChildVector()->operator[](targetPosition) = std::move(andNode);
     }
 }
 
@@ -205,7 +226,7 @@ bool pushdownNode(MatchExpression* node,
         return pushdownNode(node, indexedOr, std::move(destinations));
     }
 
-    MONGO_UNREACHABLE;
+    MONGO_UNREACHABLE_TASSERT(4457014);
 }
 
 // Populates 'out' with all descendants of 'node' that have OrPushdownTags, assuming the initial
@@ -274,7 +295,7 @@ void resolveOrPushdowns(MatchExpression* tree) {
                 std::vector<MatchExpression*> orPushdownDescendants;
                 getElemMatchOrPushdownDescendants(child, &orPushdownDescendants);
                 for (auto descendant : orPushdownDescendants) {
-                    processOrPushdownNode(descendant, indexedOr);
+                    static_cast<void>(processOrPushdownNode(descendant, indexedOr));
                 }
             } else if (processOrPushdownNode(child, indexedOr)) {
                 // The indexed $or can completely satisfy the child predicate, so we trim it.

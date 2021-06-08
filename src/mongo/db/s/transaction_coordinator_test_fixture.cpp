@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
@@ -37,10 +37,11 @@
 #include "mongo/db/commands/txn_cmds_gen.h"
 #include "mongo/db/commands/txn_two_phase_commit_cmds_gen.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/repl/wait_for_majority_service.h"
+#include "mongo/rpc/metadata/client_metadata.h"
 #include "mongo/s/catalog/sharding_catalog_client_mock.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
@@ -64,15 +65,21 @@ void TransactionCoordinatorTestFixture::setUp() {
             uassertStatusOK(shardRegistry()->getShard(operationContext(), shardId))->getTargeter());
         shardTargeter->setFindHostReturnValue(makeHostAndPort(shardId));
     }
+
+    WaitForMajorityService::get(getServiceContext()).startup(getServiceContext());
 }
 
-std::unique_ptr<ShardingCatalogClient> TransactionCoordinatorTestFixture::makeShardingCatalogClient(
-    std::unique_ptr<DistLockManager> distLockManager) {
+void TransactionCoordinatorTestFixture::tearDown() {
+    WaitForMajorityService::get(getServiceContext()).shutDown();
+    ShardServerTestFixture::tearDown();
+}
+
+std::unique_ptr<ShardingCatalogClient>
+TransactionCoordinatorTestFixture::makeShardingCatalogClient() {
 
     class StaticCatalogClient final : public ShardingCatalogClientMock {
     public:
-        StaticCatalogClient(std::vector<ShardId> shardIds)
-            : ShardingCatalogClientMock(nullptr), _shardIds(std::move(shardIds)) {}
+        StaticCatalogClient(std::vector<ShardId> shardIds) : _shardIds(std::move(shardIds)) {}
 
         StatusWith<repl::OpTimeWith<std::vector<ShardType>>> getAllShards(
             OperationContext* opCtx, repl::ReadConcernLevel readConcern) override {
@@ -92,7 +99,7 @@ std::unique_ptr<ShardingCatalogClient> TransactionCoordinatorTestFixture::makeSh
         const std::vector<ShardId> _shardIds;
     };
 
-    return stdx::make_unique<StaticCatalogClient>(kThreeShardIdList);
+    return std::make_unique<StaticCatalogClient>(kThreeShardIdList);
 }
 
 void TransactionCoordinatorTestFixture::assertCommandSentAndRespondWith(
@@ -115,4 +122,19 @@ void TransactionCoordinatorTestFixture::advanceClockAndExecuteScheduledTasks() {
     network()->advanceTime(network()->now() + Seconds{1});
 }
 
+void TransactionCoordinatorTestFixture::associateClientMetadata(Client* client,
+                                                                std::string appName) {
+    BSONObjBuilder metadataBuilder;
+    ASSERT_OK(ClientMetadata::serializePrivate(std::string("DriverName").insert(0, appName),
+                                               std::string("DriverVersion").insert(0, appName),
+                                               std::string("OsType").insert(0, appName),
+                                               std::string("OsName").insert(0, appName),
+                                               std::string("OsArchitecture").insert(0, appName),
+                                               std::string("OsVersion").insert(0, appName),
+                                               appName,
+                                               &metadataBuilder));
+    auto clientMetadata = metadataBuilder.obj();
+    auto clientMetadataParse = ClientMetadata::parse(clientMetadata["client"]);
+    ClientMetadata::setAndFinalize(client, std::move(clientMetadataParse.getValue()));
+}
 }  // namespace mongo

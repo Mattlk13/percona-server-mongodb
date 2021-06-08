@@ -11,9 +11,11 @@
 // (connection connected after shard change).
 //
 
-// Checking UUID consistency involves talking to shard primaries, but by the end of this test, one
-// shard does not have a primary.
+// Checking UUID and index consistency involves talking to shard primaries, but by the end of this
+// test, one shard does not have a primary.
 TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
+TestData.skipCheckingIndexesConsistentAcrossCluster = true;
+TestData.skipCheckOrphans = true;
 
 // Replica set nodes started with --shardsvr do not enable key generation until they are added to a
 // sharded cluster and reject commands with gossiped clusterTime from users without the
@@ -21,10 +23,9 @@ TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
 // authenticates as __system and recieves clusterTime metadata then will fail trying to gossip that
 // time later in setup.
 //
-// TODO SERVER-32672: remove this flag.
-TestData.skipGossipingClusterTime = true;
 
-// TODO SERVER-35447: Multiple users cannot be authenticated on one connection within a session.
+// Multiple users cannot be authenticated on one connection within a session.
+// @tags: [live_record_incompatible]
 TestData.disableImplicitSessions = true;
 
 var options = {rs: true, rsOptions: {nodes: 2}, keyFile: "jstests/libs/key1"};
@@ -52,8 +53,8 @@ var collSharded = mongos.getCollection("fooSharded.barSharded");
 var collUnsharded = mongos.getCollection("fooUnsharded.barUnsharded");
 
 // Create the unsharded database with shard0 primary
-assert.writeOK(collUnsharded.insert({some: "doc"}));
-assert.writeOK(collUnsharded.remove({}));
+assert.commandWorked(collUnsharded.insert({some: "doc"}));
+assert.commandWorked(collUnsharded.remove({}));
 assert.commandWorked(
     admin.runCommand({movePrimary: collUnsharded.getDB().toString(), to: st.shard0.shardName}));
 
@@ -110,9 +111,9 @@ var mongosConnNew = null;
 
 var wc = {writeConcern: {w: 2, wtimeout: 60000}};
 
-assert.writeOK(mongosConnActive.getCollection(collSharded.toString()).insert({_id: -1}, wc));
-assert.writeOK(mongosConnActive.getCollection(collSharded.toString()).insert({_id: 1}, wc));
-assert.writeOK(mongosConnActive.getCollection(collUnsharded.toString()).insert({_id: 1}, wc));
+assert.commandWorked(mongosConnActive.getCollection(collSharded.toString()).insert({_id: -1}, wc));
+assert.commandWorked(mongosConnActive.getCollection(collSharded.toString()).insert({_id: 1}, wc));
+assert.commandWorked(mongosConnActive.getCollection(collUnsharded.toString()).insert({_id: 1}, wc));
 
 jsTest.log("Stopping primary of third shard...");
 
@@ -126,15 +127,15 @@ assert.neq(null, mongosConnActive.getCollection(collSharded.toString()).findOne(
 assert.neq(null, mongosConnActive.getCollection(collSharded.toString()).findOne({_id: 1}));
 assert.neq(null, mongosConnActive.getCollection(collUnsharded.toString()).findOne({_id: 1}));
 
-assert.writeOK(mongosConnActive.getCollection(collSharded.toString()).insert({_id: -2}, wc));
-assert.writeOK(mongosConnActive.getCollection(collSharded.toString()).insert({_id: 2}, wc));
-assert.writeOK(mongosConnActive.getCollection(collUnsharded.toString()).insert({_id: 2}, wc));
+assert.commandWorked(mongosConnActive.getCollection(collSharded.toString()).insert({_id: -2}, wc));
+assert.commandWorked(mongosConnActive.getCollection(collSharded.toString()).insert({_id: 2}, wc));
+assert.commandWorked(mongosConnActive.getCollection(collUnsharded.toString()).insert({_id: 2}, wc));
 
 jsTest.log("Testing idle connection with third primary down...");
 
-assert.writeOK(mongosConnIdle.getCollection(collSharded.toString()).insert({_id: -3}, wc));
-assert.writeOK(mongosConnIdle.getCollection(collSharded.toString()).insert({_id: 3}, wc));
-assert.writeOK(mongosConnIdle.getCollection(collUnsharded.toString()).insert({_id: 3}, wc));
+assert.commandWorked(mongosConnIdle.getCollection(collSharded.toString()).insert({_id: -3}, wc));
+assert.commandWorked(mongosConnIdle.getCollection(collSharded.toString()).insert({_id: 3}, wc));
+assert.commandWorked(mongosConnIdle.getCollection(collUnsharded.toString()).insert({_id: 3}, wc));
 
 assert.neq(null, mongosConnIdle.getCollection(collSharded.toString()).findOne({_id: -1}));
 assert.neq(null, mongosConnIdle.getCollection(collSharded.toString()).findOne({_id: 1}));
@@ -150,19 +151,19 @@ mongosConnNew = authDBUsers(new Mongo(mongos.host));
 assert.neq(null, mongosConnNew.getCollection(collUnsharded.toString()).findOne({_id: 1}));
 
 mongosConnNew = authDBUsers(new Mongo(mongos.host));
-assert.writeOK(mongosConnNew.getCollection(collSharded.toString()).insert({_id: -4}, wc));
+assert.commandWorked(mongosConnNew.getCollection(collSharded.toString()).insert({_id: -4}, wc));
 mongosConnNew = authDBUsers(new Mongo(mongos.host));
-assert.writeOK(mongosConnNew.getCollection(collSharded.toString()).insert({_id: 4}, wc));
+assert.commandWorked(mongosConnNew.getCollection(collSharded.toString()).insert({_id: 4}, wc));
 mongosConnNew = authDBUsers(new Mongo(mongos.host));
-assert.writeOK(mongosConnNew.getCollection(collUnsharded.toString()).insert({_id: 4}, wc));
+assert.commandWorked(mongosConnNew.getCollection(collUnsharded.toString()).insert({_id: 4}, wc));
 
 gc();  // Clean up new connections
 
 jsTest.log("Stopping primary of second shard...");
 
-mongosConnActive.setSlaveOk();
+mongosConnActive.setSecondaryOk();
 mongosConnIdle = authDBUsers(new Mongo(mongos.host));
-mongosConnIdle.setSlaveOk();
+mongosConnIdle.setSecondaryOk();
 
 // Need to save this node for later
 var rs1Secondary = st.rs1.getSecondary();
@@ -175,15 +176,15 @@ assert.neq(null, mongosConnActive.getCollection(collSharded.toString()).findOne(
 assert.neq(null, mongosConnActive.getCollection(collSharded.toString()).findOne({_id: 1}));
 assert.neq(null, mongosConnActive.getCollection(collUnsharded.toString()).findOne({_id: 1}));
 
-assert.writeOK(mongosConnActive.getCollection(collSharded.toString()).insert({_id: -5}, wc));
+assert.commandWorked(mongosConnActive.getCollection(collSharded.toString()).insert({_id: -5}, wc));
 assert.writeError(mongosConnActive.getCollection(collSharded.toString()).insert({_id: 5}, wc));
-assert.writeOK(mongosConnActive.getCollection(collUnsharded.toString()).insert({_id: 5}, wc));
+assert.commandWorked(mongosConnActive.getCollection(collUnsharded.toString()).insert({_id: 5}, wc));
 
 jsTest.log("Testing idle connection with second primary down...");
 
-assert.writeOK(mongosConnIdle.getCollection(collSharded.toString()).insert({_id: -6}, wc));
+assert.commandWorked(mongosConnIdle.getCollection(collSharded.toString()).insert({_id: -6}, wc));
 assert.writeError(mongosConnIdle.getCollection(collSharded.toString()).insert({_id: 6}, wc));
-assert.writeOK(mongosConnIdle.getCollection(collUnsharded.toString()).insert({_id: 6}, wc));
+assert.commandWorked(mongosConnIdle.getCollection(collUnsharded.toString()).insert({_id: 6}, wc));
 
 assert.neq(null, mongosConnIdle.getCollection(collSharded.toString()).findOne({_id: -1}));
 assert.neq(null, mongosConnIdle.getCollection(collSharded.toString()).findOne({_id: 1}));
@@ -192,29 +193,29 @@ assert.neq(null, mongosConnIdle.getCollection(collUnsharded.toString()).findOne(
 jsTest.log("Testing new connections with second primary down...");
 
 mongosConnNew = authDBUsers(new Mongo(mongos.host));
-mongosConnNew.setSlaveOk();
+mongosConnNew.setSecondaryOk();
 assert.neq(null, mongosConnNew.getCollection(collSharded.toString()).findOne({_id: -1}));
 mongosConnNew = authDBUsers(new Mongo(mongos.host));
-mongosConnNew.setSlaveOk();
+mongosConnNew.setSecondaryOk();
 assert.neq(null, mongosConnNew.getCollection(collSharded.toString()).findOne({_id: 1}));
 mongosConnNew = authDBUsers(new Mongo(mongos.host));
-mongosConnNew.setSlaveOk();
+mongosConnNew.setSecondaryOk();
 assert.neq(null, mongosConnNew.getCollection(collUnsharded.toString()).findOne({_id: 1}));
 
 mongosConnNew = authDBUsers(new Mongo(mongos.host));
-assert.writeOK(mongosConnNew.getCollection(collSharded.toString()).insert({_id: -7}, wc));
+assert.commandWorked(mongosConnNew.getCollection(collSharded.toString()).insert({_id: -7}, wc));
 mongosConnNew = authDBUsers(new Mongo(mongos.host));
 assert.writeError(mongosConnNew.getCollection(collSharded.toString()).insert({_id: 7}, wc));
 mongosConnNew = authDBUsers(new Mongo(mongos.host));
-assert.writeOK(mongosConnNew.getCollection(collUnsharded.toString()).insert({_id: 7}, wc));
+assert.commandWorked(mongosConnNew.getCollection(collUnsharded.toString()).insert({_id: 7}, wc));
 
 gc();  // Clean up new connections
 
 jsTest.log("Stopping primary of first shard...");
 
-mongosConnActive.setSlaveOk();
+mongosConnActive.setSecondaryOk();
 mongosConnIdle = authDBUsers(new Mongo(mongos.host));
-mongosConnIdle.setSlaveOk();
+mongosConnIdle.setSecondaryOk();
 
 st.rs0.stop(st.rs0.getPrimary());
 
@@ -241,13 +242,13 @@ assert.neq(null, mongosConnIdle.getCollection(collUnsharded.toString()).findOne(
 jsTest.log("Testing new connections with first primary down...");
 
 mongosConnNew = authDBUsers(new Mongo(mongos.host));
-mongosConnNew.setSlaveOk();
+mongosConnNew.setSecondaryOk();
 assert.neq(null, mongosConnNew.getCollection(collSharded.toString()).findOne({_id: -1}));
 mongosConnNew = authDBUsers(new Mongo(mongos.host));
-mongosConnNew.setSlaveOk();
+mongosConnNew.setSecondaryOk();
 assert.neq(null, mongosConnNew.getCollection(collSharded.toString()).findOne({_id: 1}));
 mongosConnNew = authDBUsers(new Mongo(mongos.host));
-mongosConnNew.setSlaveOk();
+mongosConnNew.setSecondaryOk();
 assert.neq(null, mongosConnNew.getCollection(collUnsharded.toString()).findOne({_id: 1}));
 
 mongosConnNew = authDBUsers(new Mongo(mongos.host));
@@ -261,9 +262,9 @@ gc();  // Clean up new connections
 
 jsTest.log("Stopping second shard...");
 
-mongosConnActive.setSlaveOk();
+mongosConnActive.setSecondaryOk();
 mongosConnIdle = authDBUsers(new Mongo(mongos.host));
-mongosConnIdle.setSlaveOk();
+mongosConnIdle.setSecondaryOk();
 
 st.rs1.stop(rs1Secondary);
 
@@ -288,10 +289,10 @@ assert.neq(null, mongosConnIdle.getCollection(collUnsharded.toString()).findOne(
 jsTest.log("Testing new connections with second shard down...");
 
 mongosConnNew = authDBUsers(new Mongo(mongos.host));
-mongosConnNew.setSlaveOk();
+mongosConnNew.setSecondaryOk();
 assert.neq(null, mongosConnNew.getCollection(collSharded.toString()).findOne({_id: -1}));
 mongosConnNew = authDBUsers(new Mongo(mongos.host));
-mongosConnNew.setSlaveOk();
+mongosConnNew.setSecondaryOk();
 assert.neq(null, mongosConnNew.getCollection(collUnsharded.toString()).findOne({_id: 1}));
 
 mongosConnNew = authDBUsers(new Mongo(mongos.host));

@@ -50,11 +50,11 @@ class SeekableRecordCursor;
  */
 class FetchStage : public RequiresCollectionStage {
 public:
-    FetchStage(OperationContext* opCtx,
+    FetchStage(ExpressionContext* expCtx,
                WorkingSet* ws,
-               PlanStage* child,
+               std::unique_ptr<PlanStage> child,
                const MatchExpression* filter,
-               const Collection* collection);
+               const CollectionPtr& collection);
 
     ~FetchStage();
 

@@ -1,7 +1,9 @@
 //
 // More tests for N-dimensional polygon querying
 //
-// @tags: [requires_fastcount]
+// @tags: [
+//   requires_fastcount,
+// ]
 
 // Create a polygon of some shape (no holes)
 // using turtle graphics.  Basically, will look like a very contorted octopus (quad-pus?) shape.
@@ -22,7 +24,6 @@ for (var test = 0; test < numTests; test++) {
     printjson({test: test, rotation: rotation, bits: bits});
 
     var rotatePoint = function(x, y) {
-
         if (y == undefined) {
             y = x[1];
             x = x[0];
@@ -46,7 +47,6 @@ for (var test = 0; test < numTests; test++) {
     }
 
     grid.toString = function() {
-
         var gridStr = "";
         for (var j = grid[0].length - 1; j >= -1; j--) {
             for (var i = 0; i < grid.length; i++) {
@@ -81,7 +81,6 @@ for (var test = 0; test < numTests; test++) {
     // print( grid.toString() )
 
     var pickDirections = function() {
-
         var up = Math.floor(Random.rand() * 3);
         if (up == 2)
             up = -1;
@@ -127,7 +126,6 @@ for (var test = 0; test < numTests; test++) {
         turtlePath = [];
 
         var nextSeg = function(currTurtle, prevTurtle) {
-
             var pathX = currTurtle[0];
 
             if (currTurtle[1] < prevTurtle[1]) {
@@ -233,7 +231,7 @@ for (var test = 0; test < numTests; test++) {
         }
     }
 
-    var res = t.ensureIndex({loc: "2d"}, {bits: 1 + bits, max: bounds[1], min: bounds[0]});
+    var res = t.createIndex({loc: "2d"}, {bits: 1 + bits, max: bounds[1], min: bounds[0]});
     assert.commandWorked(res);
 
     t.insert({loc: allPointsIn});

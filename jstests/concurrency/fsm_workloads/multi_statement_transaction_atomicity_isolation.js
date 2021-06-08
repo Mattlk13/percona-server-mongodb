@@ -53,7 +53,6 @@ load('jstests/concurrency/fsm_workload_helpers/auto_retry_transaction.js');
 load("jstests/aggregation/extras/utils.js");
 
 var $config = (function() {
-
     function checkTransactionCommitOrder(documents) {
         const graph = new Graph();
 
@@ -95,9 +94,7 @@ var $config = (function() {
             }
         }
 
-        for (let {
-                 op, actual
-             } of updateCounts.values()) {
+        for (let {op, actual} of updateCounts.values()) {
             assert.eq(op.numUpdated, actual, () => {
                 return 'transaction ' + tojson(op) + ' should have updated ' + op.numUpdated +
                     ' documents, but ' + actual + ' were updated: ' + tojson(updateCounts.values());
@@ -174,8 +171,8 @@ var $config = (function() {
         assertWhenOwnColl.eq(allDocuments.length, numDocs * this.collections.length, () => {
             if (this.session) {
                 return "txnNumber: " + tojson(this.session.getTxnNumber_forTesting()) +
-                    ", session id: " + tojson(this.session.getSessionId()) + ", all documents: " +
-                    tojson(allDocuments);
+                    ", session id: " + tojson(this.session.getSessionId()) +
+                    ", all documents: " + tojson(allDocuments);
             }
             return "all documents: " + tojson(allDocuments);
         });
@@ -192,9 +189,16 @@ var $config = (function() {
     }
 
     const states = (function() {
-
         return {
             init: function init(db, collName) {
+                // The default WC is majority and this workload may not be able to satisfy majority
+                // writes.
+                assert.commandWorked(db.adminCommand({
+                    setDefaultRWConcern: 1,
+                    defaultWriteConcern: {w: 1},
+                    writeConcern: {w: "majority"}
+                }));
+
                 this.iteration = 0;
                 // Set causalConsistency = true to ensure that in the checkConsistency state
                 // function, we will be able to read our own writes that were committed as a
@@ -361,11 +365,14 @@ var $config = (function() {
             getAllDocuments,
             getDocIdsToUpdate,
             numDocs: 10,
-            retryOnKilledSession: false,
+            // Because of the usage of 'getMore' command in this test, we may receive
+            // 'CursorNotFound' exception from the server, if a node was stepped down between the
+            // 'find' and subsequent 'getMore' command. We retry the entire transaction in this
+            // case.
+            retryOnKilledSession: TestData.runningWithShardStepdowns,
             updatedDocsClientHistory: [],
         },
         setup: setup,
         teardown: teardown,
     };
-
 })();

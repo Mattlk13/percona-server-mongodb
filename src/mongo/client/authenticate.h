@@ -29,15 +29,19 @@
 
 #pragma once
 
+#include <functional>
+#include <memory>
 #include <string>
 
 #include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/client/internal_auth.h"
+#include "mongo/client/mongo_uri.h"
+#include "mongo/client/sasl_client_session.h"
 #include "mongo/db/auth/user_name.h"
 #include "mongo/executor/remote_command_response.h"
 #include "mongo/rpc/op_msg.h"
-#include "mongo/stdx/functional.h"
 #include "mongo/util/future.h"
 #include "mongo/util/md5.h"
 #include "mongo/util/net/hostandport.h"
@@ -48,10 +52,10 @@ class BSONObj;
 
 namespace auth {
 
-using RunCommandHook = stdx::function<Future<BSONObj>(OpMsgRequest request)>;
+using RunCommandHook = std::function<Future<BSONObj>(OpMsgRequest request)>;
 
 /* Hook for legacy MONGODB-CR support provided by shell client only */
-using AuthMongoCRHandler = stdx::function<Future<void>(RunCommandHook, const BSONObj&)>;
+using AuthMongoCRHandler = std::function<Future<void>(RunCommandHook, const BSONObj&)>;
 extern AuthMongoCRHandler authMongoCR;
 
 /**
@@ -64,7 +68,36 @@ constexpr auto kMechanismSaslPlain = "PLAIN"_sd;
 constexpr auto kMechanismGSSAPI = "GSSAPI"_sd;
 constexpr auto kMechanismScramSha1 = "SCRAM-SHA-1"_sd;
 constexpr auto kMechanismScramSha256 = "SCRAM-SHA-256"_sd;
+constexpr auto kMechanismMongoAWS = "MONGODB-AWS"_sd;
 constexpr auto kInternalAuthFallbackMechanism = kMechanismScramSha1;
+
+constexpr auto kSaslSupportedMechanisms = "saslSupportedMechs"_sd;
+constexpr auto kSpeculativeAuthenticate = "speculativeAuthenticate"_sd;
+constexpr auto kClusterAuthenticate = "clusterAuthenticate"_sd;
+constexpr auto kAuthenticateCommand = "authenticate"_sd;
+
+/**
+ * On replication step down, should the current connection be killed or left open.
+ */
+enum class StepDownBehavior { kKillConnection, kKeepConnectionOpen };
+
+/**
+ * Provider of SASL credentials for internal authentication purposes.
+ */
+class InternalAuthParametersProvider {
+public:
+    virtual ~InternalAuthParametersProvider() = default;
+
+    /**
+     * Get the information for a given SASL mechanism.
+     *
+     * If there are multiple entries for a mechanism, suppots retrieval by index. Used when rotating
+     * the security key.
+     */
+    virtual BSONObj get(size_t index, StringData mechanism) = 0;
+};
+
+std::shared_ptr<InternalAuthParametersProvider> createDefaultInternalAuthProvider();
 
 /**
  * Authenticate a user.
@@ -106,35 +139,18 @@ Future<void> authenticateClient(const BSONObj& params,
  * (e.g. SCRAM-SHA-256). If it is boost::none, then an isMaster will be called to negotiate
  * a SASL mechanism with the server.
  *
+ * The "stepDownBehavior" parameter controls whether replication will kill the connection on
+ * stepdown.
+ *
  * Because this may retry during cluster keyfile rollover, this may call the RunCommandHook more
  * than once, but will only call the AuthCompletionHandler once.
  */
-Future<void> authenticateInternalClient(const std::string& clientSubjectName,
-                                        boost::optional<std::string> mechanismHint,
-                                        RunCommandHook runCommand);
-
-/**
- * Sets the keys used by authenticateInternalClient - these should be a vector of raw passwords,
- * they will be digested and prepped appropriately by authenticateInternalClient depending
- * on what mechanism is used.
- */
-void setInternalAuthKeys(const std::vector<std::string>& keys);
-
-/**
- * Sets the parameters for non-password based internal authentication.
- */
-void setInternalUserAuthParams(BSONObj obj);
-
-/**
- * Returns whether there are multiple keys that will be tried while authenticating an internal
- * client (used for logging a startup warning).
- */
-bool hasMultipleInternalAuthKeys();
-
-/**
- * Returns whether there are any internal auth data set.
- */
-bool isInternalAuthSet();
+Future<void> authenticateInternalClient(
+    const std::string& clientSubjectName,
+    boost::optional<std::string> mechanismHint,
+    StepDownBehavior stepDownBehavior,
+    RunCommandHook runCommand,
+    std::shared_ptr<InternalAuthParametersProvider> internalParamsProvider);
 
 /**
  * Build a BSONObject representing parameters to be passed to authenticateClient(). Takes
@@ -155,7 +171,8 @@ BSONObj buildAuthParams(StringData dbname,
  */
 Future<std::string> negotiateSaslMechanism(RunCommandHook runCommand,
                                            const UserName& username,
-                                           boost::optional<std::string> mechanismHint);
+                                           boost::optional<std::string> mechanismHint,
+                                           StepDownBehavior stepDownBehavior);
 
 /**
  * Return the field name for the database containing credential information.
@@ -166,6 +183,30 @@ StringData getSaslCommandUserDBFieldName();
  * Return the field name for the user to authenticate.
  */
 StringData getSaslCommandUserFieldName();
+
+/**
+ * Which type of speculative authentication was performed (if any).
+ */
+enum class SpeculativeAuthType {
+    kNone,
+    kAuthenticate,
+    kSaslStart,
+};
+
+/**
+ * Constructs a "speculativeAuthenticate" or "speculativeSaslStart"
+ * payload for an isMaster request based on a given URI.
+ */
+SpeculativeAuthType speculateAuth(BSONObjBuilder* isMasterRequest,
+                                  const MongoURI& uri,
+                                  std::shared_ptr<SaslClientSession>* saslClientSession);
+
+/**
+ * Constructs a "speculativeAuthenticate" or "speculativeSaslStart"
+ * payload for an isMaster request using internal (intracluster) authentication.
+ */
+SpeculativeAuthType speculateInternalAuth(BSONObjBuilder* isMasterRequest,
+                                          std::shared_ptr<SaslClientSession>* saslClientSession);
 
 }  // namespace auth
 }  // namespace mongo

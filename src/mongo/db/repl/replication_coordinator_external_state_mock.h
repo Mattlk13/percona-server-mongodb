@@ -37,8 +37,8 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/repl/last_vote.h"
 #include "mongo/db/repl/replication_coordinator_external_state.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/net/hostandport.h"
 
@@ -59,23 +59,26 @@ public:
 
     ReplicationCoordinatorExternalStateMock();
     virtual ~ReplicationCoordinatorExternalStateMock();
-    virtual void startThreads(const ReplSettings& settings) override;
+    virtual void startThreads() override;
     virtual void startSteadyStateReplication(OperationContext* opCtx,
                                              ReplicationCoordinator* replCoord) override;
-    virtual void stopDataReplication(OperationContext* opCtx) override;
     virtual bool isInitialSyncFlagSet(OperationContext* opCtx) override;
 
     virtual void shutdown(OperationContext* opCtx);
+    virtual void clearAppliedThroughIfCleanShutdown(OperationContext* opCtx);
     virtual executor::TaskExecutor* getTaskExecutor() const override;
+    virtual std::shared_ptr<executor::TaskExecutor> getSharedTaskExecutor() const override;
     virtual ThreadPool* getDbWorkThreadPool() const override;
     virtual Status initializeReplSetStorage(OperationContext* opCtx, const BSONObj& config);
     void onDrainComplete(OperationContext* opCtx) override;
     OpTime onTransitionToPrimary(OperationContext* opCtx) override;
-    virtual void forwardSlaveProgress();
+    virtual void forwardSecondaryProgress();
     virtual bool isSelf(const HostAndPort& host, ServiceContext* service);
     virtual HostAndPort getClientHostAndPort(const OperationContext* opCtx);
     virtual StatusWith<BSONObj> loadLocalConfigDocument(OperationContext* opCtx);
-    virtual Status storeLocalConfigDocument(OperationContext* opCtx, const BSONObj& config);
+    virtual Status storeLocalConfigDocument(OperationContext* opCtx,
+                                            const BSONObj& config,
+                                            bool writeOplog);
     virtual StatusWith<LastVote> loadLocalLastVoteDocument(OperationContext* opCtx);
     virtual Status storeLocalLastVoteDocument(OperationContext* opCtx, const LastVote& lastVote);
     virtual void setGlobalTimestamp(ServiceContext* service, const Timestamp& newTime);
@@ -83,13 +86,14 @@ public:
     bool oplogExists(OperationContext* opCtx) override;
     virtual StatusWith<OpTimeAndWallTime> loadLastOpTimeAndWallTime(OperationContext* opCtx);
     virtual void closeConnections();
-    virtual void shardingOnStepDownHook();
+    virtual void onStepDownHook();
     virtual void signalApplierToChooseNewSyncSource();
     virtual void stopProducer();
     virtual void startProducerIfStopped();
-    virtual void dropAllSnapshots();
+    virtual bool tooStale();
+    virtual void clearCommittedSnapshot();
     virtual void updateCommittedSnapshot(const OpTime& newCommitPoint);
-    virtual void updateLocalSnapshot(const OpTime& optime);
+    virtual void updateLastAppliedSnapshot(const OpTime& optime);
     virtual bool snapshotsEnabled() const;
     virtual void notifyOplogMetadataWaiters(const OpTime& committedOpTime);
     boost::optional<OpTime> getEarliestDropPendingOpTime() const final;
@@ -106,9 +110,20 @@ public:
     void addSelf(const HostAndPort& host);
 
     /**
+     * Remove all hosts from the list of hosts that this mock will match when responding to "isSelf"
+     * messages.
+     */
+    void clearSelfHosts();
+
+    /**
      * Sets the return value for subsequent calls to loadLocalConfigDocument().
      */
     void setLocalConfigDocument(const StatusWith<BSONObj>& localConfigDocument);
+
+    /**
+     * Initializes the return value for subsequent calls to loadLocalLastVoteDocument().
+     */
+    Status createLocalLastVoteCollection(OperationContext* opCtx) final;
 
     /**
      * Sets the return value for subsequent calls to loadLocalLastVoteDocument().
@@ -124,7 +139,7 @@ public:
      * Sets the return value for subsequent calls to loadLastOpTimeApplied.
      */
     void setLastOpTimeAndWallTime(const StatusWith<OpTime>& lastApplied,
-                                  Date_t lastAppliedWall = Date_t::min());
+                                  Date_t lastAppliedWall = Date_t());
 
     /**
      * Sets the return value for subsequent calls to storeLocalConfigDocument().
@@ -191,7 +206,8 @@ private:
     Status _storeLocalConfigDocumentStatus;
     Status _storeLocalLastVoteDocumentStatus;
     // mutex and cond var for controlling stroeLocalLastVoteDocument()'s hanging
-    stdx::mutex _shouldHangLastVoteMutex;
+    Mutex _shouldHangLastVoteMutex =
+        MONGO_MAKE_LATCH("ReplicationCoordinatorExternalStateMock::_shouldHangLastVoteMutex");
     stdx::condition_variable _shouldHangLastVoteCondVar;
     bool _storeLocalLastVoteDocumentShouldHang;
     bool _connectionsClosed;

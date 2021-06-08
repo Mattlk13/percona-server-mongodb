@@ -31,16 +31,15 @@
 
 #include "mongo/scripting/mozjs/mongo.h"
 
+#include <memory>
+
 #include "mongo/bson/simple_bsonelement_comparator.h"
+#include "mongo/client/client_api_version_parameters_gen.h"
 #include "mongo/client/dbclient_base.h"
 #include "mongo/client/dbclient_rs.h"
 #include "mongo/client/global_conn_pool.h"
 #include "mongo/client/mongo_uri.h"
-#include "mongo/client/native_sasl_client_session.h"
 #include "mongo/client/replica_set_monitor.h"
-#include "mongo/client/sasl_client_authenticate.h"
-#include "mongo/client/sasl_client_session.h"
-#include "mongo/db/auth/sasl_command_constants.h"
 #include "mongo/db/logical_session_id.h"
 #include "mongo/db/logical_session_id_helpers.h"
 #include "mongo/db/namespace_string.h"
@@ -53,7 +52,6 @@
 #include "mongo/scripting/mozjs/valuereader.h"
 #include "mongo/scripting/mozjs/valuewriter.h"
 #include "mongo/scripting/mozjs/wrapconstrainedmethod.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/quick_exit.h"
 
@@ -63,7 +61,6 @@ namespace mozjs {
 const JSFunctionSpec MongoBase::methods[] = {
     MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(auth, MongoExternalInfo),
     MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(close, MongoExternalInfo),
-    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(copyDatabaseWithSCRAM, MongoExternalInfo),
     MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(cursorFromId, MongoExternalInfo),
     MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(cursorHandleFromId, MongoExternalInfo),
     MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(find, MongoExternalInfo),
@@ -86,6 +83,8 @@ const JSFunctionSpec MongoBase::methods[] = {
     MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(getMaxWireVersion, MongoExternalInfo),
     MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(isReplicaSetMember, MongoExternalInfo),
     MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(isMongos, MongoExternalInfo),
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(isTLS, MongoExternalInfo),
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(getApiParameters, MongoExternalInfo),
     MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(_startSession, MongoExternalInfo),
     JS_FS_END,
 };
@@ -189,7 +188,8 @@ void setHiddenMongo(JSContext* cx,
 
         ObjectWrapper from(cx, args.thisv());
         ObjectWrapper to(cx, newMongo);
-        for (const auto& k : {InternedString::slaveOk, InternedString::defaultDB}) {
+        for (const auto& k :
+             {InternedString::slaveOk, InternedString::defaultDB, InternedString::authenticated}) {
             JS::RootedValue tmpValue(cx);
             from.getValue(k, &tmpValue);
             to.setValue(k, tmpValue);
@@ -280,6 +280,12 @@ void MongoBase::Functions::runCommand::call(JSContext* cx, JS::CallArgs args) {
     // Also, we make a copy here because we want a copy after we dump cmdRes
     ValueReader(cx, args.rval()).fromBSON(cmdRes.getOwned(), nullptr, false /* read only */);
     setHiddenMongo(cx, std::get<1>(resTuple), conn.get(), args);
+
+    ObjectWrapper o(cx, args.rval());
+    if (!o.hasField(InternedString::_commandObj)) {
+        o.defineProperty(
+            InternedString::_commandObj, args.get(1), JSPROP_READONLY | JSPROP_PERMANENT);
+    }
 }
 
 void MongoBase::Functions::runCommandWithMetadata::call(JSContext* cx, JS::CallArgs args) {
@@ -364,7 +370,7 @@ void MongoBase::Functions::find::call(JSContext* cx, JS::CallArgs args) {
                                                        q,
                                                        nToReturn,
                                                        nToSkip,
-                                                       haveFields ? &fields : NULL,
+                                                       haveFields ? &fields : nullptr,
                                                        options,
                                                        batchSize));
     if (!cursor.get()) {
@@ -590,7 +596,7 @@ void MongoBase::Functions::cursorFromId::call(JSContext* cx, JS::CallArgs args) 
     long long cursorId = NumberLongInfo::ToNumberLong(cx, args.get(1));
 
     // The shell only calls this method when it wants to test OP_GETMORE.
-    auto cursor = stdx::make_unique<DBClientCursor>(
+    auto cursor = std::make_unique<DBClientCursor>(
         conn, NamespaceString(ns), cursorId, 0, DBClientCursor::QueryOptionLocal_forceOpQuery);
 
     if (args.get(2).isNumber())
@@ -627,84 +633,6 @@ void MongoBase::Functions::cursorHandleFromId::call(JSContext* cx, JS::CallArgs 
     setCursorHandle(scope, c, NamespaceString(ns), cursorId, args);
 
     args.rval().setObjectOrNull(c);
-}
-
-void MongoBase::Functions::copyDatabaseWithSCRAM::call(JSContext* cx, JS::CallArgs args) {
-    auto conn = getConnection(args);
-
-    if (!conn)
-        uasserted(ErrorCodes::BadValue, "no connection");
-
-    if (args.length() != 6)
-        uasserted(ErrorCodes::BadValue, "copyDatabase needs 6 arg");
-
-    // copyDatabase(fromdb, todb, fromhost, username, password);
-    std::string fromDb = ValueWriter(cx, args.get(0)).toString();
-    std::string toDb = ValueWriter(cx, args.get(1)).toString();
-    std::string fromHost = ValueWriter(cx, args.get(2)).toString();
-    std::string user = ValueWriter(cx, args.get(3)).toString();
-    std::string password = ValueWriter(cx, args.get(4)).toString();
-    bool slaveOk = ValueWriter(cx, args.get(5)).toBoolean();
-
-    std::string hashedPwd = DBClientBase::createPasswordDigest(user, password);
-
-    std::unique_ptr<SaslClientSession> session(new NativeSaslClientSession());
-
-    session->setParameter(SaslClientSession::parameterMechanism, "SCRAM-SHA-1");
-    session->setParameter(SaslClientSession::parameterUser, user);
-    session->setParameter(SaslClientSession::parameterPassword, hashedPwd);
-    session->initialize().transitional_ignore();
-
-    BSONObj saslFirstCommandPrefix =
-        BSON("copydbsaslstart" << 1 << "fromhost" << fromHost << "fromdb" << fromDb
-                               << saslCommandMechanismFieldName
-                               << "SCRAM-SHA-1");
-
-    BSONObj saslFollowupCommandPrefix = BSON(
-        "copydb" << 1 << "fromhost" << fromHost << "fromdb" << fromDb << "todb" << toDb << "slaveOk"
-                 << slaveOk);
-
-    BSONObj saslCommandPrefix = saslFirstCommandPrefix;
-    BSONObj inputObj = BSON(saslCommandPayloadFieldName << "");
-    bool isServerDone = false;
-
-    while (!session->isSuccess()) {
-        std::string payload;
-        BSONType type;
-
-        Status status = saslExtractPayload(inputObj, &payload, &type);
-        uassertStatusOK(status);
-
-        std::string responsePayload;
-        status = session->step(payload, &responsePayload);
-        uassertStatusOK(status);
-
-        BSONObjBuilder commandBuilder(std::move(saslCommandPrefix));
-        commandBuilder.appendBinData(saslCommandPayloadFieldName,
-                                     static_cast<int>(responsePayload.size()),
-                                     BinDataGeneral,
-                                     responsePayload.c_str());
-        BSONElement conversationId = inputObj[saslCommandConversationIdFieldName];
-        if (!conversationId.eoo())
-            commandBuilder.append(conversationId);
-
-        BSONObj command = commandBuilder.obj();
-
-        bool ok = conn->runCommand("admin", command, inputObj);
-        if (!ok) {
-            ValueReader(cx, args.rval()).fromBSON(inputObj, nullptr, true);
-            return;
-        }
-
-        isServerDone = inputObj[saslCommandDoneFieldName].trueValue();
-        saslCommandPrefix = saslFollowupCommandPrefix;
-    }
-
-    if (!isServerDone) {
-        uasserted(ErrorCodes::InternalError, "copydb client finished before server.");
-    }
-
-    ValueReader(cx, args.rval()).fromBSON(inputObj, nullptr, true);
 }
 
 void MongoBase::Functions::getClientRPCProtocols::call(JSContext* cx, JS::CallArgs args) {
@@ -760,7 +688,7 @@ void MongoBase::Functions::isReplicaSetConnection::call(JSContext* cx, JS::CallA
         uasserted(ErrorCodes::BadValue, "isReplicaSetConnection takes no args");
     }
 
-    args.rval().setBoolean(conn->type() == ConnectionString::ConnectionType::SET);
+    args.rval().setBoolean(conn->type() == ConnectionString::ConnectionType::kReplicaSet);
 }
 
 void MongoBase::Functions::_markNodeAsFailed::call(JSContext* cx, JS::CallArgs args) {
@@ -814,6 +742,7 @@ void setEncryptedDBClientCallback(EncryptedDBClientCallback* callback) {
     encryptedDBClientCallback = callback;
 }
 
+// "new Mongo(uri, encryptedDBClientCallback, {options...})"
 void MongoExternalInfo::construct(JSContext* cx, JS::CallArgs args) {
     auto scope = getScope(cx);
 
@@ -825,15 +754,39 @@ void MongoExternalInfo::construct(JSContext* cx, JS::CallArgs args) {
 
     auto cs = uassertStatusOK(MongoURI::parse(host));
 
+    ClientAPIVersionParameters apiParameters;
+    if (args.length() > 2 && !args.get(2).isUndefined()) {
+        uassert(4938000,
+                str::stream() << "the 'options' parameter to Mongo() must be an object",
+                args.get(2).isObject());
+        auto options = ValueWriter(cx, args.get(2)).toBSON();
+        if (options.hasField("api")) {
+            uassert(4938001,
+                    "the 'api' option for Mongo() must be an object",
+                    options["api"].isABSONObj());
+            apiParameters = ClientAPIVersionParameters::parse(IDLParserErrorContext("api"_sd),
+                                                              options["api"].Obj());
+            if (apiParameters.getDeprecationErrors().value_or(false) ||
+                apiParameters.getStrict().value_or(false)) {
+                uassert(4938002,
+                        "the 'api' option for Mongo() must include 'version' if it includes "
+                        "'strict' or "
+                        "'deprecationErrors'",
+                        apiParameters.getVersion());
+            }
+        }
+    }
+
     boost::optional<std::string> appname = cs.getAppName();
     std::string errmsg;
-    std::unique_ptr<DBClientBase> conn(cs.connect(appname.value_or("MongoDB Shell"), errmsg));
+    std::unique_ptr<DBClientBase> conn(
+        cs.connect(appname.value_or("MongoDB Shell"), errmsg, boost::none, &apiParameters));
 
     if (!conn.get()) {
         uasserted(ErrorCodes::InternalError, errmsg);
     }
 
-    ScriptEngine::runConnectCallback(*conn);
+    ScriptEngine::runConnectCallback(*conn, host);
 
     JS::RootedObject thisv(cx);
     scope->getProto<MongoExternalInfo>().newObject(&thisv);
@@ -884,6 +837,17 @@ void MongoBase::Functions::isMongos::call(JSContext* cx, JS::CallArgs args) {
     args.rval().setBoolean(conn->isMongos());
 }
 
+void MongoBase::Functions::isTLS::call(JSContext* cx, JS::CallArgs args) {
+    auto conn = getConnection(args);
+
+    args.rval().setBoolean(conn->isTLS());
+}
+
+void MongoBase::Functions::getApiParameters::call(JSContext* cx, JS::CallArgs args) {
+    auto conn = getConnection(args);
+    ValueReader(cx, args.rval()).fromBSON(conn->getApiParameters().toBSON(), nullptr, false);
+}
+
 void MongoBase::Functions::_startSession::call(JSContext* cx, JS::CallArgs args) {
     auto client =
         static_cast<std::shared_ptr<DBClientBase>*>(JS_GetPrivate(args.thisv().toObjectOrNull()));
@@ -923,7 +887,7 @@ void MongoExternalInfo::Functions::_forgetReplSet::call(JSContext* cx, JS::CallA
     }
 
     std::string rsName = ValueWriter(cx, args.get(0)).toString();
-    globalRSMonitorManager.removeMonitor(rsName);
+    ReplicaSetMonitorManager::get()->removeMonitor(rsName);
 
     args.rval().setUndefined();
 }

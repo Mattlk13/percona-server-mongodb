@@ -51,15 +51,7 @@ int ProcessInfo::getResidentSize() {
     return -1;
 }
 
-double ProcessInfo::getSystemMemoryPressurePercentage() {
-    return 0.0;
-}
-
 bool ProcessInfo::checkNumaEnabled() {
-    return false;
-}
-
-bool ProcessInfo::blockCheckSupported() {
     return false;
 }
 
@@ -67,15 +59,7 @@ void ProcessInfo::SystemInfo::collectSystemInfo() {}
 
 void ProcessInfo::getExtraInfo(BSONObjBuilder& info) {}
 
-bool ProcessInfo::blockInMemory(const void* start) {
-    verify(0);
-}
-
-bool ProcessInfo::pagesInMemory(const void* start, size_t numPages, std::vector<char>* out) {
-    verify(0);
-}
-
 boost::optional<unsigned long> ProcessInfo::getNumCoresForProcess() {
     return boost::none;
 }
-}
+}  // namespace mongo

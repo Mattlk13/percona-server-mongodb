@@ -27,28 +27,32 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kASIO
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kASIO
 
 #include "mongo/platform/basic.h"
 
+#include <memory>
+
 #include "mongo/client/connection_string.h"
+#include "mongo/db/wire_version.h"
 #include "mongo/executor/network_interface_factory.h"
 #include "mongo/executor/network_interface_integration_fixture.h"
 #include "mongo/executor/remote_command_response.h"
 #include "mongo/executor/task_executor.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/stdx/future.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/integration_test.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace executor {
 
-void NetworkInterfaceIntegrationFixture::startNet(
-    std::unique_ptr<NetworkConnectionHook> connectHook) {
-    ConnectionPool::Options options;
+void NetworkInterfaceIntegrationFixture::createNet(
+    std::unique_ptr<NetworkConnectionHook> connectHook, ConnectionPool::Options options) {
+
+    options.minConnections = 0u;
+
 #ifdef _WIN32
     // Connections won't queue on widnows, so attempting to open too many connections
     // concurrently will result in refused connections and test failure.
@@ -58,8 +62,13 @@ void NetworkInterfaceIntegrationFixture::startNet(
 #endif
     _net = makeNetworkInterface(
         "NetworkInterfaceIntegrationFixture", std::move(connectHook), nullptr, std::move(options));
+}
 
-    _net->startup();
+void NetworkInterfaceIntegrationFixture::startNet(
+    std::unique_ptr<NetworkConnectionHook> connectHook) {
+
+    createNet(std::move(connectHook));
+    net().startup();
 }
 
 void NetworkInterfaceIntegrationFixture::tearDown() {
@@ -83,34 +92,105 @@ PseudoRandom* NetworkInterfaceIntegrationFixture::getRandomNumberGenerator() {
     return _rng;
 }
 
+void NetworkInterfaceIntegrationFixture::resetIsInternalClient(bool isInternalClient) {
+    WireSpec::Specification newSpec = *WireSpec::instance().get();
+    newSpec.isInternalClient = isInternalClient;
+    WireSpec::instance().reset(std::move(newSpec));
+}
+
 void NetworkInterfaceIntegrationFixture::startCommand(const TaskExecutor::CallbackHandle& cbHandle,
                                                       RemoteCommandRequest& request,
                                                       StartCommandCB onFinish) {
-    net().startCommand(cbHandle, request, onFinish).transitional_ignore();
+    RemoteCommandRequestOnAny rcroa{request};
+
+    auto cb = [onFinish = std::move(onFinish)](const TaskExecutor::ResponseOnAnyStatus& rs) {
+        onFinish(rs);
+    };
+    invariant(net().startCommand(cbHandle, rcroa, std::move(cb)));
 }
 
 Future<RemoteCommandResponse> NetworkInterfaceIntegrationFixture::runCommand(
     const TaskExecutor::CallbackHandle& cbHandle, RemoteCommandRequest request) {
-    return net().startCommand(cbHandle, request);
+    RemoteCommandRequestOnAny rcroa{request};
+
+    return net().startCommand(cbHandle, rcroa).then([](TaskExecutor::ResponseOnAnyStatus roa) {
+        auto res = RemoteCommandResponse(roa);
+        if (res.isOK()) {
+            LOGV2(4820500,
+                  "Got command result: {response}",
+                  "Got command result",
+                  "response"_attr = res.toString());
+        } else {
+            LOGV2(4820501, "Command failed: {error}", "Command failed", "error"_attr = res.status);
+        }
+        return res;
+    });
+}
+
+Future<RemoteCommandOnAnyResponse> NetworkInterfaceIntegrationFixture::runCommandOnAny(
+    const TaskExecutor::CallbackHandle& cbHandle, RemoteCommandRequestOnAny request) {
+    RemoteCommandRequestOnAny rcroa{request};
+
+    return net().startCommand(cbHandle, rcroa).then([](TaskExecutor::ResponseOnAnyStatus roa) {
+        if (roa.isOK()) {
+            LOGV2(4820502,
+                  "Got command result: {response}",
+                  "Got command result",
+                  "response"_attr = roa.toString());
+        } else {
+            LOGV2(4820503, "Command failed: {error}", "Command failed", "error"_attr = roa.status);
+        }
+        return roa;
+    });
+}
+
+Future<void> NetworkInterfaceIntegrationFixture::startExhaustCommand(
+    const TaskExecutor::CallbackHandle& cbHandle,
+    RemoteCommandRequest request,
+    std::function<void(const RemoteCommandResponse&)> exhaustUtilCB,
+    const BatonHandle& baton) {
+    RemoteCommandRequestOnAny rcroa{request};
+    auto pf = makePromiseFuture<void>();
+
+    auto status = net().startExhaustCommand(
+        cbHandle,
+        rcroa,
+        [p = std::move(pf.promise), exhaustUtilCB = std::move(exhaustUtilCB)](
+            const TaskExecutor::ResponseOnAnyStatus& rs) mutable {
+            exhaustUtilCB(rs);
+
+            if (!rs.status.isOK()) {
+                invariant(!rs.moreToCome);
+                p.setError(rs.status);
+                return;
+            }
+
+            if (!rs.moreToCome) {
+                p.emplaceValue();
+            }
+        },
+        baton);
+
+    if (!status.isOK()) {
+        return status;
+    }
+    return std::move(pf.future);
 }
 
 RemoteCommandResponse NetworkInterfaceIntegrationFixture::runCommandSync(
     RemoteCommandRequest& request) {
     auto deferred = runCommand(makeCallbackHandle(), request);
     auto& res = deferred.get();
-    if (res.isOK()) {
-        log() << "got command result: " << res.toString();
-    } else {
-        log() << "command failed: " << res.status;
-    }
     return res;
 }
 
 void NetworkInterfaceIntegrationFixture::assertCommandOK(StringData db,
                                                          const BSONObj& cmd,
-                                                         Milliseconds timeoutMillis) {
+                                                         Milliseconds timeoutMillis,
+                                                         transport::ConnectSSLMode sslMode) {
     RemoteCommandRequest request{
         fixture().getServers()[0], db.toString(), cmd, BSONObj(), nullptr, timeoutMillis};
+    request.sslMode = sslMode;
     auto res = runCommandSync(request);
     ASSERT_OK(res.status);
     ASSERT_OK(getStatusFromCommandResult(res.data));

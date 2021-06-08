@@ -9,7 +9,6 @@
  * index drops.
  */
 var $config = (function() {
-
     let data = {
         collName: 'drop_index_during_replan',
         indexSpecs: [
@@ -47,7 +46,10 @@ var $config = (function() {
             db[collName].dropIndex({b: 1});
 
             // Recreate the index that was dropped.
-            assertAlways.commandWorked(db[collName].createIndex({b: 1}));
+            assertAlways.commandWorkedOrFailedWithCode(db[collName].createIndex({b: 1}), [
+                ErrorCodes.IndexBuildAborted,
+                ErrorCodes.NoMatchingDocument,
+            ]);
         }
     };
 
@@ -75,5 +77,4 @@ var $config = (function() {
         transitions: transitions,
         setup: setup
     };
-
 })();

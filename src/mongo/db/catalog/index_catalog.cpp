@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kIndex
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kIndex
 
 #include "mongo/platform/basic.h"
 
@@ -67,11 +67,13 @@ const IndexCatalogEntry* ReadyIndexesIterator::_advance() {
         ++_iterator;
 
         if (auto minSnapshot = entry->getMinimumVisibleSnapshot()) {
-            if (auto mySnapshot = _opCtx->recoveryUnit()->getPointInTimeReadTimestamp()) {
-                if (mySnapshot < minSnapshot) {
-                    // This index isn't finished in my snapshot.
-                    continue;
-                }
+            auto mySnapshot =
+                _opCtx->recoveryUnit()->getPointInTimeReadTimestamp(_opCtx).get_value_or(
+                    _opCtx->recoveryUnit()->getCatalogConflictingTimestamp());
+
+            if (!mySnapshot.isNull() && mySnapshot < minSnapshot.get()) {
+                // This index isn't finished in my snapshot.
+                continue;
             }
         }
 
@@ -97,5 +99,16 @@ const IndexCatalogEntry* AllIndexesIterator::_advance() {
     IndexCatalogEntry* entry = *_iterator;
     ++_iterator;
     return entry;
+}
+
+StringData toString(IndexBuildMethod method) {
+    switch (method) {
+        case IndexBuildMethod::kHybrid:
+            return "Hybrid"_sd;
+        case IndexBuildMethod::kForeground:
+            return "Foreground"_sd;
+    }
+
+    MONGO_UNREACHABLE;
 }
 }  // namespace mongo

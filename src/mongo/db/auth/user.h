@@ -42,6 +42,7 @@
 #include "mongo/platform/atomic_word.h"
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/stdx/unordered_set.h"
+#include "mongo/util/read_through_cache.h"
 
 namespace mongo {
 
@@ -64,6 +65,8 @@ class User {
     User& operator=(const User&) = delete;
 
 public:
+    using UserId = std::vector<std::uint8_t>;
+
     template <typename HashBlock>
     struct SCRAMCredentials {
         SCRAMCredentials() : iterationCount(0), salt(""), serverKey(""), storedKey("") {}
@@ -82,7 +85,12 @@ public:
                 base64::validate(serverKey) && (storedKey.size() == kEncodedHashLength) &&
                 base64::validate(storedKey);
         }
+
+        bool empty() const {
+            return !iterationCount && salt.empty() && serverKey.empty() && storedKey.empty();
+        }
     };
+
     struct CredentialData {
         CredentialData() : scram_sha1(), scram_sha256(), isExternal(false) {}
 
@@ -100,11 +108,12 @@ public:
         const SCRAMCredentials<HashBlock>& scram() const;
     };
 
-    typedef stdx::unordered_map<ResourcePattern, Privilege> ResourcePrivilegeMap;
+    using ResourcePrivilegeMap = stdx::unordered_map<ResourcePattern, Privilege>;
 
     explicit User(const UserName& name);
+    User(User&&) = default;
+    User& operator=(User&&) = default;
 
-    using UserId = std::vector<std::uint8_t>;
     const UserId& getID() const {
         return _id;
     }
@@ -126,7 +135,6 @@ public:
     const SHA256Block& getDigest() const {
         return _digest;
     }
-
 
     /**
      * Returns an iterator over the names of the user's direct roles
@@ -164,13 +172,6 @@ public:
      * Returns true if the user has is allowed to perform an action on the given resource.
      */
     bool hasActionsForResource(const ResourcePattern& resource) const;
-
-    /**
-     * Returns true if this copy of information about this user is still valid. If this returns
-     * false, this object should no longer be used and should be returned to the
-     * AuthorizationManager and a new User object for this user should be requested.
-     */
-    bool isValid() const;
 
     // Mutators below.  Mutation functions should *only* be called by the AuthorizationManager
 
@@ -226,23 +227,29 @@ public:
     const RestrictionDocuments& getRestrictions() const& noexcept {
         return _restrictions;
     }
-    void getRestrictions() && = delete;
 
-protected:
-    friend class AuthorizationManagerImpl;
     /**
-     * Marks this instance of the User object as invalid, most likely because information about
-     * the user has been updated and needs to be reloaded from the AuthorizationManager.
-     *
-     * This method should *only* be called by the AuthorizationManager.
+     * Replaces any existing authentication restrictions with "restrictions".
      */
-    void _invalidate();
+    void setIndirectRestrictions(RestrictionDocuments restrictions) &;
+
+    /**
+     * Gets any set authentication restrictions.
+     */
+    const RestrictionDocuments& getIndirectRestrictions() const& noexcept {
+        return _indirectRestrictions;
+    }
+
+    /**
+     * Process both direct and indirect authentication restrictions.
+     */
+    Status validateRestrictions(OperationContext* opCtx) const;
 
 private:
-    // Unique ID (often UUID) for this user.
-    // May be empty for legacy users.
+    // Unique ID (often UUID) for this user. May be empty for legacy users.
     UserId _id;
 
+    // The full user name (as specified by the administrator)
     UserName _name;
 
     // Digest of the full username
@@ -263,10 +270,41 @@ private:
     // Restrictions which must be met by a Client in order to authenticate as this user.
     RestrictionDocuments _restrictions;
 
-    // Indicates whether the user has been marked as invalid by the AuthorizationManager.
-    AtomicWord<bool> _isValid{true};
+    // Indirect restrictions inherited via roles.
+    RestrictionDocuments _indirectRestrictions;
 };
 
-using UserHandle = std::shared_ptr<User>;
+/**
+ * Represents the properties required to request a UserHandle.
+ * This type is hashable and may be used as a key describing requests
+ */
+struct UserRequest {
+    UserRequest(const UserName& name, boost::optional<std::set<RoleName>> roles)
+        : name(name), roles(std::move(roles)) {}
+
+
+    template <typename H>
+    friend H AbslHashValue(H h, const UserRequest& key) {
+        auto state = H::combine(std::move(h), key.name);
+        if (key.roles) {
+            for (const auto& role : *key.roles) {
+                state = H::combine(std::move(state), role);
+            }
+        }
+        return state;
+    }
+
+    bool operator==(const UserRequest& key) const {
+        return name == key.name && roles == key.roles;
+    }
+
+    // The name of the requested user
+    UserName name;
+    // Any authorization grants which should override and be used in favor of roles acquisition.
+    boost::optional<std::set<RoleName>> roles;
+};
+
+using UserCache = ReadThroughCache<UserRequest, User>;
+using UserHandle = UserCache::ValueHandle;
 
 }  // namespace mongo

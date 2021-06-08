@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 #include "mongo/platform/basic.h"
 
@@ -49,13 +49,16 @@
 #include <sys/types.h>
 #endif
 
+#include <fmt/format.h>
+
 #include "mongo/base/init.h"
 #include "mongo/config.h"
+#include "mongo/logv2/log.h"
 #include "mongo/platform/atomic_word.h"
-#include "mongo/util/log.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
+using namespace fmt::literals;
 
 namespace {
 
@@ -89,50 +92,59 @@ void setWindowsThreadName(DWORD dwThreadID, const char* threadName) {
 }
 #endif
 
-AtomicWord<long long> nextUnnamedThreadId{1};
+constexpr auto kMainId = size_t{0};
 
-// It is unsafe to access threadName before its dynamic initialization has completed. Use
-// the execution of mongo initializers (which only happens once we have entered main, and
-// therefore after dynamic initialization is complete) to signal that it is safe to use
-// 'threadName'.
-bool mongoInitializersHaveRun{};
-MONGO_INITIALIZER(ThreadNameInitializer)(InitializerContext*) {
-    mongoInitializersHaveRun = true;
-    // The global initializers should only ever be run from main, so setting thread name
-    // here makes sense.
-    setThreadName("main");
-    return Status::OK();
+auto makeAnonymousThreadName() {
+    static auto gNextAnonymousId = AtomicWord<size_t>{kMainId};
+    auto id = gNextAnonymousId.fetchAndAdd(1);
+    if (id == kMainId) {
+        // The first thread name should always be "main".
+        return make_intrusive<ThreadName>("main");
+    } else {
+        return make_intrusive<ThreadName>("thread{}"_format(id));
+    }
 }
 
-thread_local std::string threadNameStorage;
-}  // namespace
+struct ThreadNameSconce {
+    ThreadNameSconce() : cachedPtr(makeAnonymousThreadName()) {
+        // Note that we're not setting the thread name here. It will log differently, but appear the
+        // same in top and like.
+    }
 
-namespace for_debuggers {
-// This needs external linkage to ensure that debuggers can use it.
-thread_local StringData threadName;
-}  // namespace for_debuggers
-using for_debuggers::threadName;
+    // At any given time, either cachedPtr or activePtr can be valid, but not both.
+    boost::intrusive_ptr<ThreadName> activePtr;
+    boost::intrusive_ptr<ThreadName> cachedPtr;
+};
 
-void setThreadName(StringData name) {
-    invariant(mongoInitializersHaveRun);
-    threadNameStorage = name.toString();
-    threadName = threadNameStorage;
+auto getSconce = ThreadContext::declareDecoration<ThreadNameSconce>();
+auto& getThreadName(const boost::intrusive_ptr<ThreadContext>& context) {
+    auto& sconce = getSconce(context.get());
+    if (sconce.activePtr) {
+        return sconce.activePtr;
+    }
 
+    return sconce.cachedPtr;
+}
+
+void setOSThreadName(StringData threadName) {
 #if defined(_WIN32)
     // Naming should not be expensive compared to thread creation and connection set up, but if
     // testing shows otherwise we should make this depend on DEBUG again.
-    setWindowsThreadName(GetCurrentThreadId(), threadNameStorage.c_str());
+    setWindowsThreadName(GetCurrentThreadId(), threadName.rawData());
 #elif defined(__APPLE__)
     // Maximum thread name length on OS X is MAXTHREADNAMESIZE (64 characters). This assumes
     // OS X 10.6 or later.
-    std::string threadNameCopy = threadNameStorage;
+    std::string threadNameCopy = threadName.toString();
     if (threadNameCopy.size() > MAXTHREADNAMESIZE) {
         threadNameCopy.resize(MAXTHREADNAMESIZE - 4);
         threadNameCopy += "...";
     }
     int error = pthread_setname_np(threadNameCopy.c_str());
     if (error) {
-        log() << "Ignoring error from setting thread name: " << errnoWithDescription(error);
+        LOGV2(23102,
+              "Ignoring error from setting thread name: {error}",
+              "Ignoring error from setting thread name",
+              "error"_attr = errnoWithDescription(error));
     }
 #elif defined(__linux__) && defined(MONGO_CONFIG_HAVE_PTHREAD_SETNAME_NP)
     // Do not set thread name on the main() thread. Setting the name on main thread breaks
@@ -145,34 +157,88 @@ void setThreadName(StringData name) {
         //  limit, it's best to shorten long names.
         int error = 0;
         if (threadName.size() > 15) {
-            std::string shortName = str::stream() << threadName.substr(0, 7) << '.'
-                                                  << threadName.substr(threadName.size() - 7);
+            std::string shortName = str::stream()
+                << threadName.substr(0, 7) << '.' << threadName.substr(threadName.size() - 7);
             error = pthread_setname_np(pthread_self(), shortName.c_str());
         } else {
             error = pthread_setname_np(pthread_self(), threadName.rawData());
         }
 
         if (error) {
-            log() << "Ignoring error from setting thread name: " << errnoWithDescription(error);
+            LOGV2(23103,
+                  "Ignoring error from setting thread name: {error}",
+                  "Ignoring error from setting thread name",
+                  "error"_attr = errnoWithDescription(error));
         }
     }
 #endif
 }
 
-StringData getThreadName() {
-    if (MONGO_unlikely(!mongoInitializersHaveRun)) {
-        // 'getThreadName' has been called before dynamic initialization for this
-        // translation unit has completed, so return a fallback value rather than accessing
-        // the 'threadName' variable, which requires dynamic initialization. We assume that
-        // we are in the 'main' thread.
-        static const std::string kFallback = "main";
+}  // namespace
+
+ThreadName::Id ThreadName::_nextId() {
+    static auto gNextId = AtomicWord<Id>{0};
+    return gNextId.fetchAndAdd(1);
+}
+
+StringData ThreadName::getStaticString() {
+    auto& context = ThreadContext::get();
+    if (!context) {
+        // Use a static fallback to avoid allocations. This is the string that will be used before
+        // initializers run in main a.k.a. pre-init.
+        static constexpr auto kFallback = "-"_sd;
         return kFallback;
     }
 
-    if (threadName.empty()) {
-        setThreadName(str::stream() << "thread" << nextUnnamedThreadId.fetchAndAdd(1));
-    }
-    return threadName;
+    return getThreadName(context)->toString();
 }
+
+boost::intrusive_ptr<ThreadName> ThreadName::get(boost::intrusive_ptr<ThreadContext> context) {
+    return getThreadName(context);
+}
+
+boost::intrusive_ptr<ThreadName> ThreadName::set(boost::intrusive_ptr<ThreadContext> context,
+                                                 boost::intrusive_ptr<ThreadName> name) {
+    invariant(name);
+
+    auto& sconce = getSconce(context.get());
+
+    if (sconce.activePtr) {
+        invariant(!sconce.cachedPtr);
+        if (*sconce.activePtr == *name) {
+            // The name was already set, skip setting it to the OS thread name.
+            return {};
+        } else {
+            // Replace the current active name with the new one, and set the OS thread name.
+            setOSThreadName(name->toString());
+            return std::exchange(sconce.activePtr, name);
+        }
+    } else if (sconce.cachedPtr) {
+        if (*sconce.cachedPtr == *name) {
+            // The name was cached, set it as active and skip setting it to the OS thread name.
+            sconce.activePtr = std::exchange(sconce.cachedPtr, {});
+            return {};
+        } else {
+            // The new name is different than the cached name, set the active, reset the cached, and
+            // set the OS thread name.
+            setOSThreadName(name->toString());
+
+            sconce.activePtr = name;
+            sconce.cachedPtr.reset();
+            return {};
+        }
+    }
+
+    MONGO_UNREACHABLE;
+}
+
+void ThreadName::release(boost::intrusive_ptr<ThreadContext> context) {
+    auto& sconce = getSconce(context.get());
+    if (sconce.activePtr) {
+        sconce.cachedPtr = std::exchange(sconce.activePtr, {});
+    }
+}
+
+ThreadName::ThreadName(StringData name) : _id(_nextId()), _storage(name.toString()){};
 
 }  // namespace mongo

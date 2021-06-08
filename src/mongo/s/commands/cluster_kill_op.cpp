@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -38,15 +38,16 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/client/connpool.h"
+#include "mongo/db/api_parameters.h"
 #include "mongo/db/audit.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/kill_op_cmd_base.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/metadata.h"
 #include "mongo/s/client/shard.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
-#include "mongo/util/log.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -86,16 +87,17 @@ private:
 
         uassert(28625,
                 str::stream() << "The op argument to killOp must be of the format shardid:opid"
-                              << " but found \""
-                              << opToKill
-                              << '"',
+                              << " but found \"" << opToKill << '"',
                 (opToKill.size() >= 3) &&                  // must have at least N:N
                     (opSepPos != std::string::npos) &&     // must have ':' as separator
                     (opSepPos != 0) &&                     // can't be :NN
                     (opSepPos != (opToKill.size() - 1)));  // can't be NN:
 
         auto shardIdent = opToKill.substr(0, opSepPos);
-        log() << "want to kill op: " << redact(opToKill);
+        LOGV2(22754,
+              "About to kill op: {opToKill}",
+              "About to kill op",
+              "opToKill"_attr = redact(opToKill));
 
         // Will throw if shard id is not found
         auto shardStatus = Grid::get(opCtx)->shardRegistry()->getShard(opCtx, shardIdent);
@@ -103,15 +105,17 @@ private:
         auto shard = shardStatus.getValue();
 
         int opId;
-        uassertStatusOK(parseNumberFromStringWithBase(opToKill.substr(opSepPos + 1), 10, &opId));
+        uassertStatusOK(NumberParser().base(10)(opToKill.substr(opSepPos + 1), &opId));
 
         // shardid is actually the opid - keeping for backwards compatibility.
         result.append("shard", shardIdent);
         result.append("shardid", opId);
 
         ScopedDbConnection conn(shard->getConnString());
+        BSONObjBuilder bob(BSON("killOp" << 1 << "op" << opId));
+        APIParameters::get(opCtx).appendInfo(&bob);
         // intentionally ignore return value - that is how legacy killOp worked.
-        conn->runCommand(OpMsgRequest::fromDBAndBody("admin", BSON("killOp" << 1 << "op" << opId)));
+        conn->runCommand(OpMsgRequest::fromDBAndBody("admin", bob.obj()));
         conn.done();
 
         // The original behavior of killOp on mongos is to always return success, regardless of

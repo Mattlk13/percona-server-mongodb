@@ -44,12 +44,10 @@ Copyright (C) 2018-present Percona and/or its affiliates. All rights reserved.
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/encryption/encryption_options.h"
 #include "mongo/db/json.h"
-#include "mongo/db/storage/kv/kv_prefix.h"
 #include "mongo/db/storage/wiredtiger/encryption_keydb.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_data_protector.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_encryption_hooks.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/temp_dir.h"
 #include "mongo/unittest/unittest.h"
 
@@ -83,7 +81,7 @@ public:
             encryptionGlobalParams.encryptionKeyFile,
             boost::filesystem::owner_read | boost::filesystem::owner_write);
 
-        _encryptionKeyDB = stdx::make_unique<EncryptionKeyDB>(_keydbpath.path());
+        _encryptionKeyDB = std::make_unique<EncryptionKeyDB>(_keydbpath.path());
         _encryptionKeyDB->init();
     }
 
@@ -154,18 +152,29 @@ void test_encryption_hooks(WiredTigerEncryptionHooks* hooks) {
     std::unique_ptr<uint8_t[]> cipherText;
     cipherText.reset(new uint8_t[protectedSizeMax]);
     size_t cipherLen;
-    ASSERT_OK(hooks->protectTmpData(data, datalen, cipherText.get(), protectedSizeMax, &cipherLen));
+    // pass boost::none to use ephemeral key
+    ASSERT_OK(hooks->protectTmpData(
+        data, datalen, cipherText.get(), protectedSizeMax, &cipherLen, boost::none));
     ASSERT_TRUE(cipherLen <= protectedSizeMax);
     ASSERT_EQ(protectorTextLen, cipherLen);
 
     std::unique_ptr<uint8_t[]> plainText;
     plainText.reset(new uint8_t[cipherLen]);
     size_t plainLen;
-    ASSERT_OK(hooks->unprotectTmpData(cipherText.get(), cipherLen, plainText.get(), cipherLen, &plainLen));
+    // pass boost::none to use ephemeral key
+    ASSERT_OK(hooks->unprotectTmpData(
+        cipherText.get(), cipherLen, plainText.get(), cipherLen, &plainLen, boost::none));
     ASSERT_EQ(plainLen, datalen);
     ASSERT_EQ(0, memcmp(plainText.get(), data, datalen));
 
-    ASSERT_OK(hooks->unprotectTmpData(protectorText.get(), protectorTextLen, plainText.get(), protectorTextLen, &plainLen));
+    // dataprotector uses masterkey to encrypt data so provide empty string to select correct key
+    // for decryption
+    ASSERT_OK(hooks->unprotectTmpData(protectorText.get(),
+                                      protectorTextLen,
+                                      plainText.get(),
+                                      protectorTextLen,
+                                      &plainLen,
+                                      std::string()));
     ASSERT_EQ(plainLen, datalen);
     ASSERT_EQ(0, memcmp(plainText.get(), data, datalen));
 }

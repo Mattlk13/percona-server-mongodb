@@ -7,7 +7,7 @@ Release:        @@RELEASE@@%{?dist}
 Summary:        High-performance MongoDB replacement from Percona (metapackage)
 Group:          Applications/Databases
 
-License:        AGPL 3.0
+License:        SSPL
 URL:            https://github.com/percona/percona-server-mongodb.git
 Source0:        @@SOURCE_TARBALL@@
 Source1:        mongod.conf
@@ -40,7 +40,7 @@ BuildRoot:      /var/tmp/%{name}-%{version}-%{release}
 %define         src_dir @@SRC_DIR@@
 
 BuildRequires: gcc, make, cmake, gcc-c++, openssl-devel, cyrus-sasl-devel
-BuildRequires: snappy-devel, zlib-devel, bzip2-devel, libpcap-devel
+BuildRequires: snappy-devel, zlib-devel, bzip2-devel, libpcap-devel, openldap-devel, xz-devel
 BuildRequires: /usr/bin/scons
 
 # %if 0%{?rhel} >= 6
@@ -51,9 +51,9 @@ Requires: %{name}-mongos = %{version}-%{release}
 Requires: %{name}-server = %{version}-%{release}
 Requires: %{name}-shell = %{version}-%{release}
 Requires: %{name}-tools = %{version}-%{release}
-Requires: numactl
+Requires: numactl, openldap, cyrus-sasl-gssapi
 
-Conflicts: Percona-Server-MongoDB < 4.0.0
+Conflicts: Percona-Server-MongoDB < 4.4.0
 Conflicts: Percona-Server-MongoDB-32 Percona-Server-MongoDB-34 Percona-Server-MongoDB-36 mongodb-org
 
 %description
@@ -113,8 +113,10 @@ Conflicts: Percona-Server-MongoDB-tools Percona-Server-MongoDB-32-tools Percona-
 
 export CC=${CC:-gcc}
 export CXX=${CXX:-g++}
-export PSM_TARGETS="mongod mongos mongo perconadecrypt"
+export PSM_TARGETS="mongod mongos mongo perconadecrypt mongobridge"
 export INSTALLDIR=$RPM_BUILD_DIR/install
+export INSTALLDIR_AWS=$RPM_BUILD_DIR/install_aws
+export AWS_LIBS="/usr/local"
 export TOOLS_TAGS="ssl sasl"
 export PORTABLE=1
 export USE_SSE=1
@@ -126,30 +128,52 @@ export GOPATH=$(pwd)/
 export PATH="/usr/local/go/bin:$PATH:$GOPATH"
 export GOBINPATH="/usr/local/go/bin"
 
+#aws-sdk-cpp
+pushd $RPM_BUILD_DIR/%{src_dir}/aws-sdk-cpp
+    pushd build
+%if 0%{?rhel} >= 7
+        cmake .. -DCMAKE_BUILD_TYPE=Release -DBUILD_ONLY="s3;transfer" -DBUILD_SHARED_LIBS=OFF -DMINIMIZE_SIZE=ON -DCMAKE_INSTALL_PREFIX="${INSTALLDIR_AWS}"
+        cmake --build . --target install
+%else
+        cmake3 CC=${CC} CXX=${CXX} .. -DCMAKE_BUILD_TYPE=Release -DBUILD_ONLY="s3;transfer" -DBUILD_SHARED_LIBS=OFF -DMINIMIZE_SIZE=ON -DCMAKE_INSTALL_PREFIX="${INSTALLDIR_AWS}"
+        cmake3 --build . --target install
+%endif
+
+    popd
+popd
+mkdir -p ${INSTALLDIR}/include/
+mkdir -p ${INSTALLDIR}/lib/
+mv ${INSTALLDIR_AWS}/include/* ${INSTALLDIR}/include/
+mv ${INSTALLDIR_AWS}/lib*/* ${INSTALLDIR}/lib/
+
 # Build PSfMDB with SCons
 pushd $RPM_BUILD_DIR/%{src_dir}
-buildscripts/scons.py CC=${CC} CXX=${CXX} --audit --release --ssl --opt=on  \
-%{?_smp_mflags} --use-sasl-client CPPPATH=${INSTALLDIR}/include LIBPATH=${INSTALLDIR}/lib \
---wiredtiger --inmemory --hotbackup ${PSM_TARGETS}
+buildscripts/scons.py CC=${CC} CXX=${CXX} --disable-warnings-as-errors --audit --release --ssl --opt=on  \
+%{?_smp_mflags} --use-sasl-client CPPPATH=${INSTALLDIR}/include LIBPATH="${INSTALLDIR}/lib ${AWS_LIBS}/lib ${AWS_LIBS}/lib64" \
+--wiredtiger --inmemory --hotbackup ${PSM_TARGETS} || exit $?
+rm -fr resmoke.ini
 popd
 
 # Mongo Tools compilation
-pushd $RPM_BUILD_DIR/%{src_dir}/mongo-tools
-mkdir -p build_tools/src/github.com/mongodb/mongo-tools
 mkdir -p $RPM_BUILD_DIR/%{src_dir}/bin
-cp -r $(ls | grep -v build_tools) build_tools/src/github.com/mongodb/mongo-tools/
-pushd build_tools/src/github.com/mongodb/mongo-tools
-sed -i 's|VersionStr="$(git describe)"|VersionStr="$PSMDB_TOOLS_REVISION"|' set_goenv.sh
-sed -i 's|Gitspec="$(git rev-parse HEAD)"|Gitspec="$PSMDB_TOOLS_COMMIT_HASH"|' set_goenv.sh
-sed -i 's|go build|go build -a -x|' build.sh
-sed -i 's|exit $ec||' build.sh
+pushd $RPM_BUILD_DIR/
+[[ ${PATH} == *"/usr/local/go/bin"* && -x /usr/local/go/bin/go ]] || export PATH=/usr/local/go/bin:${PATH}
+export GOROOT="/usr/local/go/"
+export GOPATH=$(pwd)/
+export PATH="/usr/local/go/bin:$PATH:$GOPATH"
+export GOBINPATH="/usr/local/go/bin"
+mkdir -p $GOPATH/src/github.com/mongodb
+cp -r $RPM_BUILD_DIR/%{src_dir}/mongo-tools ${GOPATH}/src/github.com/mongodb
+pushd ${GOPATH}/src/github.com/mongodb/mongo-tools
 . ./set_tools_revision.sh
-. ./set_goenv.sh
-mkdir -p bin
-. ./build.sh ${TOOLS_TAGS}
+sed -i '12d' buildscript/build.go
+sed -i '167,176d' buildscript/build.go
+sed -i "s:versionStr,:\"$PSMDB_TOOLS_REVISION\",:" buildscript/build.go
+sed -i "s:gitCommit):\"$PSMDB_TOOLS_COMMIT_HASH\"):" buildscript/build.go
+./make build
 mv bin/* $RPM_BUILD_DIR/%{src_dir}/bin
 popd
-popd
+
 
 %install
 #
@@ -187,6 +211,7 @@ install -m 755 mongo %{buildroot}/%{_bindir}/
 install -m 755 mongod %{buildroot}/%{_bindir}/
 install -m 755 mongos %{buildroot}/%{_bindir}/
 install -m 755 perconadecrypt %{buildroot}/%{_bindir}/
+install -m 755 mongobridge %{buildroot}/%{_bindir}/
 
 install -m 755 $RPM_BUILD_DIR/%{src_dir}/bin/* %{buildroot}/%{_bindir}/
 
@@ -203,6 +228,7 @@ install -m 644 $RPM_BUILD_DIR/%{src_dir}/manpages/* %{buildroot}/%{_mandir}/man1
 %defattr(-,root,root,-)
 %{_bindir}/mongod
 %{_bindir}/perconadecrypt
+%{_bindir}/mongobridge
 %{_mandir}/man1/mongod.1.gz
 %{_bindir}/percona-server-mongodb-helper.sh
 %{_bindir}/percona-server-mongodb-enable-auth.sh
@@ -217,7 +243,7 @@ install -m 644 $RPM_BUILD_DIR/%{src_dir}/manpages/* %{buildroot}/%{_mandir}/man1
 %config(noreplace) %{_sysconfdir}/mongod.conf
 %config(noreplace) %{_sysconfdir}/sysconfig/mongod
 %attr(0640,mongod,mongod) %ghost /var/log/mongo/mongod.log
-%doc GNU-AGPL-3.0 README THIRD-PARTY-NOTICES
+%doc LICENSE-Community.txt README THIRD-PARTY-NOTICES
 
 %files shell
 %defattr(-,root,root,-)
@@ -242,7 +268,7 @@ install -m 644 $RPM_BUILD_DIR/%{src_dir}/manpages/* %{buildroot}/%{_mandir}/man1
 %{_mandir}/man1/mongodump.1.gz
 %{_bindir}/mongotop
 %{_mandir}/man1/mongotop.1.gz
-%{_bindir}/mongoreplay
+#%{_bindir}/mongoreplay
 
 %pre server
 if [ $1 == 1 ]; then
@@ -368,5 +394,5 @@ fi
 #
 %changelog
 
-* Wed Nov 21 2018 Evgeniy Patlan <evgeniy.patlan@percona.com> 4.0
-- Initial RPM release for Percona Server for MongoDB
+* Thu Feb 27 2020 Oleksandr Miroshnychenko <alex.miroshnychenko@percona.com> - 4.4
+- Initial RPM release for Percona Server for MongoDB 4.4

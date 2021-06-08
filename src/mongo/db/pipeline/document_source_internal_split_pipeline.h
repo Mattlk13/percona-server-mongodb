@@ -71,18 +71,19 @@ public:
                 FacetRequirement::kAllowed,
                 TransactionRequirement::kAllowed,
                 _mergeType == HostTypeRequirement::kMongoS ? LookupRequirement::kNotAllowed
-                                                           : LookupRequirement::kAllowed};
+                                                           : LookupRequirement::kAllowed,
+                UnionRequirement::kAllowed};
     }
-
-    GetNextResult getNext() final;
 
 private:
     DocumentSourceInternalSplitPipeline(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                         HostTypeRequirement mergeType)
-        : DocumentSource(expCtx), _mergeType(mergeType) {}
+        : DocumentSource(kStageName, expCtx), _mergeType(mergeType) {}
+
+    GetNextResult doGetNext() final;
 
     Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
     HostTypeRequirement _mergeType = HostTypeRequirement::kNone;
 };
 
-}  // namesace mongo
+}  // namespace mongo

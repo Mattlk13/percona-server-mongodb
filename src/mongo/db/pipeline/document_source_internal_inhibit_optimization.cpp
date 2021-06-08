@@ -35,7 +35,8 @@ namespace mongo {
 
 REGISTER_DOCUMENT_SOURCE(_internalInhibitOptimization,
                          LiteParsedDocumentSourceDefault::parse,
-                         DocumentSourceInternalInhibitOptimization::createFromBson);
+                         DocumentSourceInternalInhibitOptimization::createFromBson,
+                         LiteParsedDocumentSource::AllowedWithApiStrict::kNeverInVersion1);
 
 constexpr StringData DocumentSourceInternalInhibitOptimization::kStageName;
 
@@ -55,8 +56,7 @@ boost::intrusive_ptr<DocumentSource> DocumentSourceInternalInhibitOptimization::
     return new DocumentSourceInternalInhibitOptimization(expCtx);
 }
 
-DocumentSource::GetNextResult DocumentSourceInternalInhibitOptimization::getNext() {
-    pExpCtx->checkForInterrupt();
+DocumentSource::GetNextResult DocumentSourceInternalInhibitOptimization::doGetNext() {
     return pSource->getNext();
 }
 
@@ -65,4 +65,4 @@ Value DocumentSourceInternalInhibitOptimization::serialize(
     return Value(Document{{getSourceName(), Value{Document{}}}});
 }
 
-}  // namesace mongo
+}  // namespace mongo

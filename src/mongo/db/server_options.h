@@ -30,6 +30,7 @@
 #pragma once
 
 #include "mongo/db/jsobj.h"
+#include "mongo/logv2/log_format.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/process_id.h"
 #include "mongo/stdx/variant.h"
@@ -38,7 +39,7 @@
 namespace mongo {
 
 const int DEFAULT_UNIX_PERMS = 0700;
-const int RATE_LIMIT_MAX = 1000;
+constexpr int RATE_LIMIT_MAX = 1000;
 constexpr size_t DEFAULT_MAX_CONN = 1000000;
 
 enum class ClusterRole { None, ShardServer, ConfigServer };
@@ -48,10 +49,13 @@ struct ServerGlobalParams {
     std::string cwd;         // cwd of when process started
 
     int port = DefaultDBPort;  // --port
-    enum { DefaultDBPort = 27017, ConfigServerPort = 27019, ShardServerPort = 27018 };
-    bool isDefaultPort() const {
-        return port == DefaultDBPort;
-    }
+    enum {
+        ConfigServerPort = 27019,
+        CryptDServerPort = 27020,
+        DefaultDBPort = 27017,
+        ShardServerPort = 27018,
+    };
+
     static std::string getPortSettingHelpText();
 
     std::vector<std::string> bind_ips;  // --bind_ip
@@ -59,8 +63,6 @@ struct ServerGlobalParams {
     bool rest = false;  // --rest
 
     int listenBacklog = 0;  // --listenBacklog, real default is SOMAXCONN
-
-    bool indexBuildRetry = true;  // --noIndexBuildRetry
 
     AtomicWord<bool> quiet{false};  // --quiet
 
@@ -70,7 +72,8 @@ struct ServerGlobalParams {
 
     bool objcheck = true;  // --objcheck
 
-    int defaultProfile = 0;                // --profile
+    int defaultProfile = 0;  // --profile
+    boost::optional<BSONObj> defaultProfileFilter;
     int slowMS = 100;                      // --time in ms that is "slow"
     int rateLimit = 1;                     // --rate limit in the range 1-RATE_LIMIT_MAX represents a  1/N probability that a query will be profiled
     double sampleRate = 1.0;               // --samplerate rate at which to sample slow queries
@@ -81,9 +84,6 @@ struct ServerGlobalParams {
     bool doFork = false;          // --fork
     std::string socket = "/tmp";  // UNIX domain socket directory
     std::string transportLayer;   // --transportLayer (must be either "asio" or "legacy")
-
-    // --serviceExecutor ("adaptive", "synchronous")
-    std::string serviceExecutor;
 
     size_t maxConns = DEFAULT_MAX_CONN;  // Maximum number of simultaneous open connections.
     std::vector<stdx::variant<CIDR, std::string>> maxConnsOverride;
@@ -97,15 +97,16 @@ struct ServerGlobalParams {
 
     bool relaxPermChecks = false;  // --relaxPermChecks
 
-    std::string logpath;            // Path to log file, if logging to a file; otherwise, empty.
+    std::string logpath;  // Path to log file, if logging to a file; otherwise, empty.
+    logv2::LogTimestampFormat logTimestampFormat = logv2::LogTimestampFormat::kISO8601Local;
+
     bool logAppend = false;         // True if logging to a file in append mode.
     bool logRenameOnRotate = true;  // True if logging should rename log files on rotate
     bool logWithSyslog = false;     // True if logging to syslog; must not be set if logpath is set.
     int syslogFacility;             // Facility used when appending messages to the syslog.
 
 #ifndef _WIN32
-    ProcessId parentProc;  // --fork pid of initial process
-    ProcessId leaderProc;  // --fork pid of leader process
+    int forkReadyFd = -1;  // for `--fork`. Write to it and close it when daemon service is up.
 #endif
 
     /***************************************
@@ -127,7 +128,7 @@ struct ServerGlobalParams {
         bool storageDetailsCmdEnabled;  // -- enableExperimentalStorageDetailsCmd
     } experimental;
 
-    time_t started = ::time(0);
+    time_t started = ::time(nullptr);
 
     BSONArray argvArray;
     BSONObj parsedOpts;
@@ -142,23 +143,23 @@ struct ServerGlobalParams {
     enum ClusterAuthModes {
         ClusterAuthMode_undefined,
         /**
-        * Authenticate using keyfile, accept only keyfiles
-        */
+         * Authenticate using keyfile, accept only keyfiles
+         */
         ClusterAuthMode_keyFile,
 
         /**
-        * Authenticate using keyfile, accept both keyfiles and X.509
-        */
+         * Authenticate using keyfile, accept both keyfiles and X.509
+         */
         ClusterAuthMode_sendKeyFile,
 
         /**
-        * Authenticate using X.509, accept both keyfiles and X.509
-        */
+         * Authenticate using X.509, accept both keyfiles and X.509
+         */
         ClusterAuthMode_sendX509,
 
         /**
-        * Authenticate using X.509, accept only X.509
-        */
+         * Authenticate using X.509, accept only X.509
+         */
         ClusterAuthMode_x509
     };
 
@@ -166,59 +167,98 @@ struct ServerGlobalParams {
     // queryableBackupMode.
     BSONObj overrideShardIdentity;
 
+    // True if the current binary version is an LTS Version.
+    static constexpr bool kIsLTSBinaryVersion = false;
+
     struct FeatureCompatibility {
         /**
-         * The combination of the fields (version, targetVersion) in the featureCompatiiblityVersion
-         * document in the server configuration collection (admin.system.version) are represented by
-         * this enum and determine this node's behavior.
+         * The combination of the fields (version, targetVersion, previousVersion) in the
+         * featureCompatibilityVersion document in the server configuration collection
+         * (admin.system.version) are represented by this enum and determine this node's behavior.
          *
          * Features can be gated for specific versions, or ranges of versions above or below some
          * minimum or maximum version, respectively.
          *
-         * The legal enum (and featureCompatibilityVersion document) states are:
+         * While upgrading from version X to Y or downgrading from Y to X, the server supports the
+         * features of the older of the two versions.
          *
-         * kFullyDowngradedTo40
-         * (4.0, Unset): Only 4.0 features are available, and new and existing storage
-         *               engine entries use the 4.0 format
+         * For versions X and Y, the legal enums and featureCompatibilityVersion documents are:
          *
-         * kUpgradingTo42
-         * (4.0, 4.2): Only 4.0 features are available, but new storage engine entries
-         *             use the 4.2 format, and existing entries may have either the
-         *             4.0 or 4.2 format
+         * kFullyDowngradedToX
+         * (X, Unset, Unset): Only version X features are available, and new and existing storage
+         *                    engine entries use the X format
          *
-         * kFullyUpgradedTo42
-         * (4.2, Unset): 4.2 features are available, and new and existing storage
-         *               engine entries use the 4.2 format
+         * kUpgradingFromXToY
+         * (X, Y, Unset): Only version X features are available, but new storage engine entries
+         *                use the Y format, and existing entries may have either the X or
+         *                Y format
          *
-         * kDowngradingTo40
-         * (4.0, 4.0): Only 4.0 features are available and new storage engine
-         *             entries use the 4.0 format, but existing entries may have
-         *             either the 4.0 or 4.2 format
+         * kVersionX
+         * (X, Unset, Unset): X features are available, and new and existing storage engine
+         *                    entries use the X format
          *
-         * kUnsetDefault40Behavior
-         * (Unset, Unset): This is the case on startup before the fCV document is
-         *                 loaded into memory. isVersionInitialized() will return
-         *                 false, and getVersion() will return the default
-         *                 (kFullyDowngradedTo40).
+         * kDowngradingFromXToY
+         * (Y, Y, X): Only Y features are available and new storage engine entries use the
+         *            Y format, but existing entries may have either the Y or X format
+         *
+         * kUnsetDefault44Behavior
+         * (Unset, Unset, Unset): This is the case on startup before the fCV document is loaded into
+         *                        memory. isVersionInitialized() will return false, and getVersion()
+         *                        will return the default (kUnsetDefault44Behavior).
          *
          */
         enum class Version {
-            // The order of these enums matter, higher upgrades having higher values, so that
-            // features can be active or inactive if the version is higher than some minimum or
-            // lower than some maximum, respectively.
-            kUnsetDefault40Behavior = 0,
-            kFullyDowngradedTo40 = 1,
-            kDowngradingTo40 = 2,
-            kUpgradingTo42 = 3,
-            kFullyUpgradedTo42 = 4,
+            // The order of these enums matter: sort by (version, targetVersion, previousVersion).
+            kInvalid,
+            kUnsetDefault44Behavior,
+            kFullyDowngradedTo44,    // { version: 4.4 }
+            kDowngradingFrom47To44,  // { version: 4.4, targetVersion: 4.4, previousVersion: 4.7 }
+            kDowngradingFrom48To44,  // { version: 4.4, targetVersion: 4.4, previousVersion: 4.8 }
+            kDowngradingFrom49To44,  // { version: 4.4, targetVersion: 4.4, previousVersion: 4.9 }
+            kDowngradingFrom50To44,  // { version: 4.4, targetVersion: 4.4, previousVersion: 5.0 }
+            kUpgradingFrom44To47,    // { version: 4.4, targetVersion: 4.7 }
+            kUpgradingFrom44To48,    // { version: 4.4, targetVersion: 4.8 }
+            kUpgradingFrom44To49,    // { version: 4.4, targetVersion: 4.9 }
+            kUpgradingFrom44To50,    // { version: 4.4, targetVersion: 5.0 }
+            kVersion47,              // { version: 4.7 }
+            kDowngradingFrom48To47,  // { version: 4.7, targetVersion: 4.7, previousVersion: 4.8 }
+            kUpgradingFrom47To48,    // { version: 4.7, targetVersion: 4.8 }
+            kVersion48,              // { version: 4.8 }
+            kDowngradingFrom49To48,  // { version: 4.8, targetVersion: 4.8, previousVersion: 4.9 }
+            kUpgradingFrom48To49,    // { version: 4.8, targetVersion: 4.9 }
+            kVersion49,              // { version: 4.9 }
+            kDowngradingFrom50To49,  // { version: 4.9, targetVersion: 4.9, previousVersion: 5.0 }
+            kUpgradingFrom49To50,    // { version: 4.9, targetVersion: 5.0 }
+            kVersion50,              // { version: 5.0 }
         };
+
+        // These constants should only be used for generic FCV references. Generic references are
+        // FCV references that are expected to exist across LTS binary versions.
+        static constexpr Version kLatest = Version::kVersion50;
+        static constexpr Version kLastContinuous = Version::kVersion49;
+        static constexpr Version kLastLTS = Version::kFullyDowngradedTo44;
+
+        // These constants should only be used for generic FCV references. Generic references are
+        // FCV references that are expected to exist across LTS binary versions.
+        // NOTE: DO NOT USE THEM FOR REGULAR FCV CHECKS.
+        static constexpr Version kUpgradingFromLastLTSToLatest = Version::kUpgradingFrom44To50;
+        static constexpr Version kUpgradingFromLastContinuousToLatest =
+            Version::kUpgradingFrom49To50;
+        static constexpr Version kDowngradingFromLatestToLastLTS = Version::kDowngradingFrom50To44;
+        static constexpr Version kDowngradingFromLatestToLastContinuous =
+            Version::kDowngradingFrom50To49;
+        // kUpgradingFromLastLTSToLastContinuous is only ever set to a valid FCV when
+        // kLastLTS and kLastContinuous are not equal. Otherwise, this value should be set to
+        // kInvalid.
+        static constexpr Version kUpgradingFromLastLTSToLastContinuous =
+            Version::kUpgradingFrom44To49;
 
         /**
          * On startup, the featureCompatibilityVersion may not have been explicitly set yet. This
          * exposes the actual state of the featureCompatibilityVersion if it is uninitialized.
          */
         const bool isVersionInitialized() const {
-            return _version.load() != Version::kUnsetDefault40Behavior;
+            return _version.load() != Version::kUnsetDefault44Behavior;
         }
 
         /**
@@ -230,40 +270,67 @@ struct ServerGlobalParams {
             return _version.load();
         }
 
-        /**
-         * This unsafe getter for the featureCompatibilityVersion parameter returns the last-stable
-         * featureCompatibilityVersion value if the parameter has not yet been initialized with a
-         * meaningful value. This getter should only be used if the parameter is intentionally read
-         * prior to the creation/parsing of the featureCompatibilityVersion document.
-         */
-        const Version getVersionUnsafe() const {
-            Version v = _version.load();
-            return (v == Version::kUnsetDefault40Behavior) ? Version::kFullyDowngradedTo40 : v;
+        bool isLessThanOrEqualTo(Version version, Version* versionReturn = nullptr) const {
+            Version currentVersion = getVersion();
+            if (versionReturn != nullptr) {
+                *versionReturn = currentVersion;
+            }
+            return currentVersion <= version;
+        }
+
+        bool isGreaterThanOrEqualTo(Version version, Version* versionReturn = nullptr) const {
+            Version currentVersion = getVersion();
+            if (versionReturn != nullptr) {
+                *versionReturn = currentVersion;
+            }
+            return currentVersion >= version;
+        }
+
+        bool isLessThan(Version version, Version* versionReturn = nullptr) const {
+            Version currentVersion = getVersion();
+            if (versionReturn != nullptr) {
+                *versionReturn = currentVersion;
+            }
+            return currentVersion < version;
+        }
+
+        bool isGreaterThan(Version version, Version* versionReturn = nullptr) const {
+            Version currentVersion = getVersion();
+            if (versionReturn != nullptr) {
+                *versionReturn = currentVersion;
+            }
+            return currentVersion > version;
+        }
+
+        // This function is to be used for generic FCV references only, and not for FCV-gating.
+        bool isUpgradingOrDowngrading(boost::optional<Version> version = boost::none) const {
+            if (version == boost::none) {
+                version = getVersion();
+            }
+            return version != kLatest && version != kLastContinuous && version != kLastLTS;
         }
 
         void reset() {
-            _version.store(Version::kUnsetDefault40Behavior);
+            _version.store(Version::kUnsetDefault44Behavior);
         }
 
         void setVersion(Version version) {
             return _version.store(version);
         }
 
-        bool isVersionUpgradingOrUpgraded() {
-            return (getVersion() == Version::kUpgradingTo42 ||
-                    getVersion() == Version::kFullyUpgradedTo42);
-        }
-
     private:
-        AtomicWord<Version> _version{Version::kUnsetDefault40Behavior};
+        AtomicWord<Version> _version{Version::kUnsetDefault44Behavior};
 
-    } featureCompatibility;
+    } mutableFeatureCompatibility;
+
+    // Const reference for featureCompatibilityVersion checks.
+    const FeatureCompatibility& featureCompatibility = mutableFeatureCompatibility;
 
     // Feature validation differs depending on the role of a mongod in a replica set. Replica set
     // primaries can accept user-initiated writes and validate based on the feature compatibility
     // version. A secondary always validates in the upgraded mode so that it can sync new features,
     // even when in the downgraded feature compatibility mode.
-    AtomicWord<bool> validateFeaturesAsMaster{true};
+    AtomicWord<bool> validateFeaturesAsPrimary{true};
 
     std::vector<std::string> disabledSecureAllocatorDomains;
 
@@ -283,4 +350,4 @@ struct TraitNamedDomain {
         return ret;
     }
 };
-}
+}  // namespace mongo

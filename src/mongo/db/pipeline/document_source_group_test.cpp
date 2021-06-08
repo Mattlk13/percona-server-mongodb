@@ -32,6 +32,7 @@
 #include <boost/intrusive_ptr.hpp>
 #include <deque>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -39,18 +40,18 @@
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/json.h"
+#include "mongo/db/exec/document_value/document_value_test_util.h"
+#include "mongo/db/exec/document_value/value_comparator.h"
+#include "mongo/db/pipeline/aggregate_command_gen.h"
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
-#include "mongo/db/pipeline/aggregation_request.h"
+#include "mongo/db/pipeline/aggregation_request_helper.h"
 #include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/document_source_group.h"
 #include "mongo/db/pipeline/document_source_mock.h"
-#include "mongo/db/pipeline/document_value_test_util.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
-#include "mongo/db/pipeline/value_comparator.h"
 #include "mongo/db/query/query_test_service_context.h"
 #include "mongo/dbtests/dbtests.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/stdx/unordered_set.h"
 #include "mongo/unittest/temp_dir.h"
 #include "mongo/unittest/unittest.h"
@@ -73,11 +74,12 @@ TEST_F(DocumentSourceGroupTest, ShouldBeAbleToPauseLoading) {
     auto expCtx = getExpCtx();
     expCtx->inMongos = true;  // Disallow external sort.
                               // This is the only way to do this in a debug build.
-    AccumulationStatement countStatement{"count",
-                                         ExpressionConstant::create(expCtx, Value(1)),
-                                         AccumulationStatement::getFactory("$sum")};
+    auto&& parser = AccumulationStatement::getParser("$sum", boost::none);
+    auto accumulatorArg = BSON("" << 1);
+    auto accExpr = parser(expCtx.get(), accumulatorArg.firstElement(), expCtx->variablesParseState);
+    AccumulationStatement countStatement{"count", accExpr};
     auto group = DocumentSourceGroup::create(
-        expCtx, ExpressionConstant::create(expCtx, Value(BSONNULL)), {countStatement});
+        expCtx, ExpressionConstant::create(expCtx.get(), Value(BSONNULL)), {countStatement});
     auto mock =
         DocumentSourceMock::createForTest({DocumentSource::GetNextResult::makePauseExecution(),
                                            Document(),
@@ -85,7 +87,8 @@ TEST_F(DocumentSourceGroupTest, ShouldBeAbleToPauseLoading) {
                                            Document(),
                                            Document(),
                                            DocumentSource::GetNextResult::makePauseExecution(),
-                                           Document()});
+                                           Document()},
+                                          expCtx);
     group->setSource(mock.get());
 
     // There were 3 pauses, so we should expect 3 paused results before any results can be returned.
@@ -108,11 +111,13 @@ TEST_F(DocumentSourceGroupTest, ShouldBeAbleToPauseLoadingWhileSpilled) {
     expCtx->allowDiskUse = true;
     const size_t maxMemoryUsageBytes = 1000;
 
-    VariablesParseState vps = expCtx->variablesParseState;
-    AccumulationStatement pushStatement{"spaceHog",
-                                        ExpressionFieldPath::parse(expCtx, "$largeStr", vps),
-                                        AccumulationStatement::getFactory("$push")};
-    auto groupByExpression = ExpressionFieldPath::parse(expCtx, "$_id", vps);
+    auto&& parser = AccumulationStatement::getParser("$push", boost::none);
+    auto accumulatorArg = BSON(""
+                               << "$largeStr");
+    auto accExpr = parser(expCtx.get(), accumulatorArg.firstElement(), expCtx->variablesParseState);
+    AccumulationStatement pushStatement{"spaceHog", accExpr};
+    auto groupByExpression =
+        ExpressionFieldPath::parse(expCtx.get(), "$_id", expCtx->variablesParseState);
     auto group = DocumentSourceGroup::create(
         expCtx, groupByExpression, {pushStatement}, maxMemoryUsageBytes);
 
@@ -122,7 +127,8 @@ TEST_F(DocumentSourceGroupTest, ShouldBeAbleToPauseLoadingWhileSpilled) {
                                            DocumentSource::GetNextResult::makePauseExecution(),
                                            Document{{"_id", 1}, {"largeStr", largeStr}},
                                            DocumentSource::GetNextResult::makePauseExecution(),
-                                           Document{{"_id", 2}, {"largeStr", largeStr}}});
+                                           Document{{"_id", 2}, {"largeStr", largeStr}}},
+                                          expCtx);
     group->setSource(mock.get());
 
     // There were 2 pauses, so we should expect 2 paused results before any results can be returned.
@@ -148,20 +154,24 @@ TEST_F(DocumentSourceGroupTest, ShouldErrorIfNotAllowedToSpillToDiskAndResultSet
     expCtx->inMongos = true;  // Disallow external sort.
                               // This is the only way to do this in a debug build.
 
-    VariablesParseState vps = expCtx->variablesParseState;
-    AccumulationStatement pushStatement{"spaceHog",
-                                        ExpressionFieldPath::parse(expCtx, "$largeStr", vps),
-                                        AccumulationStatement::getFactory("$push")};
-    auto groupByExpression = ExpressionFieldPath::parse(expCtx, "$_id", vps);
+    auto&& parser = AccumulationStatement::getParser("$push", boost::none);
+    auto accumulatorArg = BSON(""
+                               << "$largeStr");
+    auto accExpr = parser(expCtx.get(), accumulatorArg.firstElement(), expCtx->variablesParseState);
+    AccumulationStatement pushStatement{"spaceHog", accExpr};
+    auto groupByExpression =
+        ExpressionFieldPath::parse(expCtx.get(), "$_id", expCtx->variablesParseState);
     auto group = DocumentSourceGroup::create(
         expCtx, groupByExpression, {pushStatement}, maxMemoryUsageBytes);
 
     string largeStr(maxMemoryUsageBytes, 'x');
     auto mock = DocumentSourceMock::createForTest({Document{{"_id", 0}, {"largeStr", largeStr}},
-                                                   Document{{"_id", 1}, {"largeStr", largeStr}}});
+                                                   Document{{"_id", 1}, {"largeStr", largeStr}}},
+                                                  expCtx);
     group->setSource(mock.get());
 
-    ASSERT_THROWS_CODE(group->getNext(), AssertionException, 16945);
+    ASSERT_THROWS_CODE(
+        group->getNext(), AssertionException, ErrorCodes::QueryExceededMemoryLimitNoDiskUseAllowed);
 }
 
 TEST_F(DocumentSourceGroupTest, ShouldCorrectlyTrackMemoryUsageBetweenPauses) {
@@ -170,11 +180,13 @@ TEST_F(DocumentSourceGroupTest, ShouldCorrectlyTrackMemoryUsageBetweenPauses) {
     expCtx->inMongos = true;  // Disallow external sort.
                               // This is the only way to do this in a debug build.
 
-    VariablesParseState vps = expCtx->variablesParseState;
-    AccumulationStatement pushStatement{"spaceHog",
-                                        ExpressionFieldPath::parse(expCtx, "$largeStr", vps),
-                                        AccumulationStatement::getFactory("$push")};
-    auto groupByExpression = ExpressionFieldPath::parse(expCtx, "$_id", vps);
+    auto&& parser = AccumulationStatement::getParser("$push", boost::none);
+    auto accumulatorArg = BSON(""
+                               << "$largeStr");
+    auto accExpr = parser(expCtx.get(), accumulatorArg.firstElement(), expCtx->variablesParseState);
+    AccumulationStatement pushStatement{"spaceHog", accExpr};
+    auto groupByExpression =
+        ExpressionFieldPath::parse(expCtx.get(), "$_id", expCtx->variablesParseState);
     auto group = DocumentSourceGroup::create(
         expCtx, groupByExpression, {pushStatement}, maxMemoryUsageBytes);
 
@@ -183,20 +195,22 @@ TEST_F(DocumentSourceGroupTest, ShouldCorrectlyTrackMemoryUsageBetweenPauses) {
         DocumentSourceMock::createForTest({Document{{"_id", 0}, {"largeStr", largeStr}},
                                            DocumentSource::GetNextResult::makePauseExecution(),
                                            Document{{"_id", 1}, {"largeStr", largeStr}},
-                                           Document{{"_id", 2}, {"largeStr", largeStr}}});
+                                           Document{{"_id", 2}, {"largeStr", largeStr}}},
+                                          expCtx);
     group->setSource(mock.get());
 
     // The first getNext() should pause.
     ASSERT_TRUE(group->getNext().isPaused());
 
     // The next should realize it's used too much memory.
-    ASSERT_THROWS_CODE(group->getNext(), AssertionException, 16945);
+    ASSERT_THROWS_CODE(
+        group->getNext(), AssertionException, ErrorCodes::QueryExceededMemoryLimitNoDiskUseAllowed);
 }
 
 TEST_F(DocumentSourceGroupTest, ShouldReportSingleFieldGroupKeyAsARename) {
     auto expCtx = getExpCtx();
     VariablesParseState vps = expCtx->variablesParseState;
-    auto groupByExpression = ExpressionFieldPath::parse(expCtx, "$x", vps);
+    auto groupByExpression = ExpressionFieldPath::parse(expCtx.get(), "$x", vps);
     auto group = DocumentSourceGroup::create(expCtx, groupByExpression, {});
     auto modifiedPathsRet = group->getModifiedPaths();
     ASSERT(modifiedPathsRet.type == DocumentSource::GetModPathsReturn::Type::kAllExcept);
@@ -208,22 +222,9 @@ TEST_F(DocumentSourceGroupTest, ShouldReportSingleFieldGroupKeyAsARename) {
 TEST_F(DocumentSourceGroupTest, ShouldReportMultipleFieldGroupKeysAsARename) {
     auto expCtx = getExpCtx();
     VariablesParseState vps = expCtx->variablesParseState;
-    auto x = ExpressionFieldPath::parse(expCtx, "$x", vps);
-    auto y = ExpressionFieldPath::parse(expCtx, "$y", vps);
-    auto groupByExpression = [&]() {
-        std::vector<boost::intrusive_ptr<Expression>> children;
-        std::vector<std::pair<std::string, boost::intrusive_ptr<Expression>&>> expressions;
-        auto doc = std::vector<std::pair<std::string, boost::intrusive_ptr<Expression>>>{{"x", x},
-                                                                                         {"y", y}};
-        for (auto & [ unused, expression ] : doc)
-            children.push_back(std::move(expression));
-        std::vector<boost::intrusive_ptr<Expression>>::size_type index = 0;
-        for (auto & [ fieldName, unused ] : doc) {
-            expressions.emplace_back(fieldName, children[index]);
-            ++index;
-        }
-        return ExpressionObject::create(expCtx, std::move(children), std::move(expressions));
-    }();
+    auto x = ExpressionFieldPath::parse(expCtx.get(), "$x", vps);
+    auto y = ExpressionFieldPath::parse(expCtx.get(), "$y", vps);
+    auto groupByExpression = ExpressionObject::create(expCtx.get(), {{"x", x}, {"y", y}});
     auto group = DocumentSourceGroup::create(expCtx, groupByExpression, {});
     auto modifiedPathsRet = group->getModifiedPaths();
     ASSERT(modifiedPathsRet.type == DocumentSource::GetModPathsReturn::Type::kAllExcept);
@@ -236,7 +237,7 @@ TEST_F(DocumentSourceGroupTest, ShouldReportMultipleFieldGroupKeysAsARename) {
 TEST_F(DocumentSourceGroupTest, ShouldNotReportDottedGroupKeyAsARename) {
     auto expCtx = getExpCtx();
     VariablesParseState vps = expCtx->variablesParseState;
-    auto xDotY = ExpressionFieldPath::parse(expCtx, "$x.y", vps);
+    auto xDotY = ExpressionFieldPath::parse(expCtx.get(), "$x.y", vps);
     auto group = DocumentSourceGroup::create(expCtx, xDotY, {});
     auto modifiedPathsRet = group->getModifiedPaths();
     ASSERT(modifiedPathsRet.type == DocumentSource::GetModPathsReturn::Type::kAllExcept);
@@ -256,7 +257,7 @@ public:
     Base()
         : _opCtx(makeOperationContext()),
           _ctx(new ExpressionContextForTest(_opCtx.get(),
-                                            AggregationRequest(NamespaceString(ns), {}))),
+                                            AggregateCommandRequest(NamespaceString(ns), {}))),
           _tempDir("DocumentSourceGroupTest") {}
 
 protected:
@@ -264,8 +265,8 @@ protected:
         BSONObj namedSpec = BSON("$group" << spec);
         BSONElement specElement = namedSpec.firstElement();
 
-        intrusive_ptr<ExpressionContextForTest> expressionContext =
-            new ExpressionContextForTest(_opCtx.get(), AggregationRequest(NamespaceString(ns), {}));
+        intrusive_ptr<ExpressionContextForTest> expressionContext = new ExpressionContextForTest(
+            _opCtx.get(), AggregateCommandRequest(NamespaceString(ns), {}));
         // For $group, 'inShard' implies 'fromMongos' and 'needsMerge'.
         expressionContext->fromMongos = expressionContext->needsMerge = inShard;
         expressionContext->inMongos = inMongos;
@@ -325,7 +326,7 @@ public:
     virtual ~ExpressionBase() {}
     void _doTest() final {
         createGroup(spec());
-        auto source = DocumentSourceMock::createForTest(Document(doc()));
+        auto source = DocumentSourceMock::createForTest(Document(doc()), ctx());
         group()->setSource(source.get());
         // A group result is available.
         auto next = group()->getNext();
@@ -523,8 +524,9 @@ class AggregateObjectExpression : public ExpressionBase {
         return BSON("a" << 6);
     }
     BSONObj spec() {
-        return BSON("_id" << 0 << "z" << BSON("$first" << BSON("x"
-                                                               << "$a")));
+        return BSON("_id" << 0 << "z"
+                          << BSON("$first" << BSON("x"
+                                                   << "$a")));
     }
     BSONObj expected() {
         return BSON("_id" << 0 << "z" << BSON("x" << 6));
@@ -537,8 +539,9 @@ class AggregateOperatorExpression : public ExpressionBase {
         return BSON("a" << 6);
     }
     BSONObj spec() {
-        return BSON("_id" << 0 << "z" << BSON("$first"
-                                              << "$a"));
+        return BSON("_id" << 0 << "z"
+                          << BSON("$first"
+                                  << "$a"));
     }
     BSONObj expected() {
         return BSON("_id" << 0 << "z" << 6);
@@ -561,7 +564,7 @@ public:
     }
     void runSharded(bool sharded) {
         createGroup(groupSpec());
-        auto source = DocumentSourceMock::createForTest(inputData());
+        auto source = DocumentSourceMock::createForTest(inputData(), ctx());
         group()->setSource(source.get());
 
         intrusive_ptr<DocumentSource> sink = group();
@@ -635,8 +638,9 @@ class SingleDocument : public CheckResultsBase {
         return {DOC("a" << 1)};
     }
     virtual BSONObj groupSpec() {
-        return BSON("_id" << 0 << "a" << BSON("$sum"
-                                              << "$a"));
+        return BSON("_id" << 0 << "a"
+                          << BSON("$sum"
+                                  << "$a"));
     }
     virtual string expectedResultSetString() {
         return "[{_id:0,a:1}]";
@@ -649,8 +653,9 @@ class TwoValuesSingleKey : public CheckResultsBase {
         return {DOC("a" << 1), DOC("a" << 2)};
     }
     virtual BSONObj groupSpec() {
-        return BSON("_id" << 0 << "a" << BSON("$push"
-                                              << "$a"));
+        return BSON("_id" << 0 << "a"
+                          << BSON("$push"
+                                  << "$a"));
     }
     virtual string expectedResultSetString() {
         return "[{_id:0,a:[1,2]}]";
@@ -708,8 +713,7 @@ class FourValuesTwoKeysTwoAccumulators : public CheckResultsBase {
                     << "list"
                     << BSON("$push"
                             << "$a")
-                    << "sum"
-                    << BSON("$sum" << BSON("$divide" << BSON_ARRAY("$a" << 2))));
+                    << "sum" << BSON("$sum" << BSON("$divide" << BSON_ARRAY("$a" << 2))));
     }
     virtual string expectedResultSetString() {
         return "[{_id:0,list:[1,3],sum:2},{_id:1,list:[2,4],sum:3}]";
@@ -770,8 +774,9 @@ class UndefinedAccumulatorValue : public CheckResultsBase {
         return {Document()};
     }
     virtual BSONObj groupSpec() {
-        return BSON("_id" << 0 << "first" << BSON("$first"
-                                                  << "$missing"));
+        return BSON("_id" << 0 << "first"
+                          << BSON("$first"
+                                  << "$missing"));
     }
     virtual string expectedResultSetString() {
         return "[{_id:0, first:null}]";
@@ -785,7 +790,8 @@ public:
         auto source = DocumentSourceMock::createForTest({"{_id:0,list:[1,2]}",
                                                          "{_id:1,list:[3,4]}",
                                                          "{_id:0,list:[10,20]}",
-                                                         "{_id:1,list:[30,40]}]}"});
+                                                         "{_id:1,list:[30,40]}]}"},
+                                                        ctx());
 
         // Create a group source.
         createGroup(BSON("_id"
@@ -822,7 +828,7 @@ public:
         ASSERT_EQUALS(1U, dependencies.fields.count("u"));
         ASSERT_EQUALS(1U, dependencies.fields.count("v"));
         ASSERT_EQUALS(false, dependencies.needWholeDocument);
-        ASSERT_EQUALS(false, dependencies.getNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE));
+        ASSERT_EQUALS(false, dependencies.getNeedsMetadata(DocumentMetadataFields::kTextScore));
     }
 };
 
@@ -863,9 +869,10 @@ public:
     }
 };
 
-class All : public Suite {
+class All : public OldStyleSuiteSpecification {
 public:
-    All() : Suite("DocumentSourceGroupTests") {}
+    All() : OldStyleSuiteSpecification("DocumentSourceGroupTests") {}
+
     void setupTests() {
         add<NonObject>();
         add<EmptySpec>();
@@ -919,7 +926,7 @@ public:
     }
 };
 
-SuiteInstance<All> myall;
+OldStyleSuiteInitializer<All> myall;
 
 }  // namespace
 }  // namespace mongo

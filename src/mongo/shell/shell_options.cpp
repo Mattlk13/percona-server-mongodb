@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault;
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -39,14 +39,16 @@
 
 #include "mongo/base/status.h"
 #include "mongo/bson/util/builder.h"
+#include "mongo/client/client_api_version_parameters_gen.h"
 #include "mongo/client/mongo_uri.h"
 #include "mongo/config.h"
 #include "mongo/db/auth/sasl_command_constants.h"
 #include "mongo/db/server_options.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/protocol.h"
 #include "mongo/shell/shell_utils.h"
+#include "mongo/transport/message_compressor_options_client_gen.h"
 #include "mongo/transport/message_compressor_registry.h"
-#include "mongo/util/log.h"
 #include "mongo/util/net/socket_utils.h"
 #include "mongo/util/options_parser/startup_options.h"
 #include "mongo/util/str.h"
@@ -60,8 +62,14 @@ using std::string;
 using std::vector;
 
 // SERVER-36807: Limit --setShellParameter to SetParameters we know we want to expose.
-const std::set<std::string> kSetShellParameterWhitelist = {
-    "disabledSecureAllocatorDomains", "newLineAfterPasswordPromptForTest",
+const std::set<std::string> kSetShellParameterAllowlist = {
+    "awsEC2InstanceMetadataUrl",
+    "awsECSInstanceMetadataUrl",
+    "ocspEnabled",
+    "ocspClientHttpTimeoutSecs",
+    "disabledSecureAllocatorDomains",
+    "newLineAfterPasswordPromptForTest",
+    "skipShellCursorFinalize",
 };
 
 std::string getMongoShellHelp(StringData name, const moe::OptionSection& options) {
@@ -80,15 +88,16 @@ std::string getMongoShellHelp(StringData name, const moe::OptionSection& options
 
 bool handlePreValidationMongoShellOptions(const moe::Environment& params,
                                           const std::vector<std::string>& args) {
-    auto&& vii = VersionInfoInterface::instance();
-    if (params.count("version") || params.count("help")) {
-        setPlainConsoleLogger();
-        log() << mongoShellVersion(vii);
-        if (params.count("help")) {
-            log() << getMongoShellHelp(args[0], moe::startupOptions);
-        } else {
-            vii.logBuildInfo();
-        }
+    if (params.count("help")) {
+        auto&& vii = VersionInfoInterface::instance();
+        std::cout << mongoShellVersion(vii) << std::endl;
+        std::cout << getMongoShellHelp(args[0], moe::startupOptions) << std::endl;
+        return false;
+    }
+    if (params.count("version")) {
+        auto&& vii = VersionInfoInterface::instance();
+        std::cout << mongoShellVersion(vii) << std::endl;
+        vii.logBuildInfo(&std::cout);
         return false;
     }
     return true;
@@ -105,9 +114,12 @@ Status storeMongoShellOptions(const moe::Environment& params,
         shellGlobalParams.enableIPv6 = true;
     }
 
+    auto minimumLoggedSeveity = logv2::LogSeverity::Info();
     if (params.count("verbose")) {
-        logger::globalLogDomain()->setMinimumLoggedSeverity(logger::LogSeverity::Debug(1));
+        minimumLoggedSeveity = logv2::LogSeverity::Debug(1);
     }
+    logv2::LogManager::global().getGlobalSettings().setMinimumLoggedSeverity(
+        mongo::logv2::LogComponent::kDefault, minimumLoggedSeveity);
 
     // `objcheck` option is part of `serverGlobalParams` to avoid making common parts depend upon
     // the client options.  The option is set to false in clients by default.
@@ -237,6 +249,10 @@ Status storeMongoShellOptions(const moe::Environment& params,
         shellGlobalParams.jsHeapLimitMB = jsHeapLimitMB;
     }
 
+    if (params.count("idleSessionTimeout")) {
+        shellGlobalParams.idleSessionTimeout = Seconds(params["idleSessionTimeout"].as<int>());
+    }
+
     if (shellGlobalParams.url == "*") {
         StringBuilder sb;
         sb << "ERROR: "
@@ -276,7 +292,8 @@ Status storeMongoShellOptions(const moe::Environment& params,
             } else if (shellGlobalParams.gssapiServiceName != saslDefaultServiceName &&
                        uriOptions.count("gssapiServiceName")) {
                 sb << "the GSSAPI service name";
-            } else if (!shellGlobalParams.networkMessageCompressors.empty() &&
+            } else if (shellGlobalParams.networkMessageCompressors !=
+                           kNet_compression_compressorsDefault &&
                        uriOptions.count("compressors") &&
                        uriOptions["compressors"] != shellGlobalParams.networkMessageCompressors) {
                 sb << "different network message compressors";
@@ -304,32 +321,56 @@ Status storeMongoShellOptions(const moe::Environment& params,
         }
     }
 
+    // Future API versions may require logic changes in the shell, so ban them for now.
+    if (!shellGlobalParams.apiVersion.empty() && shellGlobalParams.apiVersion != "1") {
+        uasserted(4938003,
+                  str::stream() << "Bad value --apiVersion '" << shellGlobalParams.apiVersion
+                                << "', only API Version 1 is supported");
+    }
+
     if (params.count("setShellParameter")) {
         auto ssp = params["setShellParameter"].as<std::map<std::string, std::string>>();
         auto map = ServerParameterSet::getGlobal()->getMap();
         for (auto it : ssp) {
             const auto& name = it.first;
             auto paramIt = map.find(name);
-            if (paramIt == map.end() || !kSetShellParameterWhitelist.count(name)) {
+            if (paramIt == map.end() || !kSetShellParameterAllowlist.count(name)) {
                 return {ErrorCodes::BadValue,
                         str::stream() << "Unknown --setShellParameter '" << name << "'"};
             }
             auto* param = paramIt->second;
             if (!param->allowedToChangeAtStartup()) {
                 return {ErrorCodes::BadValue,
-                        str::stream() << "Cannot use --setShellParameter to set '" << name
-                                      << "' at startup"};
+                        str::stream()
+                            << "Cannot use --setShellParameter to set '" << name << "' at startup"};
             }
             auto status = param->setFromString(it.second);
             if (!status.isOK()) {
                 return {ErrorCodes::BadValue,
-                        str::stream() << "Bad value for parameter '" << name << "': "
-                                      << status.reason()};
+                        str::stream()
+                            << "Bad value for parameter '" << name << "': " << status.reason()};
             }
         }
     }
 
     return Status::OK();
+}
+
+std::string getApiParametersJSON() {
+    BSONObjBuilder bob;
+    if (!shellGlobalParams.apiVersion.empty()) {
+        bob.append(ClientAPIVersionParameters::kVersionFieldName, shellGlobalParams.apiVersion);
+    }
+
+    if (shellGlobalParams.apiStrict) {
+        bob.append(ClientAPIVersionParameters::kStrictFieldName, true);
+    }
+
+    if (shellGlobalParams.apiDeprecationErrors) {
+        bob.append(ClientAPIVersionParameters::kDeprecationErrorsFieldName, true);
+    }
+
+    return bob.done().jsonString();
 }
 
 }  // namespace mongo

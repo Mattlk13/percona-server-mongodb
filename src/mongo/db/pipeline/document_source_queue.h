@@ -52,7 +52,6 @@ public:
                         const boost::intrusive_ptr<ExpressionContext>& expCtx);
     virtual ~DocumentSourceQueue() {}
 
-    GetNextResult getNext() override;
     const char* getSourceName() const override;
     Value serialize(
         boost::optional<ExplainOptions::Verbosity> explain = boost::none) const override {
@@ -69,7 +68,8 @@ public:
                                      DiskUseRequirement::kNoDiskUse,
                                      FacetRequirement::kNotAllowed,
                                      TransactionRequirement::kAllowed,
-                                     LookupRequirement::kAllowed);
+                                     LookupRequirement::kAllowed,
+                                     UnionRequirement::kAllowed);
 
         constraints.requiresInputDocSource = false;
         return constraints;
@@ -100,6 +100,7 @@ public:
     }
 
 protected:
+    GetNextResult doGetNext() override;
     // Return documents from front of queue.
     std::deque<GetNextResult> _queue;
 };

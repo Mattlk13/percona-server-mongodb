@@ -13,12 +13,14 @@ for (x = -180; x < 180; x += .5) {
         bulk.insert(o);
     }
 }
-assert.writeOK(bulk.execute());
+assert.commandWorked(bulk.execute());
 
 var numTests = 31;
-for (var n = 0; n < numTests; n++) {
+// Reduce the amount of repetitions on live-record buildvariant
+var start = (TestData.undoRecorderPath ? 20 : 0);
+for (var n = start; n < numTests; n++) {
     t.dropIndexes();
-    t.ensureIndex({loc: "2d"}, {bits: 2 + n});
+    t.createIndex({loc: "2d"}, {bits: 2 + n});
 
     assert.between(9 - 2,
                    t.find({loc: {"$within": {"$polygon": [[0, 0], [1, 1], [0, 2]]}}}).count(),
@@ -51,14 +53,13 @@ for (var n = 0; n < numTests; n++) {
             341,
             "Square Missing Chunk Test",
             true);
-        assert.between(
-            21 - 2,
-            t.find({
-                 loc: {"$within": {"$polygon": [[0, 0], [0, 2], [2, 2], [2, 0], [1, 1]]}}
-             }).count(),
-            21,
-            "Square Missing Chunk Test 2",
-            true);
+        assert.between(21 - 2,
+                       t.find({
+                            loc: {"$within": {"$polygon": [[0, 0], [0, 2], [2, 2], [2, 0], [1, 1]]}}
+                        }).count(),
+                       21,
+                       "Square Missing Chunk Test 2",
+                       true);
     }
 
     assert.eq(1,

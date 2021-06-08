@@ -29,6 +29,8 @@
 
 #pragma once
 
+#include <type_traits>
+
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/transformer_interface.h"
 
@@ -42,15 +44,21 @@ namespace mongo {
  */
 class DocumentSourceSingleDocumentTransformation final : public DocumentSource {
 public:
+    virtual boost::intrusive_ptr<DocumentSource> clone() const {
+        auto list = DocumentSource::parse(pExpCtx, serialize().getDocument().toBson());
+        invariant(list.size() == 1);
+        return list.front();
+    }
+
     DocumentSourceSingleDocumentTransformation(
         const boost::intrusive_ptr<ExpressionContext>& pExpCtx,
         std::unique_ptr<TransformerInterface> parsedTransform,
-        std::string name,
+        const StringData name,
         bool independentOfAnyCollection);
 
     // virtuals from DocumentSource
     const char* getSourceName() const final;
-    GetNextResult getNext() final;
+
     boost::intrusive_ptr<DocumentSource> optimize() final;
     Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
     DepsTracker::State getDependencies(DepsTracker* deps) const final;
@@ -63,9 +71,10 @@ public:
                                      FacetRequirement::kAllowed,
                                      TransactionRequirement::kAllowed,
                                      LookupRequirement::kAllowed,
-                                     ChangeStreamRequirement::kWhitelist);
+                                     UnionRequirement::kAllowed,
+                                     ChangeStreamRequirement::kAllowlist);
         constraints.canSwapWithMatch = true;
-        constraints.canSwapWithLimitAndSample = true;
+        constraints.canSwapWithSkippingOrLimitingStage = true;
         constraints.isAllowedWithinUpdatePipeline = true;
         // This transformation could be part of a 'collectionless' change stream on an entire
         // database or cluster, mark as independent of any collection if so.
@@ -85,11 +94,42 @@ public:
         return *_parsedTransform;
     }
 
-    bool isSubsetOfProjection(const BSONObj& proj) const {
-        return _parsedTransform->isSubsetOfProjection(proj);
+    /**
+     * Extract computed projection(s) depending on the 'oldName' argument if the transformation is
+     * of type inclusion projection or computed projection. Extraction is not allowed if the name of
+     * the projection is in the 'reservedNames' set. The function returns a pair of <BSONObj, bool>.
+     * The BSONObj contains the computed projections in which the 'oldName' is substituted for the
+     * 'newName'. The boolean flag is true if the original projection has become empty after the
+     * extraction and can be deleted by the caller.
+     *
+     * For transformation of type inclusion projection the computed projections are replaced with a
+     * projected field or an identity projection depending on their position in the order of
+     * additional fields.
+     * For transformation of type computed projection the extracted computed projections are
+     * removed.
+     *
+     * The function has no effect for exclusion projections, or if there are no computed
+     * projections, or the computed expression depends on other fields than the oldName.
+     */
+    std::pair<BSONObj, bool> extractComputedProjections(const StringData& oldName,
+                                                        const StringData& newName,
+                                                        const std::set<StringData>& reservedNames) {
+        return _parsedTransform->extractComputedProjections(oldName, newName, reservedNames);
+    }
+
+    /**
+     * If this transformation is a project, removes and returns a BSONObj representing the part of
+     * this project that depends only on 'oldName'. Also returns a bool indicating whether this
+     * entire project is extracted. In the extracted $project, 'oldName' is renamed to 'newName'.
+     * 'oldName' should not be dotted.
+     */
+    std::pair<BSONObj, bool> extractProjectOnFieldAndRename(const StringData& oldName,
+                                                            const StringData& newName) {
+        return _parsedTransform->extractProjectOnFieldAndRename(oldName, newName);
     }
 
 protected:
+    GetNextResult doGetNext() final;
     void doDispose() final;
 
     Pipeline::SourceContainer::iterator doOptimizeAt(Pipeline::SourceContainer::iterator itr,

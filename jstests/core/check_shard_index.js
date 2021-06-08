@@ -1,4 +1,8 @@
-// @tags: [requires_non_retryable_writes, requires_fastcount, requires_sharding]
+// @tags: [
+//   requires_fastcount,
+//   requires_non_retryable_writes,
+//   requires_sharding,
+// ]
 
 // -------------------------
 //  CHECKSHARDINGINDEX TEST UTILS
@@ -12,7 +16,7 @@ f.drop();
 //
 
 f.drop();
-f.ensureIndex({x: 1, y: 1});
+f.createIndex({x: 1, y: 1});
 assert.eq(0, f.count(), "1. initial count should be zero");
 
 res = db.runCommand({checkShardingIndex: "test.jstests_shardingindex", keyPattern: {x: 1, y: 1}});
@@ -24,11 +28,11 @@ res = db.runCommand({checkShardingIndex: "test.jstests_shardingindex", keyPatter
 assert.eq(true, res.ok, "1b");
 
 // -------------------------
-// Case 2: entry with null values would make an index unsuitable
+// Case 2: entry with null values would make an index suitable
 //
 
 f.drop();
-f.ensureIndex({x: 1, y: 1});
+f.createIndex({x: 1, y: 1});
 assert.eq(0, f.count(), "2. initial count should be zero");
 
 f.save({x: 1, y: 1});
@@ -40,7 +44,7 @@ assert.eq(true, res.ok, "2a " + tojson(res));
 f.save({y: 2});
 assert.eq(3, f.count(), "2. count after initial insert should be 3");
 res = db.runCommand({checkShardingIndex: "test.jstests_shardingindex", keyPattern: {x: 1, y: 1}});
-assert.eq(false, res.ok, "2b " + tojson(res));
+assert.eq(true, res.ok, "2b " + tojson(res));
 
 // Check _id index
 res = db.runCommand({checkShardingIndex: "test.jstests_shardingindex", keyPattern: {_id: 1}});
@@ -52,7 +56,7 @@ assert(res.idskip, "2d " + tojson(res));
 //
 
 f.drop();
-f.ensureIndex({x: 1, y: 1});
+f.createIndex({x: 1, y: 1});
 assert.eq(0, f.count(), "3. initial count should be zero");
 
 f.save({x: 1, y: 1});
@@ -63,7 +67,8 @@ res = db.runCommand({checkShardingIndex: "test.jstests_shardingindex", keyPatter
 assert.eq(false, res.ok, "3a " + tojson(res));
 
 f.remove({y: 2});
-f.reIndex();
+f.dropIndex({x: 1, y: 1});
+f.createIndex({x: 1, y: 1});
 
 assert.eq(1, f.count(), "3. count after removing array value should be 1");
 res = db.runCommand({checkShardingIndex: "test.jstests_shardingindex", keyPattern: {x: 1, y: 1}});
@@ -80,7 +85,7 @@ assert.eq(false, res.ok, "3c " + tojson(res));
 //
 
 f.drop();
-f.ensureIndex({x: 1, y: 1, z: 1});
+f.createIndex({x: 1, y: 1, z: 1});
 assert.eq(0, f.count(), "4. initial count should be zero");
 
 f.save({x: 1, y: 1, z: 1});
@@ -104,7 +109,8 @@ res = db.runCommand(
 assert.eq(false, res.ok, "4e " + tojson(res));
 
 f.remove({y: 2});
-f.reIndex();
+f.dropIndex({x: 1, y: 1, z: 1});
+f.createIndex({x: 1, y: 1, z: 1});
 
 assert.eq(1, f.count(), "4. count after removing array value should be 1");
 res = db.runCommand(
@@ -123,7 +129,9 @@ res = db.runCommand(
 assert.eq(false, res.ok, "4i " + tojson(res));
 
 f.remove({x: 3});
-f.reIndex();  // Necessary so that the index is no longer marked as multikey
+// Necessary so that the index is no longer marked as multikey
+f.dropIndex({x: 1, y: 1, z: 1});
+f.createIndex({x: 1, y: 1, z: 1});
 
 assert.eq(1, f.count(), "4. count after removing array value should be 1 again");
 res = db.runCommand(

@@ -29,13 +29,14 @@
 
 #pragma once
 
+#include <boost/optional.hpp>
+#include <memory>
 #include <pcrecpp.h>
 #include <utility>
 #include <vector>
 
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/expression_with_placeholder.h"
-#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
@@ -94,7 +95,7 @@ public:
      */
     struct Pattern {
         explicit Pattern(StringData pattern)
-            : rawRegex(pattern), regex(stdx::make_unique<pcrecpp::RE>(pattern.toString())) {}
+            : rawRegex(pattern), regex(std::make_unique<pcrecpp::RE>(pattern.toString())) {}
 
         StringData rawRegex;
         std::unique_ptr<pcrecpp::RE> regex;
@@ -112,7 +113,8 @@ public:
         StringDataSet properties,
         StringData namePlaceholder,
         std::vector<PatternSchema> patternProperties,
-        std::unique_ptr<ExpressionWithPlaceholder> otherwise);
+        std::unique_ptr<ExpressionWithPlaceholder> otherwise,
+        clonable_ptr<ErrorAnnotation> annotation = nullptr);
 
     void debugString(StringBuilder& debug, int indentationLevel) const final;
 
@@ -134,11 +136,11 @@ public:
     bool matches(const MatchableDocument* doc, MatchDetails* details) const final;
     bool matchesSingleElement(const BSONElement& element, MatchDetails* details) const final;
 
-    void serialize(BSONObjBuilder* builder) const final;
+    void serialize(BSONObjBuilder* builder, bool includePath) const final;
 
     std::unique_ptr<MatchExpression> shallowClone() const final;
 
-    std::vector<MatchExpression*>* getChildVector() final {
+    std::vector<std::unique_ptr<MatchExpression>>* getChildVector() final {
         return nullptr;
     }
 
@@ -154,6 +156,22 @@ public:
         }
 
         return _patternProperties[i - 1].second->getFilter();
+    }
+
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    const StringDataSet& getProperties() const {
+        return _properties;
+    }
+
+    const std::vector<PatternSchema>& getPatternProperties() const {
+        return _patternProperties;
     }
 
 private:

@@ -135,18 +135,12 @@ StatusWith<ShardDatabaseType> readShardDatabasesEntry(OperationContext* opCtx, S
  * Updates the collections collection entry matching 'query' with 'update' using local write
  * concern.
  *
- * Uses the $set operator on the update so that updates can be applied without resetting everything.
- * 'inc' can be used to specify fields and their increments: it will be assigned to the $inc
- * operator.
- *
  * If 'upsert' is true, expects 'lastRefreshedCollectionVersion' to be absent in the update:
  * these refreshing fields should only be added to an existing document.
- * Similarly, 'inc' should not specify 'upsert' true.
  */
 Status updateShardCollectionsEntry(OperationContext* opCtx,
                                    const BSONObj& query,
                                    const BSONObj& update,
-                                   const BSONObj& inc,
                                    const bool upsert);
 
 /**
@@ -175,7 +169,8 @@ StatusWith<std::vector<ChunkType>> readShardChunks(OperationContext* opCtx,
                                                    const BSONObj& query,
                                                    const BSONObj& sort,
                                                    boost::optional<long long> limit,
-                                                   const OID& epoch);
+                                                   const OID& epoch,
+                                                   const boost::optional<Timestamp>& timestamp);
 
 /**
  * Takes a vector of 'chunks' and updates the shard's chunks collection for 'nss'. Any chunk
@@ -201,6 +196,13 @@ Status updateShardChunks(OperationContext* opCtx,
                          const OID& currEpoch);
 
 /**
+ * Adds/removes the timestamp of the  'nss' entry in config.cache.collections
+ */
+void updateTimestampOnShardCollections(OperationContext* opCtx,
+                                       const NamespaceString& nss,
+                                       const boost::optional<Timestamp>& timestamp);
+
+/**
  * Deletes locally persisted chunk metadata associated with 'nss': drops the chunks collection
  * and removes the collections collection entry.
  *
@@ -209,6 +211,11 @@ Status updateShardChunks(OperationContext* opCtx,
  * retries, rather than returning with a useful error message.
  */
 Status dropChunksAndDeleteCollectionsEntry(OperationContext* opCtx, const NamespaceString& nss);
+
+/**
+ * Drops locally persisted chunk metadata associated with 'nss': only drops the chunks collection.
+ */
+void dropChunks(OperationContext* opCtx, const NamespaceString& nss);
 
 /**
  * Deletes locally persisted database metadata associated with 'dbName': removes the databases

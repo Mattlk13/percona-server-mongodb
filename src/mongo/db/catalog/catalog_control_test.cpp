@@ -34,75 +34,11 @@
 #include "mongo/db/index_builds_coordinator_mongod.h"
 #include "mongo/db/operation_context_noop.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/storage/storage_engine.h"
+#include "mongo/db/storage/storage_engine_mock.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
 namespace {
-
-/**
- * Mock storage engine.
- */
-class MockStorageEngine : public StorageEngine {
-public:
-    RecoveryUnit* newRecoveryUnit() final {
-        return nullptr;
-    }
-    std::vector<std::string> listDatabases() const final {
-        return {};
-    }
-    bool supportsDocLocking() const final {
-        return false;
-    }
-    bool isDurable() const final {
-        return false;
-    }
-    bool isEphemeral() const {
-        return true;
-    }
-    Status closeDatabase(OperationContext* opCtx, StringData db) final {
-        return Status::OK();
-    }
-    Status dropDatabase(OperationContext* opCtx, StringData db) final {
-        return Status::OK();
-    }
-    int flushAllFiles(OperationContext* opCtx, bool sync) final {
-        return 0;
-    }
-    Status repairRecordStore(OperationContext* opCtx, const NamespaceString& ns) final {
-        return Status::OK();
-    }
-    std::unique_ptr<TemporaryRecordStore> makeTemporaryRecordStore(OperationContext* opCtx) final {
-        return {};
-    }
-    void cleanShutdown() final {}
-    void setJournalListener(JournalListener* jl) final {}
-    bool supportsPendingDrops() const final {
-        return false;
-    }
-    void clearDropPendingState() final {}
-    Timestamp getAllCommittedTimestamp() const final {
-        return {};
-    }
-    Timestamp getOldestOpenReadTimestamp() const final {
-        return {};
-    }
-    boost::optional<Timestamp> getOplogNeededForCrashRecovery() const final {
-        return boost::none;
-    }
-    std::string getFilesystemPathForDb(const std::string& dbName) const final {
-        return "";
-    }
-    std::set<std::string> getDropPendingIdents() const final {
-        return {};
-    }
-    Status currentFilesCompatible(OperationContext* opCtx) const final {
-        return Status::OK();
-    }
-    int64_t sizeOnDiskForDb(OperationContext* opCtx, StringData dbName) {
-        return 0;
-    }
-};
 
 /**
  * Simple test for openCatalog() and closeCatalog() to check library dependencies.
@@ -118,7 +54,7 @@ private:
 void CatalogControlTest::setUp() {
     {
         auto serviceContext = ServiceContext::make();
-        auto storageEngine = std::make_unique<MockStorageEngine>();
+        auto storageEngine = std::make_unique<StorageEngineMock>();
         serviceContext->setStorageEngine(std::move(storageEngine));
         DatabaseHolder::set(serviceContext.get(), std::make_unique<DatabaseHolderMock>());
         // Only need the IndexBuildsCoordinator to call into and check whether there are any index
@@ -139,7 +75,7 @@ TEST_F(CatalogControlTest, CloseAndOpenCatalog) {
     OperationContextNoop opCtx(&cc(), 0);
     auto map = catalog::closeCatalog(&opCtx);
     ASSERT_EQUALS(0U, map.size());
-    catalog::openCatalog(&opCtx, {});
+    catalog::openCatalog(&opCtx, {}, Timestamp());
 }
 
 }  // namespace

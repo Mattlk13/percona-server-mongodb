@@ -12,7 +12,6 @@ load('jstests/concurrency/fsm_workloads/random_moveChunk_base.js');
 load('jstests/concurrency/fsm_workload_helpers/auto_retry_transaction.js');
 
 var $config = extendWorkload($config, function($config, $super) {
-
     $config.threadCount = 5;
     $config.iterations = 50;
 
@@ -24,23 +23,25 @@ var $config = extendWorkload($config, function($config, $super) {
     // applied.
     $config.data.expectedCounters = {};
 
-    // A moveChunk may fail with a WriteConflict when clearing orphans on the destination shard if
-    // any of them are concurrently written to by a broadcast transaction operation. The error
-    // message and top-level code may be different depending on where the failure occurs.
-    //
-    // TODO SERVER-39141: Don't ignore WriteConflict error message once the range deleter retries on
-    // write conflict exceptions.
-    //
-    // Additionally, because updates don't have a shard filter stage, a migration may fail if a
+    // Because updates don't have a shard filter stage, a migration may fail if a
     // broadcast update is operating on orphans from a previous migration in the range being
     // migrated back in. The particular error code is replaced with a more generic one, so this is
     // identified by the failed migration's error message.
     $config.data.isMoveChunkErrorAcceptable = (err) => {
         return err.message &&
-            (err.message.indexOf("WriteConflict") > -1 ||
-             err.message.indexOf("CommandFailed") > -1 ||
-             err.message.indexOf("Documents in target range may still be in use"));
+            (err.message.includes("CommandFailed") ||
+             err.message.includes("Documents in target range may still be in use") ||
+             // This error can occur when the test updates the shard key value of a document whose
+             // chunk has been moved to another shard. Receiving a chunk only waits for documents
+             // with shard key values in that range to have been cleaned up by the range deleter.
+             // So, if the range deleter has not yet cleaned up that document when the chunk is
+             // moved back to the original shard, the moveChunk may fail as a result of a duplicate
+             // key error on the recipient.
+             err.message.includes("Location51008"));
     };
+
+    $config.data.runningWithStepdowns =
+        TestData.runningWithConfigStepdowns || TestData.runningWithShardStepdowns;
 
     // These errors below may arrive due to expected scenarios that occur with concurrent
     // migrations and shard key updates. These include transient transaction errors (targeting
@@ -51,7 +52,8 @@ var $config = extendWorkload($config, function($config, $super) {
     // unrecoverable state. If an update fails in one of the above-described scenarios, we assert
     // that the document remains in the pre-updated state. After doing so, we may continue the
     // concurrency test.
-    $config.data.isUpdateShardKeyErrorAcceptable = (errCode, errMsg, errorLabels) => {
+    $config.data.isUpdateShardKeyErrorAcceptable = function isUpdateShardKeyAcceptable(
+        errCode, errMsg, errorLabels) {
         if (!errMsg) {
             return false;
         }
@@ -72,24 +74,36 @@ var $config = extendWorkload($config, function($config, $super) {
 
         // Some return paths will strip out the TransientTransactionError label. We want to still
         // filter out those errors.
-        const transientTransactionErrors = [
+        let skippableErrors = [
             ErrorCodes.StaleConfig,
             ErrorCodes.WriteConflict,
             ErrorCodes.LockTimeout,
-            ErrorCodes.PreparedTransactionInProgress
+            ErrorCodes.PreparedTransactionInProgress,
+            ErrorCodes.ShardInvalidatedForTargeting
         ];
+
+        // If we're running in a stepdown suite, then attempting to update the shard key may
+        // interact with stepdowns and transactions to cause the following errors. We only expect
+        // these errors in stepdown suites and not in other suites, so we surface them to the test
+        // runner in other scenarios.
+        const stepdownErrors =
+            [ErrorCodes.NoSuchTransaction, ErrorCodes.ConflictingOperationInProgress];
+
+        if (this.runningWithStepdowns) {
+            skippableErrors.push(...stepdownErrors);
+        }
 
         // Failed in the document shard key path, but not with a duplicate key error
         if (errMsg.includes(otherErrorsInChangeShardKeyMsg)) {
-            return transientTransactionErrors.includes(errCode);
+            return skippableErrors.includes(errCode);
         }
 
         return false;
     };
 
     $config.data.calculateShardKeyUpdateValues = function calculateShardKeyUpdateValues(
-        collection, shardKeyField, moveAcrossChunks) {
-        const idToUpdate = this.getIdForThread();
+        collection, collName, shardKeyField, moveAcrossChunks) {
+        const idToUpdate = this.getIdForThread(collName);
         const randomDocToUpdate = collection.findOne({_id: idToUpdate});
         assertWhenOwnColl.neq(randomDocToUpdate, null);
 
@@ -100,12 +114,15 @@ var $config = extendWorkload($config, function($config, $super) {
         const partitionSizeHalf = Math.floor(this.partitionSize / 2);
         const partitionMedian = partitionSizeHalf + this.partition.lower;
 
-        // If moveAcrossChunks is true, move the randomly generated shardKey to the other
-        // half of the partition, which will be on the other chunk owned by this thread.
-        let newShardKey = this.partition.lower + Math.floor(Math.random() * partitionSizeHalf);
+        let newShardKey = currentShardKey;
+        while (newShardKey == currentShardKey) {
+            // If moveAcrossChunks is true, move the randomly generated shardKey to the other
+            // half of the partition, which will be on the other chunk owned by this thread.
+            newShardKey = this.partition.lower + Math.floor(Math.random() * partitionSizeHalf);
 
-        if (moveAcrossChunks || currentShardKey >= partitionMedian) {
-            newShardKey += partitionSizeHalf;
+            if (moveAcrossChunks || currentShardKey >= partitionMedian) {
+                newShardKey += partitionSizeHalf;
+            }
         }
 
         return {
@@ -149,10 +166,10 @@ var $config = extendWorkload($config, function($config, $super) {
                                        : " as a retryable write. ";
         logString += "The document will ";
         logString += moveAcrossChunks ? "move across chunks. " : "stay within the same chunk. \n";
-        logString += "Original document values -- id: " + idToUpdate + ", shardKey: " +
-            currentShardKey + ", counter: " + counterForId + "\n";
-        logString += "Intended new document values -- shardKey: " + newShardKey + ", counter: " +
-            (counterForId + 1);
+        logString += "Original document values -- id: " + idToUpdate +
+            ", shardKey: " + currentShardKey + ", counter: " + counterForId + "\n";
+        logString += "Intended new document values -- shardKey: " + newShardKey +
+            ", counter: " + (counterForId + 1);
         jsTestLog(logString);
     };
 
@@ -163,20 +180,21 @@ var $config = extendWorkload($config, function($config, $super) {
         logString += "Find by old shard key (should be empty): " +
             tojson(collection.find({skey: currentShardKey}).toArray()) + "\n";
         logString += "Find by _id: " + tojson(collection.find({_id: idToUpdate}).toArray()) + "\n";
-        logString += "Find by new shard key: " +
-            tojson(collection.find({skey: newShardKey}).toArray()) + "\n";
+        logString +=
+            "Find by new shard key: " + tojson(collection.find({skey: newShardKey}).toArray()) +
+            "\n";
 
         jsTestLog(logString);
     };
 
     $config.data.findAndModifyShardKey = function findAndModifyShardKey(
         db, collName, {wrapInTransaction, moveAcrossChunks} = {}) {
-
         const collection = this.session.getDatabase(db.getName()).getCollection(collName);
-        const shardKeyField = $config.data.shardKeyField;
+        const shardKeyField = this.shardKeyField[collName];
 
         const {idToUpdate, currentShardKey, newShardKey, counterForId} =
-            this.calculateShardKeyUpdateValues(collection, shardKeyField, moveAcrossChunks);
+            this.calculateShardKeyUpdateValues(
+                collection, collName, shardKeyField, moveAcrossChunks);
 
         this.logTestIterationStart("findAndModify",
                                    wrapInTransaction,
@@ -225,10 +243,11 @@ var $config = extendWorkload($config, function($config, $super) {
     $config.data.updateShardKey = function updateShardKey(
         db, collName, {moveAcrossChunks, wrapInTransaction} = {}) {
         const collection = this.session.getDatabase(db.getName()).getCollection(collName);
-        const shardKeyField = $config.data.shardKeyField;
+        const shardKeyField = this.shardKeyField[collName];
 
         const {idToUpdate, currentShardKey, newShardKey, counterForId} =
-            this.calculateShardKeyUpdateValues(collection, shardKeyField, moveAcrossChunks);
+            this.calculateShardKeyUpdateValues(
+                collection, collName, shardKeyField, moveAcrossChunks);
 
         this.logTestIterationStart("update",
                                    wrapInTransaction,
@@ -244,7 +263,7 @@ var $config = extendWorkload($config, function($config, $super) {
                 this.generateRandomUpdateStyle(idToUpdate, newShardKey, counterForId),
                 {multi: false});
             try {
-                assertWhenOwnColl.writeOK(updateResult);
+                assertWhenOwnColl.commandWorked(updateResult);
                 this.expectedCounters[idToUpdate] = counterForId + 1;
             } catch (e) {
                 const err = updateResult instanceof WriteResult ? updateResult.getWriteError()
@@ -332,7 +351,7 @@ var $config = extendWorkload($config, function($config, $super) {
         // Assign a default counter value to each document owned by this thread.
         db[collName].find({tid: this.tid}).forEach(doc => {
             this.expectedCounters[doc._id] = 0;
-            assert.writeOK(db[collName].update({_id: doc._id}, {$set: {counter: 0}}));
+            assert.commandWorked(db[collName].update({_id: doc._id}, {$set: {counter: 0}}));
         });
     };
 
@@ -355,7 +374,7 @@ var $config = extendWorkload($config, function($config, $super) {
                 bulk.insert({_id: i, skey: i, tid: tid});
             }
 
-            assertAlways.writeOK(bulk.execute());
+            assertAlways.commandWorked(bulk.execute());
 
             // Create a chunk with boundaries matching the partition's. The low chunk's lower bound
             // is minKey, so a split is not necessary.

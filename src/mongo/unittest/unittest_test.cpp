@@ -31,13 +31,16 @@
  * Unit tests of the unittest framework itself.
  */
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
 #include "mongo/platform/basic.h"
 
+#include <functional>
 #include <limits>
 #include <string>
 
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/stdx/functional.h"
+#include "mongo/logv2/log.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
@@ -122,6 +125,27 @@ TEST(UnitTestSelfTest, TestStringComparisons) {
 
     ASSERT_TEST_FAILS(ASSERT_EQUALS(std::string("hello"), "good bye!"));
     ASSERT_TEST_FAILS(ASSERT_EQUALS("hello", std::string("good bye!")));
+}
+
+TEST(UnitTestSelfTest, TestAssertStringContains) {
+    ASSERT_STRING_CONTAINS("abcdef", "bcd");
+    ASSERT_TEST_FAILS(ASSERT_STRING_CONTAINS("abcdef", "AAA"));
+    ASSERT_TEST_FAILS_MATCH(ASSERT_STRING_CONTAINS("abcdef", "AAA") << "XmsgX", "XmsgX");
+}
+
+TEST(UnitTestSelfTest, TestAssertStringOmits) {
+    ASSERT_STRING_OMITS("abcdef", "AAA");
+    ASSERT_TEST_FAILS(ASSERT_STRING_OMITS("abcdef", "bcd"));
+    ASSERT_TEST_FAILS_MATCH(ASSERT_STRING_OMITS("abcdef", "bcd") << "XmsgX", "XmsgX");
+}
+
+TEST(UnitTestSelfTest, TestAssertIdentity) {
+    auto intIdentity = [](int x) { return x; };
+    ASSERT_IDENTITY(123, intIdentity);
+    ASSERT_IDENTITY(123, [](int x) { return x; });
+    auto zero = [](auto) { return 0; };
+    ASSERT_TEST_FAILS(ASSERT_IDENTITY(1, zero));
+    ASSERT_TEST_FAILS_MATCH(ASSERT_IDENTITY(1, zero) << "XmsgX", "XmsgX");
 }
 
 TEST(UnitTestSelfTest, TestStreamingIntoFailures) {
@@ -241,7 +265,7 @@ TEST(UnitTestSelfTest, BSONElementGTE) {
     ASSERT_BSONELT_GTE(obj2.firstElement(), obj1.firstElement());
 }
 
-DEATH_TEST(DeathTestSelfTest, TestDeath, "Invariant failure false") {
+DEATH_TEST_REGEX(DeathTestSelfTest, TestDeath, "Invariant failure.*false") {
     invariant(false);
 }
 
@@ -249,7 +273,7 @@ class DeathTestSelfTestFixture : public ::mongo::unittest::Test {
 public:
     void setUp() override {}
     void tearDown() override {
-        mongo::unittest::log() << "Died in tear-down";
+        LOGV2(24148, "Died in tear-down");
         invariant(false);
     }
 };

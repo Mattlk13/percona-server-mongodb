@@ -38,34 +38,10 @@ namespace mongo {
 namespace {
 
 MONGO_INIT_REGISTER_ERROR_EXTRA_INFO(StaleConfigInfo);
+MONGO_INIT_REGISTER_ERROR_EXTRA_INFO(StaleEpochInfo);
 MONGO_INIT_REGISTER_ERROR_EXTRA_INFO(StaleDbRoutingVersion);
 
-boost::optional<ChunkVersion> extractOptionalVersion(const BSONObj& obj, StringData field) {
-    auto swChunkVersion = ChunkVersion::parseLegacyWithField(obj, field);
-    if (swChunkVersion == ErrorCodes::NoSuchKey)
-        return boost::none;
-    return uassertStatusOK(std::move(swChunkVersion));
-}
-
 }  // namespace
-
-void StaleConfigInfo::serialize(BSONObjBuilder* bob) const {
-    bob->append("ns", _nss.ns());
-    _received.appendLegacyWithField(bob, "vReceived");
-    if (_wanted) {
-        _wanted->appendLegacyWithField(bob, "vWanted");
-    }
-}
-
-std::shared_ptr<const ErrorExtraInfo> StaleConfigInfo::parse(const BSONObj& obj) {
-    return std::make_shared<StaleConfigInfo>(parseFromCommandError(obj));
-}
-
-StaleConfigInfo StaleConfigInfo::parseFromCommandError(const BSONObj& obj) {
-    return StaleConfigInfo(NamespaceString(obj["ns"].String()),
-                           uassertStatusOK(ChunkVersion::parseLegacyWithField(obj, "vReceived")),
-                           extractOptionalVersion(obj, "vWanted"));
-}
 
 void StaleDbRoutingVersion::serialize(BSONObjBuilder* bob) const {
     bob->append("db", _db);
@@ -80,14 +56,10 @@ std::shared_ptr<const ErrorExtraInfo> StaleDbRoutingVersion::parse(const BSONObj
 }
 
 StaleDbRoutingVersion StaleDbRoutingVersion::parseFromCommandError(const BSONObj& obj) {
-    return StaleDbRoutingVersion(
-        obj["db"].String(),
-        DatabaseVersion::parse(IDLParserErrorContext("StaleDbRoutingVersion-vReceived"),
-                               obj["vReceived"].Obj()),
-        !obj["vWanted"].eoo()
-            ? DatabaseVersion::parse(IDLParserErrorContext("StaleDbRoutingVersion-vWanted"),
-                                     obj["vWanted"].Obj())
-            : boost::optional<DatabaseVersion>{});
+    return StaleDbRoutingVersion(obj["db"].String(),
+                                 DatabaseVersion(obj["vReceived"].Obj()),
+                                 !obj["vWanted"].eoo() ? DatabaseVersion(obj["vWanted"].Obj())
+                                                       : boost::optional<DatabaseVersion>{});
 }
 
 }  // namespace mongo

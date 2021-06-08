@@ -30,7 +30,7 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/bson/json.h"
-#include "mongo/db/matcher/expression_internal_expr_eq.h"
+#include "mongo/db/matcher/expression_internal_expr_comparison.h"
 #include "mongo/db/matcher/matcher.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
 #include "mongo/db/query/collation/collator_interface_mock.h"
@@ -264,7 +264,7 @@ TEST(InternalExprEqMatchExpression, SerializesCorrectly) {
                                      operand.firstElement());
 
     BSONObjBuilder bob;
-    eq.serialize(&bob);
+    eq.serialize(&bob, true);
 
     ASSERT_BSONOBJ_EQ(BSON("x" << BSON("$_internalExprEq" << 5)), bob.obj());
 }
@@ -291,7 +291,7 @@ TEST(InternalExprEqMatchExpression, EquivalentToClone) {
     CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kReverseString);
     Matcher eq(query, expCtx);
     eq.getMatchExpression()->setCollator(&collator);
-    auto relevantTag = stdx::make_unique<RelevantTag>();
+    auto relevantTag = std::make_unique<RelevantTag>();
     relevantTag->first.push_back(0u);
     relevantTag->notFirst.push_back(1u);
     eq.getMatchExpression()->setTag(relevantTag.release());
@@ -300,23 +300,23 @@ TEST(InternalExprEqMatchExpression, EquivalentToClone) {
     ASSERT_TRUE(eq.getMatchExpression()->equivalent(clone.get()));
 }
 
-DEATH_TEST(InternalExprEqMatchExpression,
-           CannotCompareToArray,
-           "Invariant failure _rhs.type() != BSONType::Array") {
+DEATH_TEST_REGEX(InternalExprEqMatchExpression,
+                 CannotCompareToArray,
+                 R"#(Invariant failure.*_rhs.type\(\) != BSONType::Array)#") {
     auto operand = BSON("a" << BSON_ARRAY(1 << 2));
     InternalExprEqMatchExpression eq(operand.firstElement().fieldNameStringData(),
                                      operand.firstElement());
 }
 
-DEATH_TEST(InternalExprEqMatchExpression,
-           CannotCompareToUndefined,
-           "Invariant failure _rhs.type() != BSONType::Undefined") {
+DEATH_TEST_REGEX(InternalExprEqMatchExpression,
+                 CannotCompareToUndefined,
+                 R"#(Invariant failure.*_rhs.type\(\) != BSONType::Undefined)#") {
     auto operand = BSON("a" << BSONUndefined);
     InternalExprEqMatchExpression eq(operand.firstElement().fieldNameStringData(),
                                      operand.firstElement());
 }
 
-DEATH_TEST(InternalExprEqMatchExpression, CannotCompareToMissing, "Invariant failure _rhs") {
+DEATH_TEST_REGEX(InternalExprEqMatchExpression, CannotCompareToMissing, "Invariant failure.*_rhs") {
     InternalExprEqMatchExpression eq("a"_sd, BSONElement());
 }
 }  // namespace

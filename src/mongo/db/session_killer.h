@@ -30,17 +30,18 @@
 #pragma once
 
 #include <boost/optional.hpp>
+#include <functional>
 #include <memory>
 #include <random>
 #include <vector>
 
 #include "mongo/base/status_with.h"
 #include "mongo/db/kill_sessions.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/stdx/unordered_set.h"
+#include "mongo/util/hierarchical_acquisition.h"
 #include "mongo/util/net/hostandport.h"
 
 namespace mongo {
@@ -91,7 +92,7 @@ public:
      * A process specific kill function (we have a different impl in mongos versus mongod).
      */
     using KillFunc =
-        stdx::function<Result(OperationContext*, const Matcher&, UniformRandomBitGenerator* urbg)>;
+        std::function<Result(OperationContext*, const Matcher&, UniformRandomBitGenerator* urbg)>;
 
     /**
      * The killer lives as a decoration on the service context.
@@ -103,6 +104,8 @@ public:
      * This method binds the SessionKiller to the ServiceContext.
      */
     static void set(ServiceContext* ctx, std::shared_ptr<SessionKiller> sk);
+
+    static void shutdown(ServiceContext* ctx);
 
     explicit SessionKiller(ServiceContext* sc, KillFunc killer);
     ~SessionKiller();
@@ -125,13 +128,13 @@ private:
         std::shared_ptr<boost::optional<Result>> result;
     };
 
-    void _periodicKill(OperationContext* opCtx, stdx::unique_lock<stdx::mutex>& lk);
+    void _periodicKill(OperationContext* opCtx, stdx::unique_lock<Latch>& lk);
 
     KillFunc _killFunc;
 
     stdx::thread _thread;
 
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH(HierarchicalAcquisitionLevel(2), "SessionKiller::_mutex");
     stdx::condition_variable _callerCV;
     stdx::condition_variable _killerCV;
 

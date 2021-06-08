@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -38,7 +38,6 @@
 #include "mongo/db/s/transaction_coordinator_service.h"
 #include "mongo/db/s/transaction_coordinator_test_fixture.h"
 #include "mongo/db/write_concern_options.h"
-#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
@@ -184,7 +183,8 @@ protected:
         }
 
         // Wait for abort to complete.
-        commitDecisionFuture.get();
+        ASSERT_THROWS_CODE(
+            commitDecisionFuture.get(), AssertionException, ErrorCodes::NoSuchTransaction);
     }
 
     auto* service() const {
@@ -192,24 +192,23 @@ protected:
     }
 };
 
-
 using TransactionCoordinatorServiceStepUpStepDownTest = TransactionCoordinatorServiceTestFixture;
 
 TEST_F(TransactionCoordinatorServiceStepUpStepDownTest, OperationsFailBeforeStepUpStarts) {
     ASSERT_THROWS_CODE(service()->createCoordinator(
                            operationContext(), makeLogicalSessionIdForTest(), 0, kCommitDeadline),
                        AssertionException,
-                       ErrorCodes::NotMaster);
+                       ErrorCodes::NotWritablePrimary);
 
     ASSERT_THROWS_CODE(service()->coordinateCommit(
                            operationContext(), makeLogicalSessionIdForTest(), 0, kTwoShardIdSet),
                        AssertionException,
-                       ErrorCodes::NotMaster);
+                       ErrorCodes::NotWritablePrimary);
 
     ASSERT_THROWS_CODE(
         service()->recoverCommit(operationContext(), makeLogicalSessionIdForTest(), 0),
         AssertionException,
-        ErrorCodes::NotMaster);
+        ErrorCodes::NotWritablePrimary);
 }
 
 TEST_F(TransactionCoordinatorServiceStepUpStepDownTest, OperationsBlockBeforeStepUpCompletes) {
@@ -273,7 +272,6 @@ TEST_F(TransactionCoordinatorServiceStepUpStepDownTest, StepDownBeforeStepUpTask
     service()->onStepDown();
 }
 
-
 class TransactionCoordinatorServiceTest : public TransactionCoordinatorServiceTestFixture {
 protected:
     void setUp() override {
@@ -284,6 +282,7 @@ protected:
 
     void tearDown() override {
         service()->onStepDown();
+        service()->joinPreviousRound();
 
         TransactionCoordinatorServiceTestFixture::tearDown();
     }
@@ -341,8 +340,6 @@ TEST_F(TransactionCoordinatorServiceTest,
     // commit acks.
     coordinatorService->createCoordinator(
         operationContext(), _lsid, _txnNumber + 1, kCommitDeadline);
-    auto newTxnCommitDecisionFuture = coordinatorService->coordinateCommit(
-        operationContext(), _lsid, _txnNumber + 1, kTwoShardIdSet);
 
     // Finish committing the old transaction by sending it commit acks from both participants.
     assertCommitSentAndRespondWithSuccess();
@@ -351,22 +348,15 @@ TEST_F(TransactionCoordinatorServiceTest,
     // The old transaction should now be committed.
     ASSERT_EQ(static_cast<int>(oldTxnCommitDecisionFuture.get()),
               static_cast<int>(txn::CommitDecision::kCommit));
+
+    auto newTxnCommitDecisionFuture = coordinatorService->coordinateCommit(
+        operationContext(), _lsid, _txnNumber + 1, kTwoShardIdSet);
+
     commitTransaction(*coordinatorService, _lsid, _txnNumber + 1, kTwoShardIdSet);
 }
 
 TEST_F(TransactionCoordinatorServiceTest, CoordinateCommitReturnsNoneIfNoCoordinatorEverExisted) {
     auto coordinatorService = TransactionCoordinatorService::get(operationContext());
-    auto commitDecisionFuture =
-        coordinatorService->coordinateCommit(operationContext(), _lsid, _txnNumber, kTwoShardIdSet);
-    ASSERT(boost::none == commitDecisionFuture);
-}
-
-TEST_F(TransactionCoordinatorServiceTest, CoordinateCommitReturnsNoneIfCoordinatorWasRemoved) {
-    auto coordinatorService = TransactionCoordinatorService::get(operationContext());
-
-    coordinatorService->createCoordinator(operationContext(), _lsid, _txnNumber, kCommitDeadline);
-    commitTransaction(*coordinatorService, _lsid, _txnNumber, kTwoShardIdSet);
-
     auto commitDecisionFuture =
         coordinatorService->coordinateCommit(operationContext(), _lsid, _txnNumber, kTwoShardIdSet);
     ASSERT(boost::none == commitDecisionFuture);
@@ -390,8 +380,10 @@ TEST_F(TransactionCoordinatorServiceTest,
     assertAbortSentAndRespondWithSuccess();
     assertAbortSentAndRespondWithSuccess();
 
-    ASSERT_EQ(static_cast<int>(commitDecisionFuture1.get()),
-              static_cast<int>(commitDecisionFuture2.get()));
+    ASSERT_THROWS_CODE(
+        commitDecisionFuture1.get(), AssertionException, ErrorCodes::NoSuchTransaction);
+    ASSERT_THROWS_CODE(
+        commitDecisionFuture2.get(), AssertionException, ErrorCodes::NoSuchTransaction);
 }
 
 TEST_F(TransactionCoordinatorServiceTest,
@@ -433,8 +425,10 @@ TEST_F(TransactionCoordinatorServiceTest, RecoverCommitJoinsOngoingCoordinationT
     assertAbortSentAndRespondWithSuccess();
     assertAbortSentAndRespondWithSuccess();
 
-    ASSERT_EQ(static_cast<int>(commitDecisionFuture1.get()),
-              static_cast<int>(commitDecisionFuture2.get()));
+    ASSERT_THROWS_CODE(
+        commitDecisionFuture1.get(), AssertionException, ErrorCodes::NoSuchTransaction);
+    ASSERT_THROWS_CODE(
+        commitDecisionFuture2.get(), AssertionException, ErrorCodes::NoSuchTransaction);
 }
 
 TEST_F(TransactionCoordinatorServiceTest, RecoverCommitJoinsOngoingCoordinationThatLeadsToCommit) {
@@ -472,7 +466,7 @@ TEST_F(TransactionCoordinatorServiceTest,
         operationContext(), _lsid, _txnNumber + 1, kCommitDeadline);
 
     ASSERT_THROWS_CODE(
-        commitDecisionFuture.get(), AssertionException, ErrorCodes::NoSuchTransaction);
+        commitDecisionFuture.get(), AssertionException, ErrorCodes::TransactionCoordinatorCanceled);
 }
 
 TEST_F(
@@ -494,8 +488,9 @@ TEST_F(
 
     // The old transaction should now be committed.
     if (oldTxnCommitDecisionFuture) {
-        ASSERT_THROWS_CODE(
-            oldTxnCommitDecisionFuture->get(), AssertionException, ErrorCodes::NoSuchTransaction);
+        ASSERT_THROWS_CODE(oldTxnCommitDecisionFuture->get(),
+                           AssertionException,
+                           ErrorCodes::TransactionCoordinatorCanceled);
     }
 
     // Make sure the newly created one works fine too.
@@ -559,8 +554,8 @@ TEST_F(TransactionCoordinatorServiceTest, CoordinatorRetriesOnWriteConcernErrorT
     assertAbortSentAndRespondWithNoSuchTransaction();
 
     // The transaction should now be aborted.
-    ASSERT_EQ(static_cast<int>(commitDecisionFuture.get()),
-              static_cast<int>(txn::CommitDecision::kAbort));
+    ASSERT_THROWS_CODE(
+        commitDecisionFuture.get(), AssertionException, ErrorCodes::NoSuchTransaction);
 }
 
 TEST_F(TransactionCoordinatorServiceTest, CoordinatorRetriesOnWriteConcernErrorToCommit) {
@@ -614,12 +609,15 @@ TEST_F(TransactionCoordinatorServiceTest, CoordinatorAbortsIfDeadlinePassesAndSt
     const auto deadline = executor()->now() + Milliseconds(1000 * 60 * 10 /* 10 hours */);
     coordinatorService->createCoordinator(operationContext(), _lsid, _txnNumber, deadline);
 
-    // Deliver the participant list before the deadline.
     ASSERT(boost::none !=
            coordinatorService->coordinateCommit(
                operationContext(), _lsid, _txnNumber, kTwoShardIdSet));
 
-    // Reach the deadline.
+    // This ensures that the VectorClock and the participants persistence step executes
+    advanceClockAndExecuteScheduledTasks();
+
+    // This ensures that the coordinator will reach the deadline and cause it to abort the
+    // transaction
     network()->enterNetwork();
     network()->advanceTime(deadline);
     network()->exitNetwork();
@@ -633,7 +631,8 @@ TEST_F(TransactionCoordinatorServiceTest, CoordinatorAbortsIfDeadlinePassesAndSt
     assertAbortSentAndRespondWithSuccess();
     assertAbortSentAndRespondWithSuccess();
 
-    ASSERT_EQ(int(txn::CommitDecision::kAbort), int(commitDecisionFuture->get()));
+    ASSERT_THROWS_CODE(
+        commitDecisionFuture->get(), AssertionException, ErrorCodes::NoSuchTransaction);
 }
 
 TEST_F(TransactionCoordinatorServiceTest,
@@ -698,17 +697,8 @@ TEST_F(TransactionCoordinatorServiceTestSingleTxn,
     assertAbortSentAndRespondWithSuccess();
     assertAbortSentAndRespondWithSuccess();
 
-    auto commitDecision = commitDecisionFuture.get();
-    ASSERT_EQ(static_cast<int>(commitDecision), static_cast<int>(txn::CommitDecision::kAbort));
-}
-
-TEST_F(TransactionCoordinatorServiceTestSingleTxn,
-       CoordinateCommitWithNoVotesReturnsNotReadyFuture) {
-
-    auto commitDecisionFuture = *coordinatorService()->coordinateCommit(
-        operationContext(), _lsid, _txnNumber, kTwoShardIdSet);
-
-    ASSERT_FALSE(commitDecisionFuture.isReady());
+    ASSERT_THROWS_CODE(
+        commitDecisionFuture.get(), AssertionException, ErrorCodes::NoSuchTransaction);
 }
 
 TEST_F(TransactionCoordinatorServiceTestSingleTxn,
@@ -716,6 +706,8 @@ TEST_F(TransactionCoordinatorServiceTestSingleTxn,
 
     auto commitDecisionFuture = *coordinatorService()->coordinateCommit(
         operationContext(), _lsid, _txnNumber, kTwoShardIdSet);
+
+    ASSERT_FALSE(commitDecisionFuture.isReady());
 
     assertPrepareSentAndRespondWithSuccess();
     assertPrepareSentAndRespondWithSuccess();
@@ -750,8 +742,10 @@ TEST_F(TransactionCoordinatorServiceTestSingleTxn,
 
     abortTransaction(*coordinatorService(), _lsid, _txnNumber, kTwoShardIdSet, kTwoShardIdList[0]);
 
-    ASSERT_EQ(static_cast<int>(commitDecisionFuture1.get()),
-              static_cast<int>(commitDecisionFuture2.get()));
+    ASSERT_THROWS_CODE(
+        commitDecisionFuture1.get(), AssertionException, ErrorCodes::NoSuchTransaction);
+    ASSERT_THROWS_CODE(
+        commitDecisionFuture2.get(), AssertionException, ErrorCodes::NoSuchTransaction);
 }
 
 }  // namespace

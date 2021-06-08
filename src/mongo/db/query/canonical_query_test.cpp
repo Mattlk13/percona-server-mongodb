@@ -98,31 +98,28 @@ TEST(CanonicalQueryTest, IsValidSortKeyMetaProjection) {
 
     // Passing a sortKey meta-projection without a sort is an error.
     {
-        const bool isExplain = false;
-        auto qr = assertGet(QueryRequest::makeFromFindCommand(
-            nss, fromjson("{find: 'testcoll', projection: {foo: {$meta: 'sortKey'}}}"), isExplain));
-        auto cq = CanonicalQuery::canonicalize(opCtx.get(), std::move(qr));
+        auto findCommand = query_request_helper::makeFromFindCommandForTests(
+            fromjson("{find: 'testcoll', projection: {foo: {$meta: 'sortKey'}}, '$db': 'test'}"));
+        auto cq = CanonicalQuery::canonicalize(opCtx.get(), std::move(findCommand));
         ASSERT_NOT_OK(cq.getStatus());
     }
 
     // Should be able to successfully create a CQ when there is a sort.
     {
-        const bool isExplain = false;
-        auto qr = assertGet(QueryRequest::makeFromFindCommand(
-            nss,
-            fromjson("{find: 'testcoll', projection: {foo: {$meta: 'sortKey'}}, sort: {bar: 1}}"),
-            isExplain));
-        auto cq = CanonicalQuery::canonicalize(opCtx.get(), std::move(qr));
+        auto findCommand = query_request_helper::makeFromFindCommandForTests(
+            fromjson("{find: 'testcoll', projection: {foo: {$meta: 'sortKey'}}, sort: {bar: 1}, "
+                     "'$db': 'test'}"));
+        auto cq = CanonicalQuery::canonicalize(opCtx.get(), std::move(findCommand));
         ASSERT_OK(cq.getStatus());
     }
 }
 
 //
-// Tests for CanonicalQuery::sortTree
+// Tests for MatchExpression::sortTree
 //
 
 /**
- * Helper function for testing CanonicalQuery::sortTree().
+ * Helper function for testing MatchExpression::sortTree().
  *
  * Verifies that sorting the expression 'unsortedQueryStr' yields an expression equivalent to
  * the expression 'sortedQueryStr'.
@@ -140,12 +137,12 @@ void testSortTree(const char* unsortedQueryStr, const char* sortedQueryStr) {
     // Sanity check that sorting the sorted expression is a no-op.
     {
         unique_ptr<MatchExpression> sortedQueryExprClone(parseMatchExpression(sortedQueryObj));
-        CanonicalQuery::sortTree(sortedQueryExprClone.get());
+        MatchExpression::sortTree(sortedQueryExprClone.get());
         assertEquivalent(unsortedQueryStr, sortedQueryExpr.get(), sortedQueryExprClone.get());
     }
 
     // Test that sorting the unsorted expression yields the sorted expression.
-    CanonicalQuery::sortTree(unsortedQueryExpr.get());
+    MatchExpression::sortTree(unsortedQueryExpr.get());
     assertEquivalent(unsortedQueryStr, unsortedQueryExpr.get(), sortedQueryExpr.get());
 }
 
@@ -182,11 +179,15 @@ unique_ptr<CanonicalQuery> canonicalize(const char* queryStr,
     QueryTestServiceContext serviceContext;
     auto opCtx = serviceContext.makeOperationContext();
 
-    auto qr = stdx::make_unique<QueryRequest>(nss);
-    qr->setFilter(fromjson(queryStr));
+    auto findCommand = std::make_unique<FindCommandRequest>(nss);
+    findCommand->setFilter(fromjson(queryStr));
 
-    auto statusWithCQ = CanonicalQuery::canonicalize(
-        opCtx.get(), std::move(qr), nullptr, ExtensionsCallbackNoop(), allowedFeatures);
+    auto statusWithCQ = CanonicalQuery::canonicalize(opCtx.get(),
+                                                     std::move(findCommand),
+                                                     false,
+                                                     nullptr,
+                                                     ExtensionsCallbackNoop(),
+                                                     allowedFeatures);
 
     ASSERT_OK(statusWithCQ.getStatus());
     return std::move(statusWithCQ.getValue());
@@ -198,11 +199,11 @@ std::unique_ptr<CanonicalQuery> canonicalize(const char* queryStr,
     QueryTestServiceContext serviceContext;
     auto opCtx = serviceContext.makeOperationContext();
 
-    auto qr = stdx::make_unique<QueryRequest>(nss);
-    qr->setFilter(fromjson(queryStr));
-    qr->setSort(fromjson(sortStr));
-    qr->setProj(fromjson(projStr));
-    auto statusWithCQ = CanonicalQuery::canonicalize(opCtx.get(), std::move(qr));
+    auto findCommand = std::make_unique<FindCommandRequest>(nss);
+    findCommand->setFilter(fromjson(queryStr));
+    findCommand->setSort(fromjson(sortStr));
+    findCommand->setProjection(fromjson(projStr));
+    auto statusWithCQ = CanonicalQuery::canonicalize(opCtx.get(), std::move(findCommand));
     ASSERT_OK(statusWithCQ.getStatus());
     return std::move(statusWithCQ.getValue());
 }
@@ -270,28 +271,32 @@ TEST(CanonicalQueryTest, CanonicalizeFromBaseQuery) {
 
     const bool isExplain = true;
     const std::string cmdStr =
-        "{find:'bogusns', filter:{$or:[{a:1,b:1},{a:1,c:1}]}, projection:{a:1}, sort:{b:1}}";
-    auto qr = assertGet(QueryRequest::makeFromFindCommand(nss, fromjson(cmdStr), isExplain));
-    auto baseCq = assertGet(CanonicalQuery::canonicalize(opCtx.get(), std::move(qr)));
+        "{find:'bogusns', filter:{$or:[{a:1,b:1},{a:1,c:1}]}, projection:{a:1}, sort:{b:1}, '$db': "
+        "'test'}";
+    auto findCommand = query_request_helper::makeFromFindCommandForTests(fromjson(cmdStr));
+    auto baseCq =
+        assertGet(CanonicalQuery::canonicalize(opCtx.get(), std::move(findCommand), isExplain));
 
     MatchExpression* firstClauseExpr = baseCq->root()->getChild(0);
     auto childCq = assertGet(CanonicalQuery::canonicalize(opCtx.get(), *baseCq, firstClauseExpr));
 
     BSONObjBuilder expectedFilter;
     firstClauseExpr->serialize(&expectedFilter);
-    ASSERT_BSONOBJ_EQ(childCq->getQueryRequest().getFilter(), expectedFilter.obj());
+    ASSERT_BSONOBJ_EQ(childCq->getFindCommandRequest().getFilter(), expectedFilter.obj());
 
-    ASSERT_BSONOBJ_EQ(childCq->getQueryRequest().getProj(), baseCq->getQueryRequest().getProj());
-    ASSERT_BSONOBJ_EQ(childCq->getQueryRequest().getSort(), baseCq->getQueryRequest().getSort());
-    ASSERT_TRUE(childCq->getQueryRequest().isExplain());
+    ASSERT_BSONOBJ_EQ(childCq->getFindCommandRequest().getProjection(),
+                      baseCq->getFindCommandRequest().getProjection());
+    ASSERT_BSONOBJ_EQ(childCq->getFindCommandRequest().getSort(),
+                      baseCq->getFindCommandRequest().getSort());
+    ASSERT_TRUE(childCq->getExplain());
 }
 
 TEST(CanonicalQueryTest, CanonicalQueryFromQRWithNoCollation) {
     QueryTestServiceContext serviceContext;
     auto opCtx = serviceContext.makeOperationContext();
 
-    auto qr = stdx::make_unique<QueryRequest>(nss);
-    auto cq = assertGet(CanonicalQuery::canonicalize(opCtx.get(), std::move(qr)));
+    auto findCommand = std::make_unique<FindCommandRequest>(nss);
+    auto cq = assertGet(CanonicalQuery::canonicalize(opCtx.get(), std::move(findCommand)));
     ASSERT_TRUE(cq->getCollator() == nullptr);
 }
 
@@ -299,10 +304,10 @@ TEST(CanonicalQueryTest, CanonicalQueryFromQRWithCollation) {
     QueryTestServiceContext serviceContext;
     auto opCtx = serviceContext.makeOperationContext();
 
-    auto qr = stdx::make_unique<QueryRequest>(nss);
-    qr->setCollation(BSON("locale"
-                          << "reverse"));
-    auto cq = assertGet(CanonicalQuery::canonicalize(opCtx.get(), std::move(qr)));
+    auto findCommand = std::make_unique<FindCommandRequest>(nss);
+    findCommand->setCollation(BSON("locale"
+                                   << "reverse"));
+    auto cq = assertGet(CanonicalQuery::canonicalize(opCtx.get(), std::move(findCommand)));
     CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kReverseString);
     ASSERT_TRUE(CollatorInterface::collatorsMatch(cq->getCollator(), &collator));
 }
@@ -311,9 +316,9 @@ TEST(CanonicalQueryTest, CanonicalQueryFromBaseQueryWithNoCollation) {
     QueryTestServiceContext serviceContext;
     auto opCtx = serviceContext.makeOperationContext();
 
-    auto qr = stdx::make_unique<QueryRequest>(nss);
-    qr->setFilter(fromjson("{$or:[{a:1,b:1},{a:1,c:1}]}"));
-    auto baseCq = assertGet(CanonicalQuery::canonicalize(opCtx.get(), std::move(qr)));
+    auto findCommand = std::make_unique<FindCommandRequest>(nss);
+    findCommand->setFilter(fromjson("{$or:[{a:1,b:1},{a:1,c:1}]}"));
+    auto baseCq = assertGet(CanonicalQuery::canonicalize(opCtx.get(), std::move(findCommand)));
     MatchExpression* firstClauseExpr = baseCq->root()->getChild(0);
     auto childCq = assertGet(CanonicalQuery::canonicalize(opCtx.get(), *baseCq, firstClauseExpr));
     ASSERT_TRUE(baseCq->getCollator() == nullptr);
@@ -324,11 +329,11 @@ TEST(CanonicalQueryTest, CanonicalQueryFromBaseQueryWithCollation) {
     QueryTestServiceContext serviceContext;
     auto opCtx = serviceContext.makeOperationContext();
 
-    auto qr = stdx::make_unique<QueryRequest>(nss);
-    qr->setFilter(fromjson("{$or:[{a:1,b:1},{a:1,c:1}]}"));
-    qr->setCollation(BSON("locale"
-                          << "reverse"));
-    auto baseCq = assertGet(CanonicalQuery::canonicalize(opCtx.get(), std::move(qr)));
+    auto findCommand = std::make_unique<FindCommandRequest>(nss);
+    findCommand->setFilter(fromjson("{$or:[{a:1,b:1},{a:1,c:1}]}"));
+    findCommand->setCollation(BSON("locale"
+                                   << "reverse"));
+    auto baseCq = assertGet(CanonicalQuery::canonicalize(opCtx.get(), std::move(findCommand)));
     MatchExpression* firstClauseExpr = baseCq->root()->getChild(0);
     auto childCq = assertGet(CanonicalQuery::canonicalize(opCtx.get(), *baseCq, firstClauseExpr));
     ASSERT(baseCq->getCollator());
@@ -340,9 +345,9 @@ TEST(CanonicalQueryTest, SettingCollatorUpdatesCollatorAndMatchExpression) {
     QueryTestServiceContext serviceContext;
     auto opCtx = serviceContext.makeOperationContext();
 
-    auto qr = stdx::make_unique<QueryRequest>(nss);
-    qr->setFilter(fromjson("{a: 'foo', b: {$in: ['bar', 'baz']}}"));
-    auto cq = assertGet(CanonicalQuery::canonicalize(opCtx.get(), std::move(qr)));
+    auto findCommand = std::make_unique<FindCommandRequest>(nss);
+    findCommand->setFilter(fromjson("{a: 'foo', b: {$in: ['bar', 'baz']}}"));
+    auto cq = assertGet(CanonicalQuery::canonicalize(opCtx.get(), std::move(findCommand)));
     ASSERT_EQUALS(2U, cq->root()->numChildren());
     auto firstChild = cq->root()->getChild(0);
     auto secondChild = cq->root()->getChild(1);
@@ -388,6 +393,65 @@ TEST(CanonicalQueryTest, NorWithOneChildNormalizedAfterNormalizingChild) {
     ASSERT_EQ(MatchExpression::NOT, root->matchType());
     ASSERT_EQ(1U, root->numChildren());
     ASSERT_EQ(MatchExpression::EQ, root->getChild(0)->matchType());
+}
+
+void assertValidSortOrder(BSONObj sort, BSONObj filter = BSONObj{}) {
+    QueryTestServiceContext serviceContext;
+    auto opCtx = serviceContext.makeOperationContext();
+
+    auto findCommand = std::make_unique<FindCommandRequest>(nss);
+    findCommand->setFilter(filter);
+    findCommand->setSort(sort);
+    auto statusWithCQ =
+        CanonicalQuery::canonicalize(opCtx.get(),
+                                     std::move(findCommand),
+                                     false,
+                                     nullptr,
+                                     ExtensionsCallbackNoop(),
+                                     MatchExpressionParser::kAllowAllSpecialFeatures);
+    ASSERT_OK(statusWithCQ.getStatus());
+}
+
+TEST(CanonicalQueryTest, ValidSortOrdersCanonicalizeSuccessfully) {
+    assertValidSortOrder(fromjson("{}"));
+    assertValidSortOrder(fromjson("{a: 1}"));
+    assertValidSortOrder(fromjson("{a: -1}"));
+    assertValidSortOrder(fromjson("{a: {$meta: \"textScore\"}}"),
+                         fromjson("{$text: {$search: 'keyword'}}"));
+    assertValidSortOrder(fromjson("{a: {$meta: \"randVal\"}}"));
+}
+
+void assertInvalidSortOrder(BSONObj sort) {
+    QueryTestServiceContext serviceContext;
+    auto opCtx = serviceContext.makeOperationContext();
+
+    auto findCommand = std::make_unique<FindCommandRequest>(nss);
+    findCommand->setSort(sort);
+    auto statusWithCQ = CanonicalQuery::canonicalize(opCtx.get(), std::move(findCommand));
+    ASSERT_NOT_OK(statusWithCQ.getStatus());
+}
+
+TEST(CanonicalQueryTest, InvalidSortOrdersFailToCanonicalize) {
+    assertInvalidSortOrder(fromjson("{a: 100}"));
+    assertInvalidSortOrder(fromjson("{a: 0}"));
+    assertInvalidSortOrder(fromjson("{a: -100}"));
+    assertInvalidSortOrder(fromjson("{a: Infinity}"));
+    assertInvalidSortOrder(fromjson("{a: -Infinity}"));
+    assertInvalidSortOrder(fromjson("{a: true}"));
+    assertInvalidSortOrder(fromjson("{a: false}"));
+    assertInvalidSortOrder(fromjson("{a: null}"));
+    assertInvalidSortOrder(fromjson("{a: {}}"));
+    assertInvalidSortOrder(fromjson("{a: {b: 1}}"));
+    assertInvalidSortOrder(fromjson("{a: []}"));
+    assertInvalidSortOrder(fromjson("{a: [1, 2, 3]}"));
+    assertInvalidSortOrder(fromjson("{a: \"\"}"));
+    assertInvalidSortOrder(fromjson("{a: \"bb\"}"));
+    assertInvalidSortOrder(fromjson("{a: {$meta: 1}}"));
+    assertInvalidSortOrder(fromjson("{a: {$meta: \"image\"}}"));
+    assertInvalidSortOrder(fromjson("{a: {$world: \"textScore\"}}"));
+    assertInvalidSortOrder(fromjson("{a: {$meta: \"textScore\", b: 1}}"));
+    assertInvalidSortOrder(fromjson("{'': 1}"));
+    assertInvalidSortOrder(fromjson("{'': -1}"));
 }
 
 }  // namespace

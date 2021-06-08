@@ -18,15 +18,15 @@ for (i = 0; i < 1000; i++) {
     t.save({tags: getTags()});
 }
 
-t.ensureIndex({tags: 1});
+t.createIndex({tags: 1});
 
 for (i = 0; i < 200; i++) {
     for (var j = 0; j < 10; j++)
         t.save({tags: getTags(100)});
     var q = {tags: {$in: getTags(10)}};
     var before = t.find(q).count();
-    var res = assert.writeOK(t.remove(q));
+    var res = assert.commandWorked(t.remove(q));
     var after = t.find(q).count();
     assert.eq(0, after, "not zero after!");
-    assert.writeOK(res);
+    assert.commandWorked(res);
 }

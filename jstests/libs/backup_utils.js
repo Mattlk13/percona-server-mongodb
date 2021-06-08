@@ -1,4 +1,4 @@
-load("jstests/libs/parallelTester.js");  // for ScopedThread.
+load("jstests/libs/parallelTester.js");  // for Thread.
 
 function backupData(mongo, destinationDirectory) {
     let backupCursor = openBackupCursor(mongo);
@@ -43,7 +43,7 @@ function startHeartbeatThread(host, backupCursor, session, stopCounter) {
         }
     };
 
-    heartbeater = new ScopedThread(heartbeatBackupCursor, host, cursorId, lsid, stopCounter);
+    heartbeater = new Thread(heartbeatBackupCursor, host, cursorId, lsid, stopCounter);
     heartbeater.start();
     return heartbeater;
 }
@@ -57,7 +57,7 @@ function getBackupCursorMetadata(backupCursor) {
 
 /**
  * Exhaust the backup cursor and copy all the listed files to the destination directory. If `async`
- * is true, this function will spawn a ScopedThread doing the copy work and return the thread along
+ * is true, this function will spawn a Thread doing the copy work and return the thread along
  * with the backup cursor metadata. The caller should `join` the thread when appropriate.
  */
 function copyBackupCursorFiles(backupCursor, dbpath, destinationDirectory, async) {
@@ -72,8 +72,7 @@ function copyBackupCursorExtendFiles(cursor, dbpath, destinationDirectory, async
     let files = _cursorToFiles(cursor);
     let copyThread;
     if (async) {
-        copyThread =
-            new ScopedThread(_copyFiles, files, dbpath, destinationDirectory, _copyFileHelper);
+        copyThread = new Thread(_copyFiles, files, dbpath, destinationDirectory, _copyFileHelper);
         copyThread.start();
     } else {
         _copyFiles(files, dbpath, destinationDirectory, _copyFileHelper);
@@ -109,13 +108,13 @@ function _copyFiles(files, dbpath, destinationDirectory, copyFileHelper) {
 
 function _copyFileHelper(absoluteFilePath, sourceDbPath, destinationDirectory) {
     // Ensure the dbpath ends with an OS appropriate slash.
+    let separator = '/';
+    if (_isWindows()) {
+        separator = '\\';
+    }
     let lastChar = sourceDbPath[sourceDbPath.length - 1];
     if (lastChar !== '/' && lastChar !== '\\') {
-        if (_isWindows()) {
-            sourceDbPath += '\\';
-        } else {
-            sourceDbPath += '/';
-        }
+        sourceDbPath += separator;
     }
 
     // Ensure that the full path starts with the returned dbpath.
@@ -124,7 +123,9 @@ function _copyFileHelper(absoluteFilePath, sourceDbPath, destinationDirectory) {
     // Grab the file path relative to the dbpath. Maintain that relation when copying
     // to the `hiddenDbpath`.
     let relativePath = absoluteFilePath.substr(sourceDbPath.length);
-    let destination = destinationDirectory + '/' + relativePath;
+    let destination = destinationDirectory + separator + relativePath;
+    const newFileDirectory = destination.substring(0, destination.lastIndexOf(separator));
+    mkdir(newFileDirectory);
     copyFile(absoluteFilePath, destination);
     return {fileSource: absoluteFilePath, relativePath: relativePath, fileDestination: destination};
 }

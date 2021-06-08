@@ -44,13 +44,14 @@
 #include "mongo/db/lasterror.h"
 #include "mongo/db/ops/update.h"
 #include "mongo/dbtests/dbtests.h"
+#include "mongo/idl/server_parameter_test_util.h"
 
 namespace UpdateTests {
 
-using std::unique_ptr;
 using std::numeric_limits;
 using std::string;
 using std::stringstream;
+using std::unique_ptr;
 using std::vector;
 
 namespace dps = ::mongo::dotted_path_support;
@@ -1665,8 +1666,8 @@ public:
     void run() {
         _client.insert(ns(), fromjson("{'_id':0,x:[{a:1},{a:3}]}"));
         // { $push : { x : { $each : [ {a:2} ], $sort: {a:1}, $slice:-2 } } }
-        BSONObj pushObj = BSON(
-            "$each" << BSON_ARRAY(BSON("a" << 2)) << "$sort" << BSON("a" << 1) << "$slice" << -2.0);
+        BSONObj pushObj = BSON("$each" << BSON_ARRAY(BSON("a" << 2)) << "$sort" << BSON("a" << 1)
+                                       << "$slice" << -2.0);
         _client.update(ns(), Query(), BSON("$push" << BSON("x" << pushObj)));
         BSONObj expected = fromjson("{'_id':0,x:[{a:2},{a:3}]}");
         BSONObj result = _client.findOne(ns(), Query());
@@ -1680,9 +1681,8 @@ public:
         BSONObj expected = fromjson("{'_id':0,x:[{a:1},{a:3}]}");
         _client.insert(ns(), expected);
         // { $push : { x : { $each : [ {a:2} ], $sort : {a:1}, $sort: {a:1} } } }
-        BSONObj pushObj =
-            BSON("$each" << BSON_ARRAY(BSON("a" << 2)) << "$sort" << BSON("a" << 1) << "$sort"
-                         << BSON("a" << 1));
+        BSONObj pushObj = BSON("$each" << BSON_ARRAY(BSON("a" << 2)) << "$sort" << BSON("a" << 1)
+                                       << "$sort" << BSON("a" << 1));
         _client.update(ns(), Query(), BSON("$push" << BSON("x" << pushObj)));
         BSONObj result = _client.findOne(ns(), Query());
         ASSERT_BSONOBJ_EQ(result, expected);
@@ -1741,8 +1741,17 @@ public:
 class CheckNoMods : public SetBase {
 public:
     void run() {
-        _client.update(ns(), BSONObj(), BSON("i" << 5 << "$set" << BSON("q" << 3)), true);
-        ASSERT(error());
+        {
+            RAIIServerParameterControllerForTest controller("featureFlagDotsAndDollars", false);
+            _client.update(ns(), BSONObj(), BSON("i" << 5 << "$set" << BSON("q" << 3)), true);
+            ASSERT(error());
+        }
+        {
+            RAIIServerParameterControllerForTest controller("featureFlagDotsAndDollars", true);
+            _client.update(ns(), BSONObj(), BSON("_id" << 52307 << "$set" << BSON("q" << 3)), true);
+            ASSERT_BSONOBJ_EQ(fromjson("{'_id':52307,$set:{q:3}}"),
+                              _client.findOne(ns(), Query(BSON("_id" << 52307))));
+        }
     }
 };
 
@@ -1763,9 +1772,7 @@ public:
             ns(), BSON("_id" << 0 << "a" << 1 << "x" << BSONObj() << "x" << BSONObj() << "z" << 5));
         _client.update(ns(), BSONObj(), BSON("$set" << BSON("x.b" << 1 << "x.c" << 1)));
         ASSERT_BSONOBJ_EQ(BSON("_id" << 0 << "a" << 1 << "x" << BSON("b" << 1 << "c" << 1) << "x"
-                                     << BSONObj()
-                                     << "z"
-                                     << 5),
+                                     << BSONObj() << "z" << 5),
                           _client.findOne(ns(), BSONObj()));
     }
 };
@@ -1779,9 +1786,7 @@ public:
         _client.update(
             ns(), BSONObj(), BSON("$set" << BSON("x.b" << 1 << "x.c" << 1 << "x.d" << 1)));
         ASSERT_BSONOBJ_EQ(BSON("_id" << 0 << "x" << BSON("b" << 1 << "c" << 1 << "d" << 1) << "x"
-                                     << BSONObj()
-                                     << "x"
-                                     << BSONObj()),
+                                     << BSONObj() << "x" << BSONObj()),
                           _client.findOne(ns(), BSONObj()));
     }
 };
@@ -2003,9 +2008,9 @@ class setswitchint : public Base {
 }  // namespace basic
 
 
-class All : public Suite {
+class All : public OldStyleSuiteSpecification {
 public:
-    All() : Suite("update") {}
+    All() : OldStyleSuiteSpecification("update") {}
     void setupTests() {
         add<ModId>();
         add<ModNonmodMix>();
@@ -2123,6 +2128,6 @@ public:
     }
 };
 
-SuiteInstance<All> myall;
+OldStyleSuiteInitializer<All> myall;
 
 }  // namespace UpdateTests

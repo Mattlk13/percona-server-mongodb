@@ -29,13 +29,13 @@
 
 #pragma once
 
+#include <list>
 #include <memory>
 
 #include "mongo/base/status_with.h"
 #include "mongo/executor/task_executor.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/list.h"
-#include "mongo/stdx/mutex.h"
 
 namespace mongo {
 namespace executor {
@@ -57,6 +57,8 @@ public:
     void startup() override;
     void shutdown() override;
     void join() override;
+    SharedSemiFuture<void> joinAsync() override;
+    bool isShuttingDown() const override;
     void appendDiagnosticBSON(BSONObjBuilder* builder) const override;
     Date_t now() override;
     StatusWith<EventHandle> makeEvent() override;
@@ -68,9 +70,15 @@ public:
                                              Date_t deadline) override;
     StatusWith<CallbackHandle> scheduleWork(CallbackFn&& work) override;
     StatusWith<CallbackHandle> scheduleWorkAt(Date_t when, CallbackFn&& work) override;
-    StatusWith<CallbackHandle> scheduleRemoteCommand(const RemoteCommandRequest& request,
-                                                     const RemoteCommandCallbackFn& cb,
-                                                     const BatonHandle& baton = nullptr) override;
+    StatusWith<CallbackHandle> scheduleRemoteCommandOnAny(
+        const RemoteCommandRequestOnAny& request,
+        const RemoteCommandOnAnyCallbackFn& cb,
+        const BatonHandle& baton = nullptr) override;
+    StatusWith<CallbackHandle> scheduleExhaustRemoteCommandOnAny(
+        const RemoteCommandRequestOnAny& request,
+        const RemoteCommandOnAnyCallbackFn& cb,
+        const BatonHandle& baton = nullptr) override;
+    bool hasTasks() override;
     void cancel(const CallbackHandle& cbHandle) override;
     void wait(const CallbackHandle& cbHandle,
               Interruptible* interruptible = Interruptible::notInterruptible()) override;

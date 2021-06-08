@@ -11,11 +11,10 @@
  * This workload was designed to reproduce SERVER-18304.
  */
 
-// For isMongod and supportsDocumentLevelConcurrency.
+// For isMongod.
 load('jstests/concurrency/fsm_workload_helpers/server_types.js');
 
 var $config = (function() {
-
     var data = {
         // Use the workload name as the database name, since the workload name is assumed to be
         // unique.
@@ -39,7 +38,7 @@ var $config = (function() {
             updateDoc.$push[this.opName] = id;
 
             var res = ownedDB[collName].update({_id: this.tid}, updateDoc, {upsert: true});
-            assertAlways.writeOK(res);
+            assertAlways.commandWorked(res);
 
             assertAlways.contains(res.nMatched, [0, 1], tojson(res));
             if (res.nMatched === 0) {
@@ -57,18 +56,15 @@ var $config = (function() {
     };
 
     var states = (function() {
-
         function remove(db, collName) {
             var res = db.runCommand(
                 {findAndModify: db[collName].getName(), query: {}, sort: {rand: -1}, remove: true});
             assertAlways.commandWorked(res);
 
             var doc = res.value;
-            if (isMongod(db) && supportsDocumentLevelConcurrency(db)) {
-                // Storage engines which do not support document-level concurrency will not
-                // automatically retry if there was a conflict, so it is expected that it may return
-                // null in the case of a conflict. All other storage engines should automatically
-                // retry the operation, and thus should never return null.
+            if (isMongod(db)) {
+                // Storage engines should automatically retry the operation, and thus should never
+                // return null.
                 assertWhenOwnColl.neq(
                     doc, null, 'findAndModify should have found and removed a matching document');
             }
@@ -78,7 +74,6 @@ var $config = (function() {
         }
 
         return {remove: remove};
-
     })();
 
     var transitions = {remove: {remove: 1}};
@@ -99,11 +94,11 @@ var $config = (function() {
             bulk.insert(doc);
         }
         var res = bulk.execute();
-        assertAlways.writeOK(res);
+        assertAlways.commandWorked(res);
         assertAlways.eq(this.numDocs, res.nInserted);
 
-        this.getIndexSpecs().forEach(function ensureIndex(indexSpec) {
-            assertAlways.commandWorked(db[collName].ensureIndex(indexSpec));
+        this.getIndexSpecs().forEach(function createIndex(indexSpec) {
+            assertAlways.commandWorked(db[collName].createIndex(indexSpec));
         });
     }
 
@@ -111,11 +106,10 @@ var $config = (function() {
         var ownedDB = db.getSiblingDB(db.getName() + this.uniqueDBName);
 
         if (this.opName === 'removed') {
-            if (isMongod(db) && supportsDocumentLevelConcurrency(db)) {
-                // On storage engines which support document-level concurrency, each findAndModify
-                // should be internally retried until it removes exactly one document. Since
-                // this.numDocs == this.iterations * this.threadCount, there should not be any
-                // documents remaining.
+            if (isMongod(db)) {
+                // Each findAndModify should be internally retried until it removes exactly one
+                // document. Since this.numDocs == this.iterations * this.threadCount, there should
+                // not be any documents remaining.
                 assertWhenOwnColl.eq(db[collName].find().itcount(),
                                      0,
                                      'Expected all documents to have been removed');
@@ -133,9 +127,7 @@ var $config = (function() {
             checkForDuplicateIds(ids, this.opName);
         });
 
-        var res = ownedDB.dropDatabase();
-        assertAlways.commandWorked(res);
-        assertAlways.eq(db.getName() + this.uniqueDBName, res.dropped);
+        assertAlways.commandWorked(ownedDB.dropDatabase());
 
         function checkForDuplicateIds(ids, opName) {
             var indices = new Array(ids.length);
@@ -194,5 +186,4 @@ var $config = (function() {
         setup: setup,
         teardown: teardown
     };
-
 })();

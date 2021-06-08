@@ -128,12 +128,17 @@ public:
      */
     void turnCrankForTest(size_t countMessagesToIgnore);
 
+    /**
+     * Deproritize the first message to force interleavings of messages.
+     */
+    void deprioritizeFirstMessageForTest(FreeMonMessageType type);
+
 private:
     // Condition variable to signal consumer
     stdx::condition_variable _condvar;
 
     // Lock for condition variable and to protect state
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH("FreeMonMessageQueue::_mutex");
 
     // Indicates whether queue has been stopped.
     bool _stop{false};

@@ -42,8 +42,9 @@ bool isStandaloneOrPrimary(OperationContext* opCtx) {
     auto replCoord = repl::ReplicationCoordinator::get(opCtx);
     const bool isReplSet =
         replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet;
-    return !isReplSet || (repl::ReplicationCoordinator::get(opCtx)->getMemberState() ==
-                          repl::MemberState::RS_PRIMARY);
+    return !isReplSet ||
+        (repl::ReplicationCoordinator::get(opCtx)->getMemberState() ==
+         repl::MemberState::RS_PRIMARY);
 }
 
 const auto getFreeMonDeleteState = OperationContext::declareDecoration<bool>();
@@ -133,8 +134,7 @@ void FreeMonOpObserver::onDelete(OperationContext* opCtx,
                                  const NamespaceString& nss,
                                  OptionalCollectionUUID uuid,
                                  StmtId stmtId,
-                                 bool fromMigrate,
-                                 const boost::optional<BSONObj>& deletedDoc) {
+                                 const OplogDeleteEntryArgs& args) {
     if (nss != NamespaceString::kServerConfigurationNamespace) {
         return;
     }

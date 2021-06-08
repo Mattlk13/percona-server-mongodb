@@ -43,29 +43,40 @@ public:
      * A "lite parsed" $out stage is similar to other stages involving foreign collections except in
      * some cases the foreign collection is allowed to be sharded.
      */
-    class LiteParsed final : public LiteParsedDocumentSourceForeignCollections {
+    class LiteParsed final : public LiteParsedDocumentSourceForeignCollection {
     public:
-        using LiteParsedDocumentSourceForeignCollections::
-            LiteParsedDocumentSourceForeignCollections;
+        using LiteParsedDocumentSourceForeignCollection::LiteParsedDocumentSourceForeignCollection;
 
-
-        static std::unique_ptr<LiteParsed> parse(const AggregationRequest& request,
+        static std::unique_ptr<LiteParsed> parse(const NamespaceString& nss,
                                                  const BSONElement& spec);
 
         bool allowShardedForeignCollection(NamespaceString nss) const final {
-            return _foreignNssSet.find(nss) == _foreignNssSet.end();
+            return _foreignNss != nss;
         }
 
         bool allowedToPassthroughFromMongos() const final {
             return false;
         }
+
+        PrivilegeVector requiredPrivileges(bool isMongos, bool bypassDocumentValidation) const {
+            ActionSet actions{ActionType::insert, ActionType::remove};
+            if (bypassDocumentValidation) {
+                actions.addAction(ActionType::bypassDocumentValidation);
+            }
+
+            return {Privilege(ResourcePattern::forExactNamespace(_foreignNss), actions)};
+        }
+
+        ReadConcernSupportResult supportsReadConcern(repl::ReadConcernLevel level) const final {
+            return {
+                {level == repl::ReadConcernLevel::kLinearizableReadConcern,
+                 {ErrorCodes::InvalidOptions,
+                  "{} cannot be used with a 'linearizable' read concern level"_format(kStageName)}},
+                Status::OK()};
+        }
     };
 
     ~DocumentSourceOut() override;
-
-    const char* getSourceName() const final override {
-        return kStageName.rawData();
-    }
 
     StageConstraints constraints(Pipeline::SplitState pipeState) const final override {
         return {StreamType::kStreaming,
@@ -74,7 +85,8 @@ public:
                 DiskUseRequirement::kWritesPersistentData,
                 FacetRequirement::kNotAllowed,
                 TransactionRequirement::kNotAllowed,
-                LookupRequirement::kNotAllowed};
+                LookupRequirement::kNotAllowed,
+                UnionRequirement::kNotAllowed};
     }
 
     Value serialize(
@@ -92,10 +104,16 @@ public:
     static boost::intrusive_ptr<DocumentSource> createFromBson(
         BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
 
+    const char* getSourceName() const final override {
+        return kStageName.rawData();
+    }
+
 private:
     DocumentSourceOut(NamespaceString outputNs,
                       const boost::intrusive_ptr<ExpressionContext>& expCtx)
-        : DocumentSourceWriter(std::move(outputNs), expCtx) {}
+        : DocumentSourceWriter(kStageName.rawData(), std::move(outputNs), expCtx) {}
+
+    static NamespaceString parseNsFromElem(const BSONElement& spec, const StringData& defaultDB);
 
     void initialize() override;
 
@@ -105,8 +123,8 @@ private:
         DocumentSourceWriteBlock writeBlock(pExpCtx->opCtx);
 
         auto targetEpoch = boost::none;
-        pExpCtx->mongoProcessInterface->insert(
-            pExpCtx, _tempNs, std::move(batch), _writeConcern, targetEpoch);
+        uassertStatusOK(pExpCtx->mongoProcessInterface->insert(
+            pExpCtx, _tempNs, std::move(batch), _writeConcern, targetEpoch));
     }
 
     std::pair<BSONObj, int> makeBatchObject(Document&& doc) const override {

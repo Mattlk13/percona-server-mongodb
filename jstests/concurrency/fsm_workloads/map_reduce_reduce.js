@@ -19,7 +19,6 @@ load('jstests/concurrency/fsm_libs/extend_workload.js');         // for extendWo
 load('jstests/concurrency/fsm_workloads/map_reduce_inline.js');  // for $config
 
 var $config = extendWorkload($config, function($config, $super) {
-
     // Use the workload name as a prefix for the collection name,
     // since the workload name is assumed to be unique.
     var prefix = 'map_reduce_reduce';
@@ -41,7 +40,6 @@ var $config = extendWorkload($config, function($config, $super) {
                      "output collection '" + fullName + "' should exist");
 
         var options = {finalize: this.finalizer, out: {reduce: this.outCollName}};
-
         var res = db[collName].mapReduce(this.mapper, this.reducer, options);
         assertAlways.commandWorked(res);
     };

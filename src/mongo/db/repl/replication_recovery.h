@@ -55,6 +55,18 @@ public:
      */
     virtual void recoverFromOplog(OperationContext* opCtx,
                                   boost::optional<Timestamp> stableTimestamp) = 0;
+
+    /**
+     *  Recovers the data on disk from the oplog and puts the node in readOnly mode. If
+     *  'takeUnstableCheckpointOnShutdown' is specified and an unstable checkpoint is present,
+     *  ensures that recovery can be skipped safely.
+     */
+    virtual void recoverFromOplogAsStandalone(OperationContext* opCtx) = 0;
+
+    /**
+     * Recovers the data on disk from the oplog up to and including the given timestamp.
+     */
+    virtual void recoverFromOplogUpTo(OperationContext* opCtx, Timestamp endPoint) = 0;
 };
 
 class ReplicationRecoveryImpl : public ReplicationRecovery {
@@ -68,15 +80,33 @@ public:
     void recoverFromOplog(OperationContext* opCtx,
                           boost::optional<Timestamp> stableTimestamp) override;
 
+    void recoverFromOplogAsStandalone(OperationContext* opCtx) override;
+
+    void recoverFromOplogUpTo(OperationContext* opCtx, Timestamp endPoint) override;
+
 private:
+    enum class RecoveryMode {
+        kStartupFromStableTimestamp,
+        kStartupFromUnstableCheckpoint,
+        kRollbackFromStableTimestamp,
+        // There is no RecoveryMode::kRollbackFromUnstableCheckpoint, rollback can only recover from
+        // a stable timestamp.
+    };
+
+    /**
+     * Confirms that the data and oplog all indicate that the nodes has an unstable checkpoint
+     * that is fully up to date.
+     */
+    void _assertNoRecoveryNeededOnUnstableCheckpoint(OperationContext* opCtx);
+
     /**
      * After truncating the oplog, completes recovery if we're recovering from a stable timestamp
      * or a stable checkpoint.
      */
     void _recoverFromStableTimestamp(OperationContext* opCtx,
                                      Timestamp stableTimestamp,
-                                     OpTime appliedThrough,
-                                     OpTime topOfOplog);
+                                     OpTime topOfOplog,
+                                     RecoveryMode recoveryMode);
 
     /**
      * After truncating the oplog, completes recovery if we're recovering from an unstable
@@ -92,7 +122,17 @@ private:
      */
     void _applyToEndOfOplog(OperationContext* opCtx,
                             const Timestamp& oplogApplicationStartPoint,
-                            const Timestamp& topOfOplog);
+                            const Timestamp& topOfOplog,
+                            RecoveryMode recoveryMode);
+
+    /**
+     * Applies all oplog entries from startPoint (exclusive) to endPoint (inclusive). Returns the
+     * Timestamp of the last applied operation.
+     */
+    Timestamp _applyOplogOperations(OperationContext* opCtx,
+                                    const Timestamp& startPoint,
+                                    const Timestamp& endPoint,
+                                    RecoveryMode recoveryMode);
 
     /**
      * Gets the last applied OpTime from the end of the oplog. Returns CollectionIsEmpty if there is
@@ -101,9 +141,30 @@ private:
     StatusWith<OpTime> _getTopOfOplog(OperationContext* opCtx) const;
 
     /**
-     * Truncates the oplog after and including the "truncateTimestamp" entry.
+     * Truncates the oplog after the "truncateAfterTimestamp" entry.
+     * If the stableTimestamp is set, may move it backwards to the new top of oplog.
      */
-    void _truncateOplogTo(OperationContext* opCtx, Timestamp truncateTimestamp);
+    void _truncateOplogTo(OperationContext* opCtx,
+                          Timestamp truncateAfterTimestamp,
+                          boost::optional<Timestamp>* stableTimestamp);
+
+    /**
+     * Uses the oplogTruncateAfterPoint, accessed via '_consistencyMarkers', to decide whether to
+     * truncate part of the oplog. If oplogTruncateAfterPoint has been set, then there may be holes
+     * in the oplog after that point. In that case, we will truncate the oplog entries starting at
+     * and including the entry associated with the oplogTruncateAfterPoint timestamp.
+     *
+     * If the oplogTruncateAfterPoint is earlier in time than or equal to the stable timestamp, we
+     * will truncate the oplog after the stable timestamp instead. There cannot be holes before a
+     * stable timestamp. The oplogTruncateAfterPoint can lag behind the stable timestamp because the
+     * oplogTruncateAfterPoint is updated on primaries by an asynchronously looping thread that can
+     * potentially be starved.
+     *
+     * If the stable timestamp is at a hole, this will move the stable timestamp back to the new
+     * top of oplog.  This can happen on primaries when EMRC=false or in single-node replica sets.
+     */
+    void _truncateOplogIfNeededAndThenClearOplogTruncateAfterPoint(
+        OperationContext* opCtx, boost::optional<Timestamp>* stableTimestamp);
 
     StorageInterface* _storageInterface;
     ReplicationConsistencyMarkers* _consistencyMarkers;

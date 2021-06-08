@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include <boost/optional.hpp>
 #include <utility>
 
 #include "mongo/bson/unordered_fields_bsonelement_comparator.h"
@@ -46,8 +47,10 @@ class InternalSchemaUniqueItemsMatchExpression final : public ArrayMatchingMatch
 public:
     static constexpr StringData kName = "$_internalSchemaUniqueItems"_sd;
 
-    explicit InternalSchemaUniqueItemsMatchExpression(StringData path)
-        : ArrayMatchingMatchExpression(MatchExpression::INTERNAL_SCHEMA_UNIQUE_ITEMS, path) {}
+    explicit InternalSchemaUniqueItemsMatchExpression(
+        StringData path, clonable_ptr<ErrorAnnotation> annotation = nullptr)
+        : ArrayMatchingMatchExpression(
+              MatchExpression::INTERNAL_SCHEMA_UNIQUE_ITEMS, path, std::move(annotation)) {}
 
     size_t numChildren() const final {
         return 0;
@@ -57,18 +60,22 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    std::vector<MatchExpression*>* getChildVector() final {
+    std::vector<std::unique_ptr<MatchExpression>>* getChildVector() final {
         return nullptr;
     }
 
     bool matchesArray(const BSONObj& array, MatchDetails*) const final {
+        return !findFirstDuplicateValue(array);
+    }
+
+    BSONElement findFirstDuplicateValue(const BSONObj& array) const {
         auto set = _comparator.makeBSONEltSet();
         for (auto&& elem : array) {
             if (!std::get<bool>(set.insert(elem))) {
-                return false;
+                return elem;
             }
         }
-        return true;
+        return {};
     }
 
     void debugString(StringBuilder& builder, int indentationLevel) const final;
@@ -78,6 +85,14 @@ public:
     BSONObj getSerializedRightHandSide() const final;
 
     std::unique_ptr<MatchExpression> shallowClone() const final;
+
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
 
 private:
     ExpressionOptimizerFunc getOptimizer() const final {

@@ -27,25 +27,29 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
-#include "mongo/db/read_concern.h"
+#include "mongo/base/shim.h"
 #include "mongo/base/status.h"
-#include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/catalog_raii.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop_failpoint_helpers.h"
-#include "mongo/db/logical_clock.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/read_concern.h"
 #include "mongo/db/read_concern_mongod_gen.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/speculative_majority_read_info.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/server_options.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/vector_clock.h"
+#include "mongo/logv2/log.h"
+#include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/grid.h"
 #include "mongo/util/concurrency/notification.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -72,7 +76,7 @@ public:
      */
     std::tuple<bool, std::shared_ptr<Notification<Status>>> getOrCreateWriteRequest(
         LogicalTime clusterTime) {
-        stdx::unique_lock<stdx::mutex> lock(_mutex);
+        stdx::unique_lock<Latch> lock(_mutex);
         auto lastEl = _writeRequests.rbegin();
         if (lastEl != _writeRequests.rend() && lastEl->first >= clusterTime.asTimestamp()) {
             return std::make_tuple(false, lastEl->second);
@@ -87,7 +91,7 @@ public:
      * Erases writeRequest that happened at clusterTime
      */
     void deleteWriteRequest(LogicalTime clusterTime) {
-        stdx::unique_lock<stdx::mutex> lock(_mutex);
+        stdx::unique_lock<Latch> lock(_mutex);
         auto el = _writeRequests.find(clusterTime.asTimestamp());
         invariant(el != _writeRequests.end());
         invariant(el->second);
@@ -96,7 +100,7 @@ public:
     }
 
 private:
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH("WriteRequestSynchronizer::_mutex");
     std::map<Timestamp, std::shared_ptr<Notification<Status>>> _writeRequests;
 };
 
@@ -119,8 +123,13 @@ Status makeNoopWriteIfNeeded(OperationContext* opCtx, LogicalTime clusterTime) {
         auto waitStatus = replCoord->waitUntilOpTimeForReadUntil(opCtx, readConcernArgs, deadline);
         lastAppliedOpTime = LogicalTime(replCoord->getMyLastAppliedOpTime().getTimestamp());
         if (!waitStatus.isOK()) {
-            LOG(1) << "Wait for clusterTime: " << clusterTime.toString()
-                   << " until deadline: " << deadline << " failed with " << waitStatus.toString();
+            LOGV2_DEBUG(20986,
+                        1,
+                        "Wait for clusterTime: {clusterTime} until deadline: {deadline} failed "
+                        "with {waitStatus}",
+                        "clusterTime"_attr = clusterTime.toString(),
+                        "deadline"_attr = deadline,
+                        "waitStatus"_attr = waitStatus.toString());
         }
     }
 
@@ -136,12 +145,10 @@ Status makeNoopWriteIfNeeded(OperationContext* opCtx, LogicalTime clusterTime) {
         }
 
         bool isConfig = (serverGlobalParams.clusterRole == ClusterRole::ConfigServer);
-        auto myShard = isConfig ? Grid::get(opCtx)->shardRegistry()->getConfigShard()
-                                : Grid::get(opCtx)->shardRegistry()->getShard(
-                                      opCtx, ShardingState::get(opCtx)->shardId());
 
-        if (!myShard.isOK()) {
-            return myShard.getStatus();
+        if (!isConfig && !ShardingState::get(opCtx)->enabled()) {
+            return {ErrorCodes::ShardingStateNotInitialized,
+                    "Failed noop write because sharding state has not been initialized"};
         }
 
         if (!remainingAttempts--) {
@@ -155,18 +162,27 @@ Status makeNoopWriteIfNeeded(OperationContext* opCtx, LogicalTime clusterTime) {
         auto myWriteRequest = writeRequests.getOrCreateWriteRequest(clusterTime);
         if (std::get<0>(myWriteRequest)) {  // Its a new request
             try {
-                LOG(2) << "New appendOplogNote request on clusterTime: " << clusterTime.toString()
-                       << " remaining attempts: " << remainingAttempts;
-                auto swRes = myShard.getValue()->runCommand(
+                LOGV2_DEBUG(20987,
+                            2,
+                            "New appendOplogNote request on clusterTime: {clusterTime} remaining "
+                            "attempts: {remainingAttempts}",
+                            "clusterTime"_attr = clusterTime.toString(),
+                            "remainingAttempts"_attr = remainingAttempts);
+
+                auto onRemoteCmdScheduled = [](executor::TaskExecutor::CallbackHandle handle) {};
+                auto onRemoteCmdComplete = [](executor::TaskExecutor::CallbackHandle handle) {};
+                auto appendOplogNoteResponse = replCoord->runCmdOnPrimaryAndAwaitResponse(
                     opCtx,
-                    ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-                    "admin",
-                    BSON("appendOplogNote" << 1 << "maxClusterTime" << clusterTime.asTimestamp()
-                                           << "data"
-                                           << BSON("noop write for afterClusterTime read concern"
-                                                   << 1)),
-                    Shard::RetryPolicy::kIdempotent);
-                status = swRes.getStatus();
+                    NamespaceString::kAdminDb.toString(),
+                    BSON("appendOplogNote"
+                         << 1 << "maxClusterTime" << clusterTime.asTimestamp() << "data"
+                         << BSON("noop write for afterClusterTime read concern" << 1)
+                         << WriteConcernOptions::kWriteConcernField
+                         << WriteConcernOptions::kInternalWriteDefault),
+                    onRemoteCmdScheduled,
+                    onRemoteCmdComplete);
+
+                status = getStatusFromCommandResult(appendOplogNoteResponse);
                 std::get<1>(myWriteRequest)->set(status);
                 writeRequests.deleteWriteRequest(clusterTime);
             } catch (const DBException& ex) {
@@ -176,8 +192,12 @@ Status makeNoopWriteIfNeeded(OperationContext* opCtx, LogicalTime clusterTime) {
                 writeRequests.deleteWriteRequest(clusterTime);
             }
         } else {
-            LOG(2) << "Join appendOplogNote request on clusterTime: " << clusterTime.toString()
-                   << " remaining attempts: " << remainingAttempts;
+            LOGV2_DEBUG(20988,
+                        2,
+                        "Join appendOplogNote request on clusterTime: {clusterTime} remaining "
+                        "attempts: {remainingAttempts}",
+                        "clusterTime"_attr = clusterTime.toString(),
+                        "remainingAttempts"_attr = remainingAttempts);
             try {
                 status = std::get<1>(myWriteRequest)->get(opCtx);
             } catch (const DBException& ex) {
@@ -188,23 +208,43 @@ Status makeNoopWriteIfNeeded(OperationContext* opCtx, LogicalTime clusterTime) {
         if (status.isOK()) {
             return status;
         }
+
+        // If the write failed with StaleClusterTime it means that the noop write to the primary was
+        // not necessary to bump the clusterTime. It could be a race where the secondary decides to
+        // issue the noop write while some writes have already happened on the primary that have
+        // bumped the clusterTime beyond the 'clusterTime' the noop write requested.
+        if (status == ErrorCodes::StaleClusterTime) {
+            LOGV2_DEBUG(54102,
+                        2,
+                        "appendOplogNote request on clusterTime {clusterTime} failed with "
+                        "StaleClusterTime",
+                        "clusterTime"_attr = clusterTime.asTimestamp());
+            return Status::OK();
+        }
+
         lastAppliedOpTime = LogicalTime(replCoord->getMyLastAppliedOpTime().getTimestamp());
     }
     // This is when the noop write failed but the opLog caught up to clusterTime by replicating.
     if (!status.isOK()) {
-        LOG(1) << "Reached clusterTime " << lastAppliedOpTime.toString()
-               << " but failed noop write due to " << status.toString();
+        LOGV2_DEBUG(20989,
+                    1,
+                    "Reached clusterTime {lastAppliedOpTime} but failed noop write due to {error}",
+                    "lastAppliedOpTime"_attr = lastAppliedOpTime.toString(),
+                    "error"_attr = status.toString());
     }
     return Status::OK();
 }
 
 /**
- * Returns whether the command should ignore prepare conflicts or not.
+ * Evaluates if it's safe for the command to ignore prepare conflicts.
  */
-bool shouldIgnorePrepared(PrepareConflictBehavior prepareConflictBehavior,
-                          repl::ReadConcernLevel readConcernLevel,
-                          boost::optional<LogicalTime> afterClusterTime,
-                          boost::optional<LogicalTime> atClusterTime) {
+bool canIgnorePrepareConflicts(OperationContext* opCtx,
+                               const repl::ReadConcernArgs& readConcernArgs) {
+    if (opCtx->inMultiDocumentTransaction()) {
+        return false;
+    }
+
+    auto readConcernLevel = readConcernArgs.getLevel();
 
     // Only these read concern levels are eligible for ignoring prepare conflicts.
     if (readConcernLevel != repl::ReadConcernLevel::kLocalReadConcern &&
@@ -213,26 +253,41 @@ bool shouldIgnorePrepared(PrepareConflictBehavior prepareConflictBehavior,
         return false;
     }
 
+    auto afterClusterTime = readConcernArgs.getArgsAfterClusterTime();
+    auto atClusterTime = readConcernArgs.getArgsAtClusterTime();
+
     if (afterClusterTime || atClusterTime) {
         return false;
     }
 
-    return prepareConflictBehavior == PrepareConflictBehavior::kIgnore;
+    return true;
 }
-}  // namespace
 
-MONGO_REGISTER_SHIM(waitForReadConcern)
-(OperationContext* opCtx,
- const repl::ReadConcernArgs& readConcernArgs,
- bool allowAfterClusterTime,
- PrepareConflictBehavior prepareConflictBehavior)
-    ->Status {
+void setPrepareConflictBehaviorForReadConcernImpl(OperationContext* opCtx,
+                                                  const repl::ReadConcernArgs& readConcernArgs,
+                                                  PrepareConflictBehavior prepareConflictBehavior) {
+    // DBDirectClient should inherit whether or not to ignore prepare conflicts from its parent.
+    if (opCtx->getClient()->isInDirectClient()) {
+        return;
+    }
+
+    // Enforce prepare conflict behavior if the command is not eligible to ignore prepare conflicts.
+    if (!(prepareConflictBehavior == PrepareConflictBehavior::kEnforce ||
+          canIgnorePrepareConflicts(opCtx, readConcernArgs))) {
+        prepareConflictBehavior = PrepareConflictBehavior::kEnforce;
+    }
+
+    opCtx->recoveryUnit()->setPrepareConflictBehavior(prepareConflictBehavior);
+}
+
+Status waitForReadConcernImpl(OperationContext* opCtx,
+                              const repl::ReadConcernArgs& readConcernArgs,
+                              bool allowAfterClusterTime) {
     // If we are in a direct client within a transaction, then we may be holding locks, so it is
     // illegal to wait for read concern. This is fine, since the outer operation should have handled
-    // waiting for read concern. We don't want to ignore prepare conflicts because snapshot reads
-    // should block on prepared transactions.
-    if (opCtx->getClient()->isInDirectClient() &&
-        readConcernArgs.getLevel() == repl::ReadConcernLevel::kSnapshotReadConcern) {
+    // waiting for read concern. We don't want to ignore prepare conflicts because reads in
+    // transactions should block on prepared transactions.
+    if (opCtx->getClient()->isInDirectClient() && opCtx->inMultiDocumentTransaction()) {
         return Status::OK();
     }
 
@@ -252,8 +307,20 @@ MONGO_REGISTER_SHIM(waitForReadConcern)
         }
 
         if (!replCoord->getMemberState().primary()) {
-            return {ErrorCodes::NotMaster,
+            return {ErrorCodes::NotWritablePrimary,
                     "cannot satisfy linearizable read concern on non-primary node"};
+        }
+    }
+
+    if (readConcernArgs.getLevel() == repl::ReadConcernLevel::kSnapshotReadConcern) {
+        if (replCoord->getReplicationMode() != repl::ReplicationCoordinator::modeReplSet) {
+            return {ErrorCodes::NotAReplicaSet,
+                    "node needs to be a replica set member to use readConcern: snapshot"};
+        }
+        if (!opCtx->inMultiDocumentTransaction() && !serverGlobalParams.enableMajorityReadConcern) {
+            return {ErrorCodes::ReadConcernMajorityNotEnabled,
+                    "read concern level snapshot is not supported when "
+                    "enableMajorityReadConcern=false"};
         }
     }
 
@@ -279,21 +346,40 @@ MONGO_REGISTER_SHIM(waitForReadConcern)
                                       << " readConcern without replication enabled"};
             }
 
-            auto currentTime = LogicalClock::get(opCtx)->getClusterTime();
-            if (currentTime < *targetClusterTime) {
+            // We must read the member state before obtaining the cluster time. Otherwise, we can
+            // run into a race where the cluster time is read as uninitialized, but the member state
+            // is set to RECOVERING by another thread before we invariant that the node is in
+            // STARTUP or STARTUP2.
+            const auto memberState = replCoord->getMemberState();
+
+            const auto currentTime = VectorClock::get(opCtx)->getTime();
+            const auto clusterTime = currentTime.clusterTime();
+            if (clusterTime == LogicalTime::kUninitialized) {
+                // currentTime should only be uninitialized if we are in startup recovery or initial
+                // sync.
+                invariant(memberState.startup() || memberState.startup2());
+                return {ErrorCodes::NotPrimaryOrSecondary,
+                        str::stream() << "Current clusterTime is uninitialized, cannot service the "
+                                         "requested clusterTime. Requested clusterTime: "
+                                      << targetClusterTime->toString()
+                                      << "; current clusterTime: " << clusterTime.toString()};
+            }
+            if (clusterTime < *targetClusterTime) {
                 return {ErrorCodes::InvalidOptions,
                         str::stream() << "readConcern " << readConcernName
                                       << " value must not be greater than the current clusterTime. "
                                          "Requested clusterTime: "
                                       << targetClusterTime->toString()
-                                      << "; current clusterTime: "
-                                      << currentTime.toString()};
+                                      << "; current clusterTime: " << clusterTime.toString()};
             }
 
             auto status = makeNoopWriteIfNeeded(opCtx, *targetClusterTime);
             if (!status.isOK()) {
-                LOG(0) << "Failed noop write at clusterTime: " << targetClusterTime->toString()
-                       << " due to " << status.toString();
+                LOGV2(20990,
+                      "Failed noop write at clusterTime: {targetClusterTime} due to {error}",
+                      "Failed noop write",
+                      "targetClusterTime"_attr = targetClusterTime,
+                      "error"_attr = status);
             }
         }
 
@@ -305,16 +391,19 @@ MONGO_REGISTER_SHIM(waitForReadConcern)
         }
     }
 
-    if (readConcernArgs.getLevel() == repl::ReadConcernLevel::kSnapshotReadConcern) {
-        if (replCoord->getReplicationMode() != repl::ReplicationCoordinator::modeReplSet) {
-            return {ErrorCodes::NotAReplicaSet,
-                    "node needs to be a replica set member to use readConcern: snapshot"};
-        }
-    }
-
+    auto ru = opCtx->recoveryUnit();
     if (atClusterTime) {
-        opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kProvided,
-                                                      atClusterTime->asTimestamp());
+        ru->setTimestampReadSource(RecoveryUnit::ReadSource::kProvided,
+                                   atClusterTime->asTimestamp());
+    } else if (readConcernArgs.getLevel() == repl::ReadConcernLevel::kSnapshotReadConcern &&
+               replCoord->getReplicationMode() == repl::ReplicationCoordinator::Mode::modeReplSet &&
+               !opCtx->inMultiDocumentTransaction()) {
+        auto opTime = replCoord->getCurrentCommittedSnapshotOpTime();
+        uassert(ErrorCodes::SnapshotUnavailable,
+                "No committed OpTime for snapshot read",
+                !opTime.isNull());
+        ru->setTimestampReadSource(RecoveryUnit::ReadSource::kProvided, opTime.getTimestamp());
+        repl::ReadConcernArgs::get(opCtx).setArgsAtClusterTimeForSnapshot(opTime.getTimestamp());
     } else if (readConcernArgs.getLevel() == repl::ReadConcernLevel::kMajorityReadConcern &&
                replCoord->getReplicationMode() == repl::ReplicationCoordinator::Mode::modeReplSet) {
         // This block is not used for kSnapshotReadConcern because snapshots are always speculative;
@@ -329,7 +418,7 @@ MONGO_REGISTER_SHIM(waitForReadConcern)
             // always reading at the minimum of the all-committed and lastApplied timestamps. This
             // allows for safe behavior on both primaries and secondaries, where the behavior of the
             // all-committed and lastApplied timestamps differ significantly.
-            opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kNoOverlap);
+            ru->setTimestampReadSource(RecoveryUnit::ReadSource::kNoOverlap);
             auto& speculativeReadInfo = repl::SpeculativeMajorityReadInfo::get(opCtx);
             speculativeReadInfo.setIsSpeculativeRead();
             return Status::OK();
@@ -337,65 +426,74 @@ MONGO_REGISTER_SHIM(waitForReadConcern)
 
         const int debugLevel = serverGlobalParams.clusterRole == ClusterRole::ConfigServer ? 1 : 2;
 
-        LOG(debugLevel) << "Waiting for 'committed' snapshot to be available for reading: "
-                        << readConcernArgs;
+        LOGV2_DEBUG(
+            20991,
+            debugLevel,
+            "Waiting for 'committed' snapshot to be available for reading: {readConcernArgs}",
+            "readConcernArgs"_attr = readConcernArgs);
 
-        opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kMajorityCommitted);
-        Status status = opCtx->recoveryUnit()->obtainMajorityCommittedSnapshot();
+        ru->setTimestampReadSource(RecoveryUnit::ReadSource::kMajorityCommitted);
+        Status status = ru->majorityCommittedSnapshotAvailable();
 
         // Wait until a snapshot is available.
         while (status == ErrorCodes::ReadConcernMajorityNotAvailableYet) {
-            LOG(debugLevel) << "Snapshot not available yet.";
+            LOGV2_DEBUG(20992, debugLevel, "Snapshot not available yet.");
             replCoord->waitUntilSnapshotCommitted(opCtx, Timestamp());
-            status = opCtx->recoveryUnit()->obtainMajorityCommittedSnapshot();
+            status = ru->majorityCommittedSnapshotAvailable();
         }
 
         if (!status.isOK()) {
             return status;
         }
 
-        LOG(debugLevel) << "Using 'committed' snapshot: " << CurOp::get(opCtx)->opDescription()
-                        << " with readTs: " << opCtx->recoveryUnit()->getPointInTimeReadTimestamp();
+        LOGV2_DEBUG(20993,
+                    debugLevel,
+                    "Using 'committed' snapshot",
+                    "operation_description"_attr = CurOp::get(opCtx)->opDescription());
     }
-
-    // DBDirectClient should inherit whether or not to ignore prepare conflicts from its parent.
-    if (!opCtx->getClient()->isInDirectClient()) {
-        // Set whether this command should ignore prepare conflicts or not.
-        opCtx->recoveryUnit()->setIgnorePrepared(shouldIgnorePrepared(
-            prepareConflictBehavior, readConcernArgs.getLevel(), afterClusterTime, atClusterTime));
-    }
-
     return Status::OK();
 }
 
-MONGO_REGISTER_SHIM(waitForLinearizableReadConcern)
-(OperationContext* opCtx, const int readConcernTimeout)->Status {
+Status waitForLinearizableReadConcernImpl(OperationContext* opCtx, const int readConcernTimeout) {
     CurOpFailpointHelpers::waitWhileFailPointEnabled(
         &hangBeforeLinearizableReadConcern, opCtx, "hangBeforeLinearizableReadConcern", [opCtx]() {
-            log() << "batch update - hangBeforeLinearizableReadConcern fail point enabled. "
-                     "Blocking until fail point is disabled.";
+            LOGV2(20994,
+                  "batch update - hangBeforeLinearizableReadConcern fail point enabled. "
+                  "Blocking until fail point is disabled.");
         });
 
     repl::ReplicationCoordinator* replCoord =
         repl::ReplicationCoordinator::get(opCtx->getClient()->getServiceContext());
 
     {
-        Lock::DBLock lk(opCtx, "local", MODE_IX);
-        Lock::CollectionLock lock(opCtx, NamespaceString("local.oplog.rs"), MODE_IX);
-
+        AutoGetOplog oplogWrite(opCtx, OplogAccessMode::kWrite);
         if (!replCoord->canAcceptWritesForDatabase(opCtx, "admin")) {
-            return {ErrorCodes::NotMaster,
+            return {ErrorCodes::NotWritablePrimary,
                     "No longer primary when waiting for linearizable read concern"};
         }
 
-        writeConflictRetry(opCtx, "waitForLinearizableReadConcern", "local.rs.oplog", [&opCtx] {
-            WriteUnitOfWork uow(opCtx);
-            opCtx->getClient()->getServiceContext()->getOpObserver()->onOpMessage(
-                opCtx,
-                BSON("msg"
-                     << "linearizable read"));
-            uow.commit();
-        });
+        // With linearizable readConcern, read commands may write to the oplog, which is an
+        // exception to the rule that writes are not allowed while ignoring prepare conflicts. If we
+        // are ignoring prepare conflicts (during a read command), force the prepare conflict
+        // behavior to permit writes.
+        auto originalBehavior = opCtx->recoveryUnit()->getPrepareConflictBehavior();
+        if (originalBehavior == PrepareConflictBehavior::kIgnoreConflicts) {
+            opCtx->recoveryUnit()->setPrepareConflictBehavior(
+                PrepareConflictBehavior::kIgnoreConflictsAllowWrites);
+        }
+
+        writeConflictRetry(
+            opCtx,
+            "waitForLinearizableReadConcern",
+            NamespaceString::kRsOplogNamespace.ns(),
+            [&opCtx] {
+                WriteUnitOfWork uow(opCtx);
+                opCtx->getClient()->getServiceContext()->getOpObserver()->onOpMessage(
+                    opCtx,
+                    BSON("msg"
+                         << "linearizable read"));
+                uow.commit();
+            });
     }
     WriteConcernOptions wc = WriteConcernOptions(
         WriteConcernOptions::kMajority, WriteConcernOptions::SyncMode::UNSET, readConcernTimeout);
@@ -410,8 +508,8 @@ MONGO_REGISTER_SHIM(waitForLinearizableReadConcern)
     return awaitReplResult.status;
 }
 
-MONGO_REGISTER_SHIM(waitForSpeculativeMajorityReadConcern)
-(OperationContext* opCtx, repl::SpeculativeMajorityReadInfo speculativeReadInfo)->Status {
+Status waitForSpeculativeMajorityReadConcernImpl(
+    OperationContext* opCtx, repl::SpeculativeMajorityReadInfo speculativeReadInfo) {
     invariant(speculativeReadInfo.isSpeculativeRead());
 
     // Select the timestamp to wait on. A command may have selected a specific timestamp to wait on.
@@ -425,14 +523,22 @@ MONGO_REGISTER_SHIM(waitForSpeculativeMajorityReadConcern)
         // Speculative majority reads are required to use the 'kNoOverlap' read source.
         invariant(opCtx->recoveryUnit()->getTimestampReadSource() ==
                   RecoveryUnit::ReadSource::kNoOverlap);
-        boost::optional<Timestamp> readTs = opCtx->recoveryUnit()->getPointInTimeReadTimestamp();
+
+        // Storage engine operations require at least Global IS.
+        Lock::GlobalLock lk(opCtx, MODE_IS);
+        boost::optional<Timestamp> readTs =
+            opCtx->recoveryUnit()->getPointInTimeReadTimestamp(opCtx);
         invariant(readTs);
         waitTs = *readTs;
     }
 
     // Block to make sure returned data is majority committed.
-    LOG(1) << "Servicing speculative majority read, waiting for timestamp " << waitTs
-           << " to become committed, current commit point: " << replCoord->getLastCommittedOpTime();
+    LOGV2_DEBUG(20995,
+                1,
+                "Servicing speculative majority read, waiting for timestamp {waitTs} to become "
+                "committed, current commit point: {replCoord_getLastCommittedOpTime}",
+                "waitTs"_attr = waitTs,
+                "replCoord_getLastCommittedOpTime"_attr = replCoord->getLastCommittedOpTime());
 
     if (!opCtx->hasDeadline()) {
         // This hard-coded value represents the maximum time we are willing to wait for a timestamp
@@ -447,11 +553,24 @@ MONGO_REGISTER_SHIM(waitForSpeculativeMajorityReadConcern)
     Timer t;
     auto waitStatus = replCoord->awaitTimestampCommitted(opCtx, waitTs);
     if (waitStatus.isOK()) {
-        LOG(1) << "Timestamp " << waitTs << " became majority committed, waited " << t.millis()
-               << "ms for speculative majority read to be satisfied.";
+        LOGV2_DEBUG(20996,
+                    1,
+                    "Timestamp {waitTs} became majority committed, waited {t_millis}ms for "
+                    "speculative majority read to be satisfied.",
+                    "waitTs"_attr = waitTs,
+                    "t_millis"_attr = t.millis());
     }
     return waitStatus;
 }
 
+auto setPrepareConflictBehaviorForReadConcernRegistration = MONGO_WEAK_FUNCTION_REGISTRATION(
+    setPrepareConflictBehaviorForReadConcern, setPrepareConflictBehaviorForReadConcernImpl);
+auto waitForReadConcernRegistration =
+    MONGO_WEAK_FUNCTION_REGISTRATION(waitForReadConcern, waitForReadConcernImpl);
+auto waitForLinearizableReadConcernRegistration = MONGO_WEAK_FUNCTION_REGISTRATION(
+    waitForLinearizableReadConcern, waitForLinearizableReadConcernImpl);
+auto waitForSpeculativeMajorityReadConcernRegistration = MONGO_WEAK_FUNCTION_REGISTRATION(
+    waitForSpeculativeMajorityReadConcern, waitForSpeculativeMajorityReadConcernImpl);
+}  // namespace
 
 }  // namespace mongo

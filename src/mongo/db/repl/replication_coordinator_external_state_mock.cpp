@@ -27,19 +27,19 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/repl/replication_coordinator_external_state_mock.h"
+
+#include <memory>
 
 #include "mongo/base/status_with.h"
 #include "mongo/bson/oid.h"
 #include "mongo/db/client.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/repl/oplog_buffer_blocking_queue.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/log.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/sequence_util.h"
 
@@ -60,7 +60,7 @@ ReplicationCoordinatorExternalStateMock::ReplicationCoordinatorExternalStateMock
 
 ReplicationCoordinatorExternalStateMock::~ReplicationCoordinatorExternalStateMock() {}
 
-void ReplicationCoordinatorExternalStateMock::startThreads(const ReplSettings& settings) {
+void ReplicationCoordinatorExternalStateMock::startThreads() {
     _threadsStarted = true;
 }
 
@@ -72,16 +72,22 @@ void ReplicationCoordinatorExternalStateMock::startSteadyStateReplication(Operat
                                                                           ReplicationCoordinator*) {
 }
 
-void ReplicationCoordinatorExternalStateMock::stopDataReplication(OperationContext*) {}
-
 Status ReplicationCoordinatorExternalStateMock::initializeReplSetStorage(OperationContext* opCtx,
                                                                          const BSONObj& config) {
-    return storeLocalConfigDocument(opCtx, config);
+    return storeLocalConfigDocument(opCtx, config, false);
 }
 
 void ReplicationCoordinatorExternalStateMock::shutdown(OperationContext*) {}
 
+void ReplicationCoordinatorExternalStateMock::clearAppliedThroughIfCleanShutdown(
+    OperationContext*) {}
+
 executor::TaskExecutor* ReplicationCoordinatorExternalStateMock::getTaskExecutor() const {
+    return nullptr;
+}
+
+std::shared_ptr<executor::TaskExecutor>
+ReplicationCoordinatorExternalStateMock::getSharedTaskExecutor() const {
     return nullptr;
 }
 
@@ -89,7 +95,7 @@ ThreadPool* ReplicationCoordinatorExternalStateMock::getDbWorkThreadPool() const
     return nullptr;
 }
 
-void ReplicationCoordinatorExternalStateMock::forwardSlaveProgress() {}
+void ReplicationCoordinatorExternalStateMock::forwardSecondaryProgress() {}
 
 bool ReplicationCoordinatorExternalStateMock::isSelf(const HostAndPort& host,
                                                      ServiceContext* const service) {
@@ -98,6 +104,10 @@ bool ReplicationCoordinatorExternalStateMock::isSelf(const HostAndPort& host,
 
 void ReplicationCoordinatorExternalStateMock::addSelf(const HostAndPort& host) {
     _selfHosts.push_back(host);
+}
+
+void ReplicationCoordinatorExternalStateMock::clearSelfHosts() {
+    _selfHosts.clear();
 }
 
 HostAndPort ReplicationCoordinatorExternalStateMock::getClientHostAndPort(
@@ -116,7 +126,8 @@ StatusWith<BSONObj> ReplicationCoordinatorExternalStateMock::loadLocalConfigDocu
 }
 
 Status ReplicationCoordinatorExternalStateMock::storeLocalConfigDocument(OperationContext* opCtx,
-                                                                         const BSONObj& config) {
+                                                                         const BSONObj& config,
+                                                                         bool writeOplog) {
     if (_storeLocalConfigDocumentStatus.isOK()) {
         setLocalConfigDocument(StatusWith<BSONObj>(config));
         return Status::OK();
@@ -129,6 +140,14 @@ void ReplicationCoordinatorExternalStateMock::setLocalConfigDocument(
     _localRsConfigDocument = localConfigDocument;
 }
 
+Status ReplicationCoordinatorExternalStateMock::createLocalLastVoteCollection(
+    OperationContext* opCtx) {
+    if (!_localRsLastVoteDocument.isOK()) {
+        setLocalLastVoteDocument(LastVote{OpTime::kInitialTerm, -1});
+    }
+    return Status::OK();
+}
+
 StatusWith<LastVote> ReplicationCoordinatorExternalStateMock::loadLocalLastVoteDocument(
     OperationContext* opCtx) {
     return _localRsLastVoteDocument;
@@ -137,7 +156,7 @@ StatusWith<LastVote> ReplicationCoordinatorExternalStateMock::loadLocalLastVoteD
 Status ReplicationCoordinatorExternalStateMock::storeLocalLastVoteDocument(
     OperationContext* opCtx, const LastVote& lastVote) {
     {
-        stdx::unique_lock<stdx::mutex> lock(_shouldHangLastVoteMutex);
+        stdx::unique_lock<Latch> lock(_shouldHangLastVoteMutex);
         while (_storeLocalLastVoteDocumentShouldHang) {
             _shouldHangLastVoteCondVar.wait(lock);
         }
@@ -202,7 +221,7 @@ void ReplicationCoordinatorExternalStateMock::setStoreLocalLastVoteDocumentStatu
 }
 
 void ReplicationCoordinatorExternalStateMock::setStoreLocalLastVoteDocumentToHang(bool hang) {
-    stdx::unique_lock<stdx::mutex> lock(_shouldHangLastVoteMutex);
+    stdx::unique_lock<Latch> lock(_shouldHangLastVoteMutex);
     _storeLocalLastVoteDocumentShouldHang = hang;
     if (!hang) {
         _shouldHangLastVoteCondVar.notify_all();
@@ -217,7 +236,7 @@ void ReplicationCoordinatorExternalStateMock::closeConnections() {
     _connectionsClosed = true;
 }
 
-void ReplicationCoordinatorExternalStateMock::shardingOnStepDownHook() {}
+void ReplicationCoordinatorExternalStateMock::onStepDownHook() {}
 
 void ReplicationCoordinatorExternalStateMock::signalApplierToChooseNewSyncSource() {}
 
@@ -225,12 +244,16 @@ void ReplicationCoordinatorExternalStateMock::stopProducer() {}
 
 void ReplicationCoordinatorExternalStateMock::startProducerIfStopped() {}
 
-void ReplicationCoordinatorExternalStateMock::dropAllSnapshots() {}
+bool ReplicationCoordinatorExternalStateMock::tooStale() {
+    return false;
+}
+
+void ReplicationCoordinatorExternalStateMock::clearCommittedSnapshot() {}
 
 void ReplicationCoordinatorExternalStateMock::updateCommittedSnapshot(
     const OpTime& newCommitPoint) {}
 
-void ReplicationCoordinatorExternalStateMock::updateLocalSnapshot(const OpTime& optime) {}
+void ReplicationCoordinatorExternalStateMock::updateLastAppliedSnapshot(const OpTime& optime) {}
 
 bool ReplicationCoordinatorExternalStateMock::snapshotsEnabled() const {
     return _areSnapshotsEnabled;

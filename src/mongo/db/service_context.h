@@ -31,24 +31,28 @@
 
 #include <boost/optional.hpp>
 #include <functional>
+#include <list>
+#include <memory>
 #include <vector>
 
-#include "mongo/base/global_initializer_registerer.h"
 #include "mongo/db/logical_session_id.h"
+#include "mongo/db/operation_id.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/platform/atomic_word.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/list.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/unordered_set.h"
-#include "mongo/transport/service_executor.h"
 #include "mongo/transport/session.h"
 #include "mongo/util/clock_source.h"
 #include "mongo/util/concurrency/with_lock.h"
 #include "mongo/util/decorable.h"
+#include "mongo/util/hierarchical_acquisition.h"
 #include "mongo/util/periodic_runner.h"
+#include "mongo/util/synchronized_value.h"
 #include "mongo/util/tick_source.h"
+#include "mongo/util/uuid.h"
+
+#include <iostream>
 
 namespace mongo {
 
@@ -86,6 +90,46 @@ protected:
     // Should not delete through a pointer of this type
     virtual ~KillOpListenerInterface() = default;
 };
+
+/**
+ * A simple container type to pass around a client and a lock on said client
+ */
+class LockedClient {
+public:
+    LockedClient() = default;
+    explicit LockedClient(Client* client);
+
+    Client* client() const noexcept {
+        return _client;
+    }
+
+    Client* operator->() const noexcept {
+        return client();
+    }
+
+    explicit operator bool() const noexcept {
+        return client();
+    }
+
+    operator WithLock() const noexcept {
+        return WithLock(_lk);
+    }
+
+private:
+    // Technically speaking, _lk holds a Client* and _client is a superfluous variable. That said,
+    // LockedClients will likely be optimized away and the extra variable is a cheap price to pay
+    // for better developer comprehension.
+    stdx::unique_lock<Client> _lk;
+    Client* _client = nullptr;
+};
+
+/**
+ * Users may provide an OperationKey when sending a command request as a stable token by which to
+ * refer to an operation (and thus an OperationContext). An OperationContext is not required to have
+ * an OperationKey. The presence of an OperationKey implies that the client is either closely
+ * tracking or speculative executing its command.
+ */
+using OperationKey = UUID;
 
 /**
  * Class representing the context of a service, such as a MongoD database service or
@@ -163,7 +207,7 @@ public:
         Client* next();
 
     private:
-        stdx::unique_lock<stdx::mutex> _lock;
+        stdx::unique_lock<Latch> _lock;
         ClientSet::const_iterator _curr;
         ClientSet::const_iterator _end;
     };
@@ -270,8 +314,25 @@ public:
                                     ConstructorAction constructor,
                                     DestructorAction destructor = {});
 
+        /**
+         * This constructor registers a constructor and optional destructor with the given
+         * "name", a list of names of prerequisites, "prereqs", and a list of names of dependents,
+         * "dependents".
+         *
+         * The named constructor will run after all of its prereqs successfully complete,
+         * and the corresponding destructor, if provided, will run before any of its
+         * prerequisites execute. The dependents will run after this constructor and
+         * the corresponding destructor, if provided, will run after any of its
+         * dependents execute.
+         */
+        ConstructorActionRegisterer(std::string name,
+                                    std::vector<std::string> prereqs,
+                                    std::vector<std::string> dependents,
+                                    ConstructorAction constructor,
+                                    DestructorAction destructor = {});
+
     private:
-        using ConstructorActionListIterator = stdx::list<ConstructorDestructorActions>::iterator;
+        using ConstructorActionListIterator = std::list<ConstructorDestructorActions>::iterator;
         ConstructorActionListIterator _iter;
         boost::optional<GlobalInitializerRegisterer> _registerer;
     };
@@ -336,9 +397,10 @@ public:
     //
 
     /**
-     * Signal all OperationContext(s) that they have been killed.
+     * Signal all OperationContext(s) that they have been killed except the ones belonging to the
+     * excluded clients.
      */
-    void setKillAllOperations();
+    void setKillAllOperations(const std::set<std::string>& excludedClients = {});
 
     /**
      * Reset the operation kill state after a killAllOperations.
@@ -361,6 +423,19 @@ public:
     void killOperation(WithLock,
                        OperationContext* opCtx,
                        ErrorCodes::Error killCode = ErrorCodes::Interrupted);
+
+    /**
+     * Kills the operation "opCtx" with the code "killCode", if opCtx has not already been killed,
+     * and delists the operation by removing it from "_clientByOperationId" and its client. Both
+     * "opCtx->getClient()->getServiceContext()" and "this" must point to the same instance of
+     * service context. Also, "opCtx" should never be deleted before this method returns. Finally,
+     * the thread invoking this method must not hold (own) the client and the service context locks.
+     * It is highly recommended to use "ErrorCodes::OperationIsKilledAndDelisted" as the error code
+     * to facilitate debugging.
+     */
+    void killAndDelistOperation(
+        OperationContext* opCtx,
+        ErrorCodes::Error killError = ErrorCodes::OperationIsKilledAndDelisted) noexcept;
 
     /**
      * Registers a listener to be notified each time an op is killed.
@@ -405,14 +480,6 @@ public:
      * See ServiceEntryPoint for more details.
      */
     ServiceEntryPoint* getServiceEntryPoint() const;
-
-    /**
-     * Get the service executor for the service context.
-     *
-     * See ServiceStateMachine for how this is used. Some configurations may not have a service
-     * executor registered and this will return a nullptr.
-     */
-    transport::ServiceExecutor* getServiceExecutor() const;
 
     /**
      * Waits for the ServiceContext to be fully initialized and for all TransportLayers to have been
@@ -499,16 +566,69 @@ public:
     void setTransportLayer(std::unique_ptr<transport::TransportLayer> tl);
 
     /**
-     * Binds the service executor to the service context
-     */
-    void setServiceExecutor(std::unique_ptr<transport::ServiceExecutor> exec);
-
-    /**
      * Creates a delayed execution baton with basic functionality
      */
     BatonHandle makeBaton(OperationContext* opCtx) const;
 
+    uint64_t getCatalogGeneration() const {
+        return _catalogGeneration.load();
+    }
+
+    void incrementCatalogGeneration() {
+        _catalogGeneration.fetchAndAdd(1);
+    }
+
+    LockedClient getLockedClient(OperationId id);
+
 private:
+    /**
+     * A synchronized owning pointer to avoid setters racing with getters.
+     * This only guarantees that getters receive a coherent value, and
+     * not that the pointer is still valid.
+     *
+     * The kernel of operations is `set` and and `get`, others ops are sugar.
+     */
+    template <typename T>
+    class SyncUnique {
+    public:
+        SyncUnique() = default;
+        explicit SyncUnique(std::unique_ptr<T> p) {
+            set(std::move(p));
+        }
+
+        ~SyncUnique() {
+            set(nullptr);
+        }
+
+        SyncUnique& operator=(std::unique_ptr<T> p) {
+            set(std::move(p));
+            return *this;
+        }
+
+        void set(std::unique_ptr<T> p) {
+            delete _ptr.swap(p.release());
+        }
+
+        T* get() const {
+            return _ptr.load();
+        }
+
+        T* operator->() const {
+            return get();
+        }
+
+        T& operator*() const {
+            return *get();
+        }
+
+        explicit operator bool() const {
+            return static_cast<bool>(get());
+        }
+
+    private:
+        AtomicWord<T*> _ptr{nullptr};
+    };
+
     class ClientObserverHolder {
     public:
         explicit ClientObserverHolder(std::unique_ptr<ClientObserver> observer)
@@ -530,32 +650,35 @@ private:
         std::unique_ptr<ClientObserver> _observer;
     };
 
-    stdx::mutex _mutex;
-
     /**
-     * The storage engine, if any.
+     * Removes the operation from its client and the `_clientByOperationId` of its service context.
+     * It will acquire both client and service context locks, and should only be used internally by
+     * other ServiceContext methods. To ensure delisted operations are shortly deleted, this method
+     * should only be called after killing an operation or in its destructor.
      */
-    std::unique_ptr<StorageEngine> _storageEngine;
+    void _delistOperation(OperationContext* opCtx) noexcept;
+
+    Mutex _mutex = MONGO_MAKE_LATCH(/*HierarchicalAcquisitionLevel(2), */ "ServiceContext::_mutex");
 
     /**
      * The periodic runner.
      */
-    std::unique_ptr<PeriodicRunner> _runner;
+    SyncUnique<PeriodicRunner> _runner;
 
     /**
      * The TransportLayer.
      */
-    std::unique_ptr<transport::TransportLayer> _transportLayer;
+    SyncUnique<transport::TransportLayer> _transportLayer;
 
     /**
      * The service entry point
      */
-    std::unique_ptr<ServiceEntryPoint> _serviceEntryPoint;
+    SyncUnique<ServiceEntryPoint> _serviceEntryPoint;
 
     /**
-     * The ServiceExecutor
+     * The storage engine, if any.
      */
-    std::unique_ptr<transport::ServiceExecutor> _serviceExecutor;
+    SyncUnique<StorageEngine> _storageEngine;
 
     /**
      * Vector of registered observers.
@@ -564,22 +687,28 @@ private:
     ClientSet _clients;
 
     /**
+     * Managing classes for our issued operation IDs.
+     */
+    std::shared_ptr<UniqueOperationIdRegistry> _opIdRegistry;
+    stdx::unordered_map<OperationId, Client*> _clientByOperationId;
+
+    /**
      * The registered OpObserver.
      */
-    std::unique_ptr<OpObserver> _opObserver;
+    SyncUnique<OpObserver> _opObserver;
 
-    std::unique_ptr<TickSource> _tickSource;
+    SyncUnique<TickSource> _tickSource;
 
     /**
      * A ClockSource implementation that may be less precise than the _preciseClockSource but
      * may be cheaper to call.
      */
-    std::unique_ptr<ClockSource> _fastClockSource;
+    SyncUnique<ClockSource> _fastClockSource;
 
     /**
      * A ClockSource implementation that is very precise but may be expensive to call.
      */
-    std::unique_ptr<ClockSource> _preciseClockSource;
+    SyncUnique<ClockSource> _preciseClockSource;
 
     // Flag set to indicate that all operations are to be interrupted ASAP.
     AtomicWord<bool> _globalKill{false};
@@ -587,8 +716,8 @@ private:
     // protected by _mutex
     std::vector<KillOpListenerInterface*> _killOpListeners;
 
-    // Counter for assigning operation ids.
-    AtomicWord<unsigned> _nextOpId{1};
+    // When the catalog is restarted, the generation goes up by one each time.
+    AtomicWord<uint64_t> _catalogGeneration{0};
 
     bool _startupComplete = false;
     stdx::condition_variable _startupCompleteCondVar;
@@ -609,18 +738,20 @@ bool hasGlobalServiceContext();
 ServiceContext* getGlobalServiceContext();
 
 /**
+ * Returns the ServiceContext associated with the current Client.
+ *
+ * Returns a nullptr if there is not a current Client
+ *
+ * Caller does not own pointer.
+ */
+ServiceContext* getCurrentServiceContext();
+
+/**
  * Sets the global ServiceContext.  If 'serviceContext' is NULL, un-sets and deletes
  * the current global ServiceContext.
  *
  * Takes ownership of 'serviceContext'.
  */
 void setGlobalServiceContext(ServiceContext::UniqueServiceContext&& serviceContext);
-
-/**
- * Shortcut for querying the storage engine about whether it supports document-level locking.
- * If this call becomes too expensive, we could cache the value somewhere so we don't have to
- * fetch the storage engine every time.
- */
-bool supportsDocLocking();
 
 }  // namespace mongo

@@ -41,7 +41,7 @@ using std::endl;
 using std::map;
 using std::string;
 
-MetricTree* MetricTree::theMetricTree = NULL;
+MetricTree* MetricTree::theMetricTree = nullptr;
 
 void MetricTree::add(ServerStatusMetric* metric) {
     string name = metric->getMetricName();
@@ -83,4 +83,4 @@ void MetricTree::appendTo(BSONObjBuilder& b) const {
         bb.done();
     }
 }
-}
+}  // namespace mongo

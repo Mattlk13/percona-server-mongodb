@@ -4,8 +4,8 @@
 
 class ConfigExpandRestServer {
     /**
-    * Create a new webserver.
-    */
+     * Create a new webserver.
+     */
     constructor() {
         load('jstests/libs/python.js');
         this.python = getPython3Binary();
@@ -58,6 +58,8 @@ class ConfigExpandRestServer {
     start() {
         this.port = allocatePort();
         print("Mock Web server is listening on port: " + this.port);
+
+        clearRawMongoProgramOutput();
 
         const args = [this.python, "-u", this.web_server_py, "--port=" + this.port];
         this.pid = _startMongoProgram({args: args});

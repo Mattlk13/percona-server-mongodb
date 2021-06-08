@@ -33,34 +33,29 @@
 
 namespace mongo {
 
-const char* DocumentSourcePlanCacheStats::kStageName = "$planCacheStats";
-
 REGISTER_DOCUMENT_SOURCE(planCacheStats,
                          DocumentSourcePlanCacheStats::LiteParsed::parse,
-                         DocumentSourcePlanCacheStats::createFromBson);
+                         DocumentSourcePlanCacheStats::createFromBson,
+                         LiteParsedDocumentSource::AllowedWithApiStrict::kNeverInVersion1);
 
 boost::intrusive_ptr<DocumentSource> DocumentSourcePlanCacheStats::createFromBson(
     BSONElement spec, const boost::intrusive_ptr<ExpressionContext>& pExpCtx) {
-    uassert(
-        ErrorCodes::FailedToParse,
-        str::stream() << kStageName << " value must be an object. Found: " << typeName(spec.type()),
-        spec.type() == BSONType::Object);
+    uassert(ErrorCodes::FailedToParse,
+            str::stream() << kStageName
+                          << " value must be an object. Found: " << typeName(spec.type()),
+            spec.type() == BSONType::Object);
 
     uassert(ErrorCodes::FailedToParse,
-            str::stream() << kStageName << " parameters object must be empty. Found: "
-                          << typeName(spec.type()),
+            str::stream() << kStageName
+                          << " parameters object must be empty. Found: " << typeName(spec.type()),
             spec.embeddedObject().isEmpty());
-
-    uassert(50932,
-            str::stream() << kStageName << " cannot be executed against a MongoS.",
-            !pExpCtx->inMongos && !pExpCtx->fromMongos && !pExpCtx->needsMerge);
 
     return new DocumentSourcePlanCacheStats(pExpCtx);
 }
 
 DocumentSourcePlanCacheStats::DocumentSourcePlanCacheStats(
     const boost::intrusive_ptr<ExpressionContext>& expCtx)
-    : DocumentSource(expCtx) {}
+    : DocumentSource(kStageName, expCtx) {}
 
 void DocumentSourcePlanCacheStats::serializeToArray(
     std::vector<Value>& array, boost::optional<ExplainOptions::Verbosity> explain) const {
@@ -93,7 +88,7 @@ Pipeline::SourceContainer::iterator DocumentSourcePlanCacheStats::doOptimizeAt(
     return container->erase(itrToNext);
 }
 
-DocumentSource::GetNextResult DocumentSourcePlanCacheStats::getNext() {
+DocumentSource::GetNextResult DocumentSourcePlanCacheStats::doGetNext() {
     if (!_haveRetrievedStats) {
         const auto matchExpr = _absorbedMatch ? _absorbedMatch->getMatchExpression() : nullptr;
         _results = pExpCtx->mongoProcessInterface->getMatchingPlanCacheEntryStats(
@@ -107,7 +102,32 @@ DocumentSource::GetNextResult DocumentSourcePlanCacheStats::getNext() {
         return GetNextResult::makeEOF();
     }
 
-    return Document{*_resultsIter++};
+    MutableDocument nextPlanCacheEntry{Document{*_resultsIter++}};
+
+    // Augment each plan cache entry with this node's host and port string.
+    if (_hostAndPort.empty()) {
+        _hostAndPort = pExpCtx->mongoProcessInterface->getHostAndPort(pExpCtx->opCtx);
+        uassert(31386,
+                "Aggregation request specified 'fromMongos' but unable to retrieve host name "
+                "for $planCacheStats pipeline stage.",
+                !_hostAndPort.empty());
+    }
+    nextPlanCacheEntry.setField("host", Value{_hostAndPort});
+
+    // If we're returning results to mongos, then additionally augment each plan cache entry with
+    // the shard name, for the node from which we're collecting plan cache information.
+    if (pExpCtx->fromMongos) {
+        if (_shardName.empty()) {
+            _shardName = pExpCtx->mongoProcessInterface->getShardName(pExpCtx->opCtx);
+            uassert(31385,
+                    "Aggregation request specified 'fromMongos' but unable to retrieve shard name "
+                    "for $planCacheStats pipeline stage.",
+                    !_shardName.empty());
+        }
+        nextPlanCacheEntry.setField("shard", Value{_shardName});
+    }
+
+    return nextPlanCacheEntry.freeze();
 }
 
 }  // namespace mongo

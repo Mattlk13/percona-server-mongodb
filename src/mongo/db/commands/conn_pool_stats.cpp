@@ -41,7 +41,6 @@
 #include "mongo/executor/connection_pool_stats.h"
 #include "mongo/executor/network_interface_factory.h"
 #include "mongo/executor/task_executor_pool.h"
-#include "mongo/s/client/shard_connection.h"
 #include "mongo/s/grid.h"
 
 namespace mongo {
@@ -107,55 +106,12 @@ public:
         stats.appendToBSON(result);
 
         // Always report all replica sets being tracked.
-        globalRSMonitorManager.report(&result);
+        ReplicaSetMonitorManager::get()->report(&result);
 
         return true;
     }
 
 } poolStatsCmd;
-
-class ShardedPoolStats final : public BasicCommand {
-public:
-    ShardedPoolStats() : BasicCommand("shardConnPoolStats") {}
-
-    std::string help() const override {
-        return "stats about the shard connection pool";
-    }
-
-    bool supportsWriteConcern(const BSONObj& cmd) const override {
-        return false;
-    }
-
-    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
-        return AllowedOnSecondary::kAlways;
-    }
-
-    /**
-     * Requires the same privileges as the connPoolStats command.
-     */
-    void addRequiredPrivileges(const std::string& dbname,
-                               const BSONObj& cmdObj,
-                               std::vector<Privilege>* out) const override {
-        ActionSet actions;
-        actions.addAction(ActionType::connPoolStats);
-        out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
-    }
-
-    bool run(OperationContext* opCtx,
-             const std::string& dbname,
-             const mongo::BSONObj& cmdObj,
-             mongo::BSONObjBuilder& result) override {
-        // Connection information
-        executor::ConnectionPoolStats stats{};
-        shardConnectionPool.appendConnectionStats(&stats);
-        stats.appendToBSON(result);
-
-        // Thread connection information
-        ShardConnection::reportActiveClientConnections(&result);
-        return true;
-    }
-
-} shardedPoolStatsCmd;
 
 }  // namespace
 }  // namespace mongo

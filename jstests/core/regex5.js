@@ -15,7 +15,6 @@ a = /.*b.*c/;
 x = /.*y.*/;
 
 doit = function() {
-
     assert.eq(1, t.find({x: a}).count(), "A");
     assert.eq(2, t.find({x: x}).count(), "B");
     assert.eq(2, t.find({x: {$in: [x]}}).count(), "C");            // SERVER-322
@@ -32,7 +31,7 @@ doit = function() {
 };
 
 doit();
-t.ensureIndex({x: 1});
+t.createIndex({x: 1});
 print("now indexed");
 doit();
 

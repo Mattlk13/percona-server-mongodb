@@ -27,28 +27,29 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/s/shard_metadata_util.h"
 
+#include <memory>
+
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/ops/write_ops.h"
+#include "mongo/db/s/type_shard_collection.h"
+#include "mongo/db/s/type_shard_database.h"
 #include "mongo/db/write_concern_options.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/unique_message.h"
 #include "mongo/s/catalog/type_chunk.h"
-#include "mongo/s/catalog/type_shard_collection.h"
-#include "mongo/s/catalog/type_shard_database.h"
+#include "mongo/s/catalog/type_collection.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/write_ops/batched_command_response.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace shardmetadatautil {
-
 namespace {
 
 const WriteConcernOptions kLocalWriteConcern(1,
@@ -93,14 +94,13 @@ Status unsetPersistedRefreshFlags(OperationContext* opCtx,
                                   const ChunkVersion& refreshedVersion) {
     // Set 'refreshing' to false and update the last refreshed collection version.
     BSONObjBuilder updateBuilder;
-    updateBuilder.append(ShardCollectionType::refreshing(), false);
-    updateBuilder.appendTimestamp(ShardCollectionType::lastRefreshedCollectionVersion(),
+    updateBuilder.append(ShardCollectionType::kRefreshingFieldName, false);
+    updateBuilder.appendTimestamp(ShardCollectionType::kLastRefreshedCollectionVersionFieldName,
                                   refreshedVersion.toLong());
 
     return updateShardCollectionsEntry(opCtx,
-                                       BSON(ShardCollectionType::ns() << nss.ns()),
-                                       updateBuilder.obj(),
-                                       BSONObj(),
+                                       BSON(ShardCollectionType::kNssFieldName << nss.ns()),
+                                       BSON("$set" << updateBuilder.obj()),
                                        false /*upsert*/);
 }
 
@@ -113,14 +113,14 @@ StatusWith<RefreshState> getPersistedRefreshFlags(OperationContext* opCtx,
     ShardCollectionType entry = statusWithCollectionEntry.getValue();
 
     // Ensure the results have not been incorrectly set somehow.
-    if (entry.hasRefreshing()) {
+    if (entry.getRefreshing()) {
         // If 'refreshing' is present and false, a refresh must have occurred (otherwise the field
         // would never have been added to the document) and there should always be a refresh
         // version.
-        invariant(entry.getRefreshing() ? true : entry.hasLastRefreshedCollectionVersion());
+        invariant(*entry.getRefreshing() ? true : !!entry.getLastRefreshedCollectionVersion());
     } else {
         // If 'refreshing' is not present, no refresh version should exist.
-        invariant(!entry.hasLastRefreshedCollectionVersion());
+        invariant(!entry.getLastRefreshedCollectionVersion());
     }
 
     return RefreshState{entry.getEpoch(),
@@ -128,16 +128,16 @@ StatusWith<RefreshState> getPersistedRefreshFlags(OperationContext* opCtx,
                         // refresh has started, but no chunks have ever yet been applied, around
                         // which these flags are set. So default to refreshing true because the
                         // chunk metadata is being updated and is not yet ready to be read.
-                        entry.hasRefreshing() ? entry.getRefreshing() : true,
-                        entry.hasLastRefreshedCollectionVersion()
-                            ? entry.getLastRefreshedCollectionVersion()
-                            : ChunkVersion(0, 0, entry.getEpoch())};
+                        entry.getRefreshing() ? *entry.getRefreshing() : true,
+                        entry.getLastRefreshedCollectionVersion()
+                            ? *entry.getLastRefreshedCollectionVersion()
+                            : ChunkVersion(0, 0, entry.getEpoch(), entry.getTimestamp())};
 }
 
 StatusWith<ShardCollectionType> readShardCollectionsEntry(OperationContext* opCtx,
                                                           const NamespaceString& nss) {
 
-    Query fullQuery(BSON(ShardCollectionType::ns() << nss.ns()));
+    Query fullQuery(BSON(ShardCollectionType::kNssFieldName << nss.ns()));
 
     try {
         DBDirectClient client(opCtx);
@@ -157,12 +157,7 @@ StatusWith<ShardCollectionType> readShardCollectionsEntry(OperationContext* opCt
         }
 
         BSONObj document = cursor->nextSafe();
-        auto statusWithCollectionEntry = ShardCollectionType::fromBSON(document);
-        if (!statusWithCollectionEntry.isOK()) {
-            return statusWithCollectionEntry.getStatus();
-        }
-
-        return statusWithCollectionEntry.getValue();
+        return ShardCollectionType(document);
     } catch (const DBException& ex) {
         return ex.toStatus(str::stream() << "Failed to read the '" << nss.ns()
                                          << "' entry locally from config.collections");
@@ -205,34 +200,23 @@ StatusWith<ShardDatabaseType> readShardDatabasesEntry(OperationContext* opCtx, S
 Status updateShardCollectionsEntry(OperationContext* opCtx,
                                    const BSONObj& query,
                                    const BSONObj& update,
-                                   const BSONObj& inc,
                                    const bool upsert) {
     invariant(query.hasField("_id"));
     if (upsert) {
         // If upserting, this should be an update from the config server that does not have shard
         // refresh / migration inc signal information.
-        invariant(!update.hasField(ShardCollectionType::lastRefreshedCollectionVersion()));
-        invariant(inc.isEmpty());
+        invariant(!update.hasField(ShardCollectionType::kLastRefreshedCollectionVersionFieldName));
     }
 
     try {
         DBDirectClient client(opCtx);
-
-        BSONObjBuilder builder;
-        if (!update.isEmpty()) {
-            // Want to modify the document if it already exists, not replace it.
-            builder.append("$set", update);
-        }
-        if (!inc.isEmpty()) {
-            builder.append("$inc", inc);
-        }
-
         auto commandResponse = client.runCommand([&] {
-            write_ops::Update updateOp(NamespaceString::kShardConfigCollectionsNamespace);
+            write_ops::UpdateCommandRequest updateOp(
+                NamespaceString::kShardConfigCollectionsNamespace);
             updateOp.setUpdates({[&] {
                 write_ops::UpdateOpEntry entry;
                 entry.setQ(query);
-                entry.setU(builder.obj());
+                entry.setU(write_ops::UpdateModification::parseFromClassicUpdate(update));
                 entry.setUpsert(upsert);
                 return entry;
             }()});
@@ -271,11 +255,12 @@ Status updateShardDatabasesEntry(OperationContext* opCtx,
         }
 
         auto commandResponse = client.runCommand([&] {
-            write_ops::Update updateOp(NamespaceString::kShardConfigDatabasesNamespace);
+            write_ops::UpdateCommandRequest updateOp(
+                NamespaceString::kShardConfigDatabasesNamespace);
             updateOp.setUpdates({[&] {
                 write_ops::UpdateOpEntry entry;
                 entry.setQ(query);
-                entry.setU(builder.obj());
+                entry.setU(write_ops::UpdateModification::parseFromClassicUpdate(builder.obj()));
                 entry.setUpsert(upsert);
                 return entry;
             }()});
@@ -294,7 +279,8 @@ StatusWith<std::vector<ChunkType>> readShardChunks(OperationContext* opCtx,
                                                    const BSONObj& query,
                                                    const BSONObj& sort,
                                                    boost::optional<long long> limit,
-                                                   const OID& epoch) {
+                                                   const OID& epoch,
+                                                   const boost::optional<Timestamp>& timestamp) {
     try {
         Query fullQuery(query);
         fullQuery.sort(sort);
@@ -313,7 +299,7 @@ StatusWith<std::vector<ChunkType>> readShardChunks(OperationContext* opCtx,
         std::vector<ChunkType> chunks;
         while (cursor->more()) {
             BSONObj document = cursor->nextSafe().getOwned();
-            auto statusWithChunk = ChunkType::fromShardBSON(document, epoch);
+            auto statusWithChunk = ChunkType::fromShardBSON(document, epoch, timestamp);
             if (!statusWithChunk.isOK()) {
                 return statusWithChunk.getStatus().withContext(
                     str::stream() << "Failed to parse chunk '" << document.toString() << "'");
@@ -373,7 +359,7 @@ Status updateShardChunks(OperationContext* opCtx,
             //
             // query: { "_id" : {"$gte": chunk.min, "$lt": chunk.max}}
             auto deleteCommandResponse = client.runCommand([&] {
-                write_ops::Delete deleteOp(chunkMetadataNss);
+                write_ops::DeleteCommandRequest deleteOp(chunkMetadataNss);
                 deleteOp.setDeletes({[&] {
                     write_ops::DeleteOpEntry entry;
                     entry.setQ(BSON(ChunkType::minShardID
@@ -388,7 +374,7 @@ Status updateShardChunks(OperationContext* opCtx,
 
             // Now the document can be expected to cleanly insert without overlap
             auto insertCommandResponse = client.runCommand([&] {
-                write_ops::Insert insertOp(chunkMetadataNss);
+                write_ops::InsertCommandRequest insertOp(chunkMetadataNss);
                 insertOp.setDocuments({chunk.toShardBSON()});
                 return insertOp.serialize({});
             }());
@@ -402,15 +388,36 @@ Status updateShardChunks(OperationContext* opCtx,
     }
 }
 
+void updateTimestampOnShardCollections(OperationContext* opCtx,
+                                       const NamespaceString& nss,
+                                       const boost::optional<Timestamp>& timestamp) {
+    write_ops::UpdateCommandRequest clearFields(
+        NamespaceString::kShardConfigCollectionsNamespace, [&] {
+            write_ops::UpdateOpEntry u;
+            u.setQ(BSON(ShardCollectionType::kNssFieldName << nss.ns()));
+            BSONObj updateOp = (timestamp)
+                ? BSON("$set" << BSON(CollectionType::kTimestampFieldName << *timestamp))
+                : BSON("$unset" << BSON(CollectionType::kTimestampFieldName << ""));
+            u.setU(write_ops::UpdateModification::parseFromClassicUpdate(updateOp));
+            return std::vector{u};
+        }());
+
+    DBDirectClient client(opCtx);
+    const auto commandResult = client.runCommand(clearFields.serialize({}));
+
+    uassertStatusOK(getStatusFromWriteCommandResponse(commandResult->getCommandReply()));
+}
+
 Status dropChunksAndDeleteCollectionsEntry(OperationContext* opCtx, const NamespaceString& nss) {
     try {
         DBDirectClient client(opCtx);
 
         auto deleteCommandResponse = client.runCommand([&] {
-            write_ops::Delete deleteOp(NamespaceString::kShardConfigCollectionsNamespace);
+            write_ops::DeleteCommandRequest deleteOp(
+                NamespaceString::kShardConfigCollectionsNamespace);
             deleteOp.setDeletes({[&] {
                 write_ops::DeleteOpEntry entry;
-                entry.setQ(BSON(ShardCollectionType::ns << nss.ns()));
+                entry.setQ(BSON(ShardCollectionType::kNssFieldName << nss.ns()));
                 entry.setMulti(true);
                 return entry;
             }()});
@@ -429,11 +436,35 @@ Status dropChunksAndDeleteCollectionsEntry(OperationContext* opCtx, const Namesp
             }
         }
 
-        LOG(1) << "Successfully cleared persisted chunk metadata for collection '" << nss << "'.";
+        LOGV2_DEBUG(
+            22090,
+            1,
+            "Successfully cleared persisted chunk metadata and collection entry for collection "
+            "{namespace}",
+            "Successfully cleared persisted chunk metadata and collection entry",
+            "namespace"_attr = nss);
         return Status::OK();
     } catch (const DBException& ex) {
         return ex.toStatus();
     }
+}
+
+void dropChunks(OperationContext* opCtx, const NamespaceString& nss) {
+    DBDirectClient client(opCtx);
+
+    // Drop the config.chunks collection associated with namespace 'nss'.
+    BSONObj result;
+    if (!client.dropCollection(ChunkType::ShardNSPrefix + nss.ns(), kLocalWriteConcern, &result)) {
+        auto status = getStatusFromCommandResult(result);
+        if (status != ErrorCodes::NamespaceNotFound) {
+            uassertStatusOK(status);
+        }
+    }
+
+    LOGV2_DEBUG(22091,
+                1,
+                "Successfully cleared persisted chunk metadata for collection",
+                "namespace"_attr = nss);
 }
 
 Status deleteDatabasesEntry(OperationContext* opCtx, StringData dbName) {
@@ -441,7 +472,8 @@ Status deleteDatabasesEntry(OperationContext* opCtx, StringData dbName) {
         DBDirectClient client(opCtx);
 
         auto deleteCommandResponse = client.runCommand([&] {
-            write_ops::Delete deleteOp(NamespaceString::kShardConfigDatabasesNamespace);
+            write_ops::DeleteCommandRequest deleteOp(
+                NamespaceString::kShardConfigDatabasesNamespace);
             deleteOp.setDeletes({[&] {
                 write_ops::DeleteOpEntry entry;
                 entry.setQ(BSON(ShardDatabaseType::name << dbName.toString()));
@@ -453,7 +485,11 @@ Status deleteDatabasesEntry(OperationContext* opCtx, StringData dbName) {
         uassertStatusOK(
             getStatusFromWriteCommandResponse(deleteCommandResponse->getCommandReply()));
 
-        LOG(1) << "Successfully cleared persisted metadata for db '" << dbName.toString() << "'.";
+        LOGV2_DEBUG(22092,
+                    1,
+                    "Successfully cleared persisted metadata for db {db}",
+                    "Successfully cleared persisted metadata for db",
+                    "db"_attr = dbName);
         return Status::OK();
     } catch (const DBException& ex) {
         return ex.toStatus();

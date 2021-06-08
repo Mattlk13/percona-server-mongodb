@@ -29,14 +29,9 @@
 
 #pragma once
 
-#include <string>
-#include <vector>
+#include <list>
 
-#include "mongo/base/string_data.h"
-#include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/user.h"
-#include "mongo/db/auth/user_name.h"
-#include "mongo/stdx/list.h"
 
 namespace mongo {
 
@@ -46,14 +41,13 @@ namespace mongo {
  * synchronizing access.
  */
 class UserSet {
-    UserSet(const UserSet&) = delete;
-    UserSet& operator=(const UserSet&) = delete;
-
 public:
-    using iterator = stdx::list<UserHandle>::iterator;
-    using const_iterator = stdx::list<UserHandle>::const_iterator;
+    using iterator = std::list<UserHandle>::iterator;
+    using const_iterator = std::list<UserHandle>::const_iterator;
 
-    UserSet() = default;
+    UserSet();
+    UserSet(const UserSet&) = default;
+    UserSet& operator=(const UserSet&) = default;
 
     /**
      * Adds a User to the UserSet.
@@ -105,14 +99,29 @@ public:
     iterator begin() {
         return _users.begin();
     }
+
     iterator end() {
         return _users.end();
+    }
+
+    // Returns the number of users stored in the set.
+    std::size_t count() const {
+        return _users.size();
+    }
+
+    // Generates a BSONArray representation of the UserSet.
+    BSONArray toBSON() const {
+        BSONArrayBuilder userNamesArray;
+        for (const auto& userHandle : _users) {
+            userHandle->getName().serializeToBSON(&userNamesArray);
+        }
+        return userNamesArray.arr();
     }
 
 private:
     // The UserSet maintains ownership of the Users in it, and is responsible for
     // returning them to the AuthorizationManager when done with them.
-    stdx::list<UserHandle> _users;
+    std::list<UserHandle> _users;
 };
 
 }  // namespace mongo

@@ -31,7 +31,7 @@
 
 #include "mongo/db/query/count_command_as_aggregation_command.h"
 
-#include "mongo/db/query/query_request.h"
+#include "mongo/db/query/query_request_helper.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -43,12 +43,11 @@ const char kSkipField[] = "skip";
 const char kHintField[] = "hint";
 const char kCollationField[] = "collation";
 const char kExplainField[] = "explain";
-const char kCommentField[] = "comment";
 const char kMaxTimeMSField[] = "maxTimeMS";
 const char kReadConcernField[] = "readConcern";
 }  // namespace
 
-StatusWith<BSONObj> countCommandAsAggregationCommand(const CountCommand& cmd,
+StatusWith<BSONObj> countCommandAsAggregationCommand(const CountCommandRequest& cmd,
                                                      const NamespaceString& nss) {
     BSONObjBuilder aggregationBuilder;
     aggregationBuilder.append("aggregate", nss.coll());
@@ -88,10 +87,6 @@ StatusWith<BSONObj> countCommandAsAggregationCommand(const CountCommand& cmd,
 
     aggregationBuilder.append(kHintField, cmd.getHint());
 
-    if (auto comment = cmd.getComment()) {
-        aggregationBuilder.append(kCommentField, comment.get());
-    }
-
     if (auto maxTime = cmd.getMaxTimeMS()) {
         if (maxTime.get() > 0) {
             aggregationBuilder.append(kMaxTimeMSField, maxTime.get());
@@ -106,7 +101,8 @@ StatusWith<BSONObj> countCommandAsAggregationCommand(const CountCommand& cmd,
 
     if (auto unwrapped = cmd.getQueryOptions()) {
         if (!unwrapped->isEmpty()) {
-            aggregationBuilder.append(QueryRequest::kUnwrappedReadPrefField, unwrapped.get());
+            aggregationBuilder.append(query_request_helper::kUnwrappedReadPrefField,
+                                      unwrapped.get());
         }
     }
 

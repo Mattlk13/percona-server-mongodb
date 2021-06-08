@@ -30,26 +30,28 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 
 #include "mongo/base/string_data.h"
 #include "mongo/client/authenticate.h"
+#include "mongo/client/client_api_version_parameters_gen.h"
 #include "mongo/client/connection_string.h"
 #include "mongo/client/dbclient_cursor.h"
 #include "mongo/client/index_spec.h"
 #include "mongo/client/mongo_uri.h"
 #include "mongo/client/query.h"
 #include "mongo/client/read_preference.h"
+#include "mongo/config.h"
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/write_concern_options.h"
-#include "mongo/logger/log_severity.h"
+#include "mongo/logv2/log_severity.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/rpc/message.h"
 #include "mongo/rpc/metadata.h"
 #include "mongo/rpc/op_msg.h"
 #include "mongo/rpc/protocol.h"
 #include "mongo/rpc/unique_message.h"
-#include "mongo/stdx/functional.h"
 #include "mongo/transport/message_compressor_manager.h"
 #include "mongo/transport/session.h"
 #include "mongo/transport/transport_layer.h"
@@ -73,27 +75,31 @@ std::string nsGetCollection(const std::string& ns);
  * them as "final" or "override" as appropriate.
  */
 class DBClientQueryInterface {
-    virtual std::unique_ptr<DBClientCursor> query(const NamespaceStringOrUUID& nsOrUuid,
-                                                  Query query,
-                                                  int nToReturn = 0,
-                                                  int nToSkip = 0,
-                                                  const BSONObj* fieldsToReturn = 0,
-                                                  int queryOptions = 0,
-                                                  int batchSize = 0) = 0;
+    virtual std::unique_ptr<DBClientCursor> query(
+        const NamespaceStringOrUUID& nsOrUuid,
+        Query query,
+        int nToReturn = 0,
+        int nToSkip = 0,
+        const BSONObj* fieldsToReturn = nullptr,
+        int queryOptions = 0,
+        int batchSize = 0,
+        boost::optional<BSONObj> readConcernObj = boost::none) = 0;
 
-    virtual unsigned long long query(stdx::function<void(const BSONObj&)> f,
+    virtual unsigned long long query(std::function<void(const BSONObj&)> f,
                                      const NamespaceStringOrUUID& nsOrUuid,
                                      Query query,
-                                     const BSONObj* fieldsToReturn = 0,
+                                     const BSONObj* fieldsToReturn = nullptr,
                                      int queryOptions = 0,
-                                     int batchSize = 0) = 0;
+                                     int batchSize = 0,
+                                     boost::optional<BSONObj> readConcernObj = boost::none) = 0;
 
-    virtual unsigned long long query(stdx::function<void(DBClientCursorBatchIterator&)> f,
+    virtual unsigned long long query(std::function<void(DBClientCursorBatchIterator&)> f,
                                      const NamespaceStringOrUUID& nsOrUuid,
                                      Query query,
-                                     const BSONObj* fieldsToReturn = 0,
+                                     const BSONObj* fieldsToReturn = nullptr,
                                      int queryOptions = 0,
-                                     int batchSize = 0) = 0;
+                                     int batchSize = 0,
+                                     boost::optional<BSONObj> readConcernObj = boost::none) = 0;
 };
 
 /**
@@ -104,11 +110,15 @@ class DBClientBase : public DBClientQueryInterface {
     DBClientBase& operator=(const DBClientBase&) = delete;
 
 public:
-    DBClientBase()
-        : _logLevel(logger::LogSeverity::Log()),
+    DBClientBase(const ClientAPIVersionParameters* apiParameters = nullptr)
+        : _logLevel(logv2::LogSeverity::Log()),
           _connectionId(ConnectionIdSequence.fetchAndAdd(1)),
           _cachedAvailableOptions((enum QueryOptions)0),
-          _haveCachedAvailableOptions(false) {}
+          _haveCachedAvailableOptions(false) {
+        if (apiParameters) {
+            _apiParameters = *apiParameters;
+        }
+    }
 
     virtual ~DBClientBase() {}
 
@@ -118,19 +128,21 @@ public:
     */
     virtual BSONObj findOne(const std::string& ns,
                             const Query& query,
-                            const BSONObj* fieldsToReturn = 0,
-                            int queryOptions = 0);
+                            const BSONObj* fieldsToReturn = nullptr,
+                            int queryOptions = 0,
+                            boost::optional<BSONObj> readConcernObj = boost::none);
 
     /** query N objects from the database into an array.  makes sense mostly when you want a small
      * number of results.  if a huge number, use query() and iterate the cursor.
-    */
+     */
     void findN(std::vector<BSONObj>& out,
                const std::string& ns,
                Query query,
                int nToReturn,
                int nToSkip = 0,
-               const BSONObj* fieldsToReturn = 0,
-               int queryOptions = 0);
+               const BSONObj* fieldsToReturn = nullptr,
+               int queryOptions = 0,
+               boost::optional<BSONObj> readConcernObj = boost::none);
 
     /**
      * @return a pair with a single object that matches the filter within the collection specified
@@ -140,9 +152,11 @@ public:
      * the query, an empty BSONObj is returned.
      * @throws AssertionException
      */
-    virtual std::pair<BSONObj, NamespaceString> findOneByUUID(const std::string& db,
-                                                              UUID uuid,
-                                                              const BSONObj& filter);
+    virtual std::pair<BSONObj, NamespaceString> findOneByUUID(
+        const std::string& db,
+        UUID uuid,
+        const BSONObj& filter,
+        boost::optional<BSONObj> readConcernObj = boost::none);
 
     virtual std::string getServerAddress() const = 0;
 
@@ -161,7 +175,7 @@ public:
 
     /**
      * actualServer is set to the actual server where they call went if there was a choice (for
-     * example SlaveOk).
+     * example SecondaryOk).
      */
     virtual bool call(Message& toSend,
                       Message& response,
@@ -173,9 +187,9 @@ public:
                      std::string* actualServer = nullptr) = 0;
 
     /* used by QueryOption_Exhaust.  To use that your subclass must implement this. */
-    virtual bool recv(Message& m, int lastRequestId) {
+    virtual Status recv(Message& m, int lastRequestId) {
         verify(false);
-        return false;
+        return {ErrorCodes::NotImplemented, "recv() not implemented"};
     }
 
     // In general, for lazy queries, we'll need to say, recv, then checkResponse
@@ -200,7 +214,7 @@ public:
 
     /**
      * Gets the RequestMetadataWriter that is set on this connection. This may
-     * be an uninitialized stdx::function, so it should be checked for validity
+     * be an uninitialized std::function, so it should be checked for validity
      * with operator bool() first.
      */
     const rpc::RequestMetadataWriter& getRequestMetadataWriter();
@@ -214,7 +228,7 @@ public:
 
     /**
      * Gets the ReplyMetadataReader that is set on this connection. This may
-     * be an uninitialized stdx::function, so it should be checked for validity
+     * be an uninitialized std::function, so it should be checked for validity
      * with operator bool() first.
      */
     const rpc::ReplyMetadataReader& getReplyMetadataReader();
@@ -260,7 +274,7 @@ public:
         directly call runCommand.
 
         @param dbname database name.  Use "admin" for global administrative commands.
-        @param cmd  the command object to execute.  For example, { ismaster : 1 }
+        @param cmd  the command object to execute.  For example, { hello : 1 }
         @param info the result object the database returns. Typically has { ok : ..., errmsg : ... }
                     fields set.
         @param options see enum QueryOptions - normally not needed to run a command
@@ -293,10 +307,11 @@ public:
         int options = 0);
 
     /**
-    * Authenticates to another cluster member using appropriate authentication data.
-    * @return true if the authentication was successful
-    */
-    virtual Status authenticateInternalUser();
+     * Authenticates to another cluster member using appropriate authentication data.
+     * @return true if the authentication was successful
+     */
+    virtual Status authenticateInternalUser(
+        auth::StepDownBehavior stepDownBehavior = auth::StepDownBehavior::kKillConnection);
 
     /**
      * Authenticate a user.
@@ -351,24 +366,24 @@ public:
     /** count number of objects in collection ns that match the query criteria specified
         throws UserAssertion if database returns an error
     */
-    virtual unsigned long long count(const std::string& ns,
-                                     const BSONObj& query = BSONObj(),
-                                     int options = 0,
-                                     int limit = 0,
-                                     int skip = 0);
+    virtual long long count(const NamespaceStringOrUUID nsOrUuid,
+                            const BSONObj& query = BSONObj(),
+                            int options = 0,
+                            int limit = 0,
+                            int skip = 0,
+                            boost::optional<BSONObj> readConcernObj = boost::none);
 
     static std::string createPasswordDigest(const std::string& username,
                                             const std::string& clearTextPassword);
 
-    /** returns true in isMaster parm if this db is the current master
-       of a replica pair.
+    /** returns true in isPrimary param if this db is the current primary of a replica pair.
 
        pass in info for more details e.g.:
-         { "ismaster" : 1.0 , "msg" : "not paired" , "ok" : 1.0  }
+         { "isprimary" : 1.0 , "msg" : "not paired" , "ok" : 1.0  }
 
        returns true if command invoked successfully.
     */
-    virtual bool isMaster(bool& isMaster, BSONObj* info = 0);
+    virtual bool isPrimary(bool& isPrimary, BSONObj* info = nullptr);
 
     /**
        Create a new collection in the database.  Normally, collection creation is automatic.  You
@@ -390,7 +405,8 @@ public:
                           long long size = 0,
                           bool capped = false,
                           int max = 0,
-                          BSONObj* info = 0);
+                          BSONObj* info = nullptr,
+                          boost::optional<BSONObj> writeConcernObj = boost::none);
 
     /** Get error result from the last write operation (insert/update/delete) on this connection.
         db doesn't change the command's behavior - it is just for auth checks.
@@ -462,6 +478,16 @@ public:
      */
     std::list<BSONObj> getCollectionInfos(const std::string& db, const BSONObj& filter = BSONObj());
 
+    /**
+     * Lists databases available on the server.
+     * @param filter A filter for the results
+     * @param nameOnly Only return the names of the databases
+     * @param authorizedDatabases Only return the databases the user is authorized on
+     */
+    std::vector<BSONObj> getDatabaseInfos(const BSONObj& filter = BSONObj(),
+                                          const bool nameOnly = false,
+                                          const bool authorizedDatabases = false);
+
     bool exists(const std::string& ns);
 
     /** Create an index on the collection 'ns' as described by the given keys. If you wish
@@ -473,8 +499,10 @@ public:
      *  @param keys Document describing keys and index types. You must provide at least one
      *  field and its direction.
      */
-    void createIndex(StringData ns, const BSONObj& keys) {
-        return createIndex(ns, IndexSpec().addKeys(keys));
+    void createIndex(StringData ns,
+                     const BSONObj& keys,
+                     boost::optional<BSONObj> writeConcernObj = boost::none) {
+        return createIndex(ns, IndexSpec().addKeys(keys), writeConcernObj);
     }
 
     /** Create an index on the collection 'ns' as described by the given
@@ -485,30 +513,57 @@ public:
      *  @param descriptor Configuration object describing the index to create. The
      *  descriptor must describe at least one key and index type.
      */
-    virtual void createIndex(StringData ns, const IndexSpec& descriptor) {
+    virtual void createIndex(StringData ns,
+                             const IndexSpec& descriptor,
+                             boost::optional<BSONObj> writeConcernObj = boost::none) {
         std::vector<const IndexSpec*> toBuild;
         toBuild.push_back(&descriptor);
-        createIndexes(ns, toBuild);
+        createIndexes(ns, toBuild, writeConcernObj);
     }
 
-    virtual void createIndexes(StringData ns, const std::vector<const IndexSpec*>& descriptor);
+    virtual void createIndexes(StringData ns,
+                               const std::vector<const IndexSpec*>& descriptor,
+                               boost::optional<BSONObj> writeConcernObj = boost::none);
 
     /**
      * Creates indexes on the collection 'ns' as described by 'specs'.
      *
      * Failure to construct the indexes is reported by throwing an AssertionException.
      */
-    virtual void createIndexes(StringData ns, const std::vector<BSONObj>& specs);
+    virtual void createIndexes(StringData ns,
+                               const std::vector<BSONObj>& specs,
+                               boost::optional<BSONObj> writeConcernObj = boost::none);
 
-    virtual std::list<BSONObj> getIndexSpecs(const std::string& ns, int options = 0);
+    /**
+     * Lists indexes on the collection 'nsOrUuid'.
+     * Includes in-progress indexes.
+     *
+     * If 'includeBuildUUIDs' is true, in-progress index specs will have the following format:
+     * {
+     *     spec: <BSONObj>
+     *     buildUUID: <UUID>
+     * }
+     * and ready index specs will only list the spec.
+     *
+     * If 'includeBuildUUIDs' is false, only the index spec will be returned without a way to
+     * distinguish between ready and in-progress index specs.
+     */
+    virtual std::list<BSONObj> getIndexSpecs(const NamespaceStringOrUUID& nsOrUuid,
+                                             bool includeBuildUUIDs,
+                                             int options);
 
-    virtual void dropIndex(const std::string& ns, BSONObj keys);
-    virtual void dropIndex(const std::string& ns, const std::string& indexName);
+    virtual void dropIndex(const std::string& ns,
+                           BSONObj keys,
+                           boost::optional<BSONObj> writeConcernObj = boost::none);
+    virtual void dropIndex(const std::string& ns,
+                           const std::string& indexName,
+                           boost::optional<BSONObj> writeConcernObj = boost::none);
 
     /**
        drops all indexes for the collection
      */
-    virtual void dropIndexes(const std::string& ns);
+    virtual void dropIndexes(const std::string& ns,
+                             boost::optional<BSONObj> writeConcernObj = boost::none);
 
     virtual void reIndex(const std::string& ns);
 
@@ -560,7 +615,7 @@ public:
     virtual int getMinWireVersion() = 0;
     virtual int getMaxWireVersion() = 0;
 
-    const std::vector<std::string>& getIsMasterSaslMechanisms() const {
+    const std::vector<std::string>& getIsPrimarySaslMechanisms() const {
         return _saslMechsForAuth;
     }
 
@@ -579,13 +634,15 @@ public:
      @return    cursor.   0 if error (connection failure)
      @throws AssertionException
     */
-    std::unique_ptr<DBClientCursor> query(const NamespaceStringOrUUID& nsOrUuid,
-                                          Query query,
-                                          int nToReturn = 0,
-                                          int nToSkip = 0,
-                                          const BSONObj* fieldsToReturn = 0,
-                                          int queryOptions = 0,
-                                          int batchSize = 0) override;
+    std::unique_ptr<DBClientCursor> query(
+        const NamespaceStringOrUUID& nsOrUuid,
+        Query query,
+        int nToReturn = 0,
+        int nToSkip = 0,
+        const BSONObj* fieldsToReturn = nullptr,
+        int queryOptions = 0,
+        int batchSize = 0,
+        boost::optional<BSONObj> readConcernObj = boost::none) override;
 
 
     /** Uses QueryOption_Exhaust, when available and specified in 'queryOptions'.
@@ -602,19 +659,21 @@ public:
         The version that takes a BSONObj cannot return the namespace queried when the query is
         is done by UUID.  If this is required, use the DBClientBatchIterator version.
      */
-    unsigned long long query(stdx::function<void(const BSONObj&)> f,
+    unsigned long long query(std::function<void(const BSONObj&)> f,
                              const NamespaceStringOrUUID& nsOrUuid,
                              Query query,
-                             const BSONObj* fieldsToReturn = 0,
+                             const BSONObj* fieldsToReturn = nullptr,
                              int queryOptions = QueryOption_Exhaust,
-                             int batchSize = 0) final;
+                             int batchSize = 0,
+                             boost::optional<BSONObj> readConcernObj = boost::none) final;
 
-    unsigned long long query(stdx::function<void(DBClientCursorBatchIterator&)> f,
+    unsigned long long query(std::function<void(DBClientCursorBatchIterator&)> f,
                              const NamespaceStringOrUUID& nsOrUuid,
                              Query query,
-                             const BSONObj* fieldsToReturn = 0,
+                             const BSONObj* fieldsToReturn = nullptr,
                              int queryOptions = QueryOption_Exhaust,
-                             int batchSize = 0) override;
+                             int batchSize = 0,
+                             boost::optional<BSONObj> readConcernObj = boost::none) override;
 
 
     /** don't use this - called automatically by DBClientCursor for you
@@ -630,22 +689,39 @@ public:
     /**
        insert an object into the database
      */
-    virtual void insert(const std::string& ns, BSONObj obj, int flags = 0);
+    virtual void insert(const std::string& ns,
+                        BSONObj obj,
+                        int flags = 0,
+                        boost::optional<BSONObj> writeConcernObj = boost::none);
 
     /**
        insert a vector of objects into the database
      */
-    virtual void insert(const std::string& ns, const std::vector<BSONObj>& v, int flags = 0);
+    virtual void insert(const std::string& ns,
+                        const std::vector<BSONObj>& v,
+                        int flags = 0,
+                        boost::optional<BSONObj> writeConcernObj = boost::none);
 
     /**
        updates objects matching query
      */
-    virtual void update(
-        const std::string& ns, Query query, BSONObj obj, bool upsert = false, bool multi = false);
+    virtual void update(const std::string& ns,
+                        Query query,
+                        BSONObj obj,
+                        bool upsert = false,
+                        bool multi = false,
+                        boost::optional<BSONObj> writeConcernObj = boost::none);
 
-    virtual void update(const std::string& ns, Query query, BSONObj obj, int flags);
+    virtual void update(const std::string& ns,
+                        Query query,
+                        BSONObj obj,
+                        int flags,
+                        boost::optional<BSONObj> writeConcernObj = boost::none);
 
-    virtual void remove(const std::string& ns, Query query, int flags = 0);
+    virtual void remove(const std::string& ns,
+                        Query query,
+                        int flags = 0,
+                        boost::optional<BSONObj> writeConcernObj = boost::none);
 
     virtual bool isFailed() const = 0;
 
@@ -670,6 +746,10 @@ public:
 
     virtual bool isMongos() const = 0;
 
+    virtual bool authenticatedDuringConnect() const {
+        return false;
+    }
+
     /**
      * Parses command replies and runs them through the metadata reader.
      * This is virtual and non-const to allow subclasses to act on failures.
@@ -677,18 +757,54 @@ public:
     virtual rpc::UniqueReply parseCommandReplyMessage(const std::string& host,
                                                       const Message& replyMsg);
 
+    /**
+     * Returns the latest operationTime tracked on this client.
+     */
+    Timestamp getOperationTime();
+
+    void setOperationTime(Timestamp operationTime);
+
     // This is only for DBClientCursor.
     static void (*withConnection_do_not_use)(std::string host, std::function<void(DBClientBase*)>);
+
+#ifdef MONGO_CONFIG_SSL
+    /**
+     * Get the SSL configuration of this client.
+     */
+    virtual const SSLConfiguration* getSSLConfiguration() = 0;
+
+    /**
+     * Returns true if this client was connected using transient SSL parameters. May return
+     * false if this client was never connected.
+     */
+    virtual bool isUsingTransientSSLParams() const {
+        return false;
+    }
+
+    virtual bool isTLS() = 0;
+#else
+    virtual bool isTLS() {
+        return false;
+    }
+#endif
+
+    const ClientAPIVersionParameters& getApiParameters() const {
+        return _apiParameters;
+    }
 
 protected:
     /** if the result of a command is ok*/
     bool isOk(const BSONObj&);
 
-    /** if the element contains a not master error */
-    bool isNotMasterErrorString(const BSONElement& e);
+    /** if the element contains a not primary error */
+    bool isNotPrimaryErrorString(const BSONElement& e);
 
-    BSONObj _countCmd(
-        const std::string& ns, const BSONObj& query, int options, int limit, int skip);
+    BSONObj _countCmd(const NamespaceStringOrUUID nsOrUuid,
+                      const BSONObj& query,
+                      int options,
+                      int limit,
+                      int skip,
+                      boost::optional<BSONObj> readConcernObj);
 
     /**
      * Look up the options available on this client.  Caches the answer from
@@ -704,7 +820,7 @@ protected:
     void _setServerRPCProtocols(rpc::ProtocolSet serverProtocols);
 
     /** controls how chatty the client is about network errors & such.  See log.h */
-    const logger::LogSeverity _logLevel;
+    const logv2::LogSeverity _logLevel;
 
     static AtomicWord<long long> ConnectionIdSequence;
     long long _connectionId;  // unique connection id for this connection
@@ -712,6 +828,13 @@ protected:
     std::vector<std::string> _saslMechsForAuth;
 
 private:
+    /**
+     * Implementation for getIndexes() and getReadyIndexes().
+     */
+    std::list<BSONObj> _getIndexSpecs(const NamespaceStringOrUUID& nsOrUuid,
+                                      const BSONObj& cmd,
+                                      int options);
+
     auth::RunCommandHook _makeAuthRunCommandHook();
 
     /**
@@ -731,9 +854,44 @@ private:
 
     enum QueryOptions _cachedAvailableOptions;
     bool _haveCachedAvailableOptions;
+
+    // The operationTime associated with the last command handled by the client.
+    Timestamp _lastOperationTime;
+
+    ClientAPIVersionParameters _apiParameters;
 };  // DBClientBase
 
 BSONElement getErrField(const BSONObj& result);
 bool hasErrField(const BSONObj& result);
+
+/*
+ * RAII-style class to set new RequestMetadataWriter and ReplyMetadataReader on DBClientConnection
+ * "_conn". On object destruction, '_conn' is set back to it's old RequestsMetadataWriter and
+ * ReplyMetadataReader.
+ */
+class ScopedMetadataWriterAndReader {
+    ScopedMetadataWriterAndReader(const ScopedMetadataWriterAndReader&) = delete;
+    ScopedMetadataWriterAndReader& operator=(const ScopedMetadataWriterAndReader&) = delete;
+
+public:
+    ScopedMetadataWriterAndReader(DBClientBase* conn,
+                                  rpc::RequestMetadataWriter writer,
+                                  rpc::ReplyMetadataReader reader)
+        : _conn(conn),
+          _oldWriter(std::move(conn->getRequestMetadataWriter())),
+          _oldReader(std::move(conn->getReplyMetadataReader())) {
+        _conn->setRequestMetadataWriter(std::move(writer));
+        _conn->setReplyMetadataReader(std::move(reader));
+    }
+    ~ScopedMetadataWriterAndReader() {
+        _conn->setRequestMetadataWriter(std::move(_oldWriter));
+        _conn->setReplyMetadataReader(std::move(_oldReader));
+    }
+
+private:
+    DBClientBase* const _conn;  // not owned.
+    rpc::RequestMetadataWriter _oldWriter;
+    rpc::ReplyMetadataReader _oldReader;
+};
 
 }  // namespace mongo

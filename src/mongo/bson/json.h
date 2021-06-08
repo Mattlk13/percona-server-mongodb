@@ -32,7 +32,9 @@
 #include <string>
 
 #include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 
@@ -52,7 +54,7 @@ namespace mongo {
 BSONObj fromjson(const std::string& str);
 
 /** @param len will be size of JSON object in text chars. */
-BSONObj fromjson(const char* str, int* len = NULL);
+BSONObj fromjson(const char* str, int* len = nullptr);
 
 /**
  * Tests whether the JSON string is an Array.
@@ -77,7 +79,9 @@ bool isArray(StringData str);
  * @param format The JSON format (TenGen, Strict).
  * @param pretty Enables pretty output.
  */
-std::string tojson(const BSONArray& arr, JsonStringFormat format = Strict, bool pretty = false);
+std::string tojson(const BSONArray& arr,
+                   JsonStringFormat format = ExtendedCanonicalV2_0_0,
+                   bool pretty = false);
 
 /**
  * Convert a BSONObj to a JSON string.
@@ -86,7 +90,9 @@ std::string tojson(const BSONArray& arr, JsonStringFormat format = Strict, bool 
  * @param format The JSON format (JS, TenGen, Strict).
  * @param pretty Enables pretty output.
  */
-std::string tojson(const BSONObj& obj, JsonStringFormat format = Strict, bool pretty = false);
+std::string tojson(const BSONObj& obj,
+                   JsonStringFormat format = ExtendedCanonicalV2_0_0,
+                   bool pretty = false);
 
 /**
  * Parser class.  A BSONObj is constructed incrementally by passing a
@@ -183,6 +189,12 @@ private:
     Status binaryObject(StringData fieldName, BSONObjBuilder&);
 
     /*
+     * UUIDOBJECT :
+     *     { FIELD("$uuid") : <string representation of UUID, in hexadecimal per RFC 4122> }
+     */
+    Status uuidObject(StringData fieldName, BSONObjBuilder&);
+
+    /*
      * DATEOBJECT :
      *     { FIELD("$date") : <64 bit signed integer for milliseconds since epoch> }
      */
@@ -207,6 +219,16 @@ private:
     Status regexObject(StringData fieldName, BSONObjBuilder&);
 
     /*
+     *     NOTE: the rules for the body of the regex are different here,
+     *     since it is quoted instead of surrounded by slashes.
+     * REGEXOBJECT :
+     *     { FIELD("$regularExpression") : {
+     *         FIELD("pattern") : <string representing body of regex>,
+     *         FIELD("options") : <string representing regex options> } }
+     */
+    Status regexObjectCanonical(StringData fieldName, BSONObjBuilder&);
+
+    /*
      * REFOBJECT :
      *     { FIELD("$ref") : <string representing collection name>,
      *          FIELD("$id") : <24 character hex std::string> }
@@ -222,10 +244,22 @@ private:
     Status undefinedObject(StringData fieldName, BSONObjBuilder&);
 
     /*
+     * NUMBERINTOBJECT :
+     *     { FIELD("$numberInt") : "<number>" }
+     */
+    Status numberIntObject(StringData fieldName, BSONObjBuilder&);
+
+    /*
      * NUMBERLONGOBJECT :
      *     { FIELD("$numberLong") : "<number>" }
      */
     Status numberLongObject(StringData fieldName, BSONObjBuilder&);
+
+    /*
+     * NUMBERDOUBLEOBJECT :
+     *     { FIELD("$numberDouble") : "<number>" }
+     */
+    Status numberDoubleObject(StringData fieldName, BSONObjBuilder&);
 
     /*
      * NUMBERDECIMALOBJECT :
@@ -410,7 +444,7 @@ private:
      * string, but there is no guarantee that it will not contain other
      * null characters.
      */
-    Status chars(std::string* result, const char* terminalSet, const char* allowedSet = NULL);
+    Status chars(std::string* result, const char* terminalSet, const char* allowedSet = nullptr);
 
     /**
      * Converts the two byte Unicode code point to its UTF8 character
@@ -472,6 +506,12 @@ private:
      * additional context information
      */
     Status parseError(StringData msg);
+
+    /**
+     * @returns a valid Date_t or FailedToParse status.
+     * Updates _input to past the end of the parsed date.
+     */
+    StatusWith<Date_t> parseDate();
 
 public:
     inline int offset() {

@@ -41,37 +41,31 @@ using boost::intrusive_ptr;
 
 REGISTER_DOCUMENT_SOURCE(indexStats,
                          DocumentSourceIndexStats::LiteParsed::parse,
-                         DocumentSourceIndexStats::createFromBson);
+                         DocumentSourceIndexStats::createFromBson,
+                         LiteParsedDocumentSource::AllowedWithApiStrict::kNeverInVersion1);
 
 const char* DocumentSourceIndexStats::getSourceName() const {
-    return "$indexStats";
+    return kStageName.rawData();
 }
 
-DocumentSource::GetNextResult DocumentSourceIndexStats::getNext() {
-    pExpCtx->checkForInterrupt();
-
-    if (_indexStatsMap.empty()) {
-        _indexStatsMap = pExpCtx->mongoProcessInterface->getIndexStats(pExpCtx->opCtx, pExpCtx->ns);
-        _indexStatsIter = _indexStatsMap.begin();
+DocumentSource::GetNextResult DocumentSourceIndexStats::doGetNext() {
+    if (_indexStats.empty()) {
+        _indexStats = pExpCtx->mongoProcessInterface->getIndexStats(
+            pExpCtx->opCtx, pExpCtx->ns, _processName, pExpCtx->fromMongos);
+        _indexStatsIter = _indexStats.cbegin();
     }
 
-    if (_indexStatsIter != _indexStatsMap.end()) {
-        const auto& stats = _indexStatsIter->second;
-        MutableDocument doc;
-        doc["name"] = Value(_indexStatsIter->first);
-        doc["key"] = Value(stats.indexKey);
-        doc["host"] = Value(_processName);
-        doc["accesses"]["ops"] = Value(stats.accesses.loadRelaxed());
-        doc["accesses"]["since"] = Value(stats.trackerStartTime);
+    if (_indexStatsIter != _indexStats.cend()) {
+        Document doc{std::move(*_indexStatsIter)};
         ++_indexStatsIter;
-        return doc.freeze();
+        return doc;
     }
 
     return GetNextResult::makeEOF();
 }
 
 DocumentSourceIndexStats::DocumentSourceIndexStats(const intrusive_ptr<ExpressionContext>& pExpCtx)
-    : DocumentSource(pExpCtx), _processName(getHostNameCachedAndPort()) {}
+    : DocumentSource(kStageName, pExpCtx), _processName(getHostNameCachedAndPort()) {}
 
 intrusive_ptr<DocumentSource> DocumentSourceIndexStats::createFromBson(
     BSONElement elem, const intrusive_ptr<ExpressionContext>& pExpCtx) {
@@ -85,4 +79,4 @@ Value DocumentSourceIndexStats::serialize(
     boost::optional<ExplainOptions::Verbosity> explain) const {
     return Value(DOC(getSourceName() << Document()));
 }
-}
+}  // namespace mongo

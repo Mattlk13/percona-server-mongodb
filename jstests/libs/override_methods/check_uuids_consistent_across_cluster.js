@@ -48,12 +48,6 @@ ShardingTest.prototype.checkUUIDsConsistentAcrossCluster = function() {
             }
             var rs = this._rs[i].test;
 
-            // The noop writer needs to be enabled in case a sync source isn't set, so that
-            // awaitLastOpCommitted() is guaranteed to finish.
-            // TODO SERVER-40211: Stop enabling the noop writer.
-            rs.getPrimary().adminCommand({setParameter: 1, periodicNoopIntervalSecs: 1});
-            rs.getPrimary().adminCommand({setParameter: 1, writePeriodicNoops: true});
-
             var keyFile = this._otherParams.keyFile;
             if (keyFile) {
                 authutil.asCluster(rs.nodes, keyFile, function() {
@@ -123,7 +117,7 @@ ShardingTest.prototype.checkUUIDsConsistentAcrossCluster = function() {
 
         for (let authoritativeCollMetadata of authoritativeCollMetadataArr) {
             const ns = authoritativeCollMetadata._id;
-            const[dbName, collName] = parseNs(ns);
+            const [dbName, collName] = parseNs(ns);
 
             for (let shardConnString of authoritativeCollMetadata.shardConnStrings) {
                 // A connection the shard may not be cached in ShardingTest if the shard was added
@@ -157,10 +151,17 @@ ShardingTest.prototype.checkUUIDsConsistentAcrossCluster = function() {
                     assert.commandWorked(shardConn.adminCommand(
                         {_flushRoutingTableCacheUpdates: ns, syncFromConfig: false}));
 
-                    const actualConfigMetadata =
-                        shardConn.getDB("config").getCollection("cache.collections").find({
-                            "_id": ns
-                        })[0];
+                    let actualConfigMetadata = shardConn.getDB("config")
+                                                   .getCollection("cache.collections")
+                                                   .find({"_id": ns})
+                                                   .toArray();
+                    assert.eq(
+                        actualConfigMetadata.length,
+                        1,
+                        "Incorrect number of entries in 'cache.collections' have been found for collection '" +
+                            ns + "' on node " + shardConn);
+                    actualConfigMetadata = actualConfigMetadata[0];
+
                     assert.eq(authoritativeCollMetadata.collInfo.uuid,
                               actualConfigMetadata.uuid,
                               "authoritative collection info on config server: " +

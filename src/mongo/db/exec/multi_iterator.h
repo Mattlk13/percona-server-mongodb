@@ -43,11 +43,11 @@ namespace mongo {
  * Iterates over a collection using multiple underlying RecordCursors.
  *
  * This is a special stage which is not used automatically by queries. It is intended for special
- * commands that work with RecordCursors. For example, it is used by the repairCursor command.
+ * commands that work with RecordCursors.
  */
 class MultiIteratorStage final : public RequiresCollectionStage {
 public:
-    MultiIteratorStage(OperationContext* opCtx, WorkingSet* ws, Collection* collection);
+    MultiIteratorStage(ExpressionContext* expCtx, WorkingSet* ws, const CollectionPtr& collection);
 
     void addIterator(std::unique_ptr<RecordCursor> it);
 
@@ -63,7 +63,7 @@ public:
 
     // Not used.
     SpecificStats* getSpecificStats() const final {
-        return NULL;
+        return nullptr;
     }
 
     // Not used.
@@ -79,7 +79,6 @@ protected:
     void doRestoreStateRequiresCollection() final;
 
 private:
-    OperationContext* _opCtx;
     std::vector<std::unique_ptr<RecordCursor>> _iterators;
 
     // Not owned by us.

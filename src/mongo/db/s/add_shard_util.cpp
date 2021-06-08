@@ -61,11 +61,12 @@ AddShard createAddShardCmd(OperationContext* opCtx, const ShardId& shardName) {
 
 BSONObj createShardIdentityUpsertForAddShard(const AddShard& addShardCmd) {
     BatchedCommandRequest request([&] {
-        write_ops::Update updateOp(NamespaceString::kServerConfigurationNamespace);
+        write_ops::UpdateCommandRequest updateOp(NamespaceString::kServerConfigurationNamespace);
         updateOp.setUpdates({[&] {
             write_ops::UpdateOpEntry entry;
             entry.setQ(BSON("_id" << kShardIdentityDocumentId));
-            entry.setU(addShardCmd.getShardIdentity().toBSON());
+            entry.setU(write_ops::UpdateModification::parseFromClassicUpdate(
+                addShardCmd.getShardIdentity().toBSON()));
             entry.setUpsert(true);
             return entry;
         }()});
@@ -77,5 +78,5 @@ BSONObj createShardIdentityUpsertForAddShard(const AddShard& addShardCmd) {
     return request.toBSON();
 }
 
-}  // namespace mongo
 }  // namespace add_shard_util
+}  // namespace mongo

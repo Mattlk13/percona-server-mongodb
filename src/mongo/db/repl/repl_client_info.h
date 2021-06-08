@@ -46,10 +46,37 @@ class ReplClientInfo {
 public:
     static const Client::Decoration<ReplClientInfo> forClient;
 
+    /**
+     * Sets the LastOp to the provided op, which MUST be greater than or equal to the current value
+     * of the LastOp. This also marks that the LastOp was set explicitly on the client so we wait
+     * for write concern.
+     */
     void setLastOp(OperationContext* opCtx, const OpTime& op);
 
     OpTime getLastOp() const {
         return _lastOp;
+    }
+
+    /**
+     * Stores the operation time of the latest proxy write, that is, a write that was forwarded
+     * to and executed on a different node instead of being executed locally.
+     */
+    void setLastProxyWriteTimestampForward(const Timestamp& timestamp) {
+        // Only advance the operation time of the latest proxy write if it is greater than the one
+        // currently stored.
+        if (timestamp > _lastProxyWriteTimestamp) {
+            _lastProxyWriteTimestamp = timestamp;
+        }
+    }
+
+    /**
+     * Returns the greater of the timestamps set by 'setLastOp()' and
+     * 'setLastProxyWriteTimestampForward()'.
+     */
+    Timestamp getMaxKnownOperationTime() const {
+        auto lastOpTimestamp = _lastOp.getTimestamp();
+        return lastOpTimestamp > _lastProxyWriteTimestamp ? lastOpTimestamp
+                                                          : _lastProxyWriteTimestamp;
     }
 
     /**
@@ -58,22 +85,36 @@ public:
      */
     bool lastOpWasSetExplicitlyByClientForCurrentOperation(OperationContext* opCtx) const;
 
-    // Resets the last op on this client; should only be used in testing.
-    void clearLastOp_forTest() {
+    /**
+     * Resets the last op on this client.
+     * WARNING: This should only be used when the lastOp is no longer needed for the client.
+     */
+    void clearLastOp() {
         _lastOp = OpTime();
     }
 
     /**
-     * Use this to set the LastOp to the latest known OpTime in the oplog.
-     * This is necessary when doing no-op writes, as we need to set the client's lastOp to a proper
-     * value for write concern wait to work.
+     * Use this to set the LastOp to the latest known OpTime in the oplog. On primary, The OpTime
+     * used consists of the timestamp of the latest oplog entry on disk and the current term. On
+     * secondaries, lastAppliedOpTime is used. Using lastAppliedOpTime on secondaries is the desired
+     * behavior, since secondaries do timestamped reads at the lastApplied.
+     *
+     * Setting the lastOp to the latest OpTime is necessary when doing no-op writes, as we need to
+     * set the client's lastOp to a proper value for write concern wait to work.
      */
     void setLastOpToSystemLastOpTime(OperationContext* opCtx);
+
+    /**
+     * Same as setLastOpToSystemLastOpTime but ignores interruption errors.
+     */
+    void setLastOpToSystemLastOpTimeIgnoringInterrupt(OperationContext* opCtx);
 
 private:
     static const long long kUninitializedTerm = -1;
 
     OpTime _lastOp = OpTime();
+
+    Timestamp _lastProxyWriteTimestamp;
 };
 
 }  // namespace repl

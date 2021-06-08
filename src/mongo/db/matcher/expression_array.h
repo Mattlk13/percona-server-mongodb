@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include <boost/optional.hpp>
 #include <vector>
 
 #include "mongo/base/status.h"
@@ -44,13 +45,14 @@ namespace mongo {
  */
 class ArrayMatchingMatchExpression : public PathMatchExpression {
 public:
-    ArrayMatchingMatchExpression(MatchType matchType, StringData path)
+    ArrayMatchingMatchExpression(MatchType matchType,
+                                 StringData path,
+                                 clonable_ptr<ErrorAnnotation> annotation = nullptr)
         : PathMatchExpression(matchType,
                               path,
                               ElementPath::LeafArrayBehavior::kNoTraversal,
-                              ElementPath::NonLeafArrayBehavior::kTraverse) {}
-
-    virtual ~ArrayMatchingMatchExpression() {}
+                              ElementPath::NonLeafArrayBehavior::kTraverse,
+                              std::move(annotation)) {}
 
     /**
      * Returns whether or not the nested array, represented as the object 'anArray', matches.
@@ -68,27 +70,29 @@ public:
     }
 };
 
-class ElemMatchObjectMatchExpression : public ArrayMatchingMatchExpression {
+class ElemMatchObjectMatchExpression final : public ArrayMatchingMatchExpression {
 public:
-    ElemMatchObjectMatchExpression(StringData path, MatchExpression* sub);
+    ElemMatchObjectMatchExpression(StringData path,
+                                   std::unique_ptr<MatchExpression> sub,
+                                   clonable_ptr<ErrorAnnotation> annotation = nullptr);
 
     bool matchesArray(const BSONObj& anArray, MatchDetails* details) const;
 
     virtual std::unique_ptr<MatchExpression> shallowClone() const {
         std::unique_ptr<ElemMatchObjectMatchExpression> e =
-            stdx::make_unique<ElemMatchObjectMatchExpression>(path(),
-                                                              _sub->shallowClone().release());
+            std::make_unique<ElemMatchObjectMatchExpression>(
+                path(), _sub->shallowClone(), _errorAnnotation);
         if (getTag()) {
             e->setTag(getTag()->clone());
         }
-        return std::move(e);
+        return e;
     }
 
     virtual void debugString(StringBuilder& debug, int indentationLevel) const;
 
     BSONObj getSerializedRightHandSide() const final;
 
-    std::vector<MatchExpression*>* getChildVector() final {
+    std::vector<std::unique_ptr<MatchExpression>>* getChildVector() final {
         return nullptr;
     }
 
@@ -108,42 +112,49 @@ public:
         _sub = std::move(newChild);
     }
 
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
 private:
     ExpressionOptimizerFunc getOptimizer() const final;
 
     std::unique_ptr<MatchExpression> _sub;
 };
 
-class ElemMatchValueMatchExpression : public ArrayMatchingMatchExpression {
+class ElemMatchValueMatchExpression final : public ArrayMatchingMatchExpression {
 public:
-    /**
-    * This constructor takes ownership of 'sub.'
-    */
-    ElemMatchValueMatchExpression(StringData path, MatchExpression* sub);
-    explicit ElemMatchValueMatchExpression(StringData path);
-    virtual ~ElemMatchValueMatchExpression();
+    ElemMatchValueMatchExpression(StringData path,
+                                  std::unique_ptr<MatchExpression> sub,
+                                  clonable_ptr<ErrorAnnotation> annotation = nullptr);
+    explicit ElemMatchValueMatchExpression(StringData path,
+                                           clonable_ptr<ErrorAnnotation> annotation = nullptr);
 
-    void add(MatchExpression* sub);
+    void add(std::unique_ptr<MatchExpression> sub);
 
     bool matchesArray(const BSONObj& anArray, MatchDetails* details) const;
 
     virtual std::unique_ptr<MatchExpression> shallowClone() const {
         std::unique_ptr<ElemMatchValueMatchExpression> e =
-            stdx::make_unique<ElemMatchValueMatchExpression>(path());
+            std::make_unique<ElemMatchValueMatchExpression>(path(), _errorAnnotation);
         for (size_t i = 0; i < _subs.size(); ++i) {
-            e->add(_subs[i]->shallowClone().release());
+            e->add(_subs[i]->shallowClone());
         }
         if (getTag()) {
             e->setTag(getTag()->clone());
         }
-        return std::move(e);
+        return e;
     }
 
     virtual void debugString(StringBuilder& debug, int indentationLevel) const;
 
     BSONObj getSerializedRightHandSide() const final;
 
-    virtual std::vector<MatchExpression*>* getChildVector() {
+    std::vector<std::unique_ptr<MatchExpression>>* getChildVector() final {
         return &_subs;
     }
 
@@ -152,7 +163,15 @@ public:
     }
 
     virtual MatchExpression* getChild(size_t i) const {
-        return _subs[i];
+        return _subs[i].get();
+    }
+
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
     }
 
 private:
@@ -160,20 +179,22 @@ private:
 
     bool _arrayElementMatchesAll(const BSONElement& e) const;
 
-    std::vector<MatchExpression*> _subs;
+    std::vector<std::unique_ptr<MatchExpression>> _subs;
 };
 
 class SizeMatchExpression : public ArrayMatchingMatchExpression {
 public:
-    SizeMatchExpression(StringData path, int size);
+    SizeMatchExpression(StringData path,
+                        int size,
+                        clonable_ptr<ErrorAnnotation> annotation = nullptr);
 
     virtual std::unique_ptr<MatchExpression> shallowClone() const {
         std::unique_ptr<SizeMatchExpression> e =
-            stdx::make_unique<SizeMatchExpression>(path(), _size);
+            std::make_unique<SizeMatchExpression>(path(), _size, _errorAnnotation);
         if (getTag()) {
             e->setTag(getTag()->clone());
         }
-        return std::move(e);
+        return e;
     }
 
     size_t numChildren() const override {
@@ -184,7 +205,7 @@ public:
         return nullptr;
     }
 
-    std::vector<MatchExpression*>* getChildVector() final {
+    std::vector<std::unique_ptr<MatchExpression>>* getChildVector() final {
         return nullptr;
     }
 
@@ -200,6 +221,14 @@ public:
         return _size;
     }
 
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
 private:
     virtual ExpressionOptimizerFunc getOptimizer() const final {
         return [](std::unique_ptr<MatchExpression> expression) { return expression; };
@@ -207,4 +236,4 @@ private:
 
     int _size;  // >= 0 real, < 0, nothing will match
 };
-}
+}  // namespace mongo

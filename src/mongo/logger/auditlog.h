@@ -34,15 +34,17 @@ Copyright (C) 2018-present Percona and/or its affiliates. All rights reserved.
 
 #pragma once
 
-namespace mongo {
-namespace logger {
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
 
-    class AuditLog {
-    public:
-        virtual void rotate() {};
-        virtual ~AuditLog() {};
+namespace mongo::logv2 {
+
+class AuditLog {
+public:
+    virtual Status rotate(bool rename, StringData renameSuffix) {
+        return Status::OK();
     };
+    virtual ~AuditLog() = default;
+};
 
-}  // namespace logger
-}  // namespace mongo
-
+}  // namespace mongo::logv2

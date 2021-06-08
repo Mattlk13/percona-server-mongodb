@@ -27,10 +27,11 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/db/auth/authorization_checks.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
@@ -39,6 +40,8 @@
 #include "mongo/db/curop_failpoint_helpers.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/count.h"
+#include "mongo/db/pipeline/aggregation_request_helper.h"
+#include "mongo/db/query/collection_query_info.h"
 #include "mongo/db/query/count_command_as_aggregation_command.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/query/get_executor.h"
@@ -46,14 +49,14 @@
 #include "mongo/db/query/view_response_formatter.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/views/resolved_view.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 namespace {
 
-using std::unique_ptr;
 using std::string;
 using std::stringstream;
+using std::unique_ptr;
 
 // Failpoint which causes to hang "count" cmd after acquiring the DB lock.
 MONGO_FAIL_POINT_DEFINE(hangBeforeCollectionCount);
@@ -73,6 +76,10 @@ public:
         return false;
     }
 
+    bool collectsResourceConsumptionMetrics() const override {
+        return true;
+    }
+
     bool canIgnorePrepareConflicts() const override {
         return true;
     }
@@ -89,10 +96,20 @@ public:
         return false;
     }
 
-    bool supportsReadConcern(const std::string& dbName,
-                             const BSONObj& cmdObj,
-                             repl::ReadConcernLevel level) const override {
-        return level != repl::ReadConcernLevel::kSnapshotReadConcern;
+    ReadConcernSupportResult supportsReadConcern(const BSONObj& cmdObj,
+                                                 repl::ReadConcernLevel level) const override {
+        static const Status kSnapshotNotSupported{ErrorCodes::InvalidOptions,
+                                                  "read concern snapshot not supported"};
+        return {{level == repl::ReadConcernLevel::kSnapshotReadConcern, kSnapshotNotSupported},
+                Status::OK()};
+    }
+
+    bool shouldAffectReadConcernCounter() const override {
+        return true;
+    }
+
+    bool supportsReadMirroring(const BSONObj&) const override {
+        return true;
     }
 
     ReadWriteType getReadWriteType() const override {
@@ -109,10 +126,10 @@ public:
         }
 
         const auto hasTerm = false;
-        return authSession->checkAuthForFind(
-            AutoGetCollection::resolveNamespaceStringOrUUID(
-                opCtx, CommandHelpers::parseNsOrUUID(dbname, cmdObj)),
-            hasTerm);
+        return auth::checkAuthForFind(authSession,
+                                      CollectionCatalog::get(opCtx)->resolveNamespaceStringOrUUID(
+                                          opCtx, CommandHelpers::parseNsOrUUID(dbname, cmdObj)),
+                                      hasTerm);
     }
 
     Status explain(OperationContext* opCtx,
@@ -123,15 +140,15 @@ public:
         const BSONObj& cmdObj = opMsgRequest.body;
         // Acquire locks. The RAII object is optional, because in the case
         // of a view, the locks need to be released.
-        boost::optional<AutoGetCollectionForReadCommand> ctx;
+        boost::optional<AutoGetCollectionForReadCommandMaybeLockFree> ctx;
         ctx.emplace(opCtx,
                     CommandHelpers::parseNsCollectionRequired(dbname, cmdObj),
-                    AutoGetCollection::ViewMode::kViewsPermitted);
+                    AutoGetCollectionViewMode::kViewsPermitted);
         const auto nss = ctx->getNss();
 
-        CountCommand request(NamespaceStringOrUUID(NamespaceString{}));
+        CountCommandRequest request(NamespaceStringOrUUID(NamespaceString{}));
         try {
-            request = CountCommand::parse(IDLParserErrorContext("count"), opMsgRequest);
+            request = CountCommandRequest::parse(IDLParserErrorContext("count"), opMsgRequest);
         } catch (...) {
             return exceptionToStatus();
         }
@@ -145,30 +162,42 @@ public:
                 return viewAggregation.getStatus();
             }
 
-            auto viewAggRequest =
-                AggregationRequest::parseFromBSON(nss, viewAggregation.getValue(), verbosity);
-            if (!viewAggRequest.isOK()) {
-                return viewAggRequest.getStatus();
-            }
+            auto viewAggCmd =
+                OpMsgRequest::fromDBAndBody(nss.db(), viewAggregation.getValue()).body;
+            auto viewAggRequest = aggregation_request_helper::parseFromBSON(
+                nss,
+                viewAggCmd,
+                verbosity,
+                APIParameters::get(opCtx).getAPIStrict().value_or(false));
 
             // An empty PrivilegeVector is acceptable because these privileges are only checked on
             // getMore and explain will not open a cursor.
             return runAggregate(opCtx,
-                                viewAggRequest.getValue().getNamespaceString(),
-                                viewAggRequest.getValue(),
+                                viewAggRequest.getNamespace(),
+                                viewAggRequest,
                                 viewAggregation.getValue(),
                                 PrivilegeVector(),
                                 result);
         }
 
-        Collection* const collection = ctx->getCollection();
+        const auto& collection = ctx->getCollection();
 
         // Prevent chunks from being cleaned up during yields - this allows us to only check the
         // version on initial entry into count.
-        auto rangePreserver = CollectionShardingState::get(opCtx, nss)->getCurrentMetadata();
+        boost::optional<ScopedCollectionFilter> rangePreserver;
+        if (collection.isSharded()) {
+            rangePreserver.emplace(
+                CollectionShardingState::getSharedForLockFreeReads(opCtx, nss)
+                    ->getOwnershipFilter(
+                        opCtx,
+                        CollectionShardingState::OrphanCleanupPolicy::kDisallowOrphanCleanup));
+        }
+
+        auto expCtx = makeExpressionContextForGetExecutor(
+            opCtx, request.getCollation().value_or(BSONObj()), nss);
 
         auto statusWithPlanExecutor =
-            getExecutorCount(opCtx, collection, request, true /*explain*/, nss);
+            getExecutorCount(expCtx, &collection, request, true /*explain*/, nss);
         if (!statusWithPlanExecutor.isOK()) {
             return statusWithPlanExecutor.getStatus();
         }
@@ -176,7 +205,7 @@ public:
         auto exec = std::move(statusWithPlanExecutor.getValue());
 
         auto bodyBuilder = result->getBodyBuilder();
-        Explain::explainStages(exec.get(), collection, verbosity, BSONObj(), &bodyBuilder);
+        Explain::explainStages(exec.get(), collection, verbosity, BSONObj(), cmdObj, &bodyBuilder);
         return Status::OK();
     }
 
@@ -187,16 +216,16 @@ public:
         CommandHelpers::handleMarkKillOnClientDisconnect(opCtx);
         // Acquire locks and resolve possible UUID. The RAII object is optional, because in the case
         // of a view, the locks need to be released.
-        boost::optional<AutoGetCollectionForReadCommand> ctx;
+        boost::optional<AutoGetCollectionForReadCommandMaybeLockFree> ctx;
         ctx.emplace(opCtx,
                     CommandHelpers::parseNsOrUUID(dbname, cmdObj),
-                    AutoGetCollection::ViewMode::kViewsPermitted);
+                    AutoGetCollectionViewMode::kViewsPermitted);
         const auto& nss = ctx->getNss();
 
         CurOpFailpointHelpers::waitWhileFailPointEnabled(
-            &hangBeforeCollectionCount, opCtx, "hangBeforeCollectionCount", []() {}, false, nss);
+            &hangBeforeCollectionCount, opCtx, "hangBeforeCollectionCount", []() {}, nss);
 
-        auto request = CountCommand::parse(IDLParserErrorContext("count"), cmdObj);
+        auto request = CountCommandRequest::parse(IDLParserErrorContext("count"), cmdObj);
 
         // Check whether we are allowed to read from this node after acquiring our locks.
         auto replCoord = repl::ReplicationCoordinator::get(opCtx);
@@ -218,14 +247,26 @@ public:
             return true;
         }
 
-        Collection* const collection = ctx->getCollection();
+        const auto& collection = ctx->getCollection();
 
         // Prevent chunks from being cleaned up during yields - this allows us to only check the
         // version on initial entry into count.
-        auto rangePreserver = CollectionShardingState::get(opCtx, nss)->getCurrentMetadata();
+        boost::optional<ScopedCollectionFilter> rangePreserver;
+        if (collection.isSharded()) {
+            rangePreserver.emplace(
+                CollectionShardingState::getSharedForLockFreeReads(opCtx, nss)
+                    ->getOwnershipFilter(
+                        opCtx,
+                        CollectionShardingState::OrphanCleanupPolicy::kDisallowOrphanCleanup));
+        }
 
         auto statusWithPlanExecutor =
-            getExecutorCount(opCtx, collection, request, false /*explain*/, nss);
+            getExecutorCount(makeExpressionContextForGetExecutor(
+                                 opCtx, request.getCollation().value_or(BSONObj()), nss),
+                             &collection,
+                             request,
+                             false /*explain*/,
+                             nss);
         uassertStatusOK(statusWithPlanExecutor.getStatus());
 
         auto exec = std::move(statusWithPlanExecutor.getValue());
@@ -234,32 +275,45 @@ public:
         auto curOp = CurOp::get(opCtx);
         {
             stdx::lock_guard<Client> lk(*opCtx->getClient());
-            curOp->setPlanSummary_inlock(Explain::getPlanSummary(exec.get()));
+            curOp->setPlanSummary_inlock(exec->getPlanExplainer().getPlanSummary());
         }
 
-        Status execPlanStatus = exec->executePlan();
-        uassertStatusOK(execPlanStatus);
+        auto countResult = exec->executeCount();
 
         PlanSummaryStats summaryStats;
-        Explain::getSummaryStats(*exec, &summaryStats);
+        exec->getPlanExplainer().getSummaryStats(&summaryStats);
         if (collection) {
-            collection->infoCache()->notifyOfQuery(opCtx, summaryStats.indexesUsed);
+            CollectionQueryInfo::get(collection).notifyOfQuery(opCtx, collection, summaryStats);
         }
         curOp->debug().setPlanSummaryMetrics(summaryStats);
 
-        if (curOp->shouldDBProfile()) {
-            BSONObjBuilder execStatsBob;
-            Explain::getWinningPlanStats(exec.get(), &execStatsBob);
-            curOp->debug().execStats = execStatsBob.obj();
+        if (curOp->shouldDBProfile(opCtx)) {
+            auto&& explainer = exec->getPlanExplainer();
+            auto&& [stats, _] =
+                explainer.getWinningPlanStats(ExplainOptions::Verbosity::kExecStats);
+            curOp->debug().execStats = std::move(stats);
         }
 
-        // Plan is done executing. We just need to pull the count out of the root stage.
-        invariant(STAGE_COUNT == exec->getRootStage()->stageType() ||
-                  STAGE_RECORD_STORE_FAST_COUNT == exec->getRootStage()->stageType());
-        auto* countStats = static_cast<const CountStats*>(exec->getRootStage()->getSpecificStats());
-
-        result.appendNumber("n", countStats->nCounted);
+        result.appendNumber("n", countResult);
         return true;
+    }
+
+    void appendMirrorableRequest(BSONObjBuilder* bob, const BSONObj& cmdObj) const override {
+        static const auto kMirrorableKeys = [] {
+            BSONObjBuilder keyBob;
+
+            keyBob.append("count", 1);
+            keyBob.append("query", 1);
+            keyBob.append("skip", 1);
+            keyBob.append("limit", 1);
+            keyBob.append("hint", 1);
+            keyBob.append("collation", 1);
+
+            return keyBob.obj();
+        }();
+
+        // Filter the keys that can be mirrored
+        cmdObj.filterFieldsUndotted(bob, kMirrorableKeys, true);
     }
 
 } cmdCount;

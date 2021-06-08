@@ -43,14 +43,22 @@ class OpTime;
 }  // namespace repl
 
 /**
- * Renames the collection from "source" to "target" and drops the existing collection iff
+ * Renames the collection from "source" to "target" and drops the existing collection if
  * "dropTarget" is true. "stayTemp" indicates whether a collection should maintain its
  * temporariness.
  */
 struct RenameCollectionOptions {
     bool dropTarget = false;
     bool stayTemp = false;
+    bool markFromMigrate = false;
 };
+
+void doLocalRenameIfOptionsAndIndexesHaveNotChanged(OperationContext* opCtx,
+                                                    const NamespaceString& sourceNs,
+                                                    const NamespaceString& targetNs,
+                                                    const RenameCollectionOptions& options,
+                                                    std::list<BSONObj> originalIndexes,
+                                                    BSONObj collectionOptions);
 
 Status renameCollection(OperationContext* opCtx,
                         const NamespaceString& source,
@@ -66,7 +74,7 @@ Status renameCollection(OperationContext* opCtx,
  */
 Status renameCollectionForApplyOps(OperationContext* opCtx,
                                    const std::string& dbName,
-                                   const BSONElement& ui,
+                                   const OptionalCollectionUUID& uuidToRename,
                                    const BSONObj& cmd,
                                    const repl::OpTime& renameOpTime);
 
@@ -79,5 +87,21 @@ Status renameCollectionForApplyOps(OperationContext* opCtx,
 Status renameCollectionForRollback(OperationContext* opCtx,
                                    const NamespaceString& target,
                                    const UUID& uuid);
+
+/**
+ * Performs validation checks to ensure source and target namespaces are eligible for rename.
+ */
+void validateNamespacesForRenameCollection(OperationContext* opCtx,
+                                           const NamespaceString& source,
+                                           const NamespaceString& target);
+
+/**
+ * Runs renameCollection() with preliminary validation checks to ensure source
+ * and target namespaces are eligible for rename.
+ */
+void validateAndRunRenameCollection(OperationContext* opCtx,
+                                    const NamespaceString& source,
+                                    const NamespaceString& target,
+                                    const RenameCollectionOptions& options);
 
 }  // namespace mongo

@@ -31,16 +31,18 @@
 
 #include "mongo/db/auth/auth_op_observer.h"
 
+#include "mongo/db/audit.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/op_observer_util.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/repl/oplog_entry.h"
 
 namespace mongo {
 
 namespace {
 
-const auto documentKeyDecoration = OperationContext::declareDecoration<BSONObj>();
+const auto documentIdDecoration = OperationContext::declareDecoration<BSONObj>();
 
 }  // namespace
 
@@ -55,6 +57,7 @@ void AuthOpObserver::onInserts(OperationContext* opCtx,
                                std::vector<InsertStatement>::const_iterator last,
                                bool fromMigrate) {
     for (auto it = first; it != last; it++) {
+        audit::logInsertOperation(opCtx->getClient(), nss, it->doc);
         AuthorizationManager::get(opCtx->getServiceContext())
             ->logOp(opCtx, "i", nss, it->doc, nullptr);
     }
@@ -64,44 +67,44 @@ void AuthOpObserver::onUpdate(OperationContext* opCtx, const OplogUpdateEntryArg
     if (args.updateArgs.update.isEmpty()) {
         return;
     }
+
+    audit::logUpdateOperation(opCtx->getClient(), args.nss, args.updateArgs.updatedDoc);
+
     AuthorizationManager::get(opCtx->getServiceContext())
         ->logOp(opCtx, "u", args.nss, args.updateArgs.update, &args.updateArgs.criteria);
-}
-
-BSONObj AuthOpObserver::getDocumentKey(OperationContext* opCtx,
-                                       NamespaceString const& nss,
-                                       BSONObj const& doc) {
-    const auto metadata = CollectionShardingState::get(opCtx, nss)->getCurrentMetadata();
-    return metadata->extractDocumentKey(doc).getOwned();
 }
 
 void AuthOpObserver::aboutToDelete(OperationContext* opCtx,
                                    NamespaceString const& nss,
                                    BSONObj const& doc) {
-    documentKeyDecoration(opCtx) = getDocumentKey(opCtx, nss, doc);
+    audit::logRemoveOperation(opCtx->getClient(), nss, doc);
+
+    // Extract the _id field from the document. If it does not have an _id, use the
+    // document itself as the _id.
+    documentIdDecoration(opCtx) = doc["_id"] ? doc["_id"].wrap() : doc;
 }
 
 void AuthOpObserver::onDelete(OperationContext* opCtx,
                               const NamespaceString& nss,
                               OptionalCollectionUUID uuid,
                               StmtId stmtId,
-                              bool fromMigrate,
-                              const boost::optional<BSONObj>& deletedDoc) {
-    auto& documentKey = documentKeyDecoration(opCtx);
-    invariant(!documentKey.isEmpty());
+                              const OplogDeleteEntryArgs& args) {
+    auto& documentId = documentIdDecoration(opCtx);
+    invariant(!documentId.isEmpty());
     AuthorizationManager::get(opCtx->getServiceContext())
-        ->logOp(opCtx, "d", nss, documentKey, nullptr);
+        ->logOp(opCtx, "d", nss, documentId, nullptr);
 }
 
 void AuthOpObserver::onCreateCollection(OperationContext* opCtx,
-                                        Collection* coll,
+                                        const CollectionPtr& coll,
                                         const NamespaceString& collectionName,
                                         const CollectionOptions& options,
                                         const BSONObj& idIndex,
                                         const OplogSlot& createOpTime) {
     const auto cmdNss = collectionName.getCommandNS();
 
-    const auto cmdObj = makeCreateCollCmdObj(collectionName, options, idIndex);
+    const auto cmdObj =
+        repl::MutableOplogEntry::makeCreateCollCmdObj(collectionName, options, idIndex);
 
     AuthorizationManager::get(opCtx->getServiceContext())
         ->logOp(opCtx, "c", cmdNss, cmdObj, nullptr);
@@ -109,14 +112,14 @@ void AuthOpObserver::onCreateCollection(OperationContext* opCtx,
 
 void AuthOpObserver::onCollMod(OperationContext* opCtx,
                                const NamespaceString& nss,
-                               OptionalCollectionUUID uuid,
+                               const UUID& uuid,
                                const BSONObj& collModCmd,
                                const CollectionOptions& oldCollOptions,
-                               boost::optional<TTLCollModInfo> ttlInfo) {
+                               boost::optional<IndexCollModInfo> indexInfo) {
     const auto cmdNss = nss.getCommandNS();
 
     // Create the 'o' field object.
-    const auto cmdObj = makeCollModCmdObj(collModCmd, oldCollOptions, ttlInfo);
+    const auto cmdObj = makeCollModCmdObj(collModCmd, oldCollOptions, indexInfo);
 
     AuthorizationManager::get(opCtx->getServiceContext())
         ->logOp(opCtx, "c", cmdNss, cmdObj, nullptr);
@@ -186,6 +189,18 @@ void AuthOpObserver::onRenameCollection(OperationContext* const opCtx,
                                         std::uint64_t numRecords,
                                         bool stayTemp) {
     postRenameCollection(opCtx, fromCollection, toCollection, uuid, dropTargetUUID, stayTemp);
+}
+
+void AuthOpObserver::onImportCollection(OperationContext* opCtx,
+                                        const UUID& importUUID,
+                                        const NamespaceString& nss,
+                                        long long numRecords,
+                                        long long dataSize,
+                                        const BSONObj& catalogEntry,
+                                        const BSONObj& storageMetadata,
+                                        bool isDryRun) {
+    AuthorizationManager::get(opCtx->getServiceContext())
+        ->logOp(opCtx, "m", nss, catalogEntry, &storageMetadata);
 }
 
 void AuthOpObserver::onApplyOps(OperationContext* opCtx,

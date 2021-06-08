@@ -30,6 +30,7 @@
 #pragma once
 
 #include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/db/auth/restriction.h"
@@ -44,7 +45,7 @@
 namespace mongo {
 
 namespace address_restriction_detail {
-using mongo::operator""_sd;
+
 struct ClientSource {
     static constexpr auto label = "Client source "_sd;
     static constexpr auto field = "clientSource"_sd;
@@ -67,7 +68,7 @@ public:
     /**
      * Construct an empty AddressRestriction.
      * Note that an empty AddressRestriciton will not validate
-     * against any addresses, since nothing has been whitelisted.
+     * against any addresses, since nothing has been allowlisted.
      */
     AddressRestriction() = default;
 

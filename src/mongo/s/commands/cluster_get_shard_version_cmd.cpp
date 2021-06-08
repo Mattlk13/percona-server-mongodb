@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -35,11 +35,11 @@
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/cluster_commands_helpers.h"
-#include "mongo/s/database_version_gen.h"
+#include "mongo/s/database_version.h"
 #include "mongo/s/grid.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
@@ -101,18 +101,39 @@ public:
             result.append("version", cachedDbInfo.databaseVersion().toBSON());
         } else {
             // Return the collection's information.
-            auto cachedCollInfo =
-                uassertStatusOK(catalogCache->getCollectionRoutingInfo(opCtx, nss));
+            const auto cm = uassertStatusOK(catalogCache->getCollectionRoutingInfo(opCtx, nss));
             uassert(ErrorCodes::NamespaceNotSharded,
                     str::stream() << "Collection " << nss.ns() << " is not sharded.",
-                    cachedCollInfo.cm());
-            const auto cm = cachedCollInfo.cm();
+                    cm.isSharded());
+            cm.getVersion().appendLegacyWithField(&result, "version");
 
-            for (const auto& chunk : cm->chunks()) {
-                log() << redact(chunk.toString());
+            if (cmdObj["fullMetadata"].trueValue()) {
+                BSONArrayBuilder chunksArrBuilder;
+                bool exceedsSizeLimit = false;
+
+                LOGV2(22753,
+                      "Routing info requested by getShardVersion: {routingInfo}",
+                      "Routing info requested by getShardVersion",
+                      "routingInfo"_attr = redact(cm.toString()));
+
+                cm.forEachChunk([&](const auto& chunk) {
+                    if (!exceedsSizeLimit) {
+                        BSONArrayBuilder chunkBB(chunksArrBuilder.subarrayStart());
+                        chunkBB.append(chunk.getMin());
+                        chunkBB.append(chunk.getMax());
+                        chunkBB.done();
+                        if (chunksArrBuilder.len() + result.len() > BSONObjMaxUserSize) {
+                            exceedsSizeLimit = true;
+                        }
+                    }
+
+                    return true;
+                });
+
+                if (!exceedsSizeLimit) {
+                    result.append("chunks", chunksArrBuilder.arr());
+                }
             }
-
-            cm->getVersion().appendLegacyWithField(&result, "version");
         }
 
         return true;

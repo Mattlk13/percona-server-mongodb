@@ -21,8 +21,6 @@
 #include "kms_request_opt_private.h"
 #include "kms_port.h"
 
-#include <assert.h>
-
 static kms_kv_list_t *
 parse_query_params (kms_request_str_t *q)
 {
@@ -63,6 +61,12 @@ kms_request_new (const char *method,
    kms_request_t *request = calloc (1, sizeof (kms_request_t));
    const char *question_mark;
 
+   KMS_ASSERT (request);
+   if (opt && opt->provider) {
+      request->provider = opt->provider;
+   } else {
+      request->provider = KMS_REQUEST_PROVIDER_AWS;
+   }
    /* parsing may set failed to true */
    request->failed = false;
 
@@ -94,10 +98,23 @@ kms_request_new (const char *method,
    request->header_fields = kms_kv_list_new ();
    request->auto_content_length = true;
 
-   kms_request_set_date (request, NULL);
+   /* For AWS KMS requests, add a X-Amz-Date header. */
+   if (request->provider == KMS_REQUEST_PROVIDER_AWS &&
+       !kms_request_set_date (request, NULL)) {
+      return request;
+   }
 
    if (opt && opt->connection_close) {
-      kms_request_add_header_field (request, "Connection", "close");
+      if (!kms_request_add_header_field (request, "Connection", "close")) {
+         return request;
+      }
+   }
+
+   if (opt && opt->crypto.sha256) {
+      memcpy (&request->crypto, &opt->crypto, sizeof (opt->crypto));
+   } else {
+      request->crypto.sha256 = kms_sha256;
+      request->crypto.sha256_hmac = kms_sha256_hmac;
    }
 
    return request;
@@ -159,7 +176,9 @@ kms_request_set_date (kms_request_t *request, const struct tm *tm)
    kms_request_str_set_chars (request->date, buf, sizeof "YYYYmmDD" - 1);
    kms_request_str_set_chars (request->datetime, buf, sizeof AMZ_DT_FORMAT - 1);
    kms_kv_list_del (request->header_fields, "X-Amz-Date");
-   kms_request_add_header_field (request, "X-Amz-Date", buf);
+   if (!kms_request_add_header_field (request, "X-Amz-Date", buf)) {
+      return false;
+   }
 
    return true;
 }
@@ -304,7 +323,8 @@ append_canonical_headers (kms_kv_list_t *lst, kms_request_str_t *str)
     * values in headers that have multiple values." */
    for (i = 0; i < lst->len; i++) {
       kv = &lst->kvs[i];
-      if (previous_key && 0 == strcasecmp (previous_key->str, kv->key->str)) {
+      if (previous_key &&
+          0 == kms_strcasecmp (previous_key->str, kv->key->str)) {
          /* duplicate header */
          kms_request_str_append_char (str, ',');
          kms_request_str_append_stripped (str, kv->value);
@@ -334,12 +354,13 @@ append_signed_headers (kms_kv_list_t *lst, kms_request_str_t *str)
 
    for (i = 0; i < lst->len; i++) {
       kv = &lst->kvs[i];
-      if (previous_key && 0 == strcasecmp (previous_key->str, kv->key->str)) {
+      if (previous_key &&
+          0 == kms_strcasecmp (previous_key->str, kv->key->str)) {
          /* duplicate header */
          continue;
       }
 
-      if (0 == strcasecmp (kv->key->str, "connection")) {
+      if (0 == kms_strcasecmp (kv->key->str, "connection")) {
          continue;
       }
 
@@ -372,7 +393,12 @@ finalize (kms_request_t *request)
    lst = request->header_fields;
 
    if (!kms_kv_list_find (lst, "Host")) {
-      /* like "kms.us-east-1.amazonaws.com" */
+      if (request->provider != KMS_REQUEST_PROVIDER_AWS) {
+         KMS_ERROR (request, "Required Host header not set");
+         return false;
+      }
+      /* For AWS requests, derive a default Host header from region + service.
+       * E.g. "kms.us-east-1.amazonaws.com" */
       k = kms_request_str_new_from_chars ("Host", -1);
       v = kms_request_str_dup (request->service);
       kms_request_str_append_char (v, '.');
@@ -405,7 +431,8 @@ finalize (kms_request_t *request)
 static int
 cmp_header_field_names (const void *a, const void *b)
 {
-   return strcasecmp (((kms_kv_t *) a)->key->str, ((kms_kv_t *) b)->key->str);
+   return kms_strcasecmp (((kms_kv_t *) a)->key->str,
+                          ((kms_kv_t *) b)->key->str);
 }
 
 static kms_kv_list_t *
@@ -413,7 +440,7 @@ canonical_headers (const kms_request_t *request)
 {
    kms_kv_list_t *lst;
 
-   assert (request->finalized);
+   KMS_ASSERT (request->finalized);
    lst = kms_kv_list_dup (request->header_fields);
    kms_kv_list_sort (lst, cmp_header_field_names);
    kms_kv_list_del (lst, "Connection");
@@ -440,6 +467,7 @@ kms_request_get_canonical (kms_request_t *request)
    kms_request_str_append_newline (canonical);
    normalized = kms_request_str_path_normalized (request->path);
    kms_request_str_append_escaped (canonical, normalized, false);
+   kms_request_str_destroy (normalized);
    kms_request_str_append_newline (canonical);
    append_canonical_query (request, canonical);
    kms_request_str_append_newline (canonical);
@@ -447,13 +475,37 @@ kms_request_get_canonical (kms_request_t *request)
    append_canonical_headers (lst, canonical);
    kms_request_str_append_newline (canonical);
    append_signed_headers (lst, canonical);
-   kms_request_str_append_newline (canonical);
-   kms_request_str_append_hashed (canonical, request->payload);
-
-   kms_request_str_destroy (normalized);
    kms_kv_list_destroy (lst);
+   kms_request_str_append_newline (canonical);
+   if (!kms_request_str_append_hashed (
+          &request->crypto, canonical, request->payload)) {
+      KMS_ERROR (request, "could not generate hash");
+      kms_request_str_destroy (canonical);
+      return NULL;
+   }
 
    return kms_request_str_detach (canonical);
+}
+
+const char *
+kms_request_get_canonical_header (kms_request_t *request, const char *header)
+{
+   const kms_kv_t *value;
+
+   if (request->failed) {
+      return NULL;
+   }
+
+   if (!finalize (request)) {
+      return NULL;
+   }
+
+   value = kms_kv_list_find (request->header_fields, header);
+   if (!value) {
+      return NULL;
+   }
+
+   return value->value->str;
 }
 
 char *
@@ -485,7 +537,11 @@ kms_request_get_string_to_sign (kms_request_t *request)
    kms_request_str_append_chars (sts, "/aws4_request\n", -1);
 
    creq = kms_request_str_wrap (kms_request_get_canonical (request), -1);
-   if (!kms_request_str_append_hashed (sts, creq)) {
+   if (!creq) {
+      goto done;
+   }
+
+   if (!kms_request_str_append_hashed (&request->crypto, sts, creq)) {
       goto done;
    }
 
@@ -501,19 +557,23 @@ done:
 }
 
 static bool
-kms_request_hmac (unsigned char *out,
+kms_request_hmac (_kms_crypto_t *crypto,
+                  unsigned char *out,
                   kms_request_str_t *key,
                   kms_request_str_t *data)
 {
-   return kms_sha256_hmac (key->str, (int) key->len, data->str, data->len, out);
+   return crypto->sha256_hmac (
+      crypto->ctx, key->str, (int) key->len, data->str, data->len, out);
 }
 
 static bool
-kms_request_hmac_again (unsigned char *out,
+kms_request_hmac_again (_kms_crypto_t *crypto,
+                        unsigned char *out,
                         unsigned char *in,
                         kms_request_str_t *data)
 {
-   return kms_sha256_hmac ((const char *) in, 32, data->str, data->len, out);
+   return crypto->sha256_hmac (
+      crypto->ctx, (const char *) in, 32, data->str, data->len, out);
 }
 
 bool
@@ -544,10 +604,14 @@ kms_request_get_signing_key (kms_request_t *request, unsigned char *key)
 
    aws4_request = kms_request_str_new_from_chars ("aws4_request", -1);
 
-   if (!(kms_request_hmac (k_date, aws4_plus_secret, request->date) &&
-         kms_request_hmac_again (k_region, k_date, request->region) &&
-         kms_request_hmac_again (k_service, k_region, request->service) &&
-         kms_request_hmac_again (key, k_service, aws4_request))) {
+   if (!(kms_request_hmac (
+            &request->crypto, k_date, aws4_plus_secret, request->date) &&
+         kms_request_hmac_again (
+            &request->crypto, k_region, k_date, request->region) &&
+         kms_request_hmac_again (
+            &request->crypto, k_service, k_region, request->service) &&
+         kms_request_hmac_again (
+            &request->crypto, key, k_service, aws4_request))) {
       goto done;
    }
 
@@ -592,7 +656,8 @@ kms_request_get_signature (kms_request_t *request)
    append_signed_headers (lst, sig);
    kms_request_str_append_chars (sig, ", Signature=", -1);
    if (!(kms_request_get_signing_key (request, signing_key) &&
-         kms_request_hmac_again (signature, signing_key, sts))) {
+         kms_request_hmac_again (
+            &request->crypto, signature, signing_key, sts))) {
       goto done;
    }
 
@@ -610,6 +675,26 @@ done:
    return kms_request_str_detach (sig);
 }
 
+void
+kms_request_validate (kms_request_t *request)
+{
+   if (0 == request->region->len) {
+      KMS_ERROR (request, "Region not set");
+   } else if (0 == request->service->len) {
+      KMS_ERROR (request, "Service not set");
+   } else if (0 == request->access_key_id->len) {
+      KMS_ERROR (request, "Access key ID not set");
+   } else if (0 == request->method->len) {
+      KMS_ERROR (request, "Method not set");
+   } else if (0 == request->path->len) {
+      KMS_ERROR (request, "Path not set");
+   } else if (0 == request->date->len) {
+      KMS_ERROR (request, "Date not set");
+   } else if (0 == request->secret_key->len) {
+      KMS_ERROR (request, "Secret key not set");
+   }
+}
+
 char *
 kms_request_get_signed (kms_request_t *request)
 {
@@ -619,6 +704,7 @@ kms_request_get_signed (kms_request_t *request)
    kms_request_str_t *sreq = NULL;
    size_t i;
 
+   kms_request_validate (request);
    if (request->failed) {
       return NULL;
    }
@@ -680,7 +766,53 @@ done:
    return kms_request_str_detach (sreq);
 }
 
+char *
+kms_request_to_string (kms_request_t *request)
+{
+   kms_kv_list_t *lst = NULL;
+   kms_request_str_t *sreq = NULL;
+   size_t i;
+
+   if (!finalize (request)) {
+      return false;
+   }
+
+   sreq = kms_request_str_new ();
+   /* like "POST / HTTP/1.1" */
+   kms_request_str_append (sreq, request->method);
+   kms_request_str_append_char (sreq, ' ');
+   kms_request_str_append (sreq, request->path);
+   if (request->query->len) {
+      kms_request_str_append_char (sreq, '?');
+      kms_request_str_append (sreq, request->query);
+   }
+
+   kms_request_str_append_chars (sreq, " HTTP/1.1", -1);
+   kms_request_str_append_newline (sreq);
+
+   /* headers */
+   lst = kms_kv_list_dup (request->header_fields);
+   kms_kv_list_sort (lst, cmp_header_field_names);
+   for (i = 0; i < lst->len; i++) {
+      kms_request_str_append (sreq, lst->kvs[i].key);
+      kms_request_str_append_char (sreq, ':');
+      kms_request_str_append (sreq, lst->kvs[i].value);
+      kms_request_str_append_newline (sreq);
+   }
+
+   kms_request_str_append_newline (sreq);
+
+   /* body */
+   if (request->payload->len) {
+      kms_request_str_append (sreq, request->payload);
+   }
+
+   kms_kv_list_destroy (lst);
+   return kms_request_str_detach (sreq);
+}
+
 void
-kms_request_free_string (char* ptr) {
-   free(ptr);
+kms_request_free_string (char *ptr)
+{
+   free (ptr);
 }

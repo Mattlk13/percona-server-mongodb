@@ -35,11 +35,11 @@
 #include "mongo/base/owned_pointer_vector.h"
 #include "mongo/base/status.h"
 #include "mongo/bson/mutable/document.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/field_ref_set.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/ops/write_ops_parsers.h"
+#include "mongo/db/ops/write_ops.h"
 #include "mongo/db/pipeline/pipeline.h"
-#include "mongo/db/pipeline/value.h"
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/update/modifier_table.h"
 #include "mongo/db/update/object_replace_executor.h"
@@ -56,7 +56,7 @@ class OperationContext;
 
 class UpdateDriver {
 public:
-    enum class UpdateType { kOperator, kReplacement, kPipeline };
+    enum class UpdateType { kOperator, kReplacement, kPipeline, kDelta };
 
     UpdateDriver(const boost::intrusive_ptr<ExpressionContext>& expCtx);
 
@@ -115,7 +115,8 @@ public:
      * The caller must either provide a null pointer, or a non-null pointer to an empty field ref
      * set.
      */
-    Status update(StringData matchedField,
+    Status update(OperationContext* opCtx,
+                  StringData matchedField,
                   mutablebson::Document* doc,
                   bool validateForStorage,
                   const FieldRefSet& immutablePaths,
@@ -185,6 +186,14 @@ public:
         return _positional;
     }
 
+    bool containsDotsAndDollarsField() const {
+        return _containsDotsAndDollarsField;
+    }
+
+    void setContainsDotsAndDollarsField(const bool containsDotsAndDollarsField) {
+        _containsDotsAndDollarsField = containsDotsAndDollarsField;
+    }
+
     /**
      * Serialize the update expression to Value. Output of this method is expected to, when parsed,
      * produce a logically equivalent update expression.
@@ -236,6 +245,9 @@ private:
 
     // Do any of the mods require positional match details when calling 'prepare'?
     bool _positional = false;
+
+    // True if the updated document contains any '.'/'$' field name.
+    bool _containsDotsAndDollarsField = false;
 
     // The document used to represent or store the object being updated.
     mutablebson::Document _objDoc;

@@ -29,14 +29,15 @@
 
 #pragma once
 
+#include <functional>
+
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/executor/task_executor.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -73,7 +74,7 @@ public:
      *
      * The returned status indicates whether or not the command was created.
      */
-    using PrepareReplSetUpdatePositionCommandFn = stdx::function<StatusWith<BSONObj>()>;
+    using PrepareReplSetUpdatePositionCommandFn = std::function<StatusWith<BSONObj>()>;
 
     Reporter(executor::TaskExecutor* executor,
              PrepareReplSetUpdatePositionCommandFn prepareReplSetUpdatePositionCommandFn,
@@ -187,7 +188,7 @@ private:
     const Milliseconds _updatePositionTimeout;
 
     // Protects member data of this Reporter declared below.
-    mutable stdx::mutex _mutex;
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("Reporter::_mutex");
 
     mutable stdx::condition_variable _condition;
 

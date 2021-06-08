@@ -36,7 +36,7 @@
 
 namespace mongo {
 
-using InspectionCallback = stdx::function<void(const executor::RemoteCommandRequest& request)>;
+using InspectionCallback = std::function<void(const executor::RemoteCommandRequest& request)>;
 
 class ClusterCommandTestFixture : public CatalogCacheTestFixture {
 protected:
@@ -60,7 +60,7 @@ protected:
 
     DbResponse runCommand(BSONObj cmd);
 
-    void runCommandSuccessful(BSONObj cmd, bool isTargeted);
+    DbResponse runCommandSuccessful(BSONObj cmd, bool isTargeted);
 
     void runTxnCommandOneError(BSONObj cmd, ErrorCodes::Error code, bool isTargeted);
 

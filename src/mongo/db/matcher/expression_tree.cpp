@@ -27,6 +27,9 @@
  *    it in the license file.
  */
 
+#include <algorithm>
+#include <iterator>
+
 #include "mongo/db/matcher/expression_tree.h"
 
 #include "mongo/bson/bsonmisc.h"
@@ -38,28 +41,15 @@
 
 namespace mongo {
 
-ListOfMatchExpression::~ListOfMatchExpression() {
-    for (unsigned i = 0; i < _expressions.size(); i++) {
-        delete _expressions[i];
-    }
-    _expressions.clear();
-}
-
-void ListOfMatchExpression::add(MatchExpression* e) {
-    verify(e);
-    _expressions.push_back(e);
-}
-
-
 void ListOfMatchExpression::_debugList(StringBuilder& debug, int indentationLevel) const {
     for (unsigned i = 0; i < _expressions.size(); i++)
         _expressions[i]->debugString(debug, indentationLevel + 1);
 }
 
-void ListOfMatchExpression::_listToBSON(BSONArrayBuilder* out) const {
+void ListOfMatchExpression::_listToBSON(BSONArrayBuilder* out, bool includePath) const {
     for (unsigned i = 0; i < _expressions.size(); i++) {
         BSONObjBuilder childBob(out->subobjStart());
-        _expressions[i]->serialize(&childBob);
+        _expressions[i]->serialize(&childBob, includePath);
     }
     out->doneFast();
 }
@@ -69,37 +59,28 @@ MatchExpression::ExpressionOptimizerFunc ListOfMatchExpression::getOptimizer() c
         auto& children = static_cast<ListOfMatchExpression&>(*expression)._expressions;
 
         // Recursively apply optimizations to child expressions.
-        for (auto& childExpression : children) {
-            // Since 'childExpression' is a reference to a member of the ListOfMatchExpression's
-            // child array, this assignment replaces the original child with the optimized child.
-            // We must set this child's entry in '_expressions' to null after assigning ownership to
-            // 'childExpressionPtr'. Otherwise, if the call to optimize() throws we will attempt to
-            // free twice.
-            std::unique_ptr<MatchExpression> childExpressionPtr(childExpression);
-            childExpression = nullptr;
-
-            auto optimizedExpression = MatchExpression::optimize(std::move(childExpressionPtr));
-            childExpression = optimizedExpression.release();
-        }
+        for (auto& childExpression : children)
+            childExpression = MatchExpression::optimize(std::move(childExpression));
 
         // Associativity of AND and OR: an AND absorbs the children of any ANDs among its children
         // (and likewise for any OR with OR children).
         MatchType matchType = expression->matchType();
         if (matchType == AND || matchType == OR) {
-            std::vector<MatchExpression*> absorbedExpressions;
-            for (MatchExpression*& childExpression : children) {
+            auto absorbedExpressions = std::vector<std::unique_ptr<MatchExpression>>{};
+            for (auto& childExpression : children) {
                 if (childExpression->matchType() == matchType) {
                     // Move this child out of the children array.
-                    std::unique_ptr<ListOfMatchExpression> childExpressionPtr(
-                        static_cast<ListOfMatchExpression*>(childExpression));
+                    auto childExpressionPtr = std::move(childExpression);
                     childExpression = nullptr;  // Null out this child's entry in _expressions, so
                                                 // that it will be deleted by the erase call below.
 
                     // Move all of the grandchildren from the child expression to
                     // absorbedExpressions.
-                    auto& grandChildren = childExpressionPtr->_expressions;
-                    absorbedExpressions.insert(
-                        absorbedExpressions.end(), grandChildren.begin(), grandChildren.end());
+                    auto& grandChildren =
+                        static_cast<ListOfMatchExpression&>(*childExpressionPtr)._expressions;
+                    std::move(grandChildren.begin(),
+                              grandChildren.end(),
+                              std::back_inserter(absorbedExpressions));
                     grandChildren.clear();
 
                     // Note that 'childExpressionPtr' will now be destroyed.
@@ -111,19 +92,18 @@ MatchExpression::ExpressionOptimizerFunc ListOfMatchExpression::getOptimizer() c
             children.erase(std::remove(children.begin(), children.end(), nullptr), children.end());
 
             // Append the absorbed children to the end of the array.
-            children.insert(children.end(), absorbedExpressions.begin(), absorbedExpressions.end());
+            std::move(absorbedExpressions.begin(),
+                      absorbedExpressions.end(),
+                      std::back_inserter(children));
         }
 
         // Remove all children of AND that are $alwaysTrue and all children of OR that are
         // $alwaysFalse.
         if (matchType == AND || matchType == OR) {
-            for (MatchExpression*& childExpression : children) {
+            for (auto& childExpression : children)
                 if ((childExpression->isTriviallyTrue() && matchType == MatchExpression::AND) ||
-                    (childExpression->isTriviallyFalse() && matchType == MatchExpression::OR)) {
-                    std::unique_ptr<MatchExpression> childPtr(childExpression);
+                    (childExpression->isTriviallyFalse() && matchType == MatchExpression::OR))
                     childExpression = nullptr;
-                }
-            }
 
             // We replaced each destroyed child expression with nullptr. Now we remove those
             // nullptrs from the vector.
@@ -137,21 +117,22 @@ MatchExpression::ExpressionOptimizerFunc ListOfMatchExpression::getOptimizer() c
         // empty AND as the same thing. The planner can create inferior plans for $alwaysTrue which
         // it would not produce for an AND with no children.
         if (children.empty() && matchType == MatchExpression::OR) {
-            return stdx::make_unique<AlwaysFalseMatchExpression>();
+            return std::make_unique<AlwaysFalseMatchExpression>();
         }
 
         if (children.size() == 1) {
             if ((matchType == AND || matchType == OR || matchType == INTERNAL_SCHEMA_XOR)) {
                 // Simplify AND/OR/XOR with exactly one operand to an expression consisting of just
                 // that operand.
-                MatchExpression* simplifiedExpression = children.front();
+                auto simplifiedExpression = std::move(children.front());
                 children.clear();
-                return std::unique_ptr<MatchExpression>(simplifiedExpression);
+                return simplifiedExpression;
             } else if (matchType == NOR) {
                 // Simplify NOR of exactly one operand to NOT of that operand.
-                auto simplifiedExpression = stdx::make_unique<NotMatchExpression>(children.front());
+                auto simplifiedExpression =
+                    std::make_unique<NotMatchExpression>(std::move(children.front()));
                 children.clear();
-                return std::move(simplifiedExpression);
+                return simplifiedExpression;
             }
         }
 
@@ -160,14 +141,150 @@ MatchExpression::ExpressionOptimizerFunc ListOfMatchExpression::getOptimizer() c
                 // An AND containing an expression that always evaluates to false can be
                 // optimized to a single $alwaysFalse expression.
                 if (childExpression->isTriviallyFalse() && matchType == MatchExpression::AND) {
-                    return stdx::make_unique<AlwaysFalseMatchExpression>();
+                    return std::make_unique<AlwaysFalseMatchExpression>();
                 }
 
                 // Likewise, an OR containing an expression that always evaluates to true can be
                 // optimized to a single $alwaysTrue expression.
                 if (childExpression->isTriviallyTrue() && matchType == MatchExpression::OR) {
-                    return stdx::make_unique<AlwaysTrueMatchExpression>();
+                    return std::make_unique<AlwaysTrueMatchExpression>();
                 }
+            }
+        }
+
+        // Rewrite an OR with EQ conditions on the same path as an IN-list. Example:
+        // {$or: [{name: "Don"}, {name: "Alice"}]}
+        // is rewritten as:
+        // {name: {$in: ["Alice", "Don"]}}
+        if (matchType == MatchExpression::OR && children.size() > 1) {
+            size_t countEquivEqPaths = 0;
+            size_t countNonEquivExpr = 0;
+            boost::optional<std::string> childPath;
+            const CollatorInterface* eqCollator = nullptr;
+
+            auto isNullOrRegEx = [](const BSONElement& elm) {
+                return (elm.isNull() || elm.type() == BSONType::RegEx);
+            };
+
+            // Check if all children are equality conditions or regular expressions with the
+            // same path argument, and same collation.
+            for (auto& childExpression : children) {
+                if (childExpression->matchType() != MatchExpression::EQ &&
+                    childExpression->matchType() != MatchExpression::REGEX) {
+                    ++countNonEquivExpr;
+                    continue;
+                }
+
+                // Disjunctions of equalities use $eq comparison, which has different semantics
+                // from $in equality comparison in two cases:
+                // (1) ('null' $eq 'undefined' = true), while ('null' $in 'undefined' = false),
+                //     that is, when comparing a 'null' argument to an 'undefined' value, the
+                //     result is different for $eq vs $in.
+                // (2) the regex under the equality is matched literally as a string constant,
+                //     while a regex inside $in is matched as a regular expression.
+                //     $lookup processing explicitly depends on this different semantics.
+                // Both these cases should not be rewritten into $in because of the different
+                // comparison semantics.
+                const CollatorInterface* curCollator = nullptr;
+                if (childExpression->matchType() == MatchExpression::EQ) {
+                    auto eqExpression =
+                        static_cast<EqualityMatchExpression*>(childExpression.get());
+                    curCollator = eqExpression->getCollator();
+                    if (isNullOrRegEx(eqExpression->getData())) {
+                        ++countNonEquivExpr;
+                        continue;
+                    }
+                }
+
+                // childExpression is an equality with $in comparison semantics.
+                // The current approach assumes there is one (large) group of $eq disjuncts
+                // that are on the same path.
+                if (!childPath) {
+                    // The path of the first equality.
+                    childPath = childExpression->path().toString();
+                    eqCollator = curCollator;
+                    countEquivEqPaths = 1;
+                } else if (*childPath == childExpression->path() && eqCollator == curCollator) {
+                    ++countEquivEqPaths;  // subsequent equality on the same path
+                } else {
+                    ++countNonEquivExpr;  // equality on another path
+                }
+            }
+            tassert(3401201,
+                    "All expressions must be classified as either eq-equiv or non-eq-equiv.",
+                    countEquivEqPaths + countNonEquivExpr == children.size());
+
+            // The condition above checks that there are at least two equalities that can be
+            // rewritten to an $in, and the we have classified all $or conditions into two disjunct
+            // groups.
+            if (countEquivEqPaths > 1) {
+                tassert(3401202, "There must be a common path.", childPath);
+                auto inExpression = std::make_unique<InMatchExpression>(StringData(*childPath));
+                auto nonEquivOrExpr =
+                    (countNonEquivExpr > 0) ? std::make_unique<OrMatchExpression>() : nullptr;
+                BSONArrayBuilder bab;
+
+                for (auto& childExpression : children) {
+                    if (*childPath != childExpression->path()) {
+                        nonEquivOrExpr->add(std::move(childExpression));
+                    } else if (childExpression->matchType() == MatchExpression::EQ) {
+                        std::unique_ptr<EqualityMatchExpression> eqExpressionPtr{
+                            static_cast<EqualityMatchExpression*>(childExpression.release())};
+                        if (isNullOrRegEx(eqExpressionPtr->getData()) ||
+                            eqExpressionPtr->getCollator() != eqCollator) {
+                            nonEquivOrExpr->add(std::move(eqExpressionPtr));
+                        } else {
+                            bab.append(eqExpressionPtr->getData());
+                        }
+                    } else if (childExpression->matchType() == MatchExpression::REGEX) {
+                        std::unique_ptr<RegexMatchExpression> regexExpressionPtr{
+                            static_cast<RegexMatchExpression*>(childExpression.release())};
+                        // Reset the path because when we parse a $in expression which contains a
+                        // regexp, we create a RegexMatchExpression with an empty path.
+                        regexExpressionPtr->setPath({});
+                        auto status = inExpression->addRegex(std::move(regexExpressionPtr));
+                        tassert(3401203,  // TODO SERVER-53380 convert to tassertStatusOK.
+                                "Conversion from OR to IN should always succeed.",
+                                status == Status::OK());
+                    } else {
+                        nonEquivOrExpr->add(std::move(childExpression));
+                    }
+                }
+                children.clear();
+                tassert(3401204,
+                        "Incorrect number of non-equivalent expressions",
+                        !nonEquivOrExpr || nonEquivOrExpr->numChildren() == countNonEquivExpr);
+
+                auto backingArr = bab.arr();
+                std::vector<BSONElement> inEqualities;
+                backingArr.elems(inEqualities);
+                tassert(3401205,
+                        "Incorrect number of in-equivalent expressions",
+                        !countEquivEqPaths ||
+                            (inEqualities.size() + inExpression->getRegexes().size()) ==
+                                countEquivEqPaths);
+
+                auto status = inExpression->setEqualities(std::move(inEqualities));
+                tassert(3401206,  // TODO SERVER-53380 convert to tassertStatusOK.
+                        "Conversion from OR to IN should always succeed.",
+                        status == Status::OK());
+
+                inExpression->setBackingBSON(std::move(backingArr));
+                if (eqCollator) {
+                    inExpression->setCollator(eqCollator);
+                }
+
+                if (countNonEquivExpr > 0) {
+                    auto parentOrExpr = std::make_unique<OrMatchExpression>();
+                    parentOrExpr->add(std::move(inExpression));
+                    if (countNonEquivExpr == 1) {
+                        parentOrExpr->add(nonEquivOrExpr->releaseChild(0));
+                    } else {
+                        parentOrExpr->add(std::move(nonEquivOrExpr));
+                    }
+                    return parentOrExpr;
+                }
+                return inExpression;
             }
         }
 
@@ -186,7 +303,7 @@ bool ListOfMatchExpression::equivalent(const MatchExpression* other) const {
 
     // TOOD: order doesn't matter
     for (unsigned i = 0; i < _expressions.size(); i++)
-        if (!_expressions[i]->equivalent(realOther->_expressions[i]))
+        if (!_expressions[i]->equivalent(realOther->_expressions[i].get()))
             return false;
 
     return true;
@@ -217,11 +334,17 @@ bool AndMatchExpression::matchesSingleElement(const BSONElement& e, MatchDetails
 
 void AndMatchExpression::debugString(StringBuilder& debug, int indentationLevel) const {
     _debugAddSpace(debug, indentationLevel);
-    debug << "$and\n";
+    debug << "$and";
+    MatchExpression::TagData* td = getTag();
+    if (td) {
+        debug << " ";
+        td->debugString(&debug);
+    }
+    debug << "\n";
     _debugList(debug, indentationLevel);
 }
 
-void AndMatchExpression::serialize(BSONObjBuilder* out) const {
+void AndMatchExpression::serialize(BSONObjBuilder* out, bool includePath) const {
     if (!numChildren()) {
         // It is possible for an AndMatchExpression to have no children, resulting in the serialized
         // expression {$and: []}, which is not a valid query object.
@@ -229,7 +352,7 @@ void AndMatchExpression::serialize(BSONObjBuilder* out) const {
     }
 
     BSONArrayBuilder arrBob(out->subarrayStart("$and"));
-    _listToBSON(&arrBob);
+    _listToBSON(&arrBob, includePath);
     arrBob.doneFast();
 }
 
@@ -241,7 +364,7 @@ bool AndMatchExpression::isTriviallyTrue() const {
 
 bool OrMatchExpression::matches(const MatchableDocument* doc, MatchDetails* details) const {
     for (size_t i = 0; i < numChildren(); i++) {
-        if (getChild(i)->matches(doc, NULL)) {
+        if (getChild(i)->matches(doc, nullptr)) {
             return true;
         }
     }
@@ -249,22 +372,23 @@ bool OrMatchExpression::matches(const MatchableDocument* doc, MatchDetails* deta
 }
 
 bool OrMatchExpression::matchesSingleElement(const BSONElement& e, MatchDetails* details) const {
-    for (size_t i = 0; i < numChildren(); i++) {
-        if (getChild(i)->matchesSingleElement(e, details)) {
-            return true;
-        }
-    }
-    return false;
+    MONGO_UNREACHABLE_TASSERT(5429901);
 }
 
 
 void OrMatchExpression::debugString(StringBuilder& debug, int indentationLevel) const {
     _debugAddSpace(debug, indentationLevel);
-    debug << "$or\n";
+    debug << "$or";
+    MatchExpression::TagData* td = getTag();
+    if (td) {
+        debug << " ";
+        td->debugString(&debug);
+    }
+    debug << "\n";
     _debugList(debug, indentationLevel);
 }
 
-void OrMatchExpression::serialize(BSONObjBuilder* out) const {
+void OrMatchExpression::serialize(BSONObjBuilder* out, bool includePath) const {
     if (!numChildren()) {
         // It is possible for an OrMatchExpression to have no children, resulting in the serialized
         // expression {$or: []}, which is not a valid query object. An empty $or is logically
@@ -273,7 +397,7 @@ void OrMatchExpression::serialize(BSONObjBuilder* out) const {
         return;
     }
     BSONArrayBuilder arrBob(out->subarrayStart("$or"));
-    _listToBSON(&arrBob);
+    _listToBSON(&arrBob, includePath);
 }
 
 bool OrMatchExpression::isTriviallyFalse() const {
@@ -284,7 +408,7 @@ bool OrMatchExpression::isTriviallyFalse() const {
 
 bool NorMatchExpression::matches(const MatchableDocument* doc, MatchDetails* details) const {
     for (size_t i = 0; i < numChildren(); i++) {
-        if (getChild(i)->matches(doc, NULL)) {
+        if (getChild(i)->matches(doc, nullptr)) {
             return false;
         }
     }
@@ -306,9 +430,9 @@ void NorMatchExpression::debugString(StringBuilder& debug, int indentationLevel)
     _debugList(debug, indentationLevel);
 }
 
-void NorMatchExpression::serialize(BSONObjBuilder* out) const {
+void NorMatchExpression::serialize(BSONObjBuilder* out, bool includePath) const {
     BSONArrayBuilder arrBob(out->subarrayStart("$nor"));
-    _listToBSON(&arrBob);
+    _listToBSON(&arrBob, includePath);
 }
 
 // -------
@@ -319,45 +443,11 @@ void NotMatchExpression::debugString(StringBuilder& debug, int indentationLevel)
     _exp->debugString(debug, indentationLevel + 1);
 }
 
-boost::optional<StringData> NotMatchExpression::getPathIfNotWithSinglePathMatchExpressionTree(
-    MatchExpression* exp) {
-    if (auto pathMatch = dynamic_cast<PathMatchExpression*>(exp)) {
-        if (dynamic_cast<TextMatchExpressionBase*>(exp)) {
-            // While TextMatchExpressionBase derives from PathMatchExpression, text match
-            // expressions cannot be serialized in the same manner as other PathMatchExpression
-            // derivatives. This is because the path for a TextMatchExpression is embedded within
-            // the $text object, whereas for other PathMatchExpressions it is on the left-hand-side,
-            // for example {x: {$eq: 1}}.
-            return boost::none;
-        }
-        return pathMatch->path();
-    }
-
-    if (exp->matchType() == MatchExpression::MatchType::AND && exp->numChildren() > 0) {
-        boost::optional<StringData> path;
-        for (size_t i = 0; i < exp->numChildren(); ++i) {
-            auto pathMatchChild = dynamic_cast<PathMatchExpression*>(exp->getChild(i));
-            if (!pathMatchChild || dynamic_cast<TextMatchExpressionBase*>(exp->getChild(i))) {
-                return boost::none;
-            }
-
-            if (path && path != pathMatchChild->path()) {
-                return boost::none;
-            } else if (!path) {
-                path = pathMatchChild->path();
-            }
-        }
-
-        invariant(path);
-        return path;
-    }
-
-    return boost::none;
-}
-
-void NotMatchExpression::serializeNotExpressionToNor(MatchExpression* exp, BSONObjBuilder* out) {
+void NotMatchExpression::serializeNotExpressionToNor(MatchExpression* exp,
+                                                     BSONObjBuilder* out,
+                                                     bool includePath) {
     BSONObjBuilder childBob;
-    exp->serialize(&childBob);
+    exp->serialize(&childBob, includePath);
     BSONObj tempObj = childBob.obj();
 
     BSONArrayBuilder tBob(out->subarrayStart("$nor"));
@@ -365,42 +455,49 @@ void NotMatchExpression::serializeNotExpressionToNor(MatchExpression* exp, BSONO
     tBob.doneFast();
 }
 
-void NotMatchExpression::serialize(BSONObjBuilder* out) const {
+void NotMatchExpression::serialize(BSONObjBuilder* out, bool includePath) const {
     if (_exp->matchType() == MatchType::AND && _exp->numChildren() == 0) {
         out->append("$alwaysFalse", 1);
         return;
     }
 
-    // When a $not contains an expression that is not a PathMatchExpression tree representing a
-    // single path, we transform to a $nor.
-    // There are trees constructed to represent JSONSchema that require a nor representation to
-    // be valid. Here is an example:
-    // JSONSchema:
-    //    {properties: {foo: {type: "string", not: {maxLength: 4}}}}
-    // MatchExpression tree generated:
-    //    {foo: {$not: {$or: [{$not: {$_internalSchemaType: [ 2 ]}},
-    //                        {$_internalSchemaMaxLength: 4}]}}}
-    boost::optional<StringData> path = getPathIfNotWithSinglePathMatchExpressionTree(_exp.get());
-    if (!path) {
-        return serializeNotExpressionToNor(_exp.get(), out);
-    }
-
-    BSONObjBuilder pathBob(out->subobjStart(*path));
-
-    if (_exp->matchType() == MatchType::AND) {
-        BSONObjBuilder notBob(pathBob.subobjStart("$not"));
-        for (size_t x = 0; x < _exp->numChildren(); ++x) {
-            auto* pathMatchExpression = dynamic_cast<PathMatchExpression*>(_exp->getChild(x));
-            invariant(pathMatchExpression);
-            notBob.appendElements(pathMatchExpression->getSerializedRightHandSide());
+    if (!includePath) {
+        BSONObjBuilder notBob(out->subobjStart("$not"));
+        // Our parser does not accept a $and directly within a $not, instead expecting the direct
+        // notation like {x: {$not: {$gt: 5, $lt: 0}}}. We represent such an expression with an AND
+        // internally, so we un-nest it here to be able to re-parse it.
+        if (_exp->matchType() == MatchType::AND) {
+            for (size_t x = 0; x < _exp->numChildren(); ++x) {
+                _exp->getChild(x)->serialize(&notBob, includePath);
+            }
+        } else {
+            _exp->serialize(&notBob, includePath);
         }
-        notBob.doneFast();
-    } else {
-        auto* pathMatchExpression = dynamic_cast<PathMatchExpression*>(_exp.get());
-        invariant(pathMatchExpression);
-        pathBob.append("$not", pathMatchExpression->getSerializedRightHandSide());
+        return;
     }
-    pathBob.doneFast();
+
+    auto expressionToNegate = _exp.get();
+    if (_exp->matchType() == MatchType::AND && _exp->numChildren() == 1) {
+        expressionToNegate = _exp->getChild(0);
+    }
+
+    // It is generally easier to be correct if we just always serialize to a $nor, since this will
+    // delegate the path serialization to lower in the tree where we have the information on-hand.
+    // However, for legibility we preserve a $not with a single path-accepting child as a $not.
+    //
+    // One exception: while TextMatchExpressionBase derives from PathMatchExpression, text match
+    // expressions cannot be serialized in the same manner as other PathMatchExpression derivatives.
+    // This is because the path for a TextMatchExpression is embedded within the $text object,
+    // whereas for other PathMatchExpressions it is on the left-hand-side, for example {x: {$eq:
+    // 1}}.
+    if (auto pathMatch = dynamic_cast<PathMatchExpression*>(expressionToNegate);
+        pathMatch && !dynamic_cast<TextMatchExpressionBase*>(expressionToNegate)) {
+        const auto path = pathMatch->path();
+        BSONObjBuilder pathBob(out->subobjStart(path));
+        pathBob.append("$not", pathMatch->getSerializedRightHandSide());
+        return;
+    }
+    return serializeNotExpressionToNor(expressionToNegate, out, includePath);
 }
 
 bool NotMatchExpression::equivalent(const MatchExpression* other) const {
@@ -419,4 +516,4 @@ MatchExpression::ExpressionOptimizerFunc NotMatchExpression::getOptimizer() cons
         return expression;
     };
 }
-}
+}  // namespace mongo

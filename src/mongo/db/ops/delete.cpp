@@ -33,7 +33,6 @@
 
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/exec/delete.h"
-#include "mongo/db/ops/delete_request.h"
 #include "mongo/db/ops/parsed_delete.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/repl/repl_client_info.h"
@@ -41,13 +40,14 @@
 namespace mongo {
 
 long long deleteObjects(OperationContext* opCtx,
-                        Collection* collection,
+                        const CollectionPtr& collection,
                         const NamespaceString& ns,
                         BSONObj pattern,
                         bool justOne,
                         bool god,
                         bool fromMigrate) {
-    DeleteRequest request(ns);
+    auto request = DeleteRequest{};
+    request.setNsString(ns);
     request.setQuery(pattern);
     request.setMulti(!justOne);
     request.setGod(god);
@@ -56,12 +56,34 @@ long long deleteObjects(OperationContext* opCtx,
     ParsedDelete parsedDelete(opCtx, &request);
     uassertStatusOK(parsedDelete.parseRequest());
 
-    auto exec = uassertStatusOK(
-        getExecutorDelete(opCtx, &CurOp::get(opCtx)->debug(), collection, &parsedDelete));
+    auto exec = uassertStatusOK(getExecutorDelete(
+        &CurOp::get(opCtx)->debug(), &collection, &parsedDelete, boost::none /* verbosity */));
 
-    uassertStatusOK(exec->executePlan());
+    return exec->executeDelete();
+}
 
-    return DeleteStage::getNumDeleted(*exec);
+DeleteResult deleteObject(OperationContext* opCtx,
+                          const CollectionPtr& collection,
+                          const DeleteRequest& request) {
+    ParsedDelete parsedDelete(opCtx, &request);
+    uassertStatusOK(parsedDelete.parseRequest());
+
+    auto exec = uassertStatusOK(getExecutorDelete(
+        &CurOp::get(opCtx)->debug(), &collection, &parsedDelete, boost::none /* verbosity */));
+
+    if (!request.getReturnDeleted()) {
+        return {exec->executeDelete(), boost::none};
+    }
+
+    // This method doesn't support multi-deletes when returning pre-images.
+    invariant(!request.getMulti());
+
+    BSONObj image;
+    if (exec->getNext(&image, nullptr) == PlanExecutor::IS_EOF) {
+        return {};
+    }
+
+    return {1, image.getOwned()};
 }
 
 }  // namespace mongo

@@ -27,8 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kAccessControl
-
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/auth/authorization_session.h"
@@ -36,6 +34,7 @@
 #include <string>
 #include <vector>
 
+#include "mongo/base/shim.h"
 #include "mongo/base/status.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
@@ -49,10 +48,8 @@
 #include "mongo/db/client.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/pipeline/aggregation_request.h"
 #include "mongo/db/pipeline/lite_parsed_pipeline.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -66,5 +63,10 @@ void AuthorizationSession::ScopedImpersonate::swap() {
     swap(*std::get<1>(impersonations), _roles);
 }
 
-MONGO_DEFINE_SHIM(AuthorizationSession::create);
+std::unique_ptr<AuthorizationSession> AuthorizationSession::create(
+    AuthorizationManager* authzManager) {
+    static auto w = MONGO_WEAK_FUNCTION_DEFINITION(AuthorizationSession::create);
+    return w(authzManager);
+}
+
 }  // namespace mongo

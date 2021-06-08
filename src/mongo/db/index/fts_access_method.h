@@ -39,7 +39,7 @@ namespace mongo {
 
 class FTSAccessMethod : public AbstractIndexAccessMethod {
 public:
-    FTSAccessMethod(IndexCatalogEntry* btreeState, SortedDataInterface* btree);
+    FTSAccessMethod(IndexCatalogEntry* btreeState, std::unique_ptr<SortedDataInterface> btree);
 
     const fts::FTSSpec& getSpec() const {
         return _ftsSpec;
@@ -52,10 +52,13 @@ private:
      * This function ignores the 'multikeyPaths' and 'multikeyMetadataKeys' pointers because text
      * indexes don't support tracking path-level multikey information.
      */
-    void doGetKeys(const BSONObj& obj,
-                   BSONObjSet* keys,
-                   BSONObjSet* multikeyMetadataKeys,
-                   MultikeyPaths* multikeyPaths) const final;
+    void doGetKeys(SharedBufferFragmentBuilder& pooledBufferBuilder,
+                   const BSONObj& obj,
+                   GetKeysContext context,
+                   KeyStringSet* keys,
+                   KeyStringSet* multikeyMetadataKeys,
+                   MultikeyPaths* multikeyPaths,
+                   boost::optional<RecordId> id) const final;
 
     fts::FTSSpec _ftsSpec;
 };

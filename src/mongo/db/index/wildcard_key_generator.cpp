@@ -31,8 +31,12 @@
 
 #include "mongo/db/index/wildcard_key_generator.h"
 
+#include "mongo/db/exec/projection_executor.h"
+#include "mongo/db/exec/projection_executor_builder.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/query/collation/collation_index_key.h"
+#include "mongo/db/query/projection_parser.h"
+#include "mongo/db/record_id_helpers.h"
 
 namespace mongo {
 namespace {
@@ -62,8 +66,8 @@ void popPathComponent(BSONElement elem, bool enclosingObjIsArray, FieldRef* path
 
 constexpr StringData WildcardKeyGenerator::kSubtreeSuffix;
 
-std::unique_ptr<ProjectionExecAgg> WildcardKeyGenerator::createProjectionExec(
-    BSONObj keyPattern, BSONObj pathProjection) {
+WildcardProjection WildcardKeyGenerator::createProjectionExecutor(BSONObj keyPattern,
+                                                                  BSONObj pathProjection) {
     // We should never have a key pattern that contains more than a single element.
     invariant(keyPattern.nFields() == 1);
 
@@ -82,35 +86,61 @@ std::unique_ptr<ProjectionExecAgg> WildcardKeyGenerator::createProjectionExec(
                          ? BSON(indexRoot.substr(0, suffixPos) << 1)
                          : pathProjection.isEmpty() ? kDefaultProjection : pathProjection);
 
-    // If the projection spec does not explicitly specify _id, we exclude it by default. We also
-    // prevent the projection from recursing through nested arrays, in order to ensure that the
-    // output document aligns with the match system's expectations.
-    return ProjectionExecAgg::create(
-        projSpec,
-        ProjectionExecAgg::DefaultIdPolicy::kExcludeId,
-        ProjectionExecAgg::ArrayRecursionPolicy::kDoNotRecurseNestedArrays);
+    // Construct a dummy ExpressionContext for ProjectionExecutor. It's OK to set the
+    // ExpressionContext's OperationContext and CollatorInterface to 'nullptr' and the namespace
+    // string to '' here; since we ban computed fields from the projection, the ExpressionContext
+    // will never be used.
+    auto expCtx = make_intrusive<ExpressionContext>(nullptr, nullptr, NamespaceString());
+    auto policies = ProjectionPolicies::wildcardIndexSpecProjectionPolicies();
+    auto projection = projection_ast::parse(expCtx, projSpec, policies);
+    return WildcardProjection{projection_executor::buildProjectionExecutor(
+        expCtx, &projection, policies, projection_executor::kDefaultBuilderParams)};
 }
 
 WildcardKeyGenerator::WildcardKeyGenerator(BSONObj keyPattern,
                                            BSONObj pathProjection,
-                                           const CollatorInterface* collator)
-    : _collator(collator), _keyPattern(keyPattern) {
-    _projExec = createProjectionExec(keyPattern, pathProjection);
-}
+                                           const CollatorInterface* collator,
+                                           KeyString::Version keyStringVersion,
+                                           Ordering ordering,
+                                           KeyFormat rsKeyFormat)
+    : _proj(createProjectionExecutor(keyPattern, pathProjection)),
+      _collator(collator),
+      _keyPattern(keyPattern),
+      _keyStringVersion(keyStringVersion),
+      _ordering(ordering),
+      _rsKeyFormat(rsKeyFormat) {}
 
-void WildcardKeyGenerator::generateKeys(BSONObj inputDoc,
-                                        BSONObjSet* keys,
-                                        BSONObjSet* multikeyPaths) const {
+void WildcardKeyGenerator::generateKeys(SharedBufferFragmentBuilder& pooledBufferBuilder,
+                                        BSONObj inputDoc,
+                                        KeyStringSet* keys,
+                                        KeyStringSet* multikeyPaths,
+                                        boost::optional<RecordId> id) const {
     FieldRef rootPath;
-    _traverseWildcard(_projExec->applyProjection(inputDoc), false, &rootPath, keys, multikeyPaths);
+    auto keysSequence = keys->extract_sequence();
+    // multikeyPaths is allowed to be nullptr
+    KeyStringSet::sequence_type multikeyPathsSequence;
+    if (multikeyPaths)
+        multikeyPathsSequence = multikeyPaths->extract_sequence();
+    _traverseWildcard(pooledBufferBuilder,
+                      _proj.exec()->applyTransformation(Document{inputDoc}).toBson(),
+                      false,
+                      &rootPath,
+                      &keysSequence,
+                      multikeyPaths ? &multikeyPathsSequence : nullptr,
+                      id);
+    if (multikeyPaths)
+        multikeyPaths->adopt_sequence(std::move(multikeyPathsSequence));
+    keys->adopt_sequence(std::move(keysSequence));
 }
 
-void WildcardKeyGenerator::_traverseWildcard(BSONObj obj,
+void WildcardKeyGenerator::_traverseWildcard(SharedBufferFragmentBuilder& pooledBufferBuilder,
+                                             BSONObj obj,
                                              bool objIsArray,
                                              FieldRef* path,
-                                             BSONObjSet* keys,
-                                             BSONObjSet* multikeyPaths) const {
-    for (const auto elem : obj) {
+                                             KeyStringSet::sequence_type* keys,
+                                             KeyStringSet::sequence_type* multikeyPaths,
+                                             boost::optional<RecordId> id) const {
+    for (const auto& elem : obj) {
         // If the element's fieldName contains a ".", fast-path skip it because it's not queryable.
         if (elem.fieldNameStringData().find('.', 0) != std::string::npos)
             continue;
@@ -121,22 +151,27 @@ void WildcardKeyGenerator::_traverseWildcard(BSONObj obj,
         switch (elem.type()) {
             case BSONType::Array:
                 // If this is a nested array, we don't descend it but instead index it as a value.
-                if (_addKeyForNestedArray(elem, *path, objIsArray, keys))
+                if (_addKeyForNestedArray(pooledBufferBuilder, elem, *path, objIsArray, keys, id))
                     break;
 
                 // Add an entry for the multi-key path, and then fall through to BSONType::Object.
-                _addMultiKey(*path, multikeyPaths);
+                _addMultiKey(pooledBufferBuilder, *path, multikeyPaths);
 
             case BSONType::Object:
-                if (_addKeyForEmptyLeaf(elem, *path, keys))
+                if (_addKeyForEmptyLeaf(pooledBufferBuilder, elem, *path, keys, id))
                     break;
 
-                _traverseWildcard(
-                    elem.Obj(), elem.type() == BSONType::Array, path, keys, multikeyPaths);
+                _traverseWildcard(pooledBufferBuilder,
+                                  elem.Obj(),
+                                  elem.type() == BSONType::Array,
+                                  path,
+                                  keys,
+                                  multikeyPaths,
+                                  id);
                 break;
 
             default:
-                _addKey(elem, *path, keys);
+                _addKey(pooledBufferBuilder, elem, *path, keys, id);
         }
 
         // Remove the element's fieldname from the path, if it was pushed onto it earlier.
@@ -144,51 +179,79 @@ void WildcardKeyGenerator::_traverseWildcard(BSONObj obj,
     }
 }
 
-bool WildcardKeyGenerator::_addKeyForNestedArray(BSONElement elem,
+bool WildcardKeyGenerator::_addKeyForNestedArray(SharedBufferFragmentBuilder& pooledBufferBuilder,
+                                                 BSONElement elem,
                                                  const FieldRef& fullPath,
                                                  bool enclosingObjIsArray,
-                                                 BSONObjSet* keys) const {
+                                                 KeyStringSet::sequence_type* keys,
+                                                 boost::optional<RecordId> id) const {
     // If this element is an array whose parent is also an array, index it as a value.
     if (enclosingObjIsArray && elem.type() == BSONType::Array) {
-        _addKey(elem, fullPath, keys);
+        _addKey(pooledBufferBuilder, elem, fullPath, keys, id);
         return true;
     }
     return false;
 }
 
-bool WildcardKeyGenerator::_addKeyForEmptyLeaf(BSONElement elem,
+bool WildcardKeyGenerator::_addKeyForEmptyLeaf(SharedBufferFragmentBuilder& pooledBufferBuilder,
+                                               BSONElement elem,
                                                const FieldRef& fullPath,
-                                               BSONObjSet* keys) const {
+                                               KeyStringSet::sequence_type* keys,
+                                               boost::optional<RecordId> id) const {
     invariant(elem.isABSONObj());
     if (elem.embeddedObject().isEmpty()) {
         // In keeping with the behaviour of regular indexes, an empty object is indexed as-is while
         // empty arrays are indexed as 'undefined'.
-        _addKey(elem.type() == BSONType::Array ? BSONElement{} : elem, fullPath, keys);
+        _addKey(pooledBufferBuilder,
+                elem.type() == BSONType::Array ? BSONElement{} : elem,
+                fullPath,
+                keys,
+                id);
         return true;
     }
     return false;
 }
 
-void WildcardKeyGenerator::_addKey(BSONElement elem,
+void WildcardKeyGenerator::_addKey(SharedBufferFragmentBuilder& pooledBufferBuilder,
+                                   BSONElement elem,
                                    const FieldRef& fullPath,
-                                   BSONObjSet* keys) const {
+                                   KeyStringSet::sequence_type* keys,
+                                   boost::optional<RecordId> id) const {
     // Wildcard keys are of the form { "": "path.to.field", "": <collation-aware value> }.
-    BSONObjBuilder bob;
-    bob.append("", fullPath.dottedField());
-    if (elem) {
-        CollationIndexKey::collationAwareIndexKeyAppend(elem, _collator, &bob);
+    KeyString::PooledBuilder keyString(pooledBufferBuilder, _keyStringVersion, _ordering);
+    keyString.appendString(fullPath.dottedField());
+    if (_collator && elem) {
+        keyString.appendBSONElement(elem, [&](StringData stringData) {
+            return _collator->getComparisonString(stringData);
+        });
+    } else if (elem) {
+        keyString.appendBSONElement(elem);
     } else {
-        bob.appendUndefined("");
+        keyString.appendUndefined();
     }
-    keys->insert(bob.obj());
+
+    if (id) {
+        keyString.appendRecordId(*id);
+    }
+    keys->push_back(keyString.release());
 }
 
-void WildcardKeyGenerator::_addMultiKey(const FieldRef& fullPath, BSONObjSet* multikeyPaths) const {
+void WildcardKeyGenerator::_addMultiKey(SharedBufferFragmentBuilder& pooledBufferBuilder,
+                                        const FieldRef& fullPath,
+                                        KeyStringSet::sequence_type* multikeyPaths) const {
     // Multikey paths are denoted by a key of the form { "": 1, "": "path.to.array" }. The argument
     // 'multikeyPaths' may be nullptr if the access method is being used in an operation which does
     // not require multikey path generation.
     if (multikeyPaths) {
-        multikeyPaths->insert(BSON("" << 1 << "" << fullPath.dottedField()));
+        auto key = BSON("" << 1 << "" << fullPath.dottedField());
+        KeyString::PooledBuilder keyString(
+            pooledBufferBuilder,
+            _keyStringVersion,
+            key,
+            _ordering,
+            record_id_helpers::reservedIdFor(
+                record_id_helpers::ReservationId::kWildcardMultikeyMetadataId, _rsKeyFormat));
+        multikeyPaths->push_back(keyString.release());
     }
 }
 

@@ -27,17 +27,19 @@
  *    it in the license file.
  */
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
 #include "mongo/platform/basic.h"
 
 #include "mongo/client/dbclient_cursor.h"
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/catalog/rename_collection.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/commands/rename_collection.h"
+#include "mongo/db/commands/rename_collection_common.h"
+#include "mongo/db/commands/rename_collection_gen.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/namespace_string.h"
@@ -67,6 +69,11 @@ public:
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return true;
     }
+
+    bool collectsResourceConsumptionMetrics() const override {
+        return true;
+    }
+
     virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
                                        const BSONObj& cmdObj) const {
@@ -85,66 +92,13 @@ public:
                            const BSONObj& cmdObj,
                            string& errmsg,
                            BSONObjBuilder& result) {
-        const auto sourceNsElt = cmdObj[getName()];
-        const auto targetNsElt = cmdObj["to"];
-
-        uassert(ErrorCodes::TypeMismatch,
-                "'renameCollection' must be of type String",
-                sourceNsElt.type() == BSONType::String);
-        uassert(ErrorCodes::TypeMismatch,
-                "'to' must be of type String",
-                targetNsElt.type() == BSONType::String);
-
-        const NamespaceString source(sourceNsElt.valueStringData());
-        const NamespaceString target(targetNsElt.valueStringData());
-
-        uassert(ErrorCodes::InvalidNamespace,
-                str::stream() << "Invalid source namespace: " << source.ns(),
-                source.isValid());
-        uassert(ErrorCodes::InvalidNamespace,
-                str::stream() << "Invalid target namespace: " << target.ns(),
-                target.isValid());
-
-        if ((repl::ReplicationCoordinator::get(opCtx)->getReplicationMode() !=
-             repl::ReplicationCoordinator::modeNone)) {
-            if (source.isOplog()) {
-                errmsg = "can't rename live oplog while replicating";
-                return false;
-            }
-            if (target.isOplog()) {
-                errmsg = "can't rename to live oplog while replicating";
-                return false;
-            }
-        }
-
-        if (source.isOplog() != target.isOplog()) {
-            errmsg = "If either the source or target of a rename is an oplog name, both must be";
-            return false;
-        }
-
-        Status sourceStatus = userAllowedWriteNS(source);
-        if (!sourceStatus.isOK()) {
-            errmsg = "error with source namespace: " + sourceStatus.reason();
-            return false;
-        }
-
-        Status targetStatus = userAllowedWriteNS(target);
-        if (!targetStatus.isOK()) {
-            errmsg = "error with target namespace: " + targetStatus.reason();
-            return false;
-        }
-
-        if (source.isServerConfigurationCollection()) {
-            uasserted(ErrorCodes::IllegalOperation,
-                      "renaming the server configuration "
-                      "collection (admin.system.version) is not "
-                      "allowed");
-        }
-
+        auto renameRequest =
+            RenameCollectionCommand::parse(IDLParserErrorContext("renameCollection"), cmdObj);
         RenameCollectionOptions options;
-        options.dropTarget = cmdObj["dropTarget"].trueValue();
-        options.stayTemp = cmdObj["stayTemp"].trueValue();
-        uassertStatusOK(renameCollection(opCtx, source, target, options));
+        options.dropTarget = renameRequest.getDropTarget();
+        options.stayTemp = renameRequest.getStayTemp();
+        validateAndRunRenameCollection(
+            opCtx, renameRequest.getCommandParameter(), renameRequest.getTo(), options);
         return true;
     }
 

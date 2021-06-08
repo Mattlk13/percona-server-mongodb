@@ -1,27 +1,46 @@
 // Tests that no-op createIndex commands do not block behind transactions.
 // @tags: [uses_transactions]
 (function() {
-    "use strict";
+"use strict";
 
-    const dbName = 'noop_createIndexes_not_blocked';
-    const collName = 'test';
-    const testDB = db.getSiblingDB(dbName);
+// TODO(SERVER-39704): Remove the following load after SERVER-39704 is completed
+// For withTxnAndAutoRetryOnMongos.
+load('jstests/libs/auto_retry_transaction_in_sharding.js');
 
-    testDB.runCommand({drop: collName, writeConcern: {w: "majority"}});
+const dbName = 'noop_createIndexes_not_blocked';
+const collName = 'test';
+const testDB = db.getSiblingDB(dbName);
 
-    const session = db.getMongo().startSession({causalConsistency: false});
-    const sessionDB = session.getDatabase(dbName);
+testDB.runCommand({drop: collName, writeConcern: {w: "majority"}});
 
-    const isMongos = assert.commandWorked(db.runCommand("ismaster")).msg === "isdbgrid";
-    if (isMongos) {
-        // Access the collection before creating indexes so it can be implicitly sharded.
-        assert.eq(sessionDB[collName].find().itcount(), 0);
-    }
+const session = db.getMongo().startSession({causalConsistency: false});
+const sessionDB = session.getDatabase(dbName);
 
-    const createIndexesCommand = {createIndexes: collName, indexes: [{key: {a: 1}, name: "a_1"}]};
-    assert.commandWorked(sessionDB.runCommand(createIndexesCommand));
+const isMongos = assert.commandWorked(db.runCommand("hello")).msg === "isdbgrid";
+if (isMongos) {
+    // Access the collection before creating indexes so it can be implicitly sharded.
+    assert.eq(sessionDB[collName].find().itcount(), 0);
+}
 
-    session.startTransaction();
+const createIndexesCommand = {
+    createIndexes: collName,
+    indexes: [{key: {a: 1}, name: "a_1"}],
+    writeConcern: {w: 'majority'},
+};
+assert.commandWorked(sessionDB.runCommand(createIndexesCommand));
+
+// Default read concern level to use for transactions. Snapshot read concern is not supported in
+// sharded transactions when majority reads are disabled.
+if (!TestData.hasOwnProperty('defaultTransactionReadConcernLevel')) {
+    TestData.defaultTransactionReadConcernLevel =
+        TestData.enableMajorityReadConcern !== false ? 'snapshot' : 'local';
+}
+
+// TODO(SERVER-39704): We use the withTxnAndAutoRetryOnMongos
+// function to handle how MongoS will propagate a StaleShardVersion error as a
+// TransientTransactionError. After SERVER-39704 is completed the
+// withTxnAndAutoRetryOnMongos function can be removed
+withTxnAndAutoRetryOnMongos(session, () => {
     assert.commandWorked(sessionDB[collName].insert({a: 5, b: 6}));
 
     // This should not block because an identical index exists.
@@ -32,14 +51,14 @@
     // This should not block but return an error because the index exists with different options.
     res = testDB.runCommand({
         createIndexes: collName,
-        indexes: [{key: {a: 1}, name: "unique_a_1", unique: true}],
+        indexes: [{key: {a: 1}, name: "storageEngine", storageEngine: {wiredTiger: {}}}],
     });
     assert.commandFailedWithCode(res, ErrorCodes.IndexOptionsConflict);
 
     // This should block and time out because the index does not already exist.
     res = testDB.runCommand(
         {createIndexes: collName, indexes: [{key: {b: 1}, name: "b_1"}], maxTimeMS: 500});
-    assert.commandFailedWithCode(res, ErrorCodes.MaxTimeMSExpired);
+    assert(ErrorCodes.isExceededTimeLimitError(res.code));
 
     // This should block and time out because one of the indexes does not already exist.
     res = testDB.runCommand({
@@ -47,7 +66,6 @@
         indexes: [{key: {a: 1}, name: "a_1"}, {key: {b: 1}, name: "b_1"}],
         maxTimeMS: 500
     });
-    assert.commandFailedWithCode(res, ErrorCodes.MaxTimeMSExpired);
-
-    assert.commandWorked(session.commitTransaction_forTesting());
+    assert(ErrorCodes.isExceededTimeLimitError(res.code));
+});
 }());

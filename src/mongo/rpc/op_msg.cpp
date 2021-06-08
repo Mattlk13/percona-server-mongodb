@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 #include "mongo/platform/basic.h"
 
@@ -39,10 +39,10 @@
 #include "mongo/base/data_type_endian.h"
 #include "mongo/config.h"
 #include "mongo/db/bson/dotted_path_support.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/object_check.h"
 #include "mongo/util/bufreader.h"
 #include "mongo/util/hex.h"
-#include "mongo/util/log.h"
 
 #ifdef MONGO_CONFIG_WIREDTIGER_ENABLED
 #include <wiredtiger.h>
@@ -98,6 +98,11 @@ void OpMsg::replaceFlags(Message* message, uint32_t flags) {
 uint32_t OpMsg::getChecksum(const Message& message) {
     invariant(message.operation() == dbMsg);
     invariant(isFlagSet(message, kChecksumPresent));
+    uassert(51252,
+            "Invalid message size for an OpMsg containing a checksum",
+            // Check that the message size is at least the size of a crc-32 checksum and
+            // the 32-bit flags section.
+            message.dataSize() > static_cast<int>(kCrc32Size + sizeof(uint32_t)));
     return BufReader(message.singleData().view2ptr() + message.size() - kCrc32Size, kCrc32Size)
         .read<LittleEndian<uint32_t>>();
 }
@@ -133,12 +138,18 @@ OpMsg OpMsg::parse(const Message& message) try {
                           << std::bitset<32>(flags).to_string(),
             !containsUnknownRequiredFlags(flags));
 
-    const bool haveChecksum = flags & kChecksumPresent;
-    const int checksumSize = haveChecksum ? kCrc32Size : 0;
+    auto dataSize = message.dataSize() - sizeof(flags);
+    boost::optional<uint32_t> checksum;
+    if (flags & kChecksumPresent) {
+        checksum = getChecksum(message);
+        uassert(51251,
+                "Invalid message size for an OpMsg containing a checksum",
+                dataSize > kCrc32Size);
+        dataSize -= kCrc32Size;
+    }
 
     // The sections begin after the flags and before the checksum (if present).
-    BufReader sectionsBuf(message.singleData().data() + sizeof(flags),
-                          message.dataSize() - sizeof(flags) - checksumSize);
+    BufReader sectionsBuf(message.singleData().data() + sizeof(flags), dataSize);
 
     // TODO some validation may make more sense in the IDL parser. I've tagged them with comments.
     bool haveBody = false;
@@ -198,30 +209,50 @@ OpMsg OpMsg::parse(const Message& message) try {
     }
 
 #ifdef MONGO_CONFIG_WIREDTIGER_ENABLED
-    if (haveChecksum) {
+    if (checksum) {
         uassert(ErrorCodes::ChecksumMismatch,
                 "OP_MSG checksum does not match contents",
-                OpMsg::getChecksum(message) == calculateChecksum(message));
+                *checksum == calculateChecksum(message));
     }
 #endif
 
     return msg;
 } catch (const DBException& ex) {
-    LOG(1) << "invalid message: " << ex.code() << " " << redact(ex) << " -- "
-           << redact(hexdump(message.singleData().view2ptr(), message.size()));
+    LOGV2_DEBUG(
+        22632,
+        1,
+        "invalid message: {ex_code} {ex} -- {hexdump_message_singleData_view2ptr_message_size}",
+        "ex_code"_attr = ex.code(),
+        "ex"_attr = redact(ex),
+        "hexdump_message_singleData_view2ptr_message_size"_attr =
+            redact(hexdump(message.singleData().view2ptr(), message.size())));
     throw;
 }
 
-Message OpMsg::serialize() const {
-    OpMsgBuilder builder;
+namespace {
+void serializeHelper(const std::vector<OpMsg::DocumentSequence>& sequences,
+                     const BSONObj& body,
+                     OpMsgBuilder* output) {
     for (auto&& seq : sequences) {
-        auto docSeq = builder.beginDocSequence(seq.name);
+        auto docSeq = output->beginDocSequence(seq.name);
         for (auto&& obj : seq.objs) {
             docSeq.append(obj);
         }
     }
-    builder.beginBody().appendElements(body);
+    output->beginBody().appendElements(body);
+}
+}  // namespace
+
+Message OpMsg::serialize() const {
+    OpMsgBuilder builder;
+    serializeHelper(sequences, body, &builder);
     return builder.finish();
+}
+
+Message OpMsg::serializeWithoutSizeChecking() const {
+    OpMsgBuilder builder;
+    serializeHelper(sequences, body, &builder);
+    return builder.finishWithoutSizeChecking();
 }
 
 void OpMsg::shareOwnershipWith(const ConstSharedBuffer& buffer) {
@@ -276,13 +307,26 @@ BSONObjBuilder OpMsgBuilder::resumeBody() {
 AtomicWord<bool> OpMsgBuilder::disableDupeFieldCheck_forTest{false};
 
 Message OpMsgBuilder::finish() {
+    const auto size = _buf.len();
+    uassert(ErrorCodes::BSONObjectTooLarge,
+            str::stream() << "BSON size limit hit while building Message. Size: " << size << " (0x"
+                          << unsignedHex(size) << "); maxSize: " << BSONObjMaxInternalSize << "("
+                          << (BSONObjMaxInternalSize / (1024 * 1024)) << "MB)",
+            size <= BSONObjMaxInternalSize);
+
+    return finishWithoutSizeChecking();
+}
+
+Message OpMsgBuilder::finishWithoutSizeChecking() {
     if (kDebugBuild && !disableDupeFieldCheck_forTest.load()) {
         std::set<StringData> seenFields;
         for (auto elem : resumeBody().asTempObj()) {
             if (!(seenFields.insert(elem.fieldNameStringData()).second)) {
-                severe() << "OP_MSG with duplicate field '" << elem.fieldNameStringData()
-                         << "' : " << redact(resumeBody().asTempObj());
-                fassert(40474, false);
+                LOGV2_FATAL(40474,
+                            "OP_MSG with duplicate field '{elem_fieldNameStringData}' : "
+                            "{resumeBody_asTempObj}",
+                            "elem_fieldNameStringData"_attr = elem.fieldNameStringData(),
+                            "resumeBody_asTempObj"_attr = redact(resumeBody().asTempObj()));
             }
         }
     }

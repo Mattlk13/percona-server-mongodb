@@ -1,4 +1,4 @@
-// SERVER-1089 Test and/or nesting
+// SERVER-1089 Test and/or/nor nesting
 
 t = db.jstests_andor;
 t.drop();
@@ -11,7 +11,6 @@ function ok(q) {
 t.save({a: 1});
 
 test = function() {
-
     ok({a: 1});
 
     ok({$and: [{a: 1}]});
@@ -45,17 +44,15 @@ test = function() {
     ok({$nor: [{$and: [{$and: [{a: 2}]}]}]});
 
     ok({$nor: [{$and: [{$nor: [{a: 1}]}]}]});
-
 };
 
 test();
-t.ensureIndex({a: 1});
+t.createIndex({a: 1});
 test();
 
 // Test an inequality base match.
 
 test = function() {
-
     ok({a: {$ne: 2}});
 
     ok({$and: [{a: {$ne: 2}}]});
@@ -89,11 +86,10 @@ test = function() {
     ok({$nor: [{$and: [{$and: [{a: {$ne: 1}}]}]}]});
 
     ok({$nor: [{$and: [{$nor: [{a: {$ne: 2}}]}]}]});
-
 };
 
 t.drop();
 t.save({a: 1});
 test();
-t.ensureIndex({a: 1});
+t.createIndex({a: 1});
 test();

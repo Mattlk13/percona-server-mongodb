@@ -5,79 +5,88 @@
  * writes if the prepared transaction commits after a hybrid index build commits.  The long term
  * solution to this problem is to synchronize index build commits.
  *
- * @tags: [uses_transactions, uses_prepare_transaction]
+ * @tags: [
+ *   uses_prepare_transaction,
+ *   uses_transactions,
+ * ]
  */
 (function() {
-    "use strict";
-    load("jstests/core/txns/libs/prepare_helpers.js");
+"use strict";
+load("jstests/core/txns/libs/prepare_helpers.js");
 
-    const replTest = new ReplSetTest({nodes: 2});
-    replTest.startSet();
-    replTest.initiate();
+const replTest = new ReplSetTest({nodes: 2});
+replTest.startSet();
+replTest.initiate();
 
-    const primary = replTest.getPrimary();
-    const secondary = replTest.getSecondary();
+const primary = replTest.getPrimary();
+const secondary = replTest.getSecondary();
 
-    const dbName = "test";
-    const collName = "prepared_transactions_index_build";
-    const testDB = primary.getDB(dbName);
-    const testColl = testDB.getCollection(collName);
+// The default WC is majority and this test can't satisfy majority writes.
+assert.commandWorked(primary.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
 
-    assert.commandWorked(testDB.runCommand({create: collName, writeConcern: {w: "majority"}}));
+const dbName = "test";
+const collName = "prepared_transactions_index_build";
+const testDB = primary.getDB(dbName);
+const testColl = testDB.getCollection(collName);
 
-    const bulk = testColl.initializeUnorderedBulkOp();
-    for (let i = 0; i < 10; ++i) {
-        bulk.insert({x: i});
-    }
-    assert.writeOK(bulk.execute());
+assert.commandWorked(testDB.runCommand({create: collName, writeConcern: {w: "majority"}}));
 
-    // activate failpoint to hang index build on secondary.
-    secondary.getDB("admin").runCommand(
-        {configureFailPoint: 'hangAfterStartingIndexBuild', mode: 'alwaysOn'});
+const bulk = testColl.initializeUnorderedBulkOp();
+for (let i = 0; i < 10; ++i) {
+    bulk.insert({x: i});
+}
+assert.commandWorked(bulk.execute());
 
-    jsTestLog("Starting a background index build.");
-    assert.commandWorked(testColl.createIndexes([{x: 1}], {}, {writeConcern: {w: 2}}));
+// activate failpoint to hang index build on secondary.
+secondary.getDB("admin").runCommand(
+    {configureFailPoint: 'hangAfterStartingIndexBuild', mode: 'alwaysOn'});
 
-    const session = primary.startSession({causalConsistency: false});
-    const sessionDB = session.getDatabase(dbName);
-    const sessionColl = sessionDB.getCollection(collName);
+// This test create indexes with fail point enabled on secondary which prevents secondary from
+// voting. So, disabling index build commit quorum.
+jsTestLog("Starting a background index build.");
+assert.commandWorked(testDB.runCommand({
+    createIndexes: collName,
+    indexes: [{key: {x: 1}, name: 'x_1'}],
+    commitQuorum: 0,
+}));
 
-    jsTestLog("Starting a transaction that should involve the index and putting it into prepare");
+const session = primary.startSession({causalConsistency: false});
+const sessionDB = session.getDatabase(dbName);
+const sessionColl = sessionDB.getCollection(collName);
 
-    session.startTransaction();
-    assert.commandWorked(sessionColl.insert({x: 1000}));
+jsTestLog("Starting a transaction that should involve the index and putting it into prepare");
 
-    const prepareTimestamp = PrepareHelpers.prepareTransaction(session, {w: 1});
-    jsTestLog("Prepared a transaction at " + prepareTimestamp);
+session.startTransaction();
+assert.commandWorked(sessionColl.insert({x: 1000}));
 
-    jsTestLog("Unblocking index build.");
+const prepareTimestamp = PrepareHelpers.prepareTransaction(session, {w: 1});
+jsTestLog("Prepared a transaction at " + tojson(prepareTimestamp));
 
-    // finish the index build
-    secondary.getDB("admin").runCommand(
-        {configureFailPoint: 'hangAfterStartingIndexBuild', mode: 'off'});
+jsTestLog("Unblocking index build.");
 
-    // It's illegal to commit a prepared transaction before its prepare oplog entry has been
-    // majority committed. So wait for prepare oplog entry to be majority committed before issuing
-    // the commitTransaction command. We know the index build is also done if the prepare has
-    // finished on the secondary.
-    jsTestLog(
-        "Waiting for prepare oplog entry to be majority committed and all index builds to finish on all nodes.");
-    PrepareHelpers.awaitMajorityCommitted(replTest, prepareTimestamp);
+// finish the index build
+secondary.getDB("admin").runCommand(
+    {configureFailPoint: 'hangAfterStartingIndexBuild', mode: 'off'});
 
-    jsTestLog("Committing txn");
-    // Commit the transaction.
-    assert.commandWorked(PrepareHelpers.commitTransaction(session, prepareTimestamp));
-    replTest.awaitReplication();
+// It's illegal to commit a prepared transaction before its prepare oplog entry has been
+// majority committed. So wait for prepare oplog entry to be majority committed before issuing
+// the commitTransaction command. We know the index build is also done if the prepare has
+// finished on the secondary.
+jsTestLog(
+    "Waiting for prepare oplog entry to be majority committed and all index builds to finish on all nodes.");
+PrepareHelpers.awaitMajorityCommitted(replTest, prepareTimestamp);
 
-    jsTestLog("Testing index integrity");
-    // Index should work.
-    assert.eq(1000,
-              secondary.getDB(dbName)
-                  .getCollection(collName)
-                  .find({x: 1000})
-                  .hint({x: 1})
-                  .toArray()[0]
-                  .x);
-    jsTestLog("Shutting down the set");
-    replTest.stopSet();
+jsTestLog("Committing txn");
+// Commit the transaction.
+assert.commandWorked(PrepareHelpers.commitTransaction(session, prepareTimestamp));
+replTest.awaitReplication();
+
+jsTestLog("Testing index integrity");
+// Index should work.
+assert.eq(
+    1000,
+    secondary.getDB(dbName).getCollection(collName).find({x: 1000}).hint({x: 1}).toArray()[0].x);
+jsTestLog("Shutting down the set");
+replTest.stopSet();
 }());

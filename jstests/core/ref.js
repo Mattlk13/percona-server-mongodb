@@ -1,6 +1,3 @@
-// to run:
-//   ./mongo jstests/ref.js
-
 db.otherthings.drop();
 db.things.drop();
 

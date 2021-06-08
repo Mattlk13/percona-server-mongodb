@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -37,10 +37,9 @@
 #include "mongo/db/commands/server_status_internal.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/stats/counters.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/net/http_client.h"
 #include "mongo/util/net/socket_utils.h"
-#include "mongo/util/ramlog.h"
 #include "mongo/util/version.h"
 
 namespace mongo {
@@ -81,7 +80,7 @@ public:
              const string& dbname,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) {
-        _runCalled = true;
+        _runCalled.store(true);
 
         const auto service = opCtx->getServiceContext();
         const auto clock = service->getFastClockSource();
@@ -96,7 +95,7 @@ public:
         result.append("version", VersionInfoInterface::instance().version());
         result.append("process", serverGlobalParams.binaryName);
         result.append("pid", ProcessId::getCurrent().asLongLong());
-        result.append("uptime", (double)(time(0) - serverGlobalParams.started));
+        result.append("uptime", (double)(time(nullptr) - serverGlobalParams.started));
         auto uptime = clock->now() - _started;
         result.append("uptimeMillis", durationCount<Milliseconds>(uptime));
         result.append("uptimeEstimate", durationCount<Seconds>(uptime));
@@ -132,7 +131,7 @@ public:
         }
 
         // --- counters
-        bool includeMetricTree = MetricTree::theMetricTree != NULL;
+        bool includeMetricTree = MetricTree::theMetricTree != nullptr;
         if (cmdObj["metrics"].type() && !cmdObj["metrics"].trueValue())
             includeMetricTree = false;
 
@@ -142,22 +141,14 @@ public:
 
         // --- some hard coded global things hard to pull out
 
-        {
-            RamLog::LineIterator rl(RamLog::get("warnings"));
-            if (rl.lastWrite() >= time(0) - (10 * 60)) {  // only show warnings from last 10 minutes
-                BSONArrayBuilder arr(result.subarrayStart("warnings"));
-                while (rl.more()) {
-                    arr.append(rl.next());
-                }
-                arr.done();
-            }
-        }
-
         auto runElapsed = clock->now() - runStart;
         timeBuilder.appendNumber("at end", durationCount<Milliseconds>(runElapsed));
         if (runElapsed > Milliseconds(1000)) {
             BSONObj t = timeBuilder.obj();
-            log() << "serverStatus was very slow: " << t;
+            LOGV2(20499,
+                  "serverStatus was very slow: {timeStats}",
+                  "serverStatus was very slow",
+                  "timeStats"_attr = t);
 
             bool include_timing = true;
             const auto& elem = cmdObj[kTimingSection];
@@ -176,13 +167,13 @@ public:
     void addSection(ServerStatusSection* section) {
         // Disallow adding a section named "timing" as it is reserved for the server status command.
         dassert(section->getSectionName() != kTimingSection);
-        verify(!_runCalled);
+        verify(!_runCalled.load());
         _sections[section->getSectionName()] = section;
     }
 
 private:
     const Date_t _started;
-    bool _runCalled;
+    AtomicWord<bool> _runCalled;
 
     typedef map<string, ServerStatusSection*> SectionMap;
     SectionMap _sections;
@@ -262,6 +253,7 @@ public:
         asserts.append("warning", assertionCount.warning.loadRelaxed());
         asserts.append("msg", assertionCount.msg.loadRelaxed());
         asserts.append("user", assertionCount.user.loadRelaxed());
+        asserts.append("tripwire", assertionCount.tripwire.loadRelaxed());
         asserts.append("rollovers", assertionCount.rollovers.loadRelaxed());
         return asserts.obj();
     }

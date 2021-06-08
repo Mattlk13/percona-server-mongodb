@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -35,7 +35,7 @@
 
 #include "mongo/base/status.h"
 #include "mongo/db/service_context.h"
-#include "mongo/rpc/metadata/client_metadata_ismaster.h"
+#include "mongo/rpc/metadata/client_metadata.h"
 #include "mongo/rpc/metadata/config_server_metadata.h"
 #include "mongo/rpc/metadata/impersonated_user_metadata.h"
 #include "mongo/rpc/metadata/metadata_hook.h"
@@ -56,8 +56,6 @@ ShardingEgressMetadataHook::ShardingEgressMetadataHook(ServiceContext* serviceCo
 Status ShardingEgressMetadataHook::writeRequestMetadata(OperationContext* opCtx,
                                                         BSONObjBuilder* metadataBob) {
     try {
-        writeAuthDataToImpersonatedUserMetadata(opCtx, metadataBob);
-        ClientMetadataIsMasterState::writeToMetadata(opCtx, metadataBob);
         rpc::ConfigServerMetadata(_getConfigServerOpTime()).writeToMetadata(metadataBob);
         return Status::OK();
     } catch (...) {
@@ -92,8 +90,7 @@ Status ShardingEgressMetadataHook::_advanceConfigOpTimeFromShard(OperationContex
             // Config servers return the config opTime as part of their own metadata.
             if (metadataObj.hasField(rpc::kReplSetMetadataFieldName)) {
                 // Sharding users of ReplSetMetadata do not use the wall clock time field.
-                auto parseStatus =
-                    rpc::ReplSetMetadata::readFromMetadata(metadataObj, /*requireWallTime*/ false);
+                auto parseStatus = rpc::ReplSetMetadata::readFromMetadata(metadataObj);
                 if (!parseStatus.isOK()) {
                     return parseStatus.getStatus();
                 }
@@ -120,8 +117,8 @@ Status ShardingEgressMetadataHook::_advanceConfigOpTimeFromShard(OperationContex
             if (opTime.is_initialized()) {
                 grid->advanceConfigOpTime(opCtx,
                                           opTime.get(),
-                                          str::stream() << "reply from shard " << shardId
-                                                        << " node");
+                                          str::stream()
+                                              << "reply from shard " << shardId << " node");
             }
         }
         return Status::OK();

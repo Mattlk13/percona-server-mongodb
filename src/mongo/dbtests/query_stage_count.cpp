@@ -53,11 +53,15 @@ using std::vector;
 
 const int kDocuments = 100;
 const int kInterjections = kDocuments;
+const NamespaceString kTestNss = NamespaceString("db.dummy");
 
 class CountStageTest {
 public:
     CountStageTest()
-        : _dbLock(&_opCtx, nsToDatabaseSubstring(ns()), MODE_X), _ctx(&_opCtx, ns()), _coll(NULL) {}
+        : _dbLock(&_opCtx, nsToDatabaseSubstring(ns()), MODE_X),
+          _ctx(&_opCtx, ns()),
+          _expCtx(make_intrusive<ExpressionContext>(&_opCtx, nullptr, kTestNss)),
+          _coll(nullptr) {}
 
     virtual ~CountStageTest() {}
 
@@ -67,17 +71,15 @@ public:
         WriteUnitOfWork wunit(&_opCtx);
 
         _ctx.db()->dropCollection(&_opCtx, nss()).transitional_ignore();
-        _coll = _ctx.db()->createCollection(&_opCtx, nss());
+        auto coll = _ctx.db()->createCollection(&_opCtx, nss());
 
-        _coll->getIndexCatalog()
+        coll->getIndexCatalog()
             ->createIndexOnEmptyCollection(&_opCtx,
                                            BSON("key" << BSON("x" << 1) << "name"
                                                       << "x_1"
-                                                      << "ns"
-                                                      << ns()
-                                                      << "v"
-                                                      << 1))
+                                                      << "v" << 1))
             .status_with_transitional_ignore();
+        _coll = coll;
 
         for (int i = 0; i < kDocuments; i++) {
             insert(BSON(GENOID << "x" << i));
@@ -94,7 +96,8 @@ public:
         params.direction = CollectionScanParams::FORWARD;
         params.tailable = false;
 
-        unique_ptr<CollectionScan> scan(new CollectionScan(&_opCtx, _coll, params, &ws, NULL));
+        unique_ptr<CollectionScan> scan(
+            new CollectionScan(_expCtx.get(), _coll, params, &ws, nullptr));
         while (!scan->isEOF()) {
             WorkingSetID id = WorkingSet::INVALID_ID;
             PlanStage::StageState state = scan->work(&id);
@@ -129,7 +132,7 @@ public:
                               Snapshotted<BSONObj>(_opCtx.recoveryUnit()->getSnapshotId(), oldDoc),
                               newDoc,
                               true,
-                              NULL,
+                              nullptr,
                               &args);
         wunit.commit();
     }
@@ -140,17 +143,16 @@ public:
     //  - asserts count is not trivial
     //  - asserts nCounted is equal to expected_n
     //  - asserts nSkipped is correct
-    void testCount(const CountCommand& request, int expected_n = kDocuments, bool indexed = false) {
+    void testCount(const CountCommandRequest& request,
+                   int expected_n = kDocuments,
+                   bool indexed = false) {
         setup();
         getRecordIds();
 
         unique_ptr<WorkingSet> ws(new WorkingSet);
 
-        const CollatorInterface* collator = nullptr;
-        const boost::intrusive_ptr<ExpressionContext> expCtx(
-            new ExpressionContext(&_opCtx, collator));
         StatusWithMatchExpression statusWithMatcher =
-            MatchExpressionParser::parse(request.getQuery(), expCtx);
+            MatchExpressionParser::parse(request.getQuery(), _expCtx);
         ASSERT(statusWithMatcher.isOK());
         unique_ptr<MatchExpression> expression = std::move(statusWithMatcher.getValue());
 
@@ -161,7 +163,7 @@ public:
             scan = createCollScan(expression.get(), ws.get());
         }
 
-        CountStage countStage(&_opCtx,
+        CountStage countStage(_expCtx.get(),
                               _coll,
                               request.getLimit().value_or(0),
                               request.getSkip().value_or(0),
@@ -176,32 +178,29 @@ public:
 
     // Performs a test using a count stage whereby each unit of work is interjected
     // in some way by the invocation of interject().
-    const CountStats* runCount(CountStage& count_stage) {
+    const CountStats* runCount(CountStage& countStage) {
         int interjection = 0;
         WorkingSetID wsid;
 
-        while (!count_stage.isEOF()) {
-            // do some work -- assumes that one work unit counts a single doc
-            PlanStage::StageState state = count_stage.work(&wsid);
-            ASSERT_NOT_EQUALS(state, PlanStage::FAILURE);
+        while (!countStage.isEOF()) {
+            countStage.work(&wsid);
+            // Prepare for yield.
+            countStage.saveState();
 
-            // prepare for yield
-            count_stage.saveState();
-
-            // interject in some way kInterjection times
+            // Interject in some way kInterjection times.
             if (interjection < kInterjections) {
-                interject(count_stage, interjection++);
+                interject(countStage, interjection++);
             }
 
-            // resume from yield
-            count_stage.restoreState();
+            // Resume from yield.
+            countStage.restoreState(&_coll);
         }
 
-        return static_cast<const CountStats*>(count_stage.getSpecificStats());
+        return static_cast<const CountStats*>(countStage.getSpecificStats());
     }
 
     IndexScan* createIndexScan(MatchExpression* expr, WorkingSet* ws) {
-        IndexCatalog* catalog = _coll->getIndexCatalog();
+        const IndexCatalog* catalog = _coll->getIndexCatalog();
         std::vector<const IndexDescriptor*> indexes;
         catalog->findIndexesByKeyPattern(&_opCtx, BSON("x" << 1), false, &indexes);
         ASSERT_EQ(indexes.size(), 1U);
@@ -216,14 +215,14 @@ public:
         params.direction = 1;
 
         // This child stage gets owned and freed by its parent CountStage
-        return new IndexScan(&_opCtx, params, ws, expr);
+        return new IndexScan(_expCtx.get(), _coll, params, ws, expr);
     }
 
     CollectionScan* createCollScan(MatchExpression* expr, WorkingSet* ws) {
         CollectionScanParams params;
 
         // This child stage gets owned and freed by its parent CountStage
-        return new CollectionScan(&_opCtx, _coll, params, ws, expr);
+        return new CollectionScan(_expCtx.get(), _coll, params, ws, expr);
     }
 
     static const char* ns() {
@@ -240,13 +239,14 @@ protected:
     OperationContext& _opCtx = *_opCtxPtr;
     Lock::DBLock _dbLock;
     OldClientContext _ctx;
-    Collection* _coll;
+    boost::intrusive_ptr<ExpressionContext> _expCtx;
+    CollectionPtr _coll;
 };
 
 class QueryStageCountNoChangeDuringYield : public CountStageTest {
 public:
     void run() {
-        CountCommand request((NamespaceString(ns())));
+        CountCommandRequest request((NamespaceString(ns())));
         request.setQuery(BSON("x" << LT << kDocuments / 2));
 
         testCount(request, kDocuments / 2);
@@ -257,7 +257,7 @@ public:
 class QueryStageCountYieldWithSkip : public CountStageTest {
 public:
     void run() {
-        CountCommand request((NamespaceString(ns())));
+        CountCommandRequest request((NamespaceString(ns())));
         request.setQuery(BSON("x" << GTE << 0));
         request.setSkip(2);
 
@@ -269,7 +269,7 @@ public:
 class QueryStageCountYieldWithLimit : public CountStageTest {
 public:
     void run() {
-        CountCommand request((NamespaceString(ns())));
+        CountCommandRequest request((NamespaceString(ns())));
         request.setQuery(BSON("x" << GTE << 0));
         request.setSkip(0);
         request.setLimit(2);
@@ -283,7 +283,7 @@ public:
 class QueryStageCountInsertDuringYield : public CountStageTest {
 public:
     void run() {
-        CountCommand request((NamespaceString(ns())));
+        CountCommandRequest request((NamespaceString(ns())));
         request.setQuery(BSON("x" << 1));
 
         testCount(request, kInterjections + 1);
@@ -301,7 +301,7 @@ public:
     void run() {
         // expected count would be 99 but we delete the second record
         // after doing the first unit of work
-        CountCommand request((NamespaceString(ns())));
+        CountCommandRequest request((NamespaceString(ns())));
         request.setQuery(BSON("x" << GTE << 1));
 
         testCount(request, kDocuments - 2);
@@ -327,7 +327,7 @@ public:
     void run() {
         // expected count would be kDocuments-2 but we update the first and second records
         // after doing the first unit of work so they wind up getting counted later on
-        CountCommand request((NamespaceString(ns())));
+        CountCommandRequest request((NamespaceString(ns())));
         request.setQuery(BSON("x" << GTE << 2));
 
         testCount(request, kDocuments);
@@ -349,7 +349,7 @@ public:
 class QueryStageCountMultiKeyDuringYield : public CountStageTest {
 public:
     void run() {
-        CountCommand request((NamespaceString(ns())));
+        CountCommandRequest request((NamespaceString(ns())));
         request.setQuery(BSON("x" << 1));
         testCount(request, kDocuments + 1, true);  // only applies to indexed case
     }
@@ -360,9 +360,9 @@ public:
     }
 };
 
-class All : public Suite {
+class All : public OldStyleSuiteSpecification {
 public:
-    All() : Suite("query_stage_count") {}
+    All() : OldStyleSuiteSpecification("query_stage_count") {}
 
     void setupTests() {
         add<QueryStageCountNoChangeDuringYield>();
@@ -373,6 +373,8 @@ public:
         add<QueryStageCountUpdateDuringYield>();
         add<QueryStageCountMultiKeyDuringYield>();
     }
-} QueryStageCountAll;
+};
+
+OldStyleSuiteInitializer<All> queryStageCountAll;
 
 }  // namespace QueryStageCount

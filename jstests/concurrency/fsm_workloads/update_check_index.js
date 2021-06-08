@@ -7,7 +7,6 @@
  * for SERVER-17132.
  */
 var $config = (function() {
-
     var states = (function() {
         function multiUpdate(db, collName) {
             // Set 'c' to some random value.
@@ -21,12 +20,12 @@ var $config = (function() {
     var transitions = {multiUpdate: {multiUpdate: 1.0}};
 
     function setup(db, collName, cluster) {
-        assertAlways.commandWorked(db[collName].ensureIndex({a: 1}));
-        assertAlways.commandWorked(db[collName].ensureIndex({b: 1}));
-        assertAlways.commandWorked(db[collName].ensureIndex({c: 1}));
+        assertAlways.commandWorked(db[collName].createIndex({a: 1}));
+        assertAlways.commandWorked(db[collName].createIndex({b: 1}));
+        assertAlways.commandWorked(db[collName].createIndex({c: 1}));
 
         for (var i = 0; i < 10; i++) {
-            assertAlways.writeOK(db[collName].insert({a: 1, b: 1, c: 1}));
+            assertAlways.commandWorked(db[collName].insert({a: 1, b: 1, c: 1}));
         }
     }
 

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 #include "mongo/db/server_options_helpers.h"
 
@@ -43,16 +43,17 @@
 #include <iostream>
 
 #include "mongo/base/status.h"
+#include "mongo/bson/json.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/config.h"
 #include "mongo/db/server_options.h"
-#include "mongo/logger/log_component.h"
-#include "mongo/logger/message_event_utf8_encoder.h"
+#include "mongo/idl/server_parameter.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/log_component_settings.h"
+#include "mongo/logv2/log_manager.h"
 #include "mongo/transport/message_compressor_registry.h"
 #include "mongo/util/cmdline_utils/censor_cmdline.h"
-#include "mongo/util/fail_point_service.h"
-#include "mongo/util/log.h"
-#include "mongo/util/map_util.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/net/sock.h"
 #include "mongo/util/net/socket_utils.h"
 #include "mongo/util/net/ssl_options.h"
@@ -91,7 +92,7 @@ CODE facilitynames[] = {{"auth", LOG_AUTH},     {"cron", LOG_CRON},     {"daemon
                         {"syslog", LOG_SYSLOG}, {"user", LOG_USER},     {"uucp", LOG_UUCP},
                         {"local0", LOG_LOCAL0}, {"local1", LOG_LOCAL1}, {"local2", LOG_LOCAL2},
                         {"local3", LOG_LOCAL3}, {"local4", LOG_LOCAL4}, {"local5", LOG_LOCAL5},
-                        {"local6", LOG_LOCAL6}, {"local7", LOG_LOCAL7}, {NULL, -1}};
+                        {"local6", LOG_LOCAL6}, {"local7", LOG_LOCAL7}, {nullptr, -1}};
 
 #endif  // !defined(INTERNAL_NOPRI)
 #endif  // defined(SYSLOG_NAMES)
@@ -145,10 +146,26 @@ Status validateBaseOptions(const moe::Environment& params) {
 
         if (enableTestCommandsValue) {
             // Only register failpoint server parameters if enableTestCommands=1.
-            getGlobalFailPointRegistry()->registerAllFailPointsAsServerParameters();
+            globalFailPointRegistry().registerAllFailPointsAsServerParameters();
         } else {
             // Deregister test-only parameters.
             ServerParameterSet::getGlobal()->disableTestParameters();
+        }
+
+        // Must come after registerAllFailPointsAsServerParameters() above.
+        const auto& spMap = ServerParameterSet::getGlobal()->getMap();
+        for (const auto& setParam : parameters) {
+            const auto it = spMap.find(setParam.first);
+
+            if (it == spMap.end()) {
+                return {ErrorCodes::BadValue,
+                        str::stream() << "Unknown --setParameter '" << setParam.first << "'"};
+            }
+            if (!enableTestCommandsValue && it->second->isTestOnly()) {
+                return {ErrorCodes::BadValue,
+                        str::stream() << "--setParameter '" << setParam.first
+                                      << "' only available when used with 'enableTestCommands'"};
+            }
         }
     }
 
@@ -253,13 +270,14 @@ Status storeBaseOptions(const moe::Environment& params) {
             return Status(ErrorCodes::BadValue,
                           "systemLog.verbosity YAML Config cannot be negative");
         }
-        logger::globalLogDomain()->setMinimumLoggedSeverity(logger::LogSeverity::Debug(verbosity));
+        logv2::LogManager::global().getGlobalSettings().setMinimumLoggedSeverity(
+            mongo::logv2::LogComponent::kDefault, logv2::LogSeverity::Debug(verbosity));
     }
 
     // log component hierarchy verbosity levels
-    for (int i = 0; i < int(logger::LogComponent::kNumLogComponents); ++i) {
-        logger::LogComponent component = static_cast<logger::LogComponent::Value>(i);
-        if (component == logger::LogComponent::kDefault) {
+    for (int i = 0; i < int(logv2::LogComponent::kNumLogComponents); ++i) {
+        logv2::LogComponent component = static_cast<logv2::LogComponent::Value>(i);
+        if (component == logv2::LogComponent::kDefault) {
             continue;
         }
         const string dottedName = "systemLog.component." + component.getDottedName() + ".verbosity";
@@ -267,10 +285,11 @@ Status storeBaseOptions(const moe::Environment& params) {
             int verbosity = params[dottedName].as<int>();
             // Clear existing log level if log level is negative.
             if (verbosity < 0) {
-                logger::globalLogDomain()->clearMinimumLoggedSeverity(component);
+                logv2::LogManager::global().getGlobalSettings().clearMinimumLoggedSeverity(
+                    component);
             } else {
-                logger::globalLogDomain()->setMinimumLoggedSeverity(
-                    component, logger::LogSeverity::Debug(verbosity));
+                logv2::LogManager::global().getGlobalSettings().setMinimumLoggedSeverity(
+                    component, logv2::LogSeverity::Debug(verbosity));
             }
         }
     }
@@ -289,21 +308,21 @@ Status storeBaseOptions(const moe::Environment& params) {
     }
 
     if (params.count("systemLog.timeStampFormat")) {
-        using logger::MessageEventDetailsEncoder;
         std::string formatterName = params["systemLog.timeStampFormat"].as<string>();
-        if (formatterName == "ctime") {
-            MessageEventDetailsEncoder::setDateFormatter(outputDateAsCtime);
-        } else if (formatterName == "iso8601-utc") {
-            MessageEventDetailsEncoder::setDateFormatter(outputDateAsISOStringUTC);
+        if (formatterName == "iso8601-utc") {
+            serverGlobalParams.logTimestampFormat = logv2::LogTimestampFormat::kISO8601UTC;
+            setDateFormatIsLocalTimezone(false);
         } else if (formatterName == "iso8601-local") {
-            MessageEventDetailsEncoder::setDateFormatter(outputDateAsISOStringLocal);
+            serverGlobalParams.logTimestampFormat = logv2::LogTimestampFormat::kISO8601Local;
+            setDateFormatIsLocalTimezone(true);
         } else {
             StringBuilder sb;
-            sb << "Value of logTimestampFormat must be one of ctime, iso8601-utc "
+            sb << "Value of logTimestampFormat must be one of iso8601-utc "
                << "or iso8601-local; not \"" << formatterName << "\".";
             return Status(ErrorCodes::BadValue, sb.str());
         }
     }
+
     if (params.count("systemLog.destination")) {
         std::string systemLogDestination = params["systemLog.destination"].as<std::string>();
         if (systemLogDestination == "file") {
@@ -340,7 +359,8 @@ Status storeBaseOptions(const moe::Environment& params) {
         bool set = false;
         // match facility string to facility value
         size_t facilitynamesLength = sizeof(facilitynames) / sizeof(facilitynames[0]);
-        for (unsigned long i = 0; i < facilitynamesLength && facilitynames[i].c_name != NULL; i++) {
+        for (unsigned long i = 0; i < facilitynamesLength && facilitynames[i].c_name != nullptr;
+             i++) {
             if (!facility.compare(facilitynames[i].c_name)) {
                 serverGlobalParams.syslogFacility = facilitynames[i].c_val;
                 set = true;
@@ -396,11 +416,10 @@ Status storeBaseOptions(const moe::Environment& params) {
         for (std::map<std::string, std::string>::iterator parametersIt = parameters.begin();
              parametersIt != parameters.end();
              parametersIt++) {
-            ServerParameter* parameter =
-                mapFindWithDefault(ServerParameterSet::getGlobal()->getMap(),
-                                   parametersIt->first,
-                                   static_cast<ServerParameter*>(NULL));
-            if (NULL == parameter) {
+            const auto& serverParams = ServerParameterSet::getGlobal()->getMap();
+            auto iter = serverParams.find(parametersIt->first);
+            ServerParameter* parameter = (iter == serverParams.end()) ? nullptr : iter->second;
+            if (nullptr == parameter) {
                 StringBuilder sb;
                 sb << "Illegal --setParameter parameter: \"" << parametersIt->first << "\"";
                 return Status(ErrorCodes::BadValue, sb.str());
@@ -435,6 +454,18 @@ Status storeBaseOptions(const moe::Environment& params) {
 
     if (params.count("operationProfiling.slowOpSampleRate")) {
         serverGlobalParams.sampleRate = params["operationProfiling.slowOpSampleRate"].as<double>();
+    }
+
+    if (params.count("operationProfiling.filter")) {
+        try {
+            serverGlobalParams.defaultProfileFilter =
+                fromjson(params["operationProfiling.filter"].as<std::string>()).getOwned();
+        } catch (AssertionException& e) {
+            // Add more context to the error
+            uasserted(ErrorCodes::FailedToParse,
+                      str::stream()
+                          << "Failed to parse option operationProfiling.filter: " << e.reason());
+        }
     }
 
     return Status::OK();

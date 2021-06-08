@@ -52,23 +52,18 @@ const WriteErrorDetail& WriteOp::getOpError() const {
     return *_error;
 }
 
-Status WriteOp::targetWrites(OperationContext* opCtx,
-                             const NSTargeter& targeter,
-                             std::vector<TargetedWrite*>* targetedWrites) {
-    auto swEndpoints = [&]() -> StatusWith<std::vector<ShardEndpoint>> {
+void WriteOp::targetWrites(OperationContext* opCtx,
+                           const NSTargeter& targeter,
+                           std::vector<TargetedWrite*>* targetedWrites) {
+    auto endpoints = [&] {
         if (_itemRef.getOpType() == BatchedCommandRequest::BatchType_Insert) {
-            auto swEndpoint = targeter.targetInsert(opCtx, _itemRef.getDocument());
-            if (!swEndpoint.isOK())
-                return swEndpoint.getStatus();
-
-            return std::vector<ShardEndpoint>{std::move(swEndpoint.getValue())};
+            return std::vector{targeter.targetInsert(opCtx, _itemRef.getDocument())};
         } else if (_itemRef.getOpType() == BatchedCommandRequest::BatchType_Update) {
-            return targeter.targetUpdate(opCtx, _itemRef.getUpdate());
+            return targeter.targetUpdate(opCtx, _itemRef);
         } else if (_itemRef.getOpType() == BatchedCommandRequest::BatchType_Delete) {
-            return targeter.targetDelete(opCtx, _itemRef.getDelete());
-        } else {
-            MONGO_UNREACHABLE;
+            return targeter.targetDelete(opCtx, _itemRef);
         }
+        MONGO_UNREACHABLE;
     }();
 
     // Unless executing as part of a transaction, if we're targeting more than one endpoint with an
@@ -76,18 +71,16 @@ Status WriteOp::targetWrites(OperationContext* opCtx,
     //
     // NOTE: Index inserts are currently specially targeted only at the current collection to avoid
     // creating collections everywhere.
-    const bool inTransaction = TransactionRouter::get(opCtx) != nullptr;
-    if (swEndpoints.isOK() && swEndpoints.getValue().size() > 1u && !inTransaction) {
-        swEndpoints = targeter.targetAllShards(opCtx);
+    const bool inTransaction = bool(TransactionRouter::get(opCtx));
+    if (endpoints.size() > 1u && !inTransaction) {
+        endpoints = targeter.targetAllShards(opCtx);
     }
 
-    // If we had an error, stop here
-    if (!swEndpoints.isOK())
-        return swEndpoints.getStatus();
-
-    auto& endpoints = swEndpoints.getValue();
-
     for (auto&& endpoint : endpoints) {
+        // If the operation was already successfull on that shard, do not repeat it
+        if (_successfulShardSet.count(endpoint.shardName))
+            continue;
+
         _childOps.emplace_back(this);
 
         WriteOpRef ref(_itemRef.getItemIndex(), _childOps.size() - 1);
@@ -104,8 +97,9 @@ Status WriteOp::targetWrites(OperationContext* opCtx,
         _childOps.back().state = WriteOpState_Pending;
     }
 
-    _state = WriteOpState_Pending;
-    return Status::OK();
+    // If all operations currently targeted were successful on a previous round we might have 0
+    // childOps, that would mean that the operation is finished.
+    _state = _childOps.size() ? WriteOpState_Pending : WriteOpState_Completed;
 }
 
 size_t WriteOp::getNumTargeted() {
@@ -113,8 +107,7 @@ size_t WriteOp::getNumTargeted() {
 }
 
 static bool isRetryErrCode(int errCode) {
-    return errCode == ErrorCodes::StaleShardVersion ||
-        errCode == ErrorCodes::CannotImplicitlyCreateCollection;
+    return errCode == ErrorCodes::StaleShardVersion || errCode == ErrorCodes::StaleDbVersion;
 }
 
 static bool errorsAllSame(const vector<ChildWriteOp const*>& errOps) {
@@ -186,8 +179,6 @@ void WriteOp::_updateOpState() {
     }
 
     if (!childErrors.empty() && isRetryError) {
-        // Since we're using broadcast mode for multi-shard writes, which cannot SCE
-        invariant(childErrors.size() == 1u);
         _state = WriteOpState_Ready;
     } else if (!childErrors.empty()) {
         _error.reset(new WriteErrorDetail);
@@ -228,7 +219,8 @@ void WriteOp::noteWriteComplete(const TargetedWrite& targetedWrite) {
     const WriteOpRef& ref = targetedWrite.writeOpRef;
     auto& childOp = _childOps[ref.second];
 
-    childOp.pendingWrite = NULL;
+    _successfulShardSet.emplace(targetedWrite.endpoint.shardName);
+    childOp.pendingWrite = nullptr;
     childOp.endpoint.reset(new ShardEndpoint(targetedWrite.endpoint));
     childOp.state = WriteOpState_Completed;
     _updateOpState();
@@ -238,7 +230,7 @@ void WriteOp::noteWriteError(const TargetedWrite& targetedWrite, const WriteErro
     const WriteOpRef& ref = targetedWrite.writeOpRef;
     auto& childOp = _childOps[ref.second];
 
-    childOp.pendingWrite = NULL;
+    childOp.pendingWrite = nullptr;
     childOp.endpoint.reset(new ShardEndpoint(targetedWrite.endpoint));
     childOp.error.reset(new WriteErrorDetail);
     error.cloneTo(childOp.error.get());

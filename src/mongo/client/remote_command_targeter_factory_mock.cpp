@@ -31,12 +31,6 @@
 
 #include "mongo/client/remote_command_targeter_factory_mock.h"
 
-#include "mongo/base/status_with.h"
-#include "mongo/client/connection_string.h"
-#include "mongo/client/remote_command_targeter_mock.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/assert_util.h"
-
 namespace mongo {
 namespace {
 
@@ -53,22 +47,26 @@ public:
         return _mock->findHost(opCtx, readPref);
     }
 
-    SemiFuture<HostAndPort> findHostWithMaxWait(const ReadPreferenceSetting& readPref,
-                                                Milliseconds maxWait) override {
-        return _mock->findHostWithMaxWait(readPref, maxWait);
+    SemiFuture<HostAndPort> findHost(const ReadPreferenceSetting& readPref,
+                                     const CancellationToken& cancelToken) override {
+        return _mock->findHost(readPref, cancelToken);
     }
 
-    SemiFuture<std::vector<HostAndPort>> findHostsWithMaxWait(const ReadPreferenceSetting& readPref,
-                                                              Milliseconds maxWait) override {
-        return _mock->findHostsWithMaxWait(readPref, maxWait);
+    SemiFuture<std::vector<HostAndPort>> findHosts(const ReadPreferenceSetting& readPref,
+                                                   const CancellationToken& cancelToken) override {
+        return _mock->findHosts(readPref, cancelToken);
     }
 
-    void markHostNotMaster(const HostAndPort& host, const Status& status) override {
-        _mock->markHostNotMaster(host, status);
+    void markHostNotPrimary(const HostAndPort& host, const Status& status) override {
+        _mock->markHostNotPrimary(host, status);
     }
 
     void markHostUnreachable(const HostAndPort& host, const Status& status) override {
         _mock->markHostUnreachable(host, status);
+    }
+
+    void markHostShuttingDown(const HostAndPort& host, const Status& status) override {
+        _mock->markHostShuttingDown(host, status);
     }
 
 private:
@@ -85,10 +83,10 @@ std::unique_ptr<RemoteCommandTargeter> RemoteCommandTargeterFactoryMock::create(
     const ConnectionString& connStr) {
     auto it = _mockTargeters.find(connStr);
     if (it != _mockTargeters.end()) {
-        return stdx::make_unique<TargeterProxy>(it->second);
+        return std::make_unique<TargeterProxy>(it->second);
     }
 
-    return stdx::make_unique<RemoteCommandTargeterMock>();
+    return std::make_unique<RemoteCommandTargeterMock>();
 }
 
 void RemoteCommandTargeterFactoryMock::addTargeterToReturn(

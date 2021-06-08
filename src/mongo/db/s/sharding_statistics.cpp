@@ -63,6 +63,10 @@ void ShardingStatistics::report(BSONObjBuilder* builder) const {
     builder->append("countRecipientMoveChunkStarted", countRecipientMoveChunkStarted.load());
     builder->append("countDocsDeletedOnDonor", countDocsDeletedOnDonor.load());
     builder->append("countDonorMoveChunkLockTimeout", countDonorMoveChunkLockTimeout.load());
+    builder->append("countDonorMoveChunkAbortConflictingIndexOperation",
+                    countDonorMoveChunkAbortConflictingIndexOperation.load());
+    builder->append("unfinishedMigrationFromPreviousPrimary",
+                    unfinishedMigrationFromPreviousPrimary.load());
 }
 
 }  // namespace mongo

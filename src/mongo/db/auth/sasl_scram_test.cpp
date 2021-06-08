@@ -27,9 +27,11 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
+
+#include <memory>
 
 #include "mongo/client/native_sasl_client_session.h"
 #include "mongo/client/scram_client_cache.h"
@@ -45,10 +47,9 @@
 #include "mongo/db/auth/sasl_mechanism_registry.h"
 #include "mongo/db/auth/sasl_scram_server_conversation.h"
 #include "mongo/db/service_context.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/logv2/log.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/base64.h"
-#include "mongo/util/log.h"
 #include "mongo/util/password_digest.h"
 
 namespace mongo {
@@ -62,16 +63,10 @@ BSONObj generateSCRAMUserDocument(StringData username, StringData password) {
     const auto sha256Cred =
         scram::Secrets<SHA256Block>::generateCredentials(password.toString(), 15000);
     return BSON("_id" << (str::stream() << database << "." << username).operator StringData()
-                      << AuthorizationManager::USER_NAME_FIELD_NAME
-                      << username
-                      << AuthorizationManager::USER_DB_FIELD_NAME
-                      << database
-                      << "credentials"
-                      << BSON("SCRAM-SHA-1" << sha1Cred << "SCRAM-SHA-256" << sha256Cred)
-                      << "roles"
-                      << BSONArray()
-                      << "privileges"
-                      << BSONArray());
+                      << AuthorizationManager::USER_NAME_FIELD_NAME << username
+                      << AuthorizationManager::USER_DB_FIELD_NAME << database << "credentials"
+                      << BSON("SCRAM-SHA-1" << sha1Cred << "SCRAM-SHA-256" << sha256Cred) << "roles"
+                      << BSONArray() << "privileges" << BSONArray());
 }
 
 std::string corruptEncodedPayload(const std::string& message,
@@ -139,7 +134,7 @@ class SCRAMMutators {
 public:
     SCRAMMutators() {}
 
-    void setMutator(SaslTestState state, stdx::function<void(std::string&)> fun) {
+    void setMutator(SaslTestState state, std::function<void(std::string&)> fun) {
         mutators.insert(std::make_pair(state, fun));
     }
 
@@ -151,7 +146,7 @@ public:
     }
 
 private:
-    std::map<SaslTestState, stdx::function<void(std::string&)>> mutators;
+    std::map<SaslTestState, std::function<void(std::string&)>> mutators;
 };
 
 struct SCRAMStepsResult {
@@ -175,7 +170,7 @@ protected:
     const SCRAMStepsResult goalState =
         SCRAMStepsResult(SaslTestState(SaslTestState::kClient, 4), Status::OK());
 
-    ServiceContext::UniqueServiceContext serviceContext;
+    ServiceContext* serviceContext;
     ServiceContext::UniqueClient client;
     ServiceContext::UniqueOperationContext opCtx;
 
@@ -187,7 +182,9 @@ protected:
     std::unique_ptr<NativeSaslClientSession> saslClientSession;
 
     void setUp() final {
-        serviceContext = ServiceContext::make();
+        auto serviceContextHolder = ServiceContext::make();
+        serviceContext = serviceContextHolder.get();
+        setGlobalServiceContext(std::move(serviceContextHolder));
         client = serviceContext->makeClient("test");
         opCtx = serviceContext->makeOperationContext(client.get());
 
@@ -195,13 +192,12 @@ protected:
             std::make_unique<AuthzManagerExternalStateMock>();
         authzManagerExternalState = uniqueAuthzManagerExternalStateMock.get();
         auto newManager = std::make_unique<AuthorizationManagerImpl>(
-            std::move(uniqueAuthzManagerExternalStateMock),
-            AuthorizationManagerImpl::InstallMockForTestingOrAuthImpl{});
+            serviceContext, std::move(uniqueAuthzManagerExternalStateMock));
         authzSession = std::make_unique<AuthorizationSessionImpl>(
             std::make_unique<AuthzSessionExternalStateMock>(newManager.get()),
             AuthorizationSessionImpl::InstallMockForTestingOrAuthImpl{});
         authzManager = newManager.get();
-        AuthorizationManager::set(serviceContext.get(), std::move(newManager));
+        AuthorizationManager::set(serviceContext, std::move(newManager));
 
         saslClientSession = std::make_unique<NativeSaslClientSession>();
         saslClientSession->setParameter(NativeSaslClientSession::parameterMechanism,
@@ -216,7 +212,8 @@ protected:
     void tearDown() final {
         opCtx.reset();
         client.reset();
-        serviceContext.reset();
+        setGlobalServiceContext(nullptr);
+        serviceContext = nullptr;
 
         saslClientSession.reset();
         saslServerSession.reset();
@@ -275,12 +272,12 @@ protected:
 
 public:
     void run() {
-        log() << "SCRAM-SHA-1 variant";
+        LOGV2(20252, "SCRAM-SHA-1 variant");
         saslServerSession = std::make_unique<SaslSCRAMSHA1ServerMechanism>("test");
         _digestPassword = true;
         Test::run();
 
-        log() << "SCRAM-SHA-256 variant";
+        LOGV2(20253, "SCRAM-SHA-256 variant");
         saslServerSession = std::make_unique<SaslSCRAMSHA256ServerMechanism>("test");
         _digestPassword = false;
         Test::run();
@@ -302,7 +299,6 @@ TEST_F(SCRAMFixture, testServerStep1DoesNotIncludeNonceFromClientStep1) {
         std::string::iterator nonceBegin = serverMessage.begin() + serverMessage.find("r=");
         std::string::iterator nonceEnd = std::find(nonceBegin, serverMessage.end(), ',');
         serverMessage = serverMessage.replace(nonceBegin, nonceEnd, "r=");
-
     });
     ASSERT_EQ(
         SCRAMStepsResult(SaslTestState(SaslTestState::kClient, 2),
@@ -348,7 +344,6 @@ TEST_F(SCRAMFixture, testClientStep2GivesBadProof) {
         std::string::iterator proofEnd = std::find(proofBegin, clientMessage.end(), ',');
         clientMessage = clientMessage.replace(
             proofBegin, proofEnd, corruptEncodedPayload(clientMessage, proofBegin, proofEnd));
-
     });
 
     ASSERT_EQ(SCRAMStepsResult(SaslTestState(SaslTestState::kServer, 2),
@@ -378,7 +373,6 @@ TEST_F(SCRAMFixture, testServerStep2GivesBadVerifier) {
             encodedVerifier = corruptEncodedPayload(serverMessage, verifierBegin, verifierEnd);
 
             serverMessage = serverMessage.replace(verifierBegin, verifierEnd, encodedVerifier);
-
         });
 
     auto result = runSteps(mutator);

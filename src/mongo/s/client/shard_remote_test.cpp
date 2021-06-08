@@ -30,9 +30,6 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/client/connection_string.h"
-#include "mongo/client/remote_command_targeter.h"
-#include "mongo/client/remote_command_targeter_factory_mock.h"
-#include "mongo/client/remote_command_targeter_mock.h"
 #include "mongo/db/logical_time.h"
 #include "mongo/db/query/cursor_response.h"
 #include "mongo/s/catalog/type_shard.h"
@@ -42,7 +39,6 @@
 #include "mongo/s/query/establish_cursors.h"
 #include "mongo/s/shard_id.h"
 #include "mongo/s/sharding_router_test_fixture.h"
-#include "mongo/unittest/unittest.h"
 
 namespace mongo {
 namespace {
@@ -71,7 +67,7 @@ protected:
             shards.push_back(shardType);
 
             std::unique_ptr<RemoteCommandTargeterMock> targeter(
-                stdx::make_unique<RemoteCommandTargeterMock>());
+                std::make_unique<RemoteCommandTargeterMock>());
             targeter->setConnectionStringReturnValue(ConnectionString(kTestShardHosts[i]));
             targeter->setFindHostReturnValue(kTestShardHosts[i]);
 
@@ -200,6 +196,32 @@ TEST_F(ShardRemoteTest, ScatterGatherRepliesWithLastCommittedOpTime) {
         ASSERT_EQ(expectedTime,
                   shardRegistry()->getShardNoReload(shardId)->getLastCommittedOpTime());
     }
+}
+
+TEST_F(ShardRemoteTest, TargeterMarksHostAsDownWhenConfigStepdown) {
+    auto targetedNode = ShardId("config");
+
+    ASSERT_EQ(0UL, configTargeter()->getAndClearMarkedDownHosts().size());
+    auto future = launchAsync([&] { runDummyCommandOnShard(targetedNode); });
+
+    auto error = Status(ErrorCodes::PrimarySteppedDown, "Config stepped down");
+    onCommand([&](const executor::RemoteCommandRequest& request) { return error; });
+
+    ASSERT_THROWS_CODE(future.default_timed_get(), DBException, ErrorCodes::PrimarySteppedDown);
+    ASSERT_EQ(1UL, configTargeter()->getAndClearMarkedDownHosts().size());
+}
+
+TEST_F(ShardRemoteTest, TargeterMarksHostAsDownWhenConfigShuttingDown) {
+    auto targetedNode = ShardId("config");
+
+    ASSERT_EQ(0UL, configTargeter()->getAndClearMarkedDownHosts().size());
+    auto future = launchAsync([&] { runDummyCommandOnShard(targetedNode); });
+
+    auto error = Status(ErrorCodes::InterruptedAtShutdown, "Interrupted at shutdown");
+    onCommand([&](const executor::RemoteCommandRequest& request) { return error; });
+
+    ASSERT_THROWS_CODE(future.default_timed_get(), DBException, ErrorCodes::InterruptedAtShutdown);
+    ASSERT_EQ(1UL, configTargeter()->getAndClearMarkedDownHosts().size());
 }
 
 }  // namespace

@@ -30,11 +30,13 @@
 #pragma once
 
 #include <boost/optional.hpp>
+#include <memory>
 
+#include "mongo/platform/mutex.h"
 #include "mongo/s/request_types/shard_collection_gen.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/s/request_types/sharded_ddl_commands_gen.h"
 #include "mongo/util/concurrency/notification.h"
+#include "mongo/util/string_map.h"
 
 namespace mongo {
 
@@ -71,29 +73,29 @@ public:
      * Otherwise returns a ConflictingOperationInProgress error.
      */
     StatusWith<ScopedShardCollection> registerShardCollection(
-        const ShardsvrShardCollection& request);
+        const ShardsvrShardCollectionRequest& request);
 
 private:
     friend class ScopedShardCollection;
 
     // Describes the state of a currently active shardCollection operation
     struct ActiveShardCollectionState {
-        ActiveShardCollectionState(ShardsvrShardCollection inRequest)
+        ActiveShardCollectionState(ShardsvrShardCollectionRequest inRequest)
             : activeRequest(std::move(inRequest)) {}
 
         /**
          * Constructs an error status to return in the case of conflicting operations.
          */
-        Status constructErrorStatus(const ShardsvrShardCollection& request) const;
+        Status constructErrorStatus(const ShardsvrShardCollectionRequest& request) const;
 
         // Exact arguments of the currently active operation
-        ShardsvrShardCollection activeRequest;
+        ShardsvrShardCollectionRequest activeRequest;
 
         /**
-         * Promise that contains the uuid for this collection so that a shardCollection object
-         * that is in 'join' mode has access to the collection uuid.
+         * Promise that contains the response of the command so that a shardCollection object that
+         * is in 'join' mode has access to the response object.
          */
-        SharedPromise<boost::optional<UUID>> _uuidPromise;
+        SharedPromise<boost::optional<CreateCollectionResponse>> _responsePromise;
     };
 
     /**
@@ -102,12 +104,13 @@ private:
      */
     void _clearShardCollection(std::string nss);
 
-    // Fulfills the promise and stores the uuid for the collection if the status is OK or sets an
+    // Fulfills the promise and stores the response for the command if the status is OK or sets an
     // error on the promise if it is not.
-    void _setUUIDOrError(std::string nss, StatusWith<boost::optional<UUID>> swUUID);
+    void _setResponseOrError(std::string nss,
+                             StatusWith<boost::optional<CreateCollectionResponse>> swResponse);
 
     // Protects the state below
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH("ActiveShardCollectionRegistry::_mutex");
 
     // Map containing any collections currently being sharded
     StringMap<std::shared_ptr<ActiveShardCollectionState>> _activeShardCollectionMap;
@@ -123,10 +126,11 @@ class ScopedShardCollection {
     ScopedShardCollection& operator=(const ScopedShardCollection&) = delete;
 
 public:
-    ScopedShardCollection(std::string nss,
-                          ActiveShardCollectionRegistry* registry,
-                          bool shouldExecute,
-                          SharedSemiFuture<boost::optional<UUID>> uuidFuture);
+    ScopedShardCollection(
+        std::string nss,
+        ActiveShardCollectionRegistry* registry,
+        bool shouldExecute,
+        SharedSemiFuture<boost::optional<CreateCollectionResponse>> responseFuture);
     ~ScopedShardCollection();
 
     ScopedShardCollection(ScopedShardCollection&&);
@@ -143,17 +147,17 @@ public:
 
     /**
      * Must only be called if the object is in the 'execute' mode when the shardCollection command
-     * was invoked (the command immediately executed). Will either emplace the uuid on the promise
-     * stored in the ActiveShardCollectionRegistry for this nss if status is OK or sets an error if
-     * it is not.
+     * was invoked (the command immediately executed). Will either emplace the response on the
+     * promise stored in the ActiveShardCollectionRegistry for this nss if status is OK or sets an
+     * error if it is not.
      */
-    void emplaceUUID(StatusWith<boost::optional<UUID>> swUUID);
+    void emplaceResponse(StatusWith<boost::optional<CreateCollectionResponse>> swResponse);
 
     /**
-     * Must only be called if the object is in the 'join' mode. Gets a future that contains the uuid
-     * for the collection.
+     * Must only be called if the object is in the 'join' mode. Gets a future that contains the
+     * response for the command.
      */
-    SharedSemiFuture<boost::optional<UUID>> getUUID();
+    SharedSemiFuture<boost::optional<CreateCollectionResponse>> getResponse();
 
 private:
     // Namespace of collection being sharded
@@ -169,9 +173,9 @@ private:
      */
     bool _shouldExecute;
 
-    // Future that will be signaled at the end of shardCollection, contains the uuid for the
-    // collection
-    SharedSemiFuture<boost::optional<UUID>> _uuidFuture;
+    // Future that will be signaled at the end of shardCollection, contains the response for the
+    // command.
+    SharedSemiFuture<boost::optional<CreateCollectionResponse>> _responseFuture;
 };
 
 }  // namespace mongo

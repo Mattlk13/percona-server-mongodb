@@ -31,11 +31,11 @@
 
 #include "mongo/dbtests/mock/mock_replica_set.h"
 
+#include "mongo/client/sdam/topology_description_builder.h"
 #include "mongo/db/repl/member_state.h"
 #include "mongo/dbtests/mock/mock_conn_registry.h"
 #include "mongo/dbtests/mock/mock_dbclient_connection.h"
 #include "mongo/util/invariant.h"
-#include "mongo/util/map_util.h"
 
 #include <sstream>
 
@@ -81,7 +81,11 @@ MockReplicaSet::MockReplicaSet(const string& setName,
     membersBuilder.done();
 
     ReplSetConfig replConfig;
-    fassert(28566, replConfig.initialize(configBuilder.obj()));
+    try {
+        replConfig = ReplSetConfig::parse(configBuilder.obj());
+    } catch (const DBException&) {
+        fassertFailed(28566);
+    }
     fassert(28573, replConfig.validate());
     setConfig(replConfig);
 }
@@ -166,7 +170,8 @@ vector<string> MockReplicaSet::getSecondaries() const {
 }
 
 MockRemoteDBServer* MockReplicaSet::getNode(const string& hostAndPort) {
-    return mapFindWithDefault(_nodeMap, hostAndPort, static_cast<MockRemoteDBServer*>(NULL));
+    auto iter = _nodeMap.find(hostAndPort);
+    return iter == _nodeMap.end() ? nullptr : iter->second;
 }
 
 repl::ReplSetConfig MockReplicaSet::getReplConfig() const {
@@ -195,90 +200,96 @@ void MockReplicaSet::restore(const string& hostAndPort) {
     _nodeMap[hostAndPort]->reboot();
 }
 
+BSONObj MockReplicaSet::mockHelloResponseFor(const MockRemoteDBServer& server) const {
+    const auto hostAndPort = server.getServerHostAndPort();
+
+    BSONObjBuilder builder;
+    builder.append("setName", _setName);
+
+    const MemberConfig* member = _replConfig.findMemberByHostAndPort(hostAndPort);
+    if (!member) {
+        builder.append("ismaster", false);
+        builder.append("secondary", false);
+
+        vector<string> hostList;
+        builder.append("hosts", hostList);
+    } else {
+        const bool isPrimary = hostAndPort.toString() == getPrimary();
+        builder.append("ismaster", isPrimary);
+        builder.append("secondary", !isPrimary);
+
+        {
+            // TODO: add passives & arbiters
+            vector<string> hostList;
+            if (hasPrimary()) {
+                hostList.push_back(getPrimary());
+            }
+
+            const vector<string> secondaries = getSecondaries();
+            for (vector<string>::const_iterator secIter = secondaries.begin();
+                 secIter != secondaries.end();
+                 ++secIter) {
+                hostList.push_back(*secIter);
+            }
+
+            builder.append("hosts", hostList);
+        }
+
+        if (hasPrimary()) {
+            builder.append("primary", getPrimary());
+        }
+
+        if (member->isArbiter()) {
+            builder.append("arbiterOnly", true);
+        }
+
+        if (member->getPriority() == 0 && !member->isArbiter()) {
+            builder.append("passive", true);
+        }
+
+        if (member->getSecondaryDelay().count()) {
+            builder.appendNumber("secondaryDelaySecs",
+                                 durationCount<Seconds>(member->getSecondaryDelay()));
+        }
+
+        if (member->isHidden()) {
+            builder.append("hidden", true);
+        }
+
+        if (!member->shouldBuildIndexes()) {
+            builder.append("buildIndexes", false);
+        }
+
+        const ReplSetTagConfig tagConfig = _replConfig.getTagConfig();
+        if (member->hasTags()) {
+            BSONObjBuilder tagBuilder;
+            for (MemberConfig::TagIterator tag = member->tagsBegin(); tag != member->tagsEnd();
+                 ++tag) {
+                std::string tagKey = tagConfig.getTagKey(*tag);
+                if (tagKey[0] == '$') {
+                    // Filter out internal tags
+                    continue;
+                }
+                tagBuilder.append(tagKey, tagConfig.getTagValue(*tag));
+            }
+            builder.append("tags", tagBuilder.done());
+        }
+    }
+
+    builder.append("me", hostAndPort.toString());
+    builder.append("ok", 1);
+
+    return builder.obj();
+}
+
 void MockReplicaSet::mockIsMasterCmd() {
     for (ReplNodeMap::iterator nodeIter = _nodeMap.begin(); nodeIter != _nodeMap.end();
          ++nodeIter) {
-        const string& hostAndPort = nodeIter->first;
-
-        BSONObjBuilder builder;
-        builder.append("setName", _setName);
-
-        const MemberConfig* member = _replConfig.findMemberByHostAndPort(HostAndPort(hostAndPort));
-        if (!member) {
-            builder.append("ismaster", false);
-            builder.append("secondary", false);
-
-            vector<string> hostList;
-            builder.append("hosts", hostList);
-        } else {
-            const bool isPrimary = hostAndPort == getPrimary();
-            builder.append("ismaster", isPrimary);
-            builder.append("secondary", !isPrimary);
-
-            {
-                // TODO: add passives & arbiters
-                vector<string> hostList;
-                if (hasPrimary()) {
-                    hostList.push_back(getPrimary());
-                }
-
-                const vector<string> secondaries = getSecondaries();
-                for (vector<string>::const_iterator secIter = secondaries.begin();
-                     secIter != secondaries.end();
-                     ++secIter) {
-                    hostList.push_back(*secIter);
-                }
-
-                builder.append("hosts", hostList);
-            }
-
-            if (hasPrimary()) {
-                builder.append("primary", getPrimary());
-            }
-
-            if (member->isArbiter()) {
-                builder.append("arbiterOnly", true);
-            }
-
-            if (member->getPriority() == 0 && !member->isArbiter()) {
-                builder.append("passive", true);
-            }
-
-            if (member->getSlaveDelay().count()) {
-                builder.appendIntOrLL("slaveDelay",
-                                      durationCount<Seconds>(member->getSlaveDelay()));
-            }
-
-            if (member->isHidden()) {
-                builder.append("hidden", true);
-            }
-
-            if (!member->shouldBuildIndexes()) {
-                builder.append("buildIndexes", false);
-            }
-
-            const ReplSetTagConfig tagConfig = _replConfig.getTagConfig();
-            if (member->hasTags(tagConfig)) {
-                BSONObjBuilder tagBuilder;
-                for (MemberConfig::TagIterator tag = member->tagsBegin(); tag != member->tagsEnd();
-                     ++tag) {
-                    std::string tagKey = tagConfig.getTagKey(*tag);
-                    if (tagKey[0] == '$') {
-                        // Filter out internal tags
-                        continue;
-                    }
-                    tagBuilder.append(tagKey, tagConfig.getTagValue(*tag));
-                }
-                builder.append("tags", tagBuilder.done());
-            }
-        }
-
-        builder.append("me", hostAndPort);
-        builder.append("ok", true);
+        auto isMaster = mockHelloResponseFor(*nodeIter->second);
 
         // DBClientBase::isMaster() sends "ismaster", but ReplicaSetMonitor sends "isMaster".
-        nodeIter->second->setCommandReply("ismaster", builder.done());
-        nodeIter->second->setCommandReply("isMaster", builder.done());
+        nodeIter->second->setCommandReply("ismaster", isMaster);
+        nodeIter->second->setCommandReply("isMaster", isMaster);
     }
 }
 
@@ -342,7 +353,7 @@ void MockReplicaSet::mockReplSetGetStatusCmd() {
         // TODO: syncingTo
 
         fullStatBuilder.append("set", _setName);
-        fullStatBuilder.appendTimeT("date", time(0));
+        fullStatBuilder.appendTimeT("date", time(nullptr));
         fullStatBuilder.append("myState", getState(node->getServerAddress()));
         fullStatBuilder.append("members", hostsField);
         fullStatBuilder.append("ok", true);
@@ -350,4 +361,30 @@ void MockReplicaSet::mockReplSetGetStatusCmd() {
         node->setCommandReply("replSetGetStatus", fullStatBuilder.done());
     }
 }
+
+sdam::TopologyDescriptionPtr MockReplicaSet::getTopologyDescription(
+    ClockSource* clockSource) const {
+    sdam::TopologyDescriptionBuilder builder;
+
+    builder.withSetName(_setName);
+    builder.withTopologyType(hasPrimary() ? sdam::TopologyType::kReplicaSetWithPrimary
+                                          : sdam::TopologyType::kReplicaSetNoPrimary);
+
+    std::vector<sdam::ServerDescriptionPtr> servers;
+    for (const auto& nodeEntry : _nodeMap) {
+        const auto& server = *nodeEntry.second;
+        if (server.isRunning()) {
+            auto helloBSON = mockHelloResponseFor(server);
+            sdam::HelloOutcome hello(server.getServerHostAndPort(), helloBSON);
+            servers.push_back(std::make_shared<sdam::ServerDescription>(clockSource, hello));
+        } else {
+            sdam::HelloOutcome hello(server.getServerHostAndPort(), {}, "mock server unreachable");
+            servers.push_back(std::make_shared<sdam::ServerDescription>(clockSource, hello));
+        }
+    }
+
+    builder.withServers(servers);
+    return builder.instance();
 }
+
+}  // namespace mongo

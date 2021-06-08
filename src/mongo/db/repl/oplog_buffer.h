@@ -89,26 +89,11 @@ public:
     virtual void shutdown(OperationContext* opCtx) = 0;
 
     /**
-     * Pushes operation into oplog buffer, ignoring any size constraints. Does not block.
-     * If the oplog buffer is already full, this will cause the size of the oplog buffer to exceed
-     * the limit returned by getMaxSize() but should not otherwise adversely affect normal
-     * functionality such as pushing and popping operations from the oplog buffer.
-     */
-    virtual void pushEvenIfFull(OperationContext* opCtx, const Value& value) = 0;
-
-    /**
-     * Pushes operation into oplog buffer.
-     * If there are size constraints on the oplog buffer, this may block until sufficient space
-     * is made available (by popping) to complete this operation.
-     */
-    virtual void push(OperationContext* opCtx, const Value& value) = 0;
-
-    /**
      * Pushes operations in the iterator range [begin, end) into the oplog buffer without blocking.
      */
-    virtual void pushAllNonBlocking(OperationContext* opCtx,
-                                    Batch::const_iterator begin,
-                                    Batch::const_iterator end) = 0;
+    virtual void push(OperationContext* opCtx,
+                      Batch::const_iterator begin,
+                      Batch::const_iterator end) = 0;
 
     /**
      * Returns when enough space is available.
@@ -167,6 +152,18 @@ public:
      * Returns the item most recently added to the oplog buffer or nothing if the buffer is empty.
      */
     virtual boost::optional<Value> lastObjectPushed(OperationContext* opCtx) const = 0;
+
+    /**
+     * Enters "drain mode".  May only be called by the producer.  When the buffer is in drain mode,
+     * "waitForData" will return immediately even if there is data in the queue.  This
+     * is an optimization and subclasses may choose not to implement this function.
+     */
+    virtual void enterDrainMode(){};
+
+    /**
+     * Leaves "drain mode".  May only be called by the producer.
+     */
+    virtual void exitDrainMode(){};
 };
 
 class OplogBuffer::Counters {
@@ -206,6 +203,37 @@ public:
 
     // Maximum size of operations in this OplogBuffer. Measured in bytes.
     Counter64 maxSize;
+};
+
+/**
+ * An OplogBuffer interface which also supports random access by timestamp.
+ * The entries in a RandomAccessOplogBuffer must be pushed in strict timestamp order.
+ *
+ * The user of a RandomAccesOplogBuffer may seek to or find timestamps which have already been read
+ * from the buffer.  It is up to the implementing subclass to ensure that such timestamps are
+ * available to be read.
+ */
+class RandomAccessOplogBuffer : public OplogBuffer {
+public:
+    enum SeekStrategy {
+        kInexact = 0,
+        kExact = 1,
+    };
+
+    /**
+     * Retrieves an oplog entry by timestamp. Returns ErrorCodes::NoSuchKey if no such entry is
+     * found.  Does not change current position of oplog buffer.
+     */
+    virtual StatusWith<Value> findByTimestamp(OperationContext* opCtx, const Timestamp& ts) = 0;
+
+    /**
+     * Change current position of oplog buffer to point to the entry with timestamp 'ts'.  If
+     * 'exact' is true, return NoSuchKey if the timestamp is not found. Otherwise, position will
+     * be before the next timestamp greater than or equal to 'ts'.
+     */
+    virtual Status seekToTimestamp(OperationContext* opCtx,
+                                   const Timestamp& ts,
+                                   SeekStrategy exact = SeekStrategy::kExact) = 0;
 };
 
 }  // namespace repl

@@ -27,9 +27,12 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
+
+#include <functional>
+#include <memory>
 
 #include "mongo/base/status.h"
 #include "mongo/db/jsobj.h"
@@ -40,25 +43,23 @@
 #include "mongo/executor/network_interface_mock.h"
 #include "mongo/executor/thread_pool_task_executor_test_fixture.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/stdx/unordered_set.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/net/hostandport.h"
 
-#define ASSERT_REASON_CONTAINS(STATUS, PATTERN)                                                 \
-    do {                                                                                        \
-        const mongo::Status s_ = (STATUS);                                                      \
-        ASSERT_FALSE(s_.reason().find(PATTERN) == std::string::npos) << #STATUS ".reason() == " \
-                                                                     << s_.reason();            \
+#define ASSERT_REASON_CONTAINS(STATUS, PATTERN)                      \
+    do {                                                             \
+        const mongo::Status s_ = (STATUS);                           \
+        ASSERT_FALSE(s_.reason().find(PATTERN) == std::string::npos) \
+            << #STATUS ".reason() == " << s_.reason();               \
     } while (false)
 
-#define ASSERT_NOT_REASON_CONTAINS(STATUS, PATTERN)                                            \
-    do {                                                                                       \
-        const mongo::Status s_ = (STATUS);                                                     \
-        ASSERT_TRUE(s_.reason().find(PATTERN) == std::string::npos) << #STATUS ".reason() == " \
-                                                                    << s_.reason();            \
+#define ASSERT_NOT_REASON_CONTAINS(STATUS, PATTERN)                 \
+    do {                                                            \
+        const mongo::Status s_ = (STATUS);                          \
+        ASSERT_TRUE(s_.reason().find(PATTERN) == std::string::npos) \
+            << #STATUS ".reason() == " << s_.reason();              \
     } while (false)
 
 namespace mongo {
@@ -87,7 +88,7 @@ private:
 
     std::unique_ptr<stdx::thread> _quorumCheckThread;
     Status _quorumCheckStatus;
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH("CheckQuorumTest::_mutex");
     bool _isQuorumCheckDone;
 };
 
@@ -108,13 +109,13 @@ Status CheckQuorumTest::waitForQuorumCheck() {
 }
 
 bool CheckQuorumTest::isQuorumCheckDone() {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     return _isQuorumCheckDone;
 }
 
 void CheckQuorumTest::_runQuorumCheck(const ReplSetConfig& config, int myIndex) {
     _quorumCheckStatus = _runQuorumCheckImpl(config, myIndex);
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     _isQuorumCheckDone = true;
 }
 
@@ -133,37 +134,30 @@ protected:
 };
 
 ReplSetConfig assertMakeRSConfig(const BSONObj& configBson) {
-    ReplSetConfig config;
-    ASSERT_OK(config.initialize(configBson));
+    ReplSetConfig config(ReplSetConfig::parse(configBson));
     ASSERT_OK(config.validate());
     return config;
 }
 
 TEST_F(CheckQuorumForInitiate, ValidSingleNodeSet) {
-    ReplSetConfig config = assertMakeRSConfig(BSON("_id"
-                                                   << "rs0"
-                                                   << "version"
-                                                   << 1
-                                                   << "protocolVersion"
-                                                   << 1
-                                                   << "members"
-                                                   << BSON_ARRAY(BSON("_id" << 1 << "host"
-                                                                            << "h1"))));
+    ReplSetConfig config =
+        assertMakeRSConfig(BSON("_id"
+                                << "rs0"
+                                << "version" << 1 << "protocolVersion" << 1 << "members"
+                                << BSON_ARRAY(BSON("_id" << 1 << "host"
+                                                         << "h1"))));
     startQuorumCheck(config, 0);
     ASSERT_OK(waitForQuorumCheck());
 }
 
 TEST_F(CheckQuorumForInitiate, QuorumCheckCanceledByShutdown) {
     getExecutor().shutdown();
-    ReplSetConfig config = assertMakeRSConfig(BSON("_id"
-                                                   << "rs0"
-                                                   << "version"
-                                                   << 1
-                                                   << "protocolVersion"
-                                                   << 1
-                                                   << "members"
-                                                   << BSON_ARRAY(BSON("_id" << 1 << "host"
-                                                                            << "h1"))));
+    ReplSetConfig config =
+        assertMakeRSConfig(BSON("_id"
+                                << "rs0"
+                                << "version" << 1 << "protocolVersion" << 1 << "members"
+                                << BSON_ARRAY(BSON("_id" << 1 << "host"
+                                                         << "h1"))));
     startQuorumCheck(config, 0);
     ASSERT_EQUALS(ErrorCodes::ShutdownInProgress, waitForQuorumCheck());
 }
@@ -172,23 +166,20 @@ TEST_F(CheckQuorumForInitiate, QuorumCheckFailedDueToSeveralDownNodes) {
     // In this test, "we" are host "h3:1".  All other nodes time out on
     // their heartbeat request, and so the quorum check for initiate
     // will fail because some members were unavailable.
-    ReplSetConfig config = assertMakeRSConfig(BSON("_id"
-                                                   << "rs0"
-                                                   << "version"
-                                                   << 1
-                                                   << "protocolVersion"
-                                                   << 1
-                                                   << "members"
-                                                   << BSON_ARRAY(BSON("_id" << 1 << "host"
-                                                                            << "h1:1")
-                                                                 << BSON("_id" << 2 << "host"
-                                                                               << "h2:1")
-                                                                 << BSON("_id" << 3 << "host"
-                                                                               << "h3:1")
-                                                                 << BSON("_id" << 4 << "host"
-                                                                               << "h4:1")
-                                                                 << BSON("_id" << 5 << "host"
-                                                                               << "h5:1"))));
+    ReplSetConfig config =
+        assertMakeRSConfig(BSON("_id"
+                                << "rs0"
+                                << "version" << 1 << "protocolVersion" << 1 << "members"
+                                << BSON_ARRAY(BSON("_id" << 1 << "host"
+                                                         << "h1:1")
+                                              << BSON("_id" << 2 << "host"
+                                                            << "h2:1")
+                                              << BSON("_id" << 3 << "host"
+                                                            << "h3:1")
+                                              << BSON("_id" << 4 << "host"
+                                                            << "h4:1")
+                                              << BSON("_id" << 5 << "host"
+                                                            << "h5:1"))));
     startQuorumCheck(config, 2);
     getNet()->enterNetwork();
     const Date_t startDate = getNet()->now();
@@ -196,7 +187,7 @@ TEST_F(CheckQuorumForInitiate, QuorumCheckFailedDueToSeveralDownNodes) {
     for (int i = 0; i < numCommandsExpected; ++i) {
         getNet()->scheduleResponse(getNet()->getNextReadyRequest(),
                                    startDate + Milliseconds(10),
-                                   {ErrorCodes::NoSuchKey, "No reply"});
+                                   {ErrorCodes::HostUnreachable, "No reply"});
     }
     getNet()->runUntil(startDate + Milliseconds(10));
     getNet()->exitNetwork();
@@ -222,7 +213,7 @@ const BSONObj makeHeartbeatRequest(const ReplSetConfig& rsConfig, int myConfigIn
         hbArgs.setCheckEmpty();
     }
     hbArgs.setSenderHost(myConfig.getHostAndPort());
-    hbArgs.setSenderId(myConfig.getId());
+    hbArgs.setSenderId(myConfig.getId().getData());
     hbArgs.setTerm(0);
     return hbArgs.toBSON();
 }
@@ -239,7 +230,7 @@ executor::RemoteCommandResponse makeHeartbeatResponse(const ReplSetConfig& rsCon
     hbResp.setConfigVersion(configVersion);
     // The smallest valid optime in PV1.
     OpTime opTime(Timestamp(), 0);
-    Date_t wallTime = Date_t::min();
+    Date_t wallTime = Date_t();
     hbResp.setAppliedOpTimeAndWallTime({opTime, wallTime});
     hbResp.setDurableOpTimeAndWallTime({opTime, wallTime});
     auto bob = BSONObjBuilder(hbResp.toBSON());
@@ -254,11 +245,7 @@ TEST_F(CheckQuorumForInitiate, QuorumCheckSuccessForFiveNodes) {
     const ReplSetConfig rsConfig =
         assertMakeRSConfig(BSON("_id"
                                 << "rs0"
-                                << "version"
-                                << 1
-                                << "protocolVersion"
-                                << 1
-                                << "members"
+                                << "version" << 1 << "protocolVersion" << 1 << "members"
                                 << BSON_ARRAY(BSON("_id" << 1 << "host"
                                                          << "h1:1")
                                               << BSON("_id" << 2 << "host"
@@ -282,8 +269,8 @@ TEST_F(CheckQuorumForInitiate, QuorumCheckSuccessForFiveNodes) {
         const RemoteCommandRequest& request = noi->getRequest();
         ASSERT_EQUALS("admin", request.dbname);
         ASSERT_BSONOBJ_EQ(hbRequest, request.cmdObj);
-        ASSERT(seenHosts.insert(request.target).second) << "Already saw "
-                                                        << request.target.toString();
+        ASSERT(seenHosts.insert(request.target).second)
+            << "Already saw " << request.target.toString();
         getNet()->scheduleResponse(
             noi, startDate + Milliseconds(10), makeHeartbeatResponse(rsConfig, Milliseconds(8)));
     }
@@ -301,19 +288,12 @@ TEST_F(CheckQuorumForInitiate, QuorumCheckFailedDueToOneDownNode) {
     const ReplSetConfig rsConfig =
         assertMakeRSConfig(BSON("_id"
                                 << "rs0"
-                                << "version"
-                                << 1
-                                << "protocolVersion"
-                                << 1
-                                << "members"
+                                << "version" << 1 << "protocolVersion" << 1 << "members"
                                 << BSON_ARRAY(BSON("_id" << 1 << "host"
                                                          << "h1:1")
                                               << BSON("_id" << 2 << "host"
                                                             << "h2:1"
-                                                            << "priority"
-                                                            << 0
-                                                            << "votes"
-                                                            << 0)
+                                                            << "priority" << 0 << "votes" << 0)
                                               << BSON("_id" << 3 << "host"
                                                             << "h3:1")
                                               << BSON("_id" << 4 << "host"
@@ -335,11 +315,11 @@ TEST_F(CheckQuorumForInitiate, QuorumCheckFailedDueToOneDownNode) {
         const RemoteCommandRequest& request = noi->getRequest();
         ASSERT_EQUALS("admin", request.dbname);
         ASSERT_BSONOBJ_EQ(hbRequest, request.cmdObj);
-        ASSERT(seenHosts.insert(request.target).second) << "Already saw "
-                                                        << request.target.toString();
+        ASSERT(seenHosts.insert(request.target).second)
+            << "Already saw " << request.target.toString();
         if (request.target == HostAndPort("h2", 1)) {
             getNet()->scheduleResponse(
-                noi, startDate + Milliseconds(10), {ErrorCodes::NoSuchKey, "No response"});
+                noi, startDate + Milliseconds(10), {ErrorCodes::HostUnreachable, "No response"});
         } else {
             getNet()->scheduleResponse(noi,
                                        startDate + Milliseconds(10),
@@ -368,11 +348,7 @@ TEST_F(CheckQuorumForInitiate, QuorumCheckFailedDueToSetNameMismatch) {
     const ReplSetConfig rsConfig =
         assertMakeRSConfig(BSON("_id"
                                 << "rs0"
-                                << "version"
-                                << 1
-                                << "protocolVersion"
-                                << 1
-                                << "members"
+                                << "version" << 1 << "protocolVersion" << 1 << "members"
                                 << BSON_ARRAY(BSON("_id" << 1 << "host"
                                                          << "h1:1")
                                               << BSON("_id" << 2 << "host"
@@ -396,8 +372,8 @@ TEST_F(CheckQuorumForInitiate, QuorumCheckFailedDueToSetNameMismatch) {
         const RemoteCommandRequest& request = noi->getRequest();
         ASSERT_EQUALS("admin", request.dbname);
         ASSERT_BSONOBJ_EQ(hbRequest, request.cmdObj);
-        ASSERT(seenHosts.insert(request.target).second) << "Already saw "
-                                                        << request.target.toString();
+        ASSERT(seenHosts.insert(request.target).second)
+            << "Already saw " << request.target.toString();
         if (request.target == HostAndPort("h4", 1)) {
             getNet()->scheduleResponse(
                 noi,
@@ -433,11 +409,7 @@ TEST_F(CheckQuorumForInitiate, QuorumCheckFailedDueToSetIdMismatch) {
     const ReplSetConfig rsConfig =
         assertMakeRSConfig(BSON("_id"
                                 << "rs0"
-                                << "version"
-                                << 1
-                                << "protocolVersion"
-                                << 1
-                                << "members"
+                                << "version" << 1 << "protocolVersion" << 1 << "members"
                                 << BSON_ARRAY(BSON("_id" << 1 << "host"
                                                          << "h1:1")
                                               << BSON("_id" << 2 << "host"
@@ -448,8 +420,7 @@ TEST_F(CheckQuorumForInitiate, QuorumCheckFailedDueToSetIdMismatch) {
                                                             << "h4:1")
                                               << BSON("_id" << 5 << "host"
                                                             << "h5:1"))
-                                << "settings"
-                                << BSON("replicaSetId" << replicaSetId)));
+                                << "settings" << BSON("replicaSetId" << replicaSetId)));
     const int myConfigIndex = 2;
     const BSONObj hbRequest = makeHeartbeatRequest(rsConfig, myConfigIndex);
 
@@ -466,18 +437,19 @@ TEST_F(CheckQuorumForInitiate, QuorumCheckFailedDueToSetIdMismatch) {
         ASSERT_EQUALS("admin", request.dbname);
         ASSERT_BSONOBJ_EQ(hbRequest, request.cmdObj);
         ASSERT_BSONOBJ_EQ(BSON(rpc::kReplSetMetadataFieldName << 1), request.metadata);
-        ASSERT(seenHosts.insert(request.target).second) << "Already saw "
-                                                        << request.target.toString();
+        ASSERT(seenHosts.insert(request.target).second)
+            << "Already saw " << request.target.toString();
         if (request.target == incompatibleHost) {
             OpTime opTime{Timestamp{10, 10}, 10};
-            Date_t wallTime = Date_t::min();
+            Date_t wallTime = Date_t();
             rpc::ReplSetMetadata metadata(opTime.getTerm(),
                                           {opTime, wallTime},
                                           opTime,
                                           rsConfig.getConfigVersion(),
+                                          rsConfig.getConfigTerm(),
                                           unexpectedId,
-                                          rpc::ReplSetMetadata::kNoPrimary,
-                                          -1);
+                                          -1,
+                                          false);
             BSONObjBuilder bob;
             uassertStatusOK(metadata.writeToMetadata(&bob));
 
@@ -496,12 +468,11 @@ TEST_F(CheckQuorumForInitiate, QuorumCheckFailedDueToSetIdMismatch) {
     getNet()->exitNetwork();
     Status status = waitForQuorumCheck();
     ASSERT_EQUALS(ErrorCodes::NewReplicaSetConfigurationIncompatible, status);
-    ASSERT_REASON_CONTAINS(status,
-                           str::stream() << "Our replica set ID of " << replicaSetId
-                                         << " did not match that of "
-                                         << incompatibleHost.toString()
-                                         << ", which is "
-                                         << unexpectedId);
+    ASSERT_REASON_CONTAINS(
+        status,
+        str::stream() << "Our replica set ID did not match that of our request target, replSetId: "
+                      << replicaSetId << ", requestTarget: " << incompatibleHost.toString()
+                      << ", requestTargetReplSetId: " << unexpectedId);
     ASSERT_NOT_REASON_CONTAINS(status, "h1:1");
     ASSERT_NOT_REASON_CONTAINS(status, "h2:1");
     ASSERT_NOT_REASON_CONTAINS(status, "h3:1");
@@ -509,29 +480,23 @@ TEST_F(CheckQuorumForInitiate, QuorumCheckFailedDueToSetIdMismatch) {
     ASSERT_NOT_REASON_CONTAINS(status, "h5:1");
 }
 
-TEST_F(CheckQuorumForInitiate, QuorumCheckFailedDueToInitializedNode) {
-    // In this test, "we" are host "h3:1".  All nodes respond
-    // successfully to their heartbeat requests, but quorum check fails because
-    // "h5" declares that it is already initialized.
+TEST_F(CheckQuorumForReconfig, QuorumCheckSucceedsWhenOtherNodesHaveHigherVersion) {
+    // In this test, "we" are host "h3:1".  The request to "h2" does not arrive before the end
+    // of the test, and the request to "h1" comes back indicating a higher config version.
+    //
+    // Since The quorum checker does not compare config versions or terms of remotes nodes,
+    // this test should always succeed.
 
     const ReplSetConfig rsConfig =
         assertMakeRSConfig(BSON("_id"
                                 << "rs0"
-                                << "version"
-                                << 1
-                                << "protocolVersion"
-                                << 1
-                                << "members"
+                                << "version" << 2 << "protocolVersion" << 1 << "members"
                                 << BSON_ARRAY(BSON("_id" << 1 << "host"
                                                          << "h1:1")
                                               << BSON("_id" << 2 << "host"
                                                             << "h2:1")
                                               << BSON("_id" << 3 << "host"
-                                                            << "h3:1")
-                                              << BSON("_id" << 4 << "host"
-                                                            << "h4:1")
-                                              << BSON("_id" << 5 << "host"
-                                                            << "h5:1"))));
+                                                            << "h3:1"))));
     const int myConfigIndex = 2;
     const BSONObj hbRequest = makeHeartbeatRequest(rsConfig, myConfigIndex);
 
@@ -545,10 +510,10 @@ TEST_F(CheckQuorumForInitiate, QuorumCheckFailedDueToInitializedNode) {
         const RemoteCommandRequest& request = noi->getRequest();
         ASSERT_EQUALS("admin", request.dbname);
         ASSERT_BSONOBJ_EQ(hbRequest, request.cmdObj);
-        ASSERT(seenHosts.insert(request.target).second) << "Already saw "
-                                                        << request.target.toString();
-        if (request.target == HostAndPort("h5", 1)) {
-            long long configVersion = 1;
+        ASSERT(seenHosts.insert(request.target).second)
+            << "Already saw " << request.target.toString();
+        if (request.target == HostAndPort("h1", 1)) {
+            long long configVersion = 5;
             getNet()->scheduleResponse(
                 noi,
                 startDate + Milliseconds(10),
@@ -562,130 +527,7 @@ TEST_F(CheckQuorumForInitiate, QuorumCheckFailedDueToInitializedNode) {
     getNet()->runUntil(startDate + Milliseconds(10));
     getNet()->exitNetwork();
     Status status = waitForQuorumCheck();
-    ASSERT_EQUALS(ErrorCodes::NewReplicaSetConfigurationIncompatible, status);
-    ASSERT_REASON_CONTAINS(status, "Our config version of");
-    ASSERT_REASON_CONTAINS(status, "is no larger than the version");
-    ASSERT_NOT_REASON_CONTAINS(status, "h1:1");
-    ASSERT_NOT_REASON_CONTAINS(status, "h2:1");
-    ASSERT_NOT_REASON_CONTAINS(status, "h3:1");
-    ASSERT_NOT_REASON_CONTAINS(status, "h4:1");
-    ASSERT_REASON_CONTAINS(status, "h5:1");
-}
-
-TEST_F(CheckQuorumForInitiate, QuorumCheckFailedDueToInitializedNodeOnlyOneRespondent) {
-    // In this test, "we" are host "h3:1".  Only node "h5" responds before the test completes,
-    // and quorum check fails because "h5" declares that it is already initialized.
-    //
-    // Compare to QuorumCheckFailedDueToInitializedNode, above.
-
-    const ReplSetConfig rsConfig =
-        assertMakeRSConfig(BSON("_id"
-                                << "rs0"
-                                << "version"
-                                << 1
-                                << "protocolVersion"
-                                << 1
-                                << "members"
-                                << BSON_ARRAY(BSON("_id" << 1 << "host"
-                                                         << "h1:1")
-                                              << BSON("_id" << 2 << "host"
-                                                            << "h2:1")
-                                              << BSON("_id" << 3 << "host"
-                                                            << "h3:1")
-                                              << BSON("_id" << 4 << "host"
-                                                            << "h4:1")
-                                              << BSON("_id" << 5 << "host"
-                                                            << "h5:1"))));
-    const int myConfigIndex = 2;
-    const BSONObj hbRequest = makeHeartbeatRequest(rsConfig, myConfigIndex);
-
-    startQuorumCheck(rsConfig, myConfigIndex);
-    const Date_t startDate = getNet()->now();
-    const int numCommandsExpected = rsConfig.getNumMembers() - 1;
-    stdx::unordered_set<HostAndPort> seenHosts;
-    getNet()->enterNetwork();
-    for (int i = 0; i < numCommandsExpected; ++i) {
-        const NetworkInterfaceMock::NetworkOperationIterator noi = getNet()->getNextReadyRequest();
-        const RemoteCommandRequest& request = noi->getRequest();
-        ASSERT_EQUALS("admin", request.dbname);
-        ASSERT_BSONOBJ_EQ(hbRequest, request.cmdObj);
-        ASSERT(seenHosts.insert(request.target).second) << "Already saw "
-                                                        << request.target.toString();
-        if (request.target == HostAndPort("h5", 1)) {
-            long long configVersion = 1;
-            getNet()->scheduleResponse(
-                noi,
-                startDate + Milliseconds(10),
-                makeHeartbeatResponse(rsConfig, Milliseconds(8), configVersion));
-        } else {
-            getNet()->blackHole(noi);
-        }
-    }
-    getNet()->runUntil(startDate + Milliseconds(10));
-    getNet()->exitNetwork();
-    Status status = waitForQuorumCheck();
-    ASSERT_EQUALS(ErrorCodes::NewReplicaSetConfigurationIncompatible, status);
-    ASSERT_REASON_CONTAINS(status, "Our config version of");
-    ASSERT_REASON_CONTAINS(status, "is no larger than the version");
-    ASSERT_NOT_REASON_CONTAINS(status, "h1:1");
-    ASSERT_NOT_REASON_CONTAINS(status, "h2:1");
-    ASSERT_NOT_REASON_CONTAINS(status, "h3:1");
-    ASSERT_NOT_REASON_CONTAINS(status, "h4:1");
-    ASSERT_REASON_CONTAINS(status, "h5:1");
-}
-
-TEST_F(CheckQuorumForReconfig, QuorumCheckVetoedDueToHigherConfigVersion) {
-    // In this test, "we" are host "h3:1".  The request to "h2" does not arrive before the end
-    // of the test, and the request to "h1" comes back indicating a higher config version.
-
-    const ReplSetConfig rsConfig =
-        assertMakeRSConfig(BSON("_id"
-                                << "rs0"
-                                << "version"
-                                << 2
-                                << "protocolVersion"
-                                << 1
-                                << "members"
-                                << BSON_ARRAY(BSON("_id" << 1 << "host"
-                                                         << "h1:1")
-                                              << BSON("_id" << 2 << "host"
-                                                            << "h2:1")
-                                              << BSON("_id" << 3 << "host"
-                                                            << "h3:1"))));
-    const int myConfigIndex = 2;
-    const BSONObj hbRequest = makeHeartbeatRequest(rsConfig, myConfigIndex);
-
-    startQuorumCheck(rsConfig, myConfigIndex);
-    const Date_t startDate = getNet()->now();
-    const int numCommandsExpected = rsConfig.getNumMembers() - 1;
-    stdx::unordered_set<HostAndPort> seenHosts;
-    getNet()->enterNetwork();
-    for (int i = 0; i < numCommandsExpected; ++i) {
-        const NetworkInterfaceMock::NetworkOperationIterator noi = getNet()->getNextReadyRequest();
-        const RemoteCommandRequest& request = noi->getRequest();
-        ASSERT_EQUALS("admin", request.dbname);
-        ASSERT_BSONOBJ_EQ(hbRequest, request.cmdObj);
-        ASSERT(seenHosts.insert(request.target).second) << "Already saw "
-                                                        << request.target.toString();
-        if (request.target == HostAndPort("h1", 1)) {
-            long long configVersion = 5;
-            getNet()->scheduleResponse(
-                noi,
-                startDate + Milliseconds(10),
-                makeHeartbeatResponse(rsConfig, Milliseconds(8), configVersion));
-        } else {
-            getNet()->blackHole(noi);
-        }
-    }
-    getNet()->runUntil(startDate + Milliseconds(10));
-    getNet()->exitNetwork();
-    Status status = waitForQuorumCheck();
-    ASSERT_EQUALS(ErrorCodes::NewReplicaSetConfigurationIncompatible, status);
-    ASSERT_REASON_CONTAINS(status, "Our config version of");
-    ASSERT_REASON_CONTAINS(status, "is no larger than the version");
-    ASSERT_REASON_CONTAINS(status, "h1:1");
-    ASSERT_NOT_REASON_CONTAINS(status, "h2:1");
-    ASSERT_NOT_REASON_CONTAINS(status, "h3:1");
+    ASSERT_OK(status);
 }
 
 TEST_F(CheckQuorumForReconfig, QuorumCheckVetoedDueToIncompatibleSetName) {
@@ -695,11 +537,7 @@ TEST_F(CheckQuorumForReconfig, QuorumCheckVetoedDueToIncompatibleSetName) {
     const ReplSetConfig rsConfig =
         assertMakeRSConfig(BSON("_id"
                                 << "rs0"
-                                << "version"
-                                << 2
-                                << "protocolVersion"
-                                << 1
-                                << "members"
+                                << "version" << 2 << "protocolVersion" << 1 << "members"
                                 << BSON_ARRAY(BSON("_id" << 1 << "host"
                                                          << "h1:1")
                                               << BSON("_id" << 2 << "host"
@@ -719,8 +557,8 @@ TEST_F(CheckQuorumForReconfig, QuorumCheckVetoedDueToIncompatibleSetName) {
         const RemoteCommandRequest& request = noi->getRequest();
         ASSERT_EQUALS("admin", request.dbname);
         ASSERT_BSONOBJ_EQ(hbRequest, request.cmdObj);
-        ASSERT(seenHosts.insert(request.target).second) << "Already saw "
-                                                        << request.target.toString();
+        ASSERT(seenHosts.insert(request.target).second)
+            << "Already saw " << request.target.toString();
         if (request.target == HostAndPort("h2", 1)) {
             getNet()->scheduleResponse(
                 noi,
@@ -731,7 +569,7 @@ TEST_F(CheckQuorumForReconfig, QuorumCheckVetoedDueToIncompatibleSetName) {
                     Milliseconds(8))));
         } else {
             getNet()->scheduleResponse(
-                noi, startDate + Milliseconds(10), {ErrorCodes::NoSuchKey, "No response"});
+                noi, startDate + Milliseconds(10), {ErrorCodes::HostUnreachable, "No response"});
         }
     }
     getNet()->runUntil(startDate + Milliseconds(10));
@@ -753,11 +591,7 @@ TEST_F(CheckQuorumForReconfig, QuorumCheckFailsDueToInsufficientVoters) {
     const ReplSetConfig rsConfig =
         assertMakeRSConfig(BSON("_id"
                                 << "rs0"
-                                << "version"
-                                << 2
-                                << "protocolVersion"
-                                << 1
-                                << "members"
+                                << "version" << 2 << "protocolVersion" << 1 << "members"
                                 << BSON_ARRAY(BSON("_id" << 1 << "host"
                                                          << "h1:1")
                                               << BSON("_id" << 2 << "host"
@@ -766,16 +600,10 @@ TEST_F(CheckQuorumForReconfig, QuorumCheckFailsDueToInsufficientVoters) {
                                                             << "h3:1")
                                               << BSON("_id" << 4 << "host"
                                                             << "h4:1"
-                                                            << "votes"
-                                                            << 0
-                                                            << "priority"
-                                                            << 0)
+                                                            << "votes" << 0 << "priority" << 0)
                                               << BSON("_id" << 5 << "host"
                                                             << "h5:1"
-                                                            << "votes"
-                                                            << 0
-                                                            << "priority"
-                                                            << 0))));
+                                                            << "votes" << 0 << "priority" << 0))));
     const int myConfigIndex = 3;
     const BSONObj hbRequest = makeHeartbeatRequest(rsConfig, myConfigIndex);
 
@@ -789,15 +617,15 @@ TEST_F(CheckQuorumForReconfig, QuorumCheckFailsDueToInsufficientVoters) {
         const RemoteCommandRequest& request = noi->getRequest();
         ASSERT_EQUALS("admin", request.dbname);
         ASSERT_BSONOBJ_EQ(hbRequest, request.cmdObj);
-        ASSERT(seenHosts.insert(request.target).second) << "Already saw "
-                                                        << request.target.toString();
+        ASSERT(seenHosts.insert(request.target).second)
+            << "Already saw " << request.target.toString();
         if (request.target == HostAndPort("h1", 1) || request.target == HostAndPort("h5", 1)) {
             getNet()->scheduleResponse(noi,
                                        startDate + Milliseconds(10),
                                        makeHeartbeatResponse(rsConfig, Milliseconds(8)));
         } else {
             getNet()->scheduleResponse(
-                noi, startDate + Milliseconds(10), {ErrorCodes::NoSuchKey, "No response"});
+                noi, startDate + Milliseconds(10), {ErrorCodes::HostUnreachable, "No response"});
         }
     }
     getNet()->runUntil(startDate + Milliseconds(10));
@@ -819,11 +647,7 @@ TEST_F(CheckQuorumForReconfig, QuorumCheckFailsDueToNoElectableNodeResponding) {
     const ReplSetConfig rsConfig =
         assertMakeRSConfig(BSON("_id"
                                 << "rs0"
-                                << "version"
-                                << 2
-                                << "protocolVersion"
-                                << 1
-                                << "members"
+                                << "version" << 2 << "protocolVersion" << 1 << "members"
                                 << BSON_ARRAY(BSON("_id" << 1 << "host"
                                                          << "h1:1")
                                               << BSON("_id" << 2 << "host"
@@ -832,12 +656,10 @@ TEST_F(CheckQuorumForReconfig, QuorumCheckFailsDueToNoElectableNodeResponding) {
                                                             << "h3:1")
                                               << BSON("_id" << 4 << "host"
                                                             << "h4:1"
-                                                            << "priority"
-                                                            << 0)
+                                                            << "priority" << 0)
                                               << BSON("_id" << 5 << "host"
                                                             << "h5:1"
-                                                            << "priority"
-                                                            << 0))));
+                                                            << "priority" << 0))));
     const int myConfigIndex = 3;
     const BSONObj hbRequest = makeHeartbeatRequest(rsConfig, myConfigIndex);
 
@@ -851,15 +673,15 @@ TEST_F(CheckQuorumForReconfig, QuorumCheckFailsDueToNoElectableNodeResponding) {
         const RemoteCommandRequest& request = noi->getRequest();
         ASSERT_EQUALS("admin", request.dbname);
         ASSERT_BSONOBJ_EQ(hbRequest, request.cmdObj);
-        ASSERT(seenHosts.insert(request.target).second) << "Already saw "
-                                                        << request.target.toString();
+        ASSERT(seenHosts.insert(request.target).second)
+            << "Already saw " << request.target.toString();
         if (request.target == HostAndPort("h5", 1)) {
             getNet()->scheduleResponse(noi,
                                        startDate + Milliseconds(10),
                                        makeHeartbeatResponse(rsConfig, Milliseconds(8)));
         } else {
             getNet()->scheduleResponse(
-                noi, startDate + Milliseconds(10), {ErrorCodes::NoSuchKey, "No response"});
+                noi, startDate + Milliseconds(10), {ErrorCodes::HostUnreachable, "No response"});
         }
     }
     getNet()->runUntil(startDate + Milliseconds(10));
@@ -869,19 +691,15 @@ TEST_F(CheckQuorumForReconfig, QuorumCheckFailsDueToNoElectableNodeResponding) {
     ASSERT_REASON_CONTAINS(status, "no electable nodes responded");
 }
 
-TEST_F(CheckQuorumForReconfig, QuorumCheckSucceedsWithAsSoonAsPossible) {
+TEST_F(CheckQuorumForReconfig, QuorumCheckSucceedsIfMinoritySetTimesOut) {
     // In this test, "we" are host "h4".  Only "h1", "h2" and "h3" can vote.
-    // This test should succeed as soon as h1 and h2 respond, so we block
-    // h3 and h5 from responding or timing out until the test completes.
+    // The quorum check should succeed even if we do not respond to a minority number of heartbeats,
+    // since those heartbeat requests will eventually time out.
 
     const ReplSetConfig rsConfig =
         assertMakeRSConfig(BSON("_id"
                                 << "rs0"
-                                << "version"
-                                << 2
-                                << "protocolVersion"
-                                << 1
-                                << "members"
+                                << "version" << 2 << "protocolVersion" << 1 << "members"
                                 << BSON_ARRAY(BSON("_id" << 1 << "host"
                                                          << "h1:1")
                                               << BSON("_id" << 2 << "host"
@@ -890,16 +708,10 @@ TEST_F(CheckQuorumForReconfig, QuorumCheckSucceedsWithAsSoonAsPossible) {
                                                             << "h3:1")
                                               << BSON("_id" << 4 << "host"
                                                             << "h4:1"
-                                                            << "votes"
-                                                            << 0
-                                                            << "priority"
-                                                            << 0)
+                                                            << "votes" << 0 << "priority" << 0)
                                               << BSON("_id" << 5 << "host"
                                                             << "h5:1"
-                                                            << "votes"
-                                                            << 0
-                                                            << "priority"
-                                                            << 0))));
+                                                            << "votes" << 0 << "priority" << 0))));
     const int myConfigIndex = 3;
     const BSONObj hbRequest = makeHeartbeatRequest(rsConfig, myConfigIndex);
 
@@ -913,8 +725,8 @@ TEST_F(CheckQuorumForReconfig, QuorumCheckSucceedsWithAsSoonAsPossible) {
         const RemoteCommandRequest& request = noi->getRequest();
         ASSERT_EQUALS("admin", request.dbname);
         ASSERT_BSONOBJ_EQ(hbRequest, request.cmdObj);
-        ASSERT(seenHosts.insert(request.target).second) << "Already saw "
-                                                        << request.target.toString();
+        ASSERT(seenHosts.insert(request.target).second)
+            << "Already saw " << request.target.toString();
         if (request.target == HostAndPort("h1", 1) || request.target == HostAndPort("h2", 1)) {
             getNet()->scheduleResponse(noi,
                                        startDate + Milliseconds(10),
@@ -923,7 +735,9 @@ TEST_F(CheckQuorumForReconfig, QuorumCheckSucceedsWithAsSoonAsPossible) {
             getNet()->blackHole(noi);
         }
     }
-    getNet()->runUntil(startDate + Milliseconds(10));
+
+    // Advance the time by more than the heartbeat timeout set in the config.
+    getNet()->runUntil(startDate + rsConfig.getHeartbeatTimeoutPeriodMillis());
     getNet()->exitNetwork();
     ASSERT_OK(waitForQuorumCheck());
 }
@@ -937,11 +751,7 @@ TEST_F(CheckQuorumForReconfig, QuorumCheckProcessesCallbackCanceledResponse) {
     const ReplSetConfig rsConfig =
         assertMakeRSConfig(BSON("_id"
                                 << "rs0"
-                                << "version"
-                                << 2
-                                << "protocolVersion"
-                                << 1
-                                << "members"
+                                << "version" << 2 << "protocolVersion" << 1 << "members"
                                 << BSON_ARRAY(BSON("_id" << 1 << "host"
                                                          << "h1:1")
                                               << BSON("_id" << 2 << "host"
@@ -961,8 +771,8 @@ TEST_F(CheckQuorumForReconfig, QuorumCheckProcessesCallbackCanceledResponse) {
         const RemoteCommandRequest& request = noi->getRequest();
         ASSERT_EQUALS("admin", request.dbname);
         ASSERT_BSONOBJ_EQ(hbRequest, request.cmdObj);
-        ASSERT(seenHosts.insert(request.target).second) << "Already saw "
-                                                        << request.target.toString();
+        ASSERT(seenHosts.insert(request.target).second)
+            << "Already saw " << request.target.toString();
         if (request.target == HostAndPort("h1", 1)) {
             getNet()->scheduleResponse(
                 noi,

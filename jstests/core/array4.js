@@ -1,4 +1,6 @@
-
+/**
+ * Basic test for querying on documents containing arrays.
+ */
 t = db.array4;
 t.drop();
 

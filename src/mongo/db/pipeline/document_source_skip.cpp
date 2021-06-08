@@ -31,13 +31,14 @@
 
 #include "mongo/db/pipeline/document_source_skip.h"
 
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/document_source_limit.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
-#include "mongo/db/pipeline/value.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -45,17 +46,16 @@ using boost::intrusive_ptr;
 
 DocumentSourceSkip::DocumentSourceSkip(const intrusive_ptr<ExpressionContext>& pExpCtx,
                                        long long nToSkip)
-    : DocumentSource(pExpCtx), _nToSkip(nToSkip) {}
+    : DocumentSource(kStageName, pExpCtx), _nToSkip(nToSkip) {}
 
 REGISTER_DOCUMENT_SOURCE(skip,
                          LiteParsedDocumentSourceDefault::parse,
-                         DocumentSourceSkip::createFromBson);
+                         DocumentSourceSkip::createFromBson,
+                         LiteParsedDocumentSource::AllowedWithApiStrict::kAlways);
 
 constexpr StringData DocumentSourceSkip::kStageName;
 
-DocumentSource::GetNextResult DocumentSourceSkip::getNext() {
-    pExpCtx->checkForInterrupt();
-
+DocumentSource::GetNextResult DocumentSourceSkip::doGetNext() {
     while (_nSkippedSoFar < _nToSkip) {
         // For performance reasons, a streaming stage must not keep references to documents across
         // calls to getNext(). Such stages must retrieve a result from their child and then release
@@ -84,6 +84,10 @@ Pipeline::SourceContainer::iterator DocumentSourceSkip::doOptimizeAt(
     Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container) {
     invariant(*itr == this);
 
+    if (std::next(itr) == container->end()) {
+        return container->end();
+    }
+
     auto nextSkip = dynamic_cast<DocumentSourceSkip*>((*std::next(itr)).get());
     if (nextSkip) {
         // '_nToSkip' can potentially overflow causing it to become negative and skip nothing.
@@ -98,18 +102,17 @@ Pipeline::SourceContainer::iterator DocumentSourceSkip::doOptimizeAt(
 
 intrusive_ptr<DocumentSourceSkip> DocumentSourceSkip::create(
     const intrusive_ptr<ExpressionContext>& pExpCtx, long long nToSkip) {
+    uassert(15956, "Argument to $skip cannot be negative", nToSkip >= 0);
     intrusive_ptr<DocumentSourceSkip> skip(new DocumentSourceSkip(pExpCtx, nToSkip));
     return skip;
 }
 
 intrusive_ptr<DocumentSource> DocumentSourceSkip::createFromBson(
     BSONElement elem, const intrusive_ptr<ExpressionContext>& pExpCtx) {
-    uassert(15972,
-            str::stream() << "Argument to $skip must be a number not a " << typeName(elem.type()),
-            elem.isNumber());
-    auto nToSkip = elem.safeNumberLong();
-    uassert(15956, "Argument to $skip cannot be negative", nToSkip >= 0);
-
-    return DocumentSourceSkip::create(pExpCtx, nToSkip);
+    const auto nToSkip = elem.parseIntegerElementToNonNegativeLong();
+    uassert(5107200,
+            str::stream() << "invalid argument to $skip stage: " << nToSkip.getStatus().reason(),
+            nToSkip.isOK());
+    return DocumentSourceSkip::create(pExpCtx, nToSkip.getValue());
 }
-}
+}  // namespace mongo

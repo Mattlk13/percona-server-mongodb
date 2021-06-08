@@ -31,7 +31,16 @@ kms_response_destroy (kms_response_t *response)
 }
 
 const char *
-kms_response_get_body (kms_response_t *response)
+kms_response_get_body (kms_response_t *response, size_t *len)
 {
+   if (len) {
+      *len = response->body->len;
+   }
    return response->body->str;
+}
+
+int
+kms_response_get_status (kms_response_t *response)
+{
+   return response->status;
 }

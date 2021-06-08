@@ -39,9 +39,11 @@ namespace mongo {
  */
 class DocumentSourceTestOptimizations : public DocumentSource {
 public:
-    DocumentSourceTestOptimizations() : DocumentSource(new ExpressionContextForTest()) {}
+    static constexpr StringData kStageName = "$_internalTestOptimizations"_sd;
+    DocumentSourceTestOptimizations(const boost::intrusive_ptr<ExpressionContext>& expCtx)
+        : DocumentSource(DocumentSourceTestOptimizations::kStageName, expCtx) {}
     virtual ~DocumentSourceTestOptimizations() = default;
-    virtual GetNextResult getNext() override {
+    virtual GetNextResult doGetNext() override {
         MONGO_UNREACHABLE;
     }
     virtual StageConstraints constraints(Pipeline::SplitState) const override {
@@ -53,7 +55,8 @@ public:
                                 DiskUseRequirement::kNoDiskUse,
                                 FacetRequirement::kAllowed,
                                 TransactionRequirement::kNotAllowed,
-                                LookupRequirement::kAllowed};
+                                LookupRequirement::kAllowed,
+                                UnionRequirement::kAllowed};
     }
 
     virtual boost::optional<DistributedPlanLogic> distributedPlanLogic() override {

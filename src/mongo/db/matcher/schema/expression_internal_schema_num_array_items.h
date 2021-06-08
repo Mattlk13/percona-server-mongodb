@@ -29,6 +29,8 @@
 
 #pragma once
 
+#include <boost/optional.hpp>
+
 #include "mongo/base/string_data.h"
 #include "mongo/db/matcher/expression_array.h"
 
@@ -42,7 +44,8 @@ public:
     InternalSchemaNumArrayItemsMatchExpression(MatchType type,
                                                StringData path,
                                                long long numItems,
-                                               StringData name);
+                                               StringData name,
+                                               clonable_ptr<ErrorAnnotation> annotation = nullptr);
 
     virtual ~InternalSchemaNumArrayItemsMatchExpression() {}
 
@@ -60,7 +63,7 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    std::vector<MatchExpression*>* getChildVector() final {
+    std::vector<std::unique_ptr<MatchExpression>>* getChildVector() final {
         return nullptr;
     }
 

@@ -31,14 +31,14 @@
 
 #include "mongo/db/pipeline/accumulator.h"
 
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/accumulation_statement.h"
-#include "mongo/db/pipeline/value.h"
 
 namespace mongo {
 
 using boost::intrusive_ptr;
 
-REGISTER_ACCUMULATOR(last, AccumulatorLast::create);
+REGISTER_ACCUMULATOR(last, genericParseSingleExpressionAccumulator<AccumulatorLast>);
 
 const char* AccumulatorLast::getOpName() const {
     return "$last";
@@ -54,8 +54,7 @@ Value AccumulatorLast::getValue(bool toBeMerged) {
     return _last;
 }
 
-AccumulatorLast::AccumulatorLast(const boost::intrusive_ptr<ExpressionContext>& expCtx)
-    : Accumulator(expCtx) {
+AccumulatorLast::AccumulatorLast(ExpressionContext* const expCtx) : AccumulatorState(expCtx) {
     _memUsageBytes = sizeof(*this);
 }
 
@@ -64,8 +63,7 @@ void AccumulatorLast::reset() {
     _last = Value();
 }
 
-intrusive_ptr<Accumulator> AccumulatorLast::create(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+intrusive_ptr<AccumulatorState> AccumulatorLast::create(ExpressionContext* const expCtx) {
     return new AccumulatorLast(expCtx);
 }
-}
+}  // namespace mongo

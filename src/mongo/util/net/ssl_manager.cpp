@@ -28,7 +28,7 @@
  */
 
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 #include "mongo/platform/basic.h"
 
@@ -40,13 +40,17 @@
 
 #include "mongo/base/init.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/client/internal_auth.h"
 #include "mongo/config.h"
+#include "mongo/db/auth/sasl_command_constants.h"
 #include "mongo/db/commands/server_status.h"
+#include "mongo/logv2/log.h"
 #include "mongo/platform/overflow_arithmetic.h"
 #include "mongo/transport/session.h"
+#include "mongo/transport/transport_layer_asio.h"
+#include "mongo/util/ctype.h"
 #include "mongo/util/hex.h"
 #include "mongo/util/icu.h"
-#include "mongo/util/log.h"
 #include "mongo/util/net/ssl_options.h"
 #include "mongo/util/net/ssl_parameters_gen.h"
 #include "mongo/util/str.h"
@@ -55,23 +59,9 @@
 
 namespace mongo {
 
-SSLManagerInterface* theSSLManager = nullptr;
+SSLManagerCoordinator* theSSLManagerCoordinator;
 
 namespace {
-
-// Some of these duplicate the std::isalpha/std::isxdigit because we don't want them to be
-// affected by the current locale.
-inline bool isAlpha(char ch) {
-    return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z');
-}
-
-inline bool isDigit(char ch) {
-    return (ch >= '0' && ch <= '9');
-}
-
-inline bool isHex(char ch) {
-    return isDigit(ch) || (ch >= 'A' && ch <= 'F') || (ch >= 'a' && ch <= 'f');
-}
 
 // This function returns true if the character is supposed to be escaped according to the rules
 // in RFC4514. The exception to the RFC the space character ' ' and the '#', because we've not
@@ -158,22 +148,20 @@ std::string RFC4514Parser::extractAttributeName() {
     StringBuilder sb;
 
     auto ch = _cur();
-    stdx::function<bool(char ch)> characterCheck;
+    std::function<bool(char ch)> characterCheck;
     // If the first character is a digit, then this is an OID and can only contain
     // numbers and '.'
-    if (isDigit(ch)) {
-        characterCheck = [](char ch) { return (isDigit(ch) || ch == '.'); };
+    if (ctype::isDigit(ch)) {
+        characterCheck = [](char ch) { return ctype::isDigit(ch) || ch == '.'; };
         // If the first character is an alpha, then this is a short name and can only
         // contain alpha/digit/hyphen characters.
-    } else if (isAlpha(ch)) {
-        characterCheck = [](char ch) { return (isAlpha(ch) || isDigit(ch) || ch == '-'); };
+    } else if (ctype::isAlpha(ch)) {
+        characterCheck = [](char ch) { return ctype::isAlnum(ch) || ch == '-'; };
         // Otherwise this is an invalid attribute name
     } else {
         uasserted(ErrorCodes::BadValue,
                   str::stream() << "DN attribute names must begin with either a digit or an alpha"
-                                << " not \'"
-                                << ch
-                                << "\'");
+                                << " not \'" << ch << "\'");
     }
 
     for (; ch != '=' && !done(); ch = _advance()) {
@@ -213,15 +201,14 @@ std::pair<std::string, RFC4514Parser::ValueTerminator> RFC4514Parser::extractVal
             if (isEscaped(ch)) {
                 sb << ch;
                 trailingSpaces = 0;
-            } else if (isHex(ch)) {
+            } else if (ctype::isXdigit(ch)) {
                 const std::array<char, 2> hexValStr = {ch, _advance()};
 
                 uassert(ErrorCodes::BadValue,
                         str::stream() << "Escaped hex value contains invalid character \'"
-                                      << hexValStr[1]
-                                      << "\'",
-                        isHex(hexValStr[1]));
-                const char hexVal = uassertStatusOK(fromHex(StringData(hexValStr.data(), 2)));
+                                      << hexValStr[1] << "\'",
+                        ctype::isXdigit(hexValStr[1]));
+                const char hexVal = hexblob::decodePair(StringData(hexValStr.data(), 2));
                 sb << hexVal;
                 if (hexVal != ' ') {
                     trailingSpaces = 0;
@@ -247,8 +234,8 @@ std::pair<std::string, RFC4514Parser::ValueTerminator> RFC4514Parser::extractVal
             }
         } else if (isEscaped(ch)) {
             uasserted(ErrorCodes::BadValue,
-                      str::stream() << "Found unescaped character that should be escaped: \'" << ch
-                                    << "\'");
+                      str::stream()
+                          << "Found unescaped character that should be escaped: \'" << ch << "\'");
         } else {
             if (ch != ' ') {
                 trailingSpaces = 0;
@@ -338,6 +325,80 @@ boost::optional<std::vector<SSLX509Name::Entry>> getClusterMemberDNOverrideParam
     return value->canonicalized;
 }
 }  // namespace
+
+SSLManagerCoordinator* SSLManagerCoordinator::get() {
+    return theSSLManagerCoordinator;
+}
+
+std::shared_ptr<SSLManagerInterface> SSLManagerCoordinator::createTransientSSLManager(
+    const TransientSSLParams& transientSSLParams) const {
+    return SSLManagerInterface::create(
+        sslGlobalParams, transientSSLParams, false /* isSSLServer */);
+}
+
+std::shared_ptr<SSLManagerInterface> SSLManagerCoordinator::getSSLManager() {
+    return *_manager;
+}
+
+void logCert(const CertInformationToLog& cert, StringData certType, const int logNum) {
+    auto attrs = cert.getDynamicAttributes();
+    attrs.add("type", certType);
+    LOGV2(logNum, "Certificate information", attrs);
+}
+
+void logCRL(const CRLInformationToLog& crl, const int logNum) {
+    LOGV2(logNum,
+          "CRL information",
+          "thumbprint"_attr = hexblob::encode(crl.thumbprint.data(), crl.thumbprint.size()),
+          "notValidBefore"_attr = crl.validityNotBefore.toString(),
+          "notValidAfter"_attr = crl.validityNotAfter.toString());
+}
+
+void logSSLInfo(const SSLInformationToLog& info,
+                const int logNumPEM,
+                const int logNumCluster,
+                const int logNumCrl) {
+    if (!(sslGlobalParams.sslPEMKeyFile.empty())) {
+        logCert(info.server, "Server", logNumPEM);
+    }
+    if (info.cluster.has_value()) {
+        logCert(info.cluster.get(), "Cluster", logNumCluster);
+    }
+    if (info.crl.has_value()) {
+        logCRL(info.crl.get(), logNumCrl);
+    }
+}
+
+void SSLManagerCoordinator::rotate() {
+    stdx::lock_guard lockGuard(_lock);
+
+    std::shared_ptr<SSLManagerInterface> manager =
+        SSLManagerInterface::create(sslGlobalParams, isSSLServer);
+
+    int clusterAuthMode = serverGlobalParams.clusterAuthMode.load();
+    if (clusterAuthMode == ServerGlobalParams::ClusterAuthMode_x509 ||
+        clusterAuthMode == ServerGlobalParams::ClusterAuthMode_sendX509) {
+        auth::setInternalUserAuthParams(auth::createInternalX509AuthDocument(
+            StringData(manager->getSSLConfiguration().clientSubjectName.toString())));
+    }
+
+    auto tl = getGlobalServiceContext()->getTransportLayer();
+    invariant(tl != nullptr);
+    uassertStatusOK(tl->rotateCertificates(manager, false));
+
+    std::shared_ptr<SSLManagerInterface> originalManager = *_manager;
+    _manager = manager;
+
+    LOGV2(4913400, "Successfully rotated X509 certificates.");
+    logSSLInfo(_manager->get()->getSSLInformationToLog());
+
+    originalManager->stopJobs();
+}
+
+SSLManagerCoordinator::SSLManagerCoordinator()
+    : _manager(SSLManagerInterface::create(sslGlobalParams, isSSLServer)) {
+    logSSLInfo(_manager->get()->getSSLInformationToLog());
+}
 
 void ClusterMemberDNOverride::append(OperationContext* opCtx,
                                      BSONObjBuilder& b,
@@ -551,20 +612,30 @@ TLSVersionCounts& TLSVersionCounts::get(ServiceContext* serviceContext) {
     return getTLSVersionCounts(serviceContext);
 }
 
-MONGO_INITIALIZER_WITH_PREREQUISITES(SSLManagerLogger, ("SSLManager", "GlobalLogManager"))
+MONGO_INITIALIZER_WITH_PREREQUISITES(SSLManagerLogger, ("SSLManager"))
 (InitializerContext*) {
     if (!isSSLServer || (sslGlobalParams.sslMode.load() != SSLParams::SSLMode_disabled)) {
-        const auto& config = theSSLManager->getSSLConfiguration();
+        const auto& config = SSLManagerCoordinator::get()->getSSLManager()->getSSLConfiguration();
         if (!config.clientSubjectName.empty()) {
-            LOG(1) << "Client Certificate Name: " << config.clientSubjectName;
+            LOGV2_DEBUG(23214,
+                        1,
+                        "Client Certificate Name: {name}",
+                        "Client certificate name",
+                        "name"_attr = config.clientSubjectName);
         }
         if (!config.serverSubjectName().empty()) {
-            LOG(1) << "Server Certificate Name: " << config.serverSubjectName();
-            LOG(1) << "Server Certificate Expiration: " << config.serverCertificateExpirationDate;
+            LOGV2_DEBUG(23215,
+                        1,
+                        "Server Certificate Name: {name}",
+                        "Server certificate name",
+                        "name"_attr = config.serverSubjectName());
+            LOGV2_DEBUG(23216,
+                        1,
+                        "Server Certificate Expiration: {expiration}",
+                        "Server certificate expiration",
+                        "expiration"_attr = config.serverCertificateExpirationDate);
         }
     }
-
-    return Status::OK();
 }
 
 Status SSLX509Name::normalizeStrings() {
@@ -597,8 +668,13 @@ Status SSLX509Name::normalizeStrings() {
                     break;
                 }
                 default:
-                    LOG(1) << "Certificate subject name contains unknown string type: "
-                           << entry.type << " (string value is \"" << entry.value << "\")";
+                    LOGV2_DEBUG(23217,
+                                1,
+                                "Certificate subject name contains unknown string type: "
+                                "{entryType} (string value is \"{entryValue}\")",
+                                "Certificate subject name contains unknown string type",
+                                "entryType"_attr = entry.type,
+                                "entryValue"_attr = entry.value);
                     break;
             }
         }
@@ -680,13 +756,19 @@ bool SSLConfiguration::isClusterMember(SSLX509Name subject) const {
 bool SSLConfiguration::isClusterMember(StringData subjectName) const {
     auto swClient = parseDN(subjectName);
     if (!swClient.isOK()) {
-        warning() << "Unable to parse client subject name: " << swClient.getStatus();
+        LOGV2_WARNING(23219,
+                      "Unable to parse client subject name: {error}",
+                      "Unable to parse client subject name",
+                      "error"_attr = swClient.getStatus());
         return false;
     }
     auto& client = swClient.getValue();
     auto status = client.normalizeStrings();
     if (!status.isOK()) {
-        warning() << "Unable to normalize client subject name: " << status;
+        LOGV2_WARNING(23220,
+                      "Unable to normalize client subject name: {error}",
+                      "Unable to normalize client subject name",
+                      "error"_attr = status);
         return false;
     }
 
@@ -695,12 +777,10 @@ bool SSLConfiguration::isClusterMember(StringData subjectName) const {
     return !canonicalClient.empty() && (canonicalClient == _canonicalServerSubjectName);
 }
 
-BSONObj SSLConfiguration::getServerStatusBSON() const {
-    BSONObjBuilder security;
-    security.append("SSLServerSubjectName", _serverSubjectName.toString());
-    security.appendBool("SSLServerHasCertificateAuthority", hasCA);
-    security.appendDate("SSLServerCertificateExpirationDate", serverCertificateExpirationDate);
-    return security.obj();
+void SSLConfiguration::getServerStatusBSON(BSONObjBuilder* security) const {
+    security->append("SSLServerSubjectName", _serverSubjectName.toString());
+    security->appendBool("SSLServerHasCertificateAuthority", hasCA);
+    security->appendDate("SSLServerCertificateExpirationDate", serverCertificateExpirationDate);
 }
 
 SSLManagerInterface::~SSLManagerInterface() {}
@@ -718,6 +798,9 @@ enum class DERType : char {
     // Primitive, not supported by the parser
     // Only exists when BER indefinite form is used which is not valid DER.
     EndOfContent = 0,
+
+    // Primitive
+    INTEGER = 2,
 
     // Primitive
     UTF8String = 12,
@@ -772,6 +855,16 @@ public:
     std::string readUtf8String() {
         invariant(_type == DERType::UTF8String);
         return std::string(_data, _length);
+    }
+
+    /**
+     * Get a vector representation for the value of this DER INTEGER
+     */
+    DERInteger readInt() {
+        invariant(_type == DERType::INTEGER);
+        DERInteger out(_length);
+        std::copy(_data, _data + _length, out.begin());
+        return out;
     }
 
     /**
@@ -832,12 +925,29 @@ StatusWith<std::string> readDERString(ConstDataRangeCursor& cdc) {
 
     if (derString.getType() != DERType::UTF8String) {
         return Status(ErrorCodes::InvalidSSLConfiguration,
-                      str::stream() << "Unexpected DER Tag, Got "
-                                    << static_cast<char>(derString.getType())
-                                    << ", Expected UTF8String");
+                      str::stream()
+                          << "Unexpected DER Tag, Got " << static_cast<char>(derString.getType())
+                          << ", Expected UTF8String");
     }
 
     return derString.readUtf8String();
+}
+
+StatusWith<DERInteger> readDERInt(ConstDataRangeCursor& cdc) {
+    auto swInt = cdc.readAndAdvanceNoThrow<DERToken>();
+    if (!swInt.isOK()) {
+        return swInt.getStatus();
+    }
+
+    auto derInt = swInt.getValue();
+
+    if (derInt.getType() != DERType::INTEGER) {
+        return Status(ErrorCodes::InvalidSSLConfiguration,
+                      str::stream() << "Unexpected DER Tag, Got "
+                                    << static_cast<char>(derInt.getType()) << ", Expected INTEGER");
+    }
+
+    return derInt.readInt();
 }
 
 
@@ -870,6 +980,11 @@ StatusWith<DERToken> DERToken::parse(ConstDataRange cdr, size_t* outLength) {
     // Validate the 6th bit is correct, and it is a known type
     switch (static_cast<DERType>(tag)) {
         case DERType::UTF8String:
+            if (!primitive) {
+                return Status(ErrorCodes::InvalidSSLConfiguration, "Unknown DER tag");
+            }
+            break;
+        case DERType::INTEGER:
             if (!primitive) {
                 return Status(ErrorCodes::InvalidSSLConfiguration, "Unknown DER tag");
             }
@@ -941,8 +1056,7 @@ StatusWith<DERToken> DERToken::parse(ConstDataRange cdr, size_t* outLength) {
     const uint64_t tagAndLengthByteCount = kTagLength + encodedLengthBytesCount;
 
     // This may overflow since derLength is from user data so check our arithmetic carefully.
-    if (mongoUnsignedAddOverflow64(tagAndLengthByteCount, derLength, outLength) ||
-        *outLength > cdr.length()) {
+    if (overflow::add(tagAndLengthByteCount, derLength, outLength) || *outLength > cdr.length()) {
         return Status(ErrorCodes::InvalidSSLConfiguration, "Invalid DER length");
     }
 
@@ -970,9 +1084,9 @@ StatusWith<stdx::unordered_set<RoleName>> parsePeerRoles(ConstDataRange cdrExten
 
     if (swSet.getValue().getType() != DERType::SET) {
         return Status(ErrorCodes::InvalidSSLConfiguration,
-                      str::stream() << "Unexpected DER Tag, Got "
-                                    << static_cast<char>(swSet.getValue().getType())
-                                    << ", Expected SET");
+                      str::stream()
+                          << "Unexpected DER Tag, Got "
+                          << static_cast<char>(swSet.getValue().getType()) << ", Expected SET");
     }
 
     ConstDataRangeCursor cdcSet(swSet.getValue().getSetRange());
@@ -1016,6 +1130,39 @@ StatusWith<stdx::unordered_set<RoleName>> parsePeerRoles(ConstDataRange cdrExten
     return roles;
 }
 
+StatusWith<std::vector<DERInteger>> parseTLSFeature(ConstDataRange cdrExtension) {
+    std::vector<DERInteger> features;
+    ConstDataRangeCursor cdcExtension(cdrExtension);
+
+    /**
+     * FEATURES ::= SEQUENCE OF INTEGER
+     */
+    auto swSeq = cdcExtension.readAndAdvanceNoThrow<DERToken>();
+    if (!swSeq.isOK()) {
+        return swSeq.getStatus();
+    }
+
+    if (swSeq.getValue().getType() != DERType::SEQUENCE) {
+        return Status(ErrorCodes::InvalidSSLConfiguration,
+                      str::stream() << "Unexpected DER Tag, Got "
+                                    << static_cast<char>(swSeq.getValue().getType())
+                                    << ", Expected SEQUENCE");
+    }
+
+    ConstDataRangeCursor cdcSeq(swSeq.getValue().getSequenceRange());
+
+    while (!cdcSeq.empty()) {
+        auto swDERInt = readDERInt(cdcSeq);
+        if (!swDERInt.isOK()) {
+            return swDERInt.getStatus();
+        }
+
+        features.emplace_back(swDERInt.getValue());
+    }
+
+    return std::move(features);
+}
+
 std::string removeFQDNRoot(std::string name) {
     if (name.back() == '.') {
         name.pop_back();
@@ -1049,7 +1196,7 @@ std::string escapeRfc2253(StringData str) {
         while (pos < str.size()) {
             if (static_cast<signed char>(str[pos]) < 0) {
                 ret += '\\';
-                ret += integerToHex(str[pos]);
+                ret += unsignedHex(str[pos]);
             } else {
                 if (std::find(rfc2253EscapeChars.cbegin(), rfc2253EscapeChars.cend(), str[pos]) !=
                     rfc2253EscapeChars.cend()) {
@@ -1070,37 +1217,6 @@ std::string escapeRfc2253(StringData str) {
 
     return ret;
 }
-
-namespace {
-/**
- * Status section of which tls versions connected to MongoDB and completed an SSL handshake.
- * Note: Clients are only not counted if they try to connect to the server with a unsupported TLS
- * version. They are still counted if the server rejects them for certificate issues in
- * parseAndValidatePeerCertificate.
- */
-class TLSVersionSatus : public ServerStatusSection {
-public:
-    TLSVersionSatus() : ServerStatusSection("transportSecurity") {}
-
-    bool includeByDefault() const override {
-        return true;
-    }
-
-    BSONObj generateSection(OperationContext* opCtx,
-                            const BSONElement& configElement) const override {
-        auto& counts = TLSVersionCounts::get(opCtx->getServiceContext());
-
-        BSONObjBuilder builder;
-        builder.append("1.0", counts.tls10.load());
-        builder.append("1.1", counts.tls11.load());
-        builder.append("1.2", counts.tls12.load());
-        builder.append("1.3", counts.tls13.load());
-        builder.append("unknown", counts.tlsUnknown.load());
-        return builder.obj();
-    }
-} tlsVersionStatus;
-
-}  // namespace
 
 void recordTLSVersion(TLSVersion version, const HostAndPort& hostForLogging) {
     StringData versionString;
@@ -1147,13 +1263,12 @@ void recordTLSVersion(TLSVersion version, const HostAndPort& hostForLogging) {
     }
 
     if (!versionString.empty()) {
-        log() << "Accepted connection with TLS Version " << versionString << " from connection "
-              << hostForLogging;
+        LOGV2(23218,
+              "Accepted connection with TLS Version {tlsVersion} from connection {remoteHost}",
+              "Accepted connection with TLS",
+              "tlsVersion"_attr = versionString,
+              "remoteHost"_attr = hostForLogging);
     }
-}
-
-SSLManagerInterface* getSSLManager() {
-    return theSSLManager;
 }
 
 // TODO SERVER-11601 Use NFC Unicode canonicalization
@@ -1173,6 +1288,21 @@ bool hostNameMatchForX509Certificates(std::string nameToMatch, std::string certH
     } else {
         return !str::caseInsensitiveCompare(nameToMatch.c_str(), certHostName.c_str());
     }
+}
+
+void tlsEmitWarningExpiringClientCertificate(const SSLX509Name& peer) {
+    LOGV2_WARNING(23221,
+                  "Peer certificate '{peerSubjectName}' expires soon",
+                  "Peer certificate expires soon",
+                  "peerSubjectName"_attr = peer);
+}
+
+void tlsEmitWarningExpiringClientCertificate(const SSLX509Name& peer, Days days) {
+    LOGV2_WARNING(23222,
+                  "Peer certificate '{peerSubjectName}' expires in {days}",
+                  "Peer certificate expiration information",
+                  "peerSubjectName"_attr = peer,
+                  "days"_attr = days);
 }
 
 }  // namespace mongo

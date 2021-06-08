@@ -5,29 +5,28 @@
  */
 
 (function() {
-    "use strict";
+"use strict";
 
-    let rst = new ReplSetTest({nodes: 1});
-    rst.startSet();
-    rst.initiate();
+let dbName = 'create_collection_not_blocked_by_txn';
+let mydb = db.getSiblingDB(dbName);
 
-    let db = rst.getPrimary().getDB("test");
+mydb.a.drop({writeConcern: {w: "majority"}});
+mydb.b.drop({writeConcern: {w: "majority"}});
+mydb.c.drop({writeConcern: {w: "majority"}});
 
-    assert.commandWorked(db.runCommand({insert: "a", documents: [{x: 1}]}));
+assert.commandWorked(mydb.runCommand({insert: "a", documents: [{x: 1}]}));
 
-    const session = db.getMongo().startSession();
-    const sessionDb = session.getDatabase("test");
+const session = mydb.getMongo().startSession();
+const sessionDb = session.getDatabase(dbName);
 
-    session.startTransaction();
-    // This holds a database IX lock and a collection IX lock on "a".
-    sessionDb.a.insert({y: 1});
+session.startTransaction();
+// This holds a database IX lock and a collection IX lock on "a".
+sessionDb.a.insert({y: 1});
 
-    // This only requires database IX lock.
-    assert.commandWorked(db.createCollection("b"));
-    // Implicit creation.
-    assert.commandWorked(db.runCommand({insert: "c", documents: [{x: 2}]}));
+// This only requires database IX lock.
+assert.commandWorked(mydb.createCollection("b"));
+// Implicit creation.
+assert.commandWorked(mydb.runCommand({insert: "c", documents: [{x: 2}]}));
 
-    session.commitTransaction();
-
-    rst.stopSet();
+assert.commandWorked(session.commitTransaction_forTesting());
 })();

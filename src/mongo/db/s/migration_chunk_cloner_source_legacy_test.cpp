@@ -30,14 +30,18 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/client/remote_command_targeter_mock.h"
+#include "mongo/db/catalog/create_collection.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/dbdirectclient.h"
+#include "mongo/db/logical_session_id_helpers.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/migration_chunk_cloner_source_legacy.h"
+#include "mongo/db/s/operation_sharding_state.h"
+#include "mongo/db/s/shard_server_test_fixture.h"
 #include "mongo/s/catalog/sharding_catalog_client_mock.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/shard_server_test_fixture.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/clock_source_mock.h"
 
@@ -48,7 +52,8 @@ using executor::RemoteCommandRequest;
 using unittest::assertGet;
 
 const NamespaceString kNss("TestDB", "TestColl");
-const BSONObj kShardKeyPattern{BSON("X" << 1)};
+const std::string kShardKey = "X";
+const BSONObj kShardKeyPattern{BSON(kShardKey << 1)};
 const ConnectionString kConfigConnStr =
     ConnectionString::forReplicaSet("Donor",
                                     {HostAndPort("DonorHost1:1234"),
@@ -94,13 +99,15 @@ protected:
                 ->setFindHostReturnValue(kRecipientConnStr.getServers()[0]);
         }
 
-        auto clockSource = stdx::make_unique<ClockSourceMock>();
+        auto clockSource = std::make_unique<ClockSourceMock>();
 
         // Timestamps of "0 seconds" are not allowed, so we must advance our clock mock to the first
         // real second.
         clockSource->advance(Seconds(1));
 
         operationContext()->getServiceContext()->setFastClockSource(std::move(clockSource));
+
+        _lsid = makeLogicalSessionId(operationContext());
     }
 
     void tearDown() override {
@@ -133,8 +140,51 @@ protected:
      * the specified initial documents.
      */
     void createShardedCollection(const std::vector<BSONObj>& initialDocs) {
-        ASSERT(_client->createCollection(kNss.ns()));
-        _client->createIndex(kNss.ns(), kShardKeyPattern);
+        {
+            OperationShardingState::ScopedAllowImplicitCollectionCreate_UNSAFE
+                unsafeCreateCollection(operationContext());
+            uassertStatusOK(createCollection(
+                operationContext(), kNss.db().toString(), BSON("create" << kNss.coll())));
+        }
+
+        const auto uuid = [&] {
+            AutoGetCollection autoColl(operationContext(), kNss, MODE_IX);
+            return autoColl.getCollection()->uuid();
+        }();
+
+        [&] {
+            const OID epoch = OID::gen();
+
+            auto rt = RoutingTableHistory::makeNew(
+                kNss,
+                uuid,
+                kShardKeyPattern,
+                nullptr,
+                false,
+                epoch,
+                boost::none /* timestamp */,
+                boost::none /* timeseriesFields */,
+                boost::none,
+                true,
+                {ChunkType{kNss,
+                           ChunkRange{BSON(kShardKey << MINKEY), BSON(kShardKey << MAXKEY)},
+                           ChunkVersion(1, 0, epoch, boost::none /* timestamp */),
+                           ShardId("dummyShardId")}});
+
+            AutoGetDb autoDb(operationContext(), kNss.db(), MODE_IX);
+            Lock::CollectionLock collLock(operationContext(), kNss, MODE_IX);
+            CollectionShardingRuntime::get(operationContext(), kNss)
+                ->setFilteringMetadata(
+                    operationContext(),
+                    CollectionMetadata(
+                        ChunkManager(ShardId("dummyShardId"),
+                                     DatabaseVersion(UUID::gen()),
+                                     makeStandaloneRoutingTableHistory(std::move(rt)),
+                                     boost::none),
+                        ShardId("dummyShardId")));
+        }();
+
+        client()->createIndex(kNss.ns(), kShardKeyPattern);
         insertDocsInShardedCollection(initialDocs);
     }
 
@@ -147,14 +197,15 @@ protected:
         MoveChunkRequest::appendAsCommand(
             &cmdBuilder,
             kNss,
-            ChunkVersion(1, 0, OID::gen()),
+            ChunkVersion(1, 0, OID::gen(), boost::none /* timestamp */),
             kConfigConnStr,
             kDonorConnStr.getSetName(),
             kRecipientConnStr.getSetName(),
             chunkRange,
             1024 * 1024,
             MigrationSecondaryThrottleOptions::create(MigrationSecondaryThrottleOptions::kDefault),
-            false);
+            false,
+            MoveChunkRequest::ForceJumbo::kDoNotForce);
 
         return assertGet(MoveChunkRequest::createFromCommand(kNss, cmdBuilder.obj()));
     }
@@ -166,12 +217,15 @@ protected:
         return BSON("_id" << value << "X" << value);
     }
 
+protected:
+    LogicalSessionId _lsid;
+    TxnNumber _txnNumber{0};
+
 private:
-    std::unique_ptr<ShardingCatalogClient> makeShardingCatalogClient(
-        std::unique_ptr<DistLockManager> distLockManager) override {
+    std::unique_ptr<ShardingCatalogClient> makeShardingCatalogClient() override {
         class StaticCatalogClient final : public ShardingCatalogClientMock {
         public:
-            StaticCatalogClient() : ShardingCatalogClientMock(nullptr) {}
+            StaticCatalogClient() = default;
 
             StatusWith<repl::OpTimeWith<std::vector<ShardType>>> getAllShards(
                 OperationContext* opCtx, repl::ReadConcernLevel readConcern) override {
@@ -188,7 +242,7 @@ private:
             }
         };
 
-        return stdx::make_unique<StaticCatalogClient>();
+        return std::make_unique<StaticCatalogClient>();
     }
 
     boost::optional<DBDirectClient> _client;
@@ -213,7 +267,7 @@ TEST_F(MigrationChunkClonerSourceLegacyTest, CorrectDocumentsFetched) {
             onCommand([&](const RemoteCommandRequest& request) { return BSON("ok" << true); });
         });
 
-        ASSERT_OK(cloner.startClone(operationContext()));
+        ASSERT_OK(cloner.startClone(operationContext(), UUID::gen(), _lsid, _txnNumber));
         futureStartClone.default_timed_get();
     }
 
@@ -311,12 +365,17 @@ TEST_F(MigrationChunkClonerSourceLegacyTest, CollectionNotFound) {
         kDonorConnStr,
         kRecipientConnStr.getServers()[0]);
 
-    ASSERT_NOT_OK(cloner.startClone(operationContext()));
+    ASSERT_NOT_OK(cloner.startClone(operationContext(), UUID::gen(), _lsid, _txnNumber));
     cloner.cancelClone(operationContext());
 }
 
 TEST_F(MigrationChunkClonerSourceLegacyTest, ShardKeyIndexNotFound) {
-    ASSERT(client()->createCollection(kNss.ns()));
+    {
+        OperationShardingState::ScopedAllowImplicitCollectionCreate_UNSAFE unsafeCreateCollection(
+            operationContext());
+        uassertStatusOK(createCollection(
+            operationContext(), kNss.db().toString(), BSON("create" << kNss.coll())));
+    }
 
     MigrationChunkClonerSourceLegacy cloner(
         createMoveChunkRequest(ChunkRange(BSON("X" << 100), BSON("X" << 200))),
@@ -324,7 +383,7 @@ TEST_F(MigrationChunkClonerSourceLegacyTest, ShardKeyIndexNotFound) {
         kDonorConnStr,
         kRecipientConnStr.getServers()[0]);
 
-    ASSERT_NOT_OK(cloner.startClone(operationContext()));
+    ASSERT_NOT_OK(cloner.startClone(operationContext(), UUID::gen(), _lsid, _txnNumber));
     cloner.cancelClone(operationContext());
 }
 
@@ -350,7 +409,8 @@ TEST_F(MigrationChunkClonerSourceLegacyTest, FailedToEngageRecipientShard) {
             });
         });
 
-        auto startCloneStatus = cloner.startClone(operationContext());
+        auto startCloneStatus =
+            cloner.startClone(operationContext(), UUID::gen(), _lsid, _txnNumber);
         ASSERT_EQ(ErrorCodes::NetworkTimeout, startCloneStatus.code());
         futureStartClone.default_timed_get();
     }

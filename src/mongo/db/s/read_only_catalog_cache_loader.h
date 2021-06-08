@@ -40,21 +40,20 @@ namespace mongo {
  */
 class ReadOnlyCatalogCacheLoader final : public CatalogCacheLoader {
 public:
+    ReadOnlyCatalogCacheLoader() = default;
+    ~ReadOnlyCatalogCacheLoader();
+
     void initializeReplicaSetRole(bool isPrimary) override {}
     void onStepDown() override {}
     void onStepUp() override {}
+    void shutDown() override;
     void notifyOfCollectionVersionUpdate(const NamespaceString& nss) override {}
     void waitForCollectionFlush(OperationContext* opCtx, const NamespaceString& nss) override;
     void waitForDatabaseFlush(OperationContext* opCtx, StringData dbName) override;
 
-    std::shared_ptr<Notification<void>> getChunksSince(
-        const NamespaceString& nss,
-        ChunkVersion version,
-        GetChunksSinceCallbackFn callbackFn) override;
-
-    void getDatabase(
-        StringData dbName,
-        stdx::function<void(OperationContext*, StatusWith<DatabaseType>)> callbackFn) override;
+    SemiFuture<CollectionAndChangedChunks> getChunksSince(const NamespaceString& nss,
+                                                          ChunkVersion version) override;
+    SemiFuture<DatabaseType> getDatabase(StringData dbName) override;
 
 private:
     ConfigServerCatalogCacheLoader _configServerLoader;

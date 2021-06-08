@@ -2,8 +2,6 @@
  * nGram tokenizer implementation for Kakao nGram Search
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
-
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/fts/fts_unicode_ngram_tokenizer.h"
@@ -13,8 +11,6 @@
 #include "mongo/db/fts/stemmer.h"
 #include "mongo/db/fts/stop_words.h"
 #include "mongo/db/fts/tokenizer.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/log.h"
 
 /**
  * NGram token size is always 2

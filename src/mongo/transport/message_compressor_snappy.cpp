@@ -27,13 +27,12 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
-
 #include "mongo/platform/basic.h"
+
+#include <memory>
 
 #include "mongo/base/data_range_cursor.h"
 #include "mongo/base/init.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/transport/message_compressor_registry.h"
 #include "mongo/transport/message_compressor_snappy.h"
 
@@ -82,7 +81,6 @@ MONGO_INITIALIZER_GENERAL(SnappyMessageCompressorInit,
                           ("AllCompressorsRegistered"))
 (InitializerContext* context) {
     auto& compressorRegistry = MessageCompressorRegistry::get();
-    compressorRegistry.registerImplementation(stdx::make_unique<SnappyMessageCompressor>());
-    return Status::OK();
+    compressorRegistry.registerImplementation(std::make_unique<SnappyMessageCompressor>());
 }
 }  // namespace mongo

@@ -27,23 +27,94 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/util/net/ssl_manager.h"
+#include <fstream>
 
 #include "mongo/config.h"
+#include "mongo/platform/basic.h"
+
+#include "mongo/transport/service_entry_point.h"
+#include "mongo/transport/transport_layer_asio.h"
+#include "mongo/transport/transport_layer_manager.h"
+#include "mongo/util/net/ssl/context.hpp"
+#include "mongo/util/net/ssl_manager.h"
+#include "mongo/util/net/ssl_options.h"
+
+#include "mongo/logv2/log.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/log.h"
 
 #if MONGO_CONFIG_SSL_PROVIDER == MONGO_CONFIG_SSL_PROVIDER_OPENSSL
 #include "mongo/util/net/dh_openssl.h"
+#include "mongo/util/net/ssl/context_openssl.hpp"
 #endif
 
 
 namespace mongo {
 namespace {
+
+// Test implementation needed by ASIO transport.
+class ServiceEntryPointUtil : public ServiceEntryPoint {
+public:
+    void startSession(transport::SessionHandle session) override {
+        stdx::unique_lock<Latch> lk(_mutex);
+        _sessions.push_back(std::move(session));
+        LOGV2(2303202, "started session");
+        _cv.notify_one();
+    }
+
+    void endAllSessions(transport::Session::TagMask tags) override {
+        LOGV2(2303302, "end all sessions");
+        std::vector<transport::SessionHandle> old_sessions;
+        {
+            stdx::unique_lock<Latch> lock(_mutex);
+            old_sessions.swap(_sessions);
+        }
+        old_sessions.clear();
+    }
+
+    Status start() override {
+        return Status::OK();
+    }
+
+    bool shutdown(Milliseconds timeout) override {
+        return true;
+    }
+
+    void appendStats(BSONObjBuilder*) const override {}
+
+    size_t numOpenSessions() const override {
+        stdx::unique_lock<Latch> lock(_mutex);
+        return _sessions.size();
+    }
+
+    Future<DbResponse> handleRequest(OperationContext* opCtx,
+                                     const Message& request) noexcept override {
+        MONGO_UNREACHABLE;
+    }
+
+    void setTransportLayer(transport::TransportLayer* tl) {
+        _transport = tl;
+    }
+
+    void waitForConnect() {
+        stdx::unique_lock<Latch> lock(_mutex);
+        _cv.wait(lock, [&] { return !_sessions.empty(); });
+    }
+
+private:
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("::_mutex");
+    stdx::condition_variable _cv;
+    std::vector<transport::SessionHandle> _sessions;
+    transport::TransportLayer* _transport = nullptr;
+};
+
+std::string loadFile(const std::string& name) {
+    std::ifstream input(name);
+    std::string str((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    return str;
+}
+
 TEST(SSLManager, matchHostname) {
     enum Expected : bool { match = true, mismatch = false };
     const struct {
@@ -78,10 +149,17 @@ TEST(SSLManager, matchHostname) {
     for (const auto& test : tests) {
         if (bool(test.expected) != hostNameMatchForX509Certificates(test.hostname, test.certName)) {
             failure = true;
-            LOG(1) << "Failure for Hostname: " << test.hostname
-                   << " Certificate: " << test.certName;
+            LOGV2_DEBUG(23266,
+                        1,
+                        "Failure for Hostname: {test_hostname} Certificate: {test_certName}",
+                        "test_hostname"_attr = test.hostname,
+                        "test_certName"_attr = test.certName);
         } else {
-            LOG(1) << "Passed for Hostname: " << test.hostname << " Certificate: " << test.certName;
+            LOGV2_DEBUG(23267,
+                        1,
+                        "Passed for Hostname: {test_hostname} Certificate: {test_certName}",
+                        "test_hostname"_attr = test.hostname,
+                        "test_certName"_attr = test.certName);
         }
     }
     ASSERT_FALSE(failure);
@@ -187,7 +265,10 @@ TEST(SSLManager, MongoDBRolesParser) {
     // Negative: Runt, only a tag and long length with wrong missing length
     {
         unsigned char derData[] = {
-            0x31, 0x88, 0xff, 0xff,
+            0x31,
+            0x88,
+            0xff,
+            0xff,
         };
         auto swPeer = parsePeerRoles(ConstDataRange(derData));
         ASSERT_NOT_OK(swPeer.getStatus());
@@ -196,7 +277,10 @@ TEST(SSLManager, MongoDBRolesParser) {
     // Negative: Runt, only a tag and long length
     {
         unsigned char derData[] = {
-            0x31, 0x82, 0xff, 0xff,
+            0x31,
+            0x82,
+            0xff,
+            0xff,
         };
         auto swPeer = parsePeerRoles(ConstDataRange(derData));
         ASSERT_NOT_OK(swPeer.getStatus());
@@ -233,6 +317,38 @@ TEST(SSLManager, MongoDBRolesParser) {
         ASSERT_EQ(roles[0].getDB(), "admin");
         ASSERT_EQ(roles[1].getRole(), "readAnyDatabase");
         ASSERT_EQ(roles[1].getDB(), "admin");
+    }
+}
+
+TEST(SSLManager, TLSFeatureParser) {
+    {
+        // test correct feature resolution with one feature
+        unsigned char derData[] = {0x30, 0x03, 0x02, 0x01, 0x05};
+        std::vector<DERInteger> correctFeatures = {{0x05}};
+        auto swFeatures = parseTLSFeature(ConstDataRange(derData));
+        ASSERT_OK(swFeatures.getStatus());
+
+        auto features = swFeatures.getValue();
+        ASSERT_TRUE(features == correctFeatures);
+    }
+
+    {
+        // test incorrect feature resolution (malformed header)
+        unsigned char derData[] = {0xFF, 0x03, 0x02, 0x01, 0x05};
+        std::vector<DERInteger> correctFeatures = {{0x05}};
+        auto swFeatures = parseTLSFeature(ConstDataRange(derData));
+        ASSERT_NOT_OK(swFeatures.getStatus());
+    }
+
+    {
+        // test feature resolution with multiple features
+        unsigned char derData[] = {0x30, 0x06, 0x02, 0x01, 0x05, 0x02, 0x01, 0x01};
+        std::vector<DERInteger> correctFeatures = {{0x05}, {0x01}};
+        auto swFeatures = parseTLSFeature(ConstDataRange(derData));
+        ASSERT_OK(swFeatures.getStatus());
+
+        auto features = swFeatures.getValue();
+        ASSERT_TRUE(features == correctFeatures);
     }
 }
 
@@ -352,7 +468,7 @@ TEST(SSLManager, DNParsingAndNormalization) {
           {"2.5.4.7", "大田区, 東京都"}}}};
 
     for (const auto& test : tests) {
-        log() << "Testing DN \"" << test.first << "\"";
+        LOGV2(23268, "Testing DN \"{test_first}\"", "test_first"_attr = test.first);
         auto swDN = parseDN(test.first);
         ASSERT_OK(swDN.getStatus());
         ASSERT_OK(swDN.getValue().normalizeStrings());
@@ -362,15 +478,200 @@ TEST(SSLManager, DNParsingAndNormalization) {
 }
 
 TEST(SSLManager, BadDNParsing) {
-    std::vector<std::string> tests = {"CN=#12345",
-                                      R"(CN=\B)",
-                                      R"(CN=<", "\)"};
+    std::vector<std::string> tests = {"CN=#12345", R"(CN=\B)", R"(CN=<", "\)"};
     for (const auto& test : tests) {
-        log() << "Testing bad DN: \"" << test << "\"";
+        LOGV2(23269, "Testing bad DN: \"{test}\"", "test"_attr = test);
         auto swDN = parseDN(test);
         ASSERT_NOT_OK(swDN.getStatus());
     }
 }
+
+TEST(SSLManager, RotateCertificatesFromFile) {
+    SSLParams params;
+    params.sslMode.store(::mongo::sslGlobalParams.SSLMode_requireSSL);
+    // Server is required to have the sslPEMKeyFile.
+    params.sslPEMKeyFile = "jstests/libs/server.pem";
+    params.sslCAFile = "jstests/libs/ca.pem";
+    params.sslClusterFile = "jstests/libs/client.pem";
+
+    std::shared_ptr<SSLManagerInterface> manager =
+        SSLManagerInterface::create(params, true /* isSSLServer */);
+
+    ServiceEntryPointUtil sepu;
+
+    auto options = [] {
+        ServerGlobalParams params;
+        params.noUnixSocket = true;
+        transport::TransportLayerASIO::Options opts(&params);
+        return opts;
+    }();
+    transport::TransportLayerASIO tla(options, &sepu);
+    uassertStatusOK(tla.rotateCertificates(manager, false /* asyncOCSPStaple */));
+}
+
+TEST(SSLManager, InitContextFromFileShouldFail) {
+    SSLParams params;
+    params.sslMode.store(::mongo::sslGlobalParams.SSLMode_requireSSL);
+    // Server is required to have the sslPEMKeyFile.
+    // We force the initialization to fail by omitting this param.
+    params.sslCAFile = "jstests/libs/ca.pem";
+    params.sslClusterFile = "jstests/libs/client.pem";
+#if MONGO_CONFIG_SSL_PROVIDER == MONGO_CONFIG_SSL_PROVIDER_OPENSSL
+    ASSERT_THROWS_CODE([&params] { SSLManagerInterface::create(params, true /* isSSLServer */); }(),
+                       DBException,
+                       ErrorCodes::InvalidSSLConfiguration);
+#endif
+}
+
+TEST(SSLManager, RotateClusterCertificatesFromFile) {
+    SSLParams params;
+    params.sslMode.store(::mongo::sslGlobalParams.SSLMode_requireSSL);
+    // Client doesn't need params.sslPEMKeyFile.
+    params.sslCAFile = "jstests/libs/ca.pem";
+    params.sslClusterFile = "jstests/libs/client.pem";
+
+    std::shared_ptr<SSLManagerInterface> manager =
+        SSLManagerInterface::create(params, false /* isSSLServer */);
+
+    ServiceEntryPointUtil sepu;
+
+    auto options = [] {
+        ServerGlobalParams params;
+        params.noUnixSocket = true;
+        transport::TransportLayerASIO::Options opts(&params);
+        return opts;
+    }();
+    transport::TransportLayerASIO tla(options, &sepu);
+    uassertStatusOK(tla.rotateCertificates(manager, false /* asyncOCSPStaple */));
+}
+
+#if MONGO_CONFIG_SSL_PROVIDER == MONGO_CONFIG_SSL_PROVIDER_OPENSSL
+
+TEST(SSLManager, InitContextFromFile) {
+    SSLParams params;
+    params.sslMode.store(::mongo::sslGlobalParams.SSLMode_requireSSL);
+    // Client doesn't need params.sslPEMKeyFile.
+    params.sslClusterFile = "jstests/libs/client.pem";
+
+    std::shared_ptr<SSLManagerInterface> manager =
+        SSLManagerInterface::create(params, false /* isSSLServer */);
+
+    auto egress = std::make_unique<asio::ssl::context>(asio::ssl::context::sslv23);
+    uassertStatusOK(manager->initSSLContext(
+        egress->native_handle(), params, SSLManagerInterface::ConnectionDirection::kOutgoing));
+}
+
+TEST(SSLManager, InitContextFromMemory) {
+    SSLParams params;
+    params.sslMode.store(::mongo::sslGlobalParams.SSLMode_requireSSL);
+    params.sslCAFile = "jstests/libs/ca.pem";
+
+    TransientSSLParams transientParams;
+    transientParams.sslClusterPEMPayload = loadFile("jstests/libs/client.pem");
+
+    std::shared_ptr<SSLManagerInterface> manager =
+        SSLManagerInterface::create(params, transientParams, false /* isSSLServer */);
+
+    auto egress = std::make_unique<asio::ssl::context>(asio::ssl::context::sslv23);
+    uassertStatusOK(manager->initSSLContext(
+        egress->native_handle(), params, SSLManagerInterface::ConnectionDirection::kOutgoing));
+}
+
+// Tests when 'is server' param to managed interface creation is set, it is ignored.
+TEST(SSLManager, IgnoreInitServerSideContextFromMemory) {
+    SSLParams params;
+    params.sslMode.store(::mongo::sslGlobalParams.SSLMode_requireSSL);
+    params.sslPEMKeyFile = "jstests/libs/server.pem";
+    params.sslCAFile = "jstests/libs/ca.pem";
+
+    TransientSSLParams transientParams;
+    transientParams.sslClusterPEMPayload = loadFile("jstests/libs/client.pem");
+
+    std::shared_ptr<SSLManagerInterface> manager =
+        SSLManagerInterface::create(params, transientParams, true /* isSSLServer */);
+
+    auto egress = std::make_unique<asio::ssl::context>(asio::ssl::context::sslv23);
+    uassertStatusOK(manager->initSSLContext(
+        egress->native_handle(), params, SSLManagerInterface::ConnectionDirection::kOutgoing));
+}
+
+TEST(SSLManager, TransientSSLParams) {
+    SSLParams params;
+    params.sslMode.store(::mongo::sslGlobalParams.SSLMode_requireSSL);
+    params.sslCAFile = "jstests/libs/ca.pem";
+    params.sslClusterFile = "jstests/libs/client.pem";
+
+    ServiceEntryPointUtil sepu;
+
+    auto options = [] {
+        ServerGlobalParams params;
+        params.noUnixSocket = true;
+        transport::TransportLayerASIO::Options opts(&params);
+        return opts;
+    }();
+    transport::TransportLayerASIO tla(options, &sepu);
+
+    TransientSSLParams transientSSLParams;
+    transientSSLParams.sslClusterPEMPayload = loadFile("jstests/libs/client.pem");
+    transientSSLParams.targetedClusterConnectionString = ConnectionString::forLocal();
+
+    auto swContext = tla.createTransientSSLContext(transientSSLParams);
+    uassertStatusOK(swContext.getStatus());
+
+    // Check that the manager owned by the transient context is also transient.
+    ASSERT_TRUE(swContext.getValue()->manager->isTransient());
+    ASSERT_EQ(transientSSLParams.targetedClusterConnectionString.toString(),
+              swContext.getValue()->manager->getTargetedClusterConnectionString());
+}
+
+#endif  // MONGO_CONFIG_SSL_PROVIDER == MONGO_CONFIG_SSL_PROVIDER_OPENSSL
+
+static bool isSanWarningWritten(const std::vector<std::string>& logLines) {
+    for (const auto& line : logLines) {
+        if (std::string::npos !=
+            line.find("Server certificate has no compatible Subject Alternative Name")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// This test verifies there is a startup warning if Subject Alternative Name is missing
+TEST(SSLManager, InitContextSanWarning) {
+    SSLParams params;
+    params.sslMode.store(::mongo::sslGlobalParams.SSLMode_requireSSL);
+    params.sslCAFile = "jstests/libs/ca.pem";
+    params.sslPEMKeyFile = "jstests/libs/server_no_SAN.pem";
+
+    startCapturingLogMessages();
+    auto manager = SSLManagerInterface::create(params, true);
+    auto egress = std::make_unique<asio::ssl::context>(asio::ssl::context::sslv23);
+
+    uassertStatusOK(manager->initSSLContext(
+        egress->native_handle(), params, SSLManagerInterface::ConnectionDirection::kIncoming));
+    stopCapturingLogMessages();
+
+    ASSERT_TRUE(isSanWarningWritten(getCapturedTextFormatLogMessages()));
+}
+
+// This test verifies there is no startup warning if Subject Alternative Name is present
+TEST(SSLManager, InitContextNoSanWarning) {
+    SSLParams params;
+    params.sslMode.store(::mongo::sslGlobalParams.SSLMode_requireSSL);
+    params.sslCAFile = "jstests/libs/ca.pem";
+    params.sslPEMKeyFile = "jstests/libs/server.pem";
+
+    startCapturingLogMessages();
+    auto manager = SSLManagerInterface::create(params, true);
+    auto egress = std::make_unique<asio::ssl::context>(asio::ssl::context::sslv23);
+
+    uassertStatusOK(manager->initSSLContext(
+        egress->native_handle(), params, SSLManagerInterface::ConnectionDirection::kIncoming));
+    stopCapturingLogMessages();
+
+    ASSERT_FALSE(isSanWarningWritten(getCapturedTextFormatLogMessages()));
+}
+
 
 }  // namespace
 }  // namespace mongo

@@ -29,10 +29,11 @@
 
 #include "mongo/platform/basic.h"
 
+#include <memory>
+
 #include "mongo/db/service_context_test_fixture.h"
 #include "mongo/db/session_catalog.h"
 #include "mongo/stdx/future.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/barrier.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
@@ -123,12 +124,14 @@ TEST_F(SessionCatalogTest, ScanSession) {
                                               makeLogicalSessionIdForTest(),
                                               makeLogicalSessionIdForTest()};
     for (const auto& lsid : lsids) {
-        stdx::async(stdx::launch::async, [this, lsid] {
-            ThreadClient tc(getServiceContext());
-            auto opCtx = makeOperationContext();
-            opCtx->setLogicalSessionId(lsid);
-            OperationContextSession ocs(opCtx.get());
-        }).get();
+        stdx::async(stdx::launch::async,
+                    [this, lsid] {
+                        ThreadClient tc(getServiceContext());
+                        auto opCtx = makeOperationContext();
+                        opCtx->setLogicalSessionId(lsid);
+                        OperationContextSession ocs(opCtx.get());
+                    })
+            .get();
     }
 
     catalog()->scanSession(lsids[0], [&lsids](const ObservableSession& session) {
@@ -154,12 +157,14 @@ TEST_F(SessionCatalogTest, ScanSessionMarkForReapWhenSessionIsIdle) {
                                               makeLogicalSessionIdForTest(),
                                               makeLogicalSessionIdForTest()};
     for (const auto& lsid : lsids) {
-        stdx::async(stdx::launch::async, [this, lsid] {
-            ThreadClient tc(getServiceContext());
-            auto opCtx = makeOperationContext();
-            opCtx->setLogicalSessionId(lsid);
-            OperationContextSession ocs(opCtx.get());
-        }).get();
+        stdx::async(stdx::launch::async,
+                    [this, lsid] {
+                        ThreadClient tc(getServiceContext());
+                        auto opCtx = makeOperationContext();
+                        opCtx->setLogicalSessionId(lsid);
+                        OperationContextSession ocs(opCtx.get());
+                    })
+            .get();
     }
 
     catalog()->scanSession(lsids[0],
@@ -196,12 +201,14 @@ TEST_F(SessionCatalogTestWithDefaultOpCtx, ScanSessions) {
                                               makeLogicalSessionIdForTest(),
                                               makeLogicalSessionIdForTest()};
     for (const auto& lsid : lsids) {
-        stdx::async(stdx::launch::async, [this, lsid] {
-            ThreadClient tc(getServiceContext());
-            auto opCtx = makeOperationContext();
-            opCtx->setLogicalSessionId(lsid);
-            OperationContextSession ocs(opCtx.get());
-        }).get();
+        stdx::async(stdx::launch::async,
+                    [this, lsid] {
+                        ThreadClient tc(getServiceContext());
+                        auto opCtx = makeOperationContext();
+                        opCtx->setLogicalSessionId(lsid);
+                        OperationContextSession ocs(opCtx.get());
+                    })
+            .get();
     }
 
     // Scan over all Sessions.
@@ -562,7 +569,7 @@ TEST_F(SessionCatalogTestWithDefaultOpCtx, ConcurrentCheckOutAndKill) {
 
         // Normal check out should start after kill.
         normalCheckOutFinish = stdx::async(stdx::launch::async, [&] {
-            ThreadClient tc(getGlobalServiceContext());
+            ThreadClient tc(getServiceContext());
             auto sideOpCtx = Client::getCurrent()->makeOperationContext();
             sideOpCtx->setLogicalSessionId(lsid);
             OperationContextSession normalCheckOut(sideOpCtx.get());
@@ -572,7 +579,7 @@ TEST_F(SessionCatalogTestWithDefaultOpCtx, ConcurrentCheckOutAndKill) {
 
         // Kill will short-cut the queue and be the next one to check out.
         killCheckOutFinish = stdx::async(stdx::launch::async, [&] {
-            ThreadClient tc(getGlobalServiceContext());
+            ThreadClient tc(getServiceContext());
             auto sideOpCtx = Client::getCurrent()->makeOperationContext();
             sideOpCtx->setLogicalSessionId(lsid);
 
@@ -593,11 +600,13 @@ TEST_F(SessionCatalogTestWithDefaultOpCtx, ConcurrentCheckOutAndKill) {
 
         // The main thread won't check in the session until it's killed.
         {
-            stdx::mutex m;
+            auto m = MONGO_MAKE_LATCH();
             stdx::condition_variable cond;
-            stdx::unique_lock<stdx::mutex> lock(m);
-            ASSERT_EQ(ErrorCodes::InternalError,
-                      _opCtx->waitForConditionOrInterruptNoAssert(cond, lock));
+            stdx::unique_lock<Latch> lock(m);
+            ASSERT_THROWS_CODE(
+                _opCtx->waitForConditionOrInterrupt(cond, lock, [] { return false; }),
+                DBException,
+                ErrorCodes::InternalError);
         }
     }
     normalCheckOutFinish.get();

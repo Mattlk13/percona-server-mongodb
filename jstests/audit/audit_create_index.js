@@ -14,6 +14,12 @@ auditTest(
         testDB = m.getDB(testDBName);
         assert.commandWorked(testDB.dropDatabase());
 
+        // insert some data to index
+        var n = 100;
+        for (var i = 0; i < n; ++i) {
+            assert.writeOK(testDB.coll.insert({a: i, b: n-i, t: 'lotsofdummydata'}));
+        }
+
         const beforeCmd = Date.now();
 
         assert.commandWorked(testDB.coll.createIndex({ a: 1 }, { name: 'cold', background: false }));

@@ -33,14 +33,18 @@
 #include <string>
 #include <vector>
 
-#include "mongo/db/pipeline/document.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/storage/storage_engine.h"
 
 namespace mongo {
 
 struct BackupCursorState {
     UUID backupId;
     boost::optional<Document> preamble;
-    std::vector<std::string> filenames;
+    std::unique_ptr<StorageEngine::StreamingCursor> streamingCursor;
+    // 'otherBackupBlocks' includes the backup blocks for the encrypted storage engine in the
+    // enterprise module.
+    std::vector<StorageEngine::BackupBlock> otherBackupBlocks;
 };
 
 struct BackupCursorExtendState {

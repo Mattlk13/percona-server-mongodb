@@ -38,12 +38,14 @@
 namespace mongo {
 
 /**
- * This include exists so that mongo/base/status_with.h can use the invariant macro without causing
- * a circular include chain. It should never be included directly in any other file other than that
- * one (and assert_util.h).
+ * This header is separated from assert_util.h so that the low-level
+ * dependencies of assert_util.h (e.g. mongo/base/status_with.h,
+ * mongo/base/status.h, mongo/base/string_data.h) can use the invariant macro
+ * without causing a circular include chain. It should never be included
+ * directly in any other files.
  */
 
-#if !defined(MONGO_INCLUDE_INVARIANT_H_WHITELISTED)
+#if !defined(MONGO_ALLOW_INCLUDE_INVARIANT_H)
 #error "Include assert_util.h instead of invariant.h."
 #endif
 
@@ -110,5 +112,14 @@ inline void invariantWithContextAndLocation(
     invariant(__VA_ARGS__)
 
 #define dassert MONGO_dassert
+
+constexpr void invariantForConstexprThrower(bool val) {
+    enum { AbortException };
+    val ? 0 : throw AbortException;
+}
+
+constexpr void invariantForConstexpr(bool val) noexcept {
+    invariantForConstexprThrower(val);
+}
 
 }  // namespace mongo

@@ -31,13 +31,21 @@
 
 #include "mongo/db/matcher/expression_with_placeholder.h"
 
-#include "mongo/db/matcher/expression_parser.h"
+#include <pcrecpp.h>
 
-#include <regex>
+#include "mongo/base/string_data.h"
+#include "mongo/db/matcher/expression_parser.h"
+#include "mongo/util/static_immortal.h"
 
 namespace mongo {
 
 namespace {
+
+bool matchesPlaceholderPattern(StringData placeholder) {
+    // The placeholder must begin with a lowercase letter and contain no special characters.
+    static StaticImmortal<pcrecpp::RE> kRe("[[:lower:]][[:alnum:]]*");
+    return kRe->FullMatch(pcrecpp::StringPiece(placeholder.rawData(), placeholder.size()));
+}
 
 /**
  * Finds the top-level field that 'expr' is over. Returns boost::none if the expression does not
@@ -65,11 +73,9 @@ StatusWith<boost::optional<StringData>> parseTopLevelFieldName(MatchExpression* 
 
             if (statusWithId.getValue() && placeholder != statusWithId.getValue()) {
                 return Status(ErrorCodes::FailedToParse,
-                              str::stream() << "Expected a single top-level field name, found '"
-                                            << *placeholder
-                                            << "' and '"
-                                            << *statusWithId.getValue()
-                                            << "'");
+                              str::stream()
+                                  << "Expected a single top-level field name, found '"
+                                  << *placeholder << "' and '" << *statusWithId.getValue() << "'");
             }
         }
         return placeholder;
@@ -87,9 +93,6 @@ bool ExpressionWithPlaceholder::equivalent(const ExpressionWithPlaceholder* othe
     return _placeholder == other->_placeholder && _filter->equivalent(other->_filter.get());
 }
 
-// The placeholder must begin with a lowercase letter and contain no special characters.
-const std::regex ExpressionWithPlaceholder::placeholderRegex("^[a-z][a-zA-Z0-9]*$");
-
 // static
 StatusWith<std::unique_ptr<ExpressionWithPlaceholder>> ExpressionWithPlaceholder::make(
     std::unique_ptr<MatchExpression> filter) {
@@ -101,17 +104,16 @@ StatusWith<std::unique_ptr<ExpressionWithPlaceholder>> ExpressionWithPlaceholder
     boost::optional<std::string> placeholder;
     if (statusWithId.getValue()) {
         placeholder = statusWithId.getValue()->toString();
-        if (!std::regex_match(*placeholder, placeholderRegex)) {
+        if (!matchesPlaceholderPattern(*placeholder)) {
             return Status(ErrorCodes::BadValue,
                           str::stream() << "The top-level field name must be an alphanumeric "
                                            "string beginning with a lowercase letter, found '"
-                                        << *placeholder
-                                        << "'");
+                                        << *placeholder << "'");
         }
     }
 
     auto exprWithPlaceholder =
-        stdx::make_unique<ExpressionWithPlaceholder>(std::move(placeholder), std::move(filter));
+        std::make_unique<ExpressionWithPlaceholder>(std::move(placeholder), std::move(filter));
     return {std::move(exprWithPlaceholder)};
 }
 
@@ -123,7 +125,7 @@ void ExpressionWithPlaceholder::optimizeFilter() {
 
     if (newPlaceholder.getValue()) {
         _placeholder = newPlaceholder.getValue()->toString();
-        dassert(std::regex_match(*_placeholder, placeholderRegex));
+        dassert(matchesPlaceholderPattern(*_placeholder));
     } else {
         _placeholder = boost::none;
     }

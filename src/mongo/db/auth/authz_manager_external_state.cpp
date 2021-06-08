@@ -29,6 +29,7 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/base/shim.h"
 #include "mongo/config.h"
 #include "mongo/db/auth/authz_manager_external_state.h"
 #include "mongo/db/auth/user_name.h"
@@ -37,25 +38,29 @@
 
 namespace mongo {
 
-MONGO_DEFINE_SHIM(AuthzManagerExternalState::create);
+std::unique_ptr<AuthzManagerExternalState> AuthzManagerExternalState::create() {
+    static auto w = MONGO_WEAK_FUNCTION_DEFINITION(AuthzManagerExternalState::create);
+    return w();
+}
 
 AuthzManagerExternalState::AuthzManagerExternalState() = default;
 AuthzManagerExternalState::~AuthzManagerExternalState() = default;
 
-bool AuthzManagerExternalState::shouldUseRolesFromConnection(OperationContext* opCtx,
-                                                             const UserName& userName) {
-#ifdef MONGO_CONFIG_SSL
-    if (!opCtx || !opCtx->getClient() || !opCtx->getClient()->session()) {
-        return false;
+Status AuthzManagerExternalState::makeRoleNotFoundStatus(
+    const stdx::unordered_set<RoleName>& unknownRoles) {
+    dassert(unknownRoles.size());
+
+    char delim = ':';
+    StringBuilder sb;
+    sb << "Could not find role";
+    if (unknownRoles.size() > 1) {
+        sb << 's';
     }
-
-    auto& sslPeerInfo = SSLPeerInfo::forSession(opCtx->getClient()->session());
-    return sslPeerInfo.subjectName.toString() == userName.getUser() &&
-        userName.getDB() == "$external" && !sslPeerInfo.roles.empty();
-#else
-    return false;
-#endif
+    for (const auto& unknownRole : unknownRoles) {
+        sb << delim << ' ' << unknownRole.toString();
+        delim = ',';
+    }
+    return {ErrorCodes::RoleNotFound, sb.str()};
 }
-
 
 }  // namespace mongo

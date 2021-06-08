@@ -32,6 +32,7 @@
 #include <boost/optional.hpp>
 
 #include "mongo/client/read_preference.h"
+#include "mongo/db/auth/authorization_checks.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/matcher/extensions_callback_noop.h"
@@ -49,24 +50,36 @@
 namespace mongo {
 namespace {
 
-using std::unique_ptr;
 using std::string;
+using std::unique_ptr;
 using std::vector;
 
 const char kTermField[] = "term";
 
-// Parses the command object to a QueryRequest, validates that no runtime constants were supplied
-// with the command, and sets the constant runtime values that will be forwarded to each shard.
-std::unique_ptr<QueryRequest> parseCmdObjectToQueryRequest(OperationContext* opCtx,
-                                                           NamespaceString nss,
-                                                           BSONObj cmdObj,
-                                                           bool isExplain) {
-    auto qr = uassertStatusOK(
-        QueryRequest::makeFromFindCommand(std::move(nss), std::move(cmdObj), isExplain));
-    uassert(
-        51202, "Cannot specify runtime constants option to a mongos", !qr->getRuntimeConstants());
-    qr->setRuntimeConstants(Variables::generateRuntimeConstants(opCtx));
-    return qr;
+// Parses the command object to a FindCommandRequest, validates that no runtime constants were
+// supplied with the command, and sets the constant runtime values that will be forwarded to each
+// shard.
+std::unique_ptr<FindCommandRequest> parseCmdObjectToFindCommandRequest(OperationContext* opCtx,
+                                                                       NamespaceString nss,
+                                                                       BSONObj cmdObj) {
+    auto findCommand = query_request_helper::makeFromFindCommand(
+        std::move(cmdObj),
+        std::move(nss),
+        APIParameters::get(opCtx).getAPIStrict().value_or(false));
+    if (!findCommand->getReadConcern()) {
+        if (opCtx->isStartingMultiDocumentTransaction() || !opCtx->inMultiDocumentTransaction()) {
+            // If there is no explicit readConcern in the cmdObj, and this is either the first
+            // operation in a transaction, or not running in a transaction, then use the readConcern
+            // from the opCtx (which may be a cluster-wide default).
+            const auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
+            findCommand->setReadConcern(readConcernArgs.toBSONInner());
+        }
+    }
+    uassert(51202,
+            "Cannot specify runtime constants option to a mongos",
+            !findCommand->getLegacyRuntimeConstants());
+    findCommand->setLegacyRuntimeConstants(Variables::generateRuntimeConstants(opCtx));
+    return findCommand;
 }
 
 /**
@@ -75,6 +88,10 @@ std::unique_ptr<QueryRequest> parseCmdObjectToQueryRequest(OperationContext* opC
 class ClusterFindCmd final : public Command {
 public:
     ClusterFindCmd() : Command("find") {}
+
+    const std::set<std::string>& apiVersions() const {
+        return kApiVersions1;
+    }
 
     std::unique_ptr<CommandInvocation> parse(OperationContext* opCtx,
                                              const OpMsgRequest& opMsgRequest) override {
@@ -112,8 +129,8 @@ public:
             return false;
         }
 
-        bool supportsReadConcern(repl::ReadConcernLevel level) const final {
-            return true;
+        ReadConcernSupportResult supportsReadConcern(repl::ReadConcernLevel level) const final {
+            return ReadConcernSupportResult::allSupportedAndDefaultPermitted();
         }
 
         NamespaceString ns() const override {
@@ -128,59 +145,65 @@ public:
          */
         void doCheckAuthorization(OperationContext* opCtx) const final {
             auto hasTerm = _request.body.hasField(kTermField);
-            uassertStatusOK(
-                AuthorizationSession::get(opCtx->getClient())->checkAuthForFind(ns(), hasTerm));
+            uassertStatusOK(auth::checkAuthForFind(
+                AuthorizationSession::get(opCtx->getClient()), ns(), hasTerm));
         }
 
         void explain(OperationContext* opCtx,
                      ExplainOptions::Verbosity verbosity,
                      rpc::ReplyBuilderInterface* result) override {
-            // Parse the command BSON to a QueryRequest.
-            const bool isExplain = true;
-            auto qr = parseCmdObjectToQueryRequest(opCtx, ns(), _request.body, isExplain);
+            // Parse the command BSON to a FindCommandRequest.
+            auto findCommand = parseCmdObjectToFindCommandRequest(opCtx, ns(), _request.body);
 
             try {
                 const auto explainCmd =
-                    ClusterExplain::wrapAsExplain(qr->asFindCommand(), verbosity);
+                    ClusterExplain::wrapAsExplain(findCommand->toBSON(BSONObj()), verbosity);
 
                 long long millisElapsed;
                 std::vector<AsyncRequestsSender::Response> shardResponses;
 
                 // We will time how long it takes to run the commands on the shards.
                 Timer timer;
-                const auto routingInfo = uassertStatusOK(
-                    Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, qr->nss()));
-                shardResponses =
-                    scatterGatherVersionedTargetByRoutingTable(opCtx,
-                                                               qr->nss().db(),
-                                                               qr->nss(),
-                                                               routingInfo,
-                                                               explainCmd,
-                                                               ReadPreferenceSetting::get(opCtx),
-                                                               Shard::RetryPolicy::kIdempotent,
-                                                               qr->getFilter(),
-                                                               qr->getCollation());
+                const auto routingInfo =
+                    uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(
+                        opCtx, *findCommand->getNamespaceOrUUID().nss()));
+                shardResponses = scatterGatherVersionedTargetByRoutingTable(
+                    opCtx,
+                    findCommand->getNamespaceOrUUID().nss()->db(),
+                    *findCommand->getNamespaceOrUUID().nss(),
+                    routingInfo,
+                    explainCmd,
+                    ReadPreferenceSetting::get(opCtx),
+                    Shard::RetryPolicy::kIdempotent,
+                    findCommand->getFilter(),
+                    findCommand->getCollation());
                 millisElapsed = timer.millis();
 
                 const char* mongosStageName =
                     ClusterExplain::getStageNameForReadOp(shardResponses.size(), _request.body);
 
                 auto bodyBuilder = result->getBodyBuilder();
-                uassertStatusOK(ClusterExplain::buildExplainResult(
-                    opCtx,
-                    ClusterExplain::downconvert(opCtx, shardResponses),
-                    mongosStageName,
-                    millisElapsed,
-                    &bodyBuilder));
+                uassertStatusOK(ClusterExplain::buildExplainResult(opCtx,
+                                                                   shardResponses,
+                                                                   mongosStageName,
+                                                                   millisElapsed,
+                                                                   _request.body,
+                                                                   &bodyBuilder));
 
             } catch (const ExceptionFor<ErrorCodes::CommandOnShardedViewNotSupportedOnMongod>& ex) {
                 auto bodyBuilder = result->getBodyBuilder();
                 bodyBuilder.resetToEmpty();
 
-                auto aggCmdOnView = uassertStatusOK(qr->asAggregationCommand());
+                auto aggCmdOnView =
+                    uassertStatusOK(query_request_helper::asAggregationCommand(*findCommand));
+                auto viewAggregationCommand =
+                    OpMsgRequest::fromDBAndBody(_dbName, aggCmdOnView).body;
 
-                auto aggRequestOnView = uassertStatusOK(
-                    AggregationRequest::parseFromBSON(ns(), aggCmdOnView, verbosity));
+                auto aggRequestOnView = aggregation_request_helper::parseFromBSON(
+                    ns(),
+                    viewAggregationCommand,
+                    verbosity,
+                    APIParameters::get(opCtx).getAPIStrict().value_or(false));
 
                 // An empty PrivilegeVector is acceptable because these privileges are only checked
                 // on getMore and explain will not open a cursor.
@@ -198,13 +221,18 @@ public:
             // We count find command as a query op.
             globalOpCounters.gotQuery();
 
-            const bool isExplain = false;
-            auto qr = parseCmdObjectToQueryRequest(opCtx, ns(), _request.body, isExplain);
+            ON_BLOCK_EXIT([opCtx] {
+                Grid::get(opCtx)->catalogCache()->checkAndRecordOperationBlockedByRefresh(
+                    opCtx, mongo::LogicalOp::opQuery);
+            });
+
+            auto findCommand = parseCmdObjectToFindCommandRequest(opCtx, ns(), _request.body);
 
             const boost::intrusive_ptr<ExpressionContext> expCtx;
             auto cq = uassertStatusOK(
                 CanonicalQuery::canonicalize(opCtx,
-                                             std::move(qr),
+                                             std::move(findCommand),
+                                             false, /* isExplain */
                                              expCtx,
                                              ExtensionsCallbackNoop(),
                                              MatchExpressionParser::kAllowAllSpecialFeatures));
@@ -212,25 +240,37 @@ public:
             try {
                 // Do the work to generate the first batch of results. This blocks waiting to get
                 // responses from the shard(s).
+                bool partialResultsReturned = false;
                 std::vector<BSONObj> batch;
-                auto cursorId =
-                    ClusterFind::runQuery(opCtx, *cq, ReadPreferenceSetting::get(opCtx), &batch);
+                auto cursorId = ClusterFind::runQuery(
+                    opCtx, *cq, ReadPreferenceSetting::get(opCtx), &batch, &partialResultsReturned);
 
                 // Build the response document.
                 CursorResponseBuilder::Options options;
                 options.isInitialResponse = true;
+                if (!opCtx->inMultiDocumentTransaction()) {
+                    options.atClusterTime =
+                        repl::ReadConcernArgs::get(opCtx).getArgsAtClusterTime();
+                }
                 CursorResponseBuilder firstBatch(result, options);
                 for (const auto& obj : batch) {
                     firstBatch.append(obj);
                 }
+                firstBatch.setPartialResultsReturned(partialResultsReturned);
                 firstBatch.done(cursorId, cq->ns());
             } catch (const ExceptionFor<ErrorCodes::CommandOnShardedViewNotSupportedOnMongod>& ex) {
                 result->reset();
 
-                auto aggCmdOnView = uassertStatusOK(cq->getQueryRequest().asAggregationCommand());
+                auto aggCmdOnView = uassertStatusOK(
+                    query_request_helper::asAggregationCommand(cq->getFindCommandRequest()));
+                auto viewAggregationCommand =
+                    OpMsgRequest::fromDBAndBody(_dbName, aggCmdOnView).body;
 
-                auto aggRequestOnView =
-                    uassertStatusOK(AggregationRequest::parseFromBSON(ns(), aggCmdOnView));
+                auto aggRequestOnView = aggregation_request_helper::parseFromBSON(
+                    ns(),
+                    viewAggregationCommand,
+                    boost::none,
+                    APIParameters::get(opCtx).getAPIStrict().value_or(false));
 
                 auto bodyBuilder = result->getBodyBuilder();
                 uassertStatusOK(ClusterAggregate::retryOnViewError(

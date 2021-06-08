@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/platform/basic.h"
 
@@ -47,11 +47,22 @@ ReplicationCoordinatorEmbedded::ReplicationCoordinatorEmbedded(ServiceContext* s
 
 ReplicationCoordinatorEmbedded::~ReplicationCoordinatorEmbedded() = default;
 
-void ReplicationCoordinatorEmbedded::startup(OperationContext* opCtx) {}
+void ReplicationCoordinatorEmbedded::startup(OperationContext* opCtx,
+                                             StorageEngine::LastShutdownState lastShutdownState) {}
 
 void ReplicationCoordinatorEmbedded::enterTerminalShutdown() {}
 
+bool ReplicationCoordinatorEmbedded::enterQuiesceModeIfSecondary(Milliseconds quiesceTime) {
+    return true;
+}
+
+bool ReplicationCoordinatorEmbedded::inQuiesceMode() const {
+    return false;
+}
+
 void ReplicationCoordinatorEmbedded::shutdown(OperationContext* opCtx) {}
+
+void ReplicationCoordinatorEmbedded::markAsCleanShutdownIfPossible(OperationContext* opCtx) {}
 
 const ReplSettings& ReplicationCoordinatorEmbedded::getSettings() const {
     static ReplSettings _settings;
@@ -62,7 +73,7 @@ ReplicationCoordinator::Mode ReplicationCoordinatorEmbedded::getReplicationMode(
     return ReplicationCoordinator::Mode::modeNone;
 }
 
-bool ReplicationCoordinatorEmbedded::isMasterForReportingPurposes() {
+bool ReplicationCoordinatorEmbedded::isWritablePrimaryForReportingPurposes() {
     return true;
 }
 
@@ -77,24 +88,24 @@ bool ReplicationCoordinatorEmbedded::canAcceptWritesForDatabase_UNSAFE(Operation
 }
 
 bool ReplicationCoordinatorEmbedded::canAcceptWritesFor(OperationContext* opCtx,
-                                                        const NamespaceString& ns) {
+                                                        const NamespaceStringOrUUID& nsOrUUID) {
     return true;
 }
 
-bool ReplicationCoordinatorEmbedded::canAcceptWritesFor_UNSAFE(OperationContext* opCtx,
-                                                               const NamespaceString& ns) {
+bool ReplicationCoordinatorEmbedded::canAcceptWritesFor_UNSAFE(
+    OperationContext* opCtx, const NamespaceStringOrUUID& nsOrUUID) {
     return true;
 }
 
 Status ReplicationCoordinatorEmbedded::checkCanServeReadsFor(OperationContext* opCtx,
                                                              const NamespaceString& ns,
-                                                             bool slaveOk) {
+                                                             bool secondaryOk) {
     return Status::OK();
 }
 
 Status ReplicationCoordinatorEmbedded::checkCanServeReadsFor_UNSAFE(OperationContext* opCtx,
                                                                     const NamespaceString& ns,
-                                                                    bool slaveOk) {
+                                                                    bool secondaryOk) {
     return Status::OK();
 }
 
@@ -138,10 +149,6 @@ OpTime ReplicationCoordinatorEmbedded::getCurrentCommittedSnapshotOpTime() const
     UASSERT_NOT_IMPLEMENTED;
 }
 
-OpTimeAndWallTime ReplicationCoordinatorEmbedded::getCurrentCommittedSnapshotOpTimeAndWallTime()
-    const {
-    UASSERT_NOT_IMPLEMENTED;
-}
 void ReplicationCoordinatorEmbedded::appendDiagnosticBSON(mongo::BSONObjBuilder*) {
     UASSERT_NOT_IMPLEMENTED;
 }
@@ -152,7 +159,7 @@ void ReplicationCoordinatorEmbedded::appendConnectionStats(
 }
 
 MemberState ReplicationCoordinatorEmbedded::getMemberState() const {
-    UASSERT_NOT_IMPLEMENTED;
+    return MemberState::RS_PRIMARY;
 }
 
 std::vector<repl::MemberData> ReplicationCoordinatorEmbedded::getMemberData() const {
@@ -167,11 +174,11 @@ Status ReplicationCoordinatorEmbedded::waitForMemberState(MemberState, Milliseco
     UASSERT_NOT_IMPLEMENTED;
 }
 
-Seconds ReplicationCoordinatorEmbedded::getSlaveDelaySecs() const {
+Seconds ReplicationCoordinatorEmbedded::getSecondaryDelaySecs() const {
     UASSERT_NOT_IMPLEMENTED;
 }
 
-void ReplicationCoordinatorEmbedded::clearSyncSourceBlacklist() {
+void ReplicationCoordinatorEmbedded::clearSyncSourceDenylist() {
     UASSERT_NOT_IMPLEMENTED;
 }
 
@@ -179,8 +186,7 @@ Status ReplicationCoordinatorEmbedded::setFollowerMode(const MemberState&) {
     UASSERT_NOT_IMPLEMENTED;
 }
 
-Status ReplicationCoordinatorEmbedded::setFollowerModeStrict(OperationContext* opCtx,
-                                                             const MemberState&) {
+Status ReplicationCoordinatorEmbedded::setFollowerModeRollback(OperationContext* opCtx) {
     UASSERT_NOT_IMPLEMENTED;
 }
 
@@ -189,10 +195,6 @@ ReplicationCoordinator::ApplierState ReplicationCoordinatorEmbedded::getApplierS
 }
 
 void ReplicationCoordinatorEmbedded::signalDrainComplete(OperationContext*, long long) {
-    UASSERT_NOT_IMPLEMENTED;
-}
-
-Status ReplicationCoordinatorEmbedded::waitForDrainFinish(Milliseconds) {
     UASSERT_NOT_IMPLEMENTED;
 }
 
@@ -205,7 +207,7 @@ void ReplicationCoordinatorEmbedded::setMyHeartbeatMessage(const std::string&) {
 }
 
 void ReplicationCoordinatorEmbedded::setMyLastAppliedOpTimeAndWallTimeForward(
-    const OpTimeAndWallTime&, DataConsistency) {
+    const OpTimeAndWallTime&) {
     UASSERT_NOT_IMPLEMENTED;
 }
 
@@ -226,7 +228,8 @@ void ReplicationCoordinatorEmbedded::resetMyLastOpTimes() {
     UASSERT_NOT_IMPLEMENTED;
 }
 
-OpTimeAndWallTime ReplicationCoordinatorEmbedded::getMyLastAppliedOpTimeAndWallTime() const {
+OpTimeAndWallTime ReplicationCoordinatorEmbedded::getMyLastAppliedOpTimeAndWallTime(
+    bool rollbackSafe) const {
     UASSERT_NOT_IMPLEMENTED;
 }
 
@@ -239,6 +242,12 @@ OpTimeAndWallTime ReplicationCoordinatorEmbedded::getMyLastDurableOpTimeAndWallT
 }
 
 OpTime ReplicationCoordinatorEmbedded::getMyLastDurableOpTime() const {
+    UASSERT_NOT_IMPLEMENTED;
+}
+
+Status ReplicationCoordinatorEmbedded::waitUntilMajorityOpTime(OperationContext* opCtx,
+                                                               repl::OpTime targetOpTime,
+                                                               boost::optional<Date_t> deadline) {
     UASSERT_NOT_IMPLEMENTED;
 }
 
@@ -272,6 +281,11 @@ ReplicationCoordinator::StatusAndDuration ReplicationCoordinatorEmbedded::awaitR
     UASSERT_NOT_IMPLEMENTED;
 }
 
+SharedSemiFuture<void> ReplicationCoordinatorEmbedded::awaitReplicationAsyncNoWTimeout(
+    const OpTime&, const WriteConcernOptions&) {
+    UASSERT_NOT_IMPLEMENTED;
+}
+
 void ReplicationCoordinatorEmbedded::stepDown(OperationContext*,
                                               const bool,
                                               const Milliseconds&,
@@ -291,10 +305,6 @@ HostAndPort ReplicationCoordinatorEmbedded::getMyHostAndPort() const {
     UASSERT_NOT_IMPLEMENTED;
 }
 
-Status ReplicationCoordinatorEmbedded::resyncData(OperationContext*, bool) {
-    UASSERT_NOT_IMPLEMENTED;
-}
-
 StatusWith<BSONObj> ReplicationCoordinatorEmbedded::prepareReplSetUpdatePositionCommand() const {
     UASSERT_NOT_IMPLEMENTED;
 }
@@ -304,12 +314,7 @@ Status ReplicationCoordinatorEmbedded::processReplSetGetStatus(BSONObjBuilder*,
     UASSERT_NOT_IMPLEMENTED;
 }
 
-void ReplicationCoordinatorEmbedded::fillIsMasterForReplSet(IsMasterResponse*,
-                                                            const SplitHorizon::Parameters&) {
-    UASSERT_NOT_IMPLEMENTED;
-}
-
-void ReplicationCoordinatorEmbedded::appendSlaveInfoData(BSONObjBuilder*) {
+void ReplicationCoordinatorEmbedded::appendSecondaryInfoData(BSONObjBuilder*) {
     UASSERT_NOT_IMPLEMENTED;
 }
 
@@ -317,7 +322,9 @@ ReplSetConfig ReplicationCoordinatorEmbedded::getConfig() const {
     UASSERT_NOT_IMPLEMENTED;
 }
 
-void ReplicationCoordinatorEmbedded::processReplSetGetConfig(BSONObjBuilder*) {
+void ReplicationCoordinatorEmbedded::processReplSetGetConfig(BSONObjBuilder*,
+                                                             bool commitmentStatus,
+                                                             bool includeNewlyAdded) {
     UASSERT_NOT_IMPLEMENTED;
 }
 
@@ -349,26 +356,41 @@ Status ReplicationCoordinatorEmbedded::processReplSetReconfig(OperationContext*,
     UASSERT_NOT_IMPLEMENTED;
 }
 
+Status ReplicationCoordinatorEmbedded::doReplSetReconfig(OperationContext* opCtx,
+                                                         GetNewConfigFn getNewConfig,
+                                                         bool force) {
+    UASSERT_NOT_IMPLEMENTED;
+}
+
+Status ReplicationCoordinatorEmbedded::doOptimizedReconfig(OperationContext* opCtx,
+                                                           GetNewConfigFn getNewConfig) {
+    UASSERT_NOT_IMPLEMENTED;
+}
+
+Status ReplicationCoordinatorEmbedded::awaitConfigCommitment(OperationContext* opCtx,
+                                                             bool waitForOplogCommitment) {
+    UASSERT_NOT_IMPLEMENTED;
+}
+
 Status ReplicationCoordinatorEmbedded::processReplSetInitiate(OperationContext*,
                                                               const BSONObj&,
                                                               BSONObjBuilder*) {
     UASSERT_NOT_IMPLEMENTED;
 }
 
-Status ReplicationCoordinatorEmbedded::abortCatchupIfNeeded() {
+Status ReplicationCoordinatorEmbedded::abortCatchupIfNeeded(PrimaryCatchUpConclusionReason reason) {
     UASSERT_NOT_IMPLEMENTED;
 }
 
-Status ReplicationCoordinatorEmbedded::processReplSetUpdatePosition(const UpdatePositionArgs&,
-                                                                    long long*) {
+void ReplicationCoordinatorEmbedded::incrementNumCatchUpOpsIfCatchingUp(long numOps) {
+    UASSERT_NOT_IMPLEMENTED;
+}
+
+Status ReplicationCoordinatorEmbedded::processReplSetUpdatePosition(const UpdatePositionArgs&) {
     UASSERT_NOT_IMPLEMENTED;
 }
 
 std::vector<HostAndPort> ReplicationCoordinatorEmbedded::getHostsWrittenTo(const OpTime&, bool) {
-    UASSERT_NOT_IMPLEMENTED;
-}
-
-std::vector<HostAndPort> ReplicationCoordinatorEmbedded::getOtherNodesInReplSet() const {
     UASSERT_NOT_IMPLEMENTED;
 }
 
@@ -382,9 +404,8 @@ Status ReplicationCoordinatorEmbedded::checkIfCommitQuorumCanBeSatisfied(
     UASSERT_NOT_IMPLEMENTED;
 }
 
-StatusWith<bool> ReplicationCoordinatorEmbedded::checkIfCommitQuorumIsSatisfied(
-    const CommitQuorumOptions& commitQuorum,
-    const std::vector<HostAndPort>& commitReadyMembers) const {
+bool ReplicationCoordinatorEmbedded::isCommitQuorumSatisfied(
+    const CommitQuorumOptions& commitQuorum, const std::vector<mongo::HostAndPort>& members) const {
     UASSERT_NOT_IMPLEMENTED;
 }
 
@@ -396,16 +417,20 @@ HostAndPort ReplicationCoordinatorEmbedded::chooseNewSyncSource(const OpTime&) {
     UASSERT_NOT_IMPLEMENTED;
 }
 
-void ReplicationCoordinatorEmbedded::blacklistSyncSource(const HostAndPort&, Date_t) {
+void ReplicationCoordinatorEmbedded::denylistSyncSource(const HostAndPort&, Date_t) {
     UASSERT_NOT_IMPLEMENTED;
 }
 
-void ReplicationCoordinatorEmbedded::resetLastOpTimesFromOplog(OperationContext*, DataConsistency) {
+void ReplicationCoordinatorEmbedded::resetLastOpTimesFromOplog(OperationContext*) {
     UASSERT_NOT_IMPLEMENTED;
 }
 
-bool ReplicationCoordinatorEmbedded::shouldChangeSyncSource(
-    const HostAndPort&, const rpc::ReplSetMetadata&, boost::optional<rpc::OplogQueryMetadata>) {
+ChangeSyncSourceAction ReplicationCoordinatorEmbedded::shouldChangeSyncSource(
+    const HostAndPort&,
+    const rpc::ReplSetMetadata&,
+    const rpc::OplogQueryMetadata&,
+    const OpTime&,
+    const OpTime&) {
     UASSERT_NOT_IMPLEMENTED;
 }
 
@@ -443,8 +468,8 @@ Status ReplicationCoordinatorEmbedded::processHeartbeatV1(const ReplSetHeartbeat
     UASSERT_NOT_IMPLEMENTED;
 }
 
-long long ReplicationCoordinatorEmbedded::getTerm() {
-    UASSERT_NOT_IMPLEMENTED;
+long long ReplicationCoordinatorEmbedded::getTerm() const {
+    return 3;  // arbitrary constant number
 }
 
 Status ReplicationCoordinatorEmbedded::updateTerm(OperationContext*, long long) {
@@ -456,11 +481,11 @@ void ReplicationCoordinatorEmbedded::waitUntilSnapshotCommitted(OperationContext
     UASSERT_NOT_IMPLEMENTED;
 }
 
-size_t ReplicationCoordinatorEmbedded::getNumUncommittedSnapshots() {
+void ReplicationCoordinatorEmbedded::createWMajorityWriteAvailabilityDateWaiter(OpTime opTime) {
     UASSERT_NOT_IMPLEMENTED;
 }
 
-void ReplicationCoordinatorEmbedded::dropAllSnapshots() {
+void ReplicationCoordinatorEmbedded::clearCommittedSnapshot() {
     UASSERT_NOT_IMPLEMENTED;
 }
 
@@ -480,8 +505,73 @@ bool ReplicationCoordinatorEmbedded::setContainsArbiter() const {
     UASSERT_NOT_IMPLEMENTED;
 }
 
+bool ReplicationCoordinatorEmbedded::replSetContainsNewlyAddedMembers() const {
+    UASSERT_NOT_IMPLEMENTED;
+}
+
 void ReplicationCoordinatorEmbedded::attemptToAdvanceStableTimestamp() {
     UASSERT_NOT_IMPLEMENTED;
+}
+
+void ReplicationCoordinatorEmbedded::finishRecoveryIfEligible(OperationContext* opCtx) {
+    UASSERT_NOT_IMPLEMENTED;
+}
+
+void ReplicationCoordinatorEmbedded::updateAndLogStateTransitionMetrics(
+    const ReplicationCoordinator::OpsKillingStateTransitionEnum stateTransition,
+    const size_t numOpsKilled,
+    const size_t numOpsRunning) const {
+    UASSERT_NOT_IMPLEMENTED;
+}
+
+TopologyVersion ReplicationCoordinatorEmbedded::getTopologyVersion() const {
+    UASSERT_NOT_IMPLEMENTED;
+}
+
+void ReplicationCoordinatorEmbedded::incrementTopologyVersion() {
+    UASSERT_NOT_IMPLEMENTED;
+}
+
+std::shared_ptr<const repl::HelloResponse> ReplicationCoordinatorEmbedded::awaitHelloResponse(
+    OperationContext* opCtx,
+    const repl::SplitHorizon::Parameters& horizonParams,
+    boost::optional<TopologyVersion> previous,
+    boost::optional<Date_t> deadline) {
+    UASSERT_NOT_IMPLEMENTED;
+};
+
+SharedSemiFuture<std::shared_ptr<const HelloResponse>>
+ReplicationCoordinatorEmbedded::getHelloResponseFuture(
+    const SplitHorizon::Parameters& horizonParams,
+    boost::optional<TopologyVersion> clientTopologyVersion) {
+    UASSERT_NOT_IMPLEMENTED;
+}
+
+StatusWith<OpTime> ReplicationCoordinatorEmbedded::getLatestWriteOpTime(
+    OperationContext* opCtx) const noexcept {
+    return getMyLastAppliedOpTime();
+}
+
+HostAndPort ReplicationCoordinatorEmbedded::getCurrentPrimaryHostAndPort() const {
+    UASSERT_NOT_IMPLEMENTED;
+}
+
+void ReplicationCoordinatorEmbedded::cancelCbkHandle(
+    executor::TaskExecutor::CallbackHandle activeHandle) {
+    MONGO_UNREACHABLE;
+}
+
+BSONObj ReplicationCoordinatorEmbedded::runCmdOnPrimaryAndAwaitResponse(
+    OperationContext* opCtx,
+    const std::string& dbName,
+    const BSONObj& cmdObj,
+    OnRemoteCmdScheduledFn onRemoteCmdScheduled,
+    OnRemoteCmdCompleteFn onRemoteCmdComplete) {
+    MONGO_UNREACHABLE;
+}
+
+void ReplicationCoordinatorEmbedded::restartScheduledHeartbeats_forTest() {
+    MONGO_UNREACHABLE;
 }
 
 }  // namespace embedded

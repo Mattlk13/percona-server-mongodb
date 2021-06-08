@@ -27,14 +27,14 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplicationRollback
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplicationRollback
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/repl/roll_back_local_operations.h"
 
+#include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -87,11 +87,15 @@ RollBackLocalOperations::RollBackLocalOperations(const OplogInterface& localOplo
 }
 
 RollBackLocalOperations::RollbackCommonPoint::RollbackCommonPoint(BSONObj oplogBSON,
-                                                                  RecordId recordId)
+                                                                  RecordId recordId,
+                                                                  BSONObj nextOplogBSON)
     : _recordId(std::move(recordId)) {
     auto oplogEntry = uassertStatusOK(repl::OplogEntry::parse(oplogBSON));
     _opTime = oplogEntry.getOpTime();
     _wallClockTime = oplogEntry.getWallClockTime();
+    // nextOplogEntry holds the oplog entry immediately after the common point.
+    auto nextOplogEntry = uassertStatusOK(repl::OplogEntry::parse(nextOplogBSON));
+    _firstWallClockTimeAfterCommonPoint = nextOplogEntry.getWallClockTime();
 }
 
 StatusWith<RollBackLocalOperations::RollbackCommonPoint> RollBackLocalOperations::onRemoteOperation(
@@ -104,9 +108,17 @@ StatusWith<RollBackLocalOperations::RollbackCommonPoint> RollBackLocalOperations
         _localOplogValue = result.getValue();
     }
 
+    // As we iterate through the oplog in reverse, opAfterCurrentEntry holds the oplog entry
+    // immediately after the entry stored in _localOplogValue.
+    BSONObj opAfterCurrentEntry = _localOplogValue.first;
+
     while (getTimestamp(_localOplogValue) > getTimestamp(operation)) {
         _scanned++;
-        LOG(2) << "Local oplog entry to roll back: " << redact(_localOplogValue.first);
+        LOGV2_DEBUG(21656,
+                    2,
+                    "Local oplog entry to roll back: {oplogEntry}",
+                    "Local oplog entry to roll back",
+                    "oplogEntry"_attr = redact(_localOplogValue.first));
         auto status = _rollbackOperation(_localOplogValue.first);
         if (!status.isOK()) {
             invariant(ErrorCodes::NoSuchKey != status.code());
@@ -115,22 +127,21 @@ StatusWith<RollBackLocalOperations::RollbackCommonPoint> RollBackLocalOperations
         auto result = _localOplogIterator->next();
         if (!result.isOK()) {
             return Status(ErrorCodes::NoMatchingDocument,
-                          str::stream() << "reached beginning of local oplog: {"
-                                        << "scanned: "
-                                        << _scanned
-                                        << ", theirTime: "
-                                        << getTimestamp(operation).toString()
-                                        << ", ourTime: "
-                                        << getTimestamp(_localOplogValue).toString()
-                                        << "}");
+                          str::stream()
+                              << "reached beginning of local oplog: {"
+                              << "scanned: " << _scanned
+                              << ", theirTime: " << getTimestamp(operation).toString()
+                              << ", ourTime: " << getTimestamp(_localOplogValue).toString() << "}");
         }
+        opAfterCurrentEntry = _localOplogValue.first;
         _localOplogValue = result.getValue();
     }
 
     if (getTimestamp(_localOplogValue) == getTimestamp(operation)) {
         _scanned++;
         if (getTerm(_localOplogValue) == getTerm(operation)) {
-            return RollbackCommonPoint(_localOplogValue.first, _localOplogValue.second);
+            return RollbackCommonPoint(
+                _localOplogValue.first, _localOplogValue.second, opAfterCurrentEntry);
         }
 
         // We don't need to advance the localOplogIterator here because it is guaranteed to advance
@@ -178,8 +189,8 @@ StatusWith<RollBackLocalOperations::RollbackCommonPoint> syncRollBackLocalOperat
     RollBackLocalOperations finder(localOplog, rollbackOperation);
     Timestamp theirTime;
     while (remoteResult.isOK()) {
-        theirTime = remoteResult.getValue().first["ts"].timestamp();
         BSONObj theirObj = remoteResult.getValue().first;
+        theirTime = theirObj["ts"].timestamp();
         auto result = finder.onRemoteOperation(theirObj);
         if (result.isOK()) {
             return result.getValue();
@@ -190,11 +201,8 @@ StatusWith<RollBackLocalOperations::RollbackCommonPoint> syncRollBackLocalOperat
     }
     return Status(ErrorCodes::NoMatchingDocument,
                   str::stream() << "reached beginning of remote oplog: {"
-                                << "them: "
-                                << remoteOplog.toString()
-                                << ", theirTime: "
-                                << theirTime.toString()
-                                << "}");
+                                << "them: " << remoteOplog.toString()
+                                << ", theirTime: " << theirTime.toString() << "}");
 }
 
 }  // namespace repl

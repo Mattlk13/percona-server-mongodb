@@ -17,6 +17,7 @@ executor:
           disableImplicitSessions: true
       readMode: commands
   hooks:
+  - class: FuzzerRestoreSettings
   - class: CheckReplDBHash
     shell_options:
       global_vars:
@@ -27,7 +28,7 @@ executor:
       global_vars:
         TestData:
           skipValidationOnInvalidViewDefinitions: true
-          forceValidationWithFeatureCompatibilityVersion: "4.2"
+          forceValidationWithFeatureCompatibilityVersion: latestFCV
   fixture:
     class: ShardedClusterFixture
     mongos_options:
@@ -38,6 +39,8 @@ executor:
       set_parameters:
         disableLogicalSessionCacheRefresh: false
         enableTestCommands: 1
+        transactionLifetimeLimitSeconds: 1
         writePeriodicNoops: 1
       verbose: ''
+    num_rs_nodes_per_shard: 1
     num_shards: 2

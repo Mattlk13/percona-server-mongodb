@@ -17,11 +17,11 @@ const ENABLE_FAULTS = "enable_faults";
 
 class FreeMonWebServer {
     /**
-    * Create a new webserver.
-    *
-    * @param {string} fault_type
-    * @param {bool} disableFaultsOnStartup optionally disable fault on startup
-    */
+     * Create a new webserver.
+     *
+     * @param {string} fault_type
+     * @param {bool} disableFaultsOnStartup optionally disable fault on startup
+     */
     constructor(fault_type, disableFaultsOnStartup) {
         this.python = "python3";
         this.disableFaultsOnStartup = disableFaultsOnStartup || false;
@@ -71,6 +71,8 @@ class FreeMonWebServer {
                 args.push("--disable-faults");
             }
         }
+
+        clearRawMongoProgramOutput();
 
         this.pid = _startMongoProgram({args: args});
 
@@ -287,4 +289,43 @@ function FreeMonGetStatus(conn) {
 
     const admin = conn.getDB("admin");
     return assert.commandWorked(admin.runCommand({getFreeMonitoringStatus: 1}));
+}
+
+/**
+ * Wait for server status state
+ *
+ * @param {object} conn
+ * @param {string} state
+ */
+function WaitForFreeMonServerStatusState(conn, state) {
+    'use strict';
+
+    // Wait for registration to occur
+    assert.soon(
+        function() {
+            let status = FreeMonGetServerStatus(conn).state;
+            return status === state;
+        },
+        "Failed to find expected server status state: expected: '" + state +
+            "', actual: " + tojson(FreeMonGetServerStatus(conn)),
+        20 * 1000);
+}
+
+/**
+ * Validate Free Monitoring Replica Set consistency
+ * WARNING: Not valid if secondary is started with enableFreeMonitoring since it registers before it
+ * joins the replica set.
+ *
+ * @param {object} rst
+ */
+function ValidateFreeMonReplicaSet(rst) {
+    'use strict';
+
+    const primary_status = FreeMonGetStatus(rst.getPrimary());
+    const primary_url = primary_status.url;
+    const secondary_status = FreeMonGetStatus(rst.getSecondary());
+    const secondary_url = secondary_status.url;
+    assert.eq(primary_url,
+              secondary_url,
+              `DUMP ${tojson(primary_status)} == ${tojson(secondary_status)}`);
 }

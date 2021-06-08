@@ -31,6 +31,7 @@
 #include "mongo/scripting/mozjs/bson.h"
 
 #include <boost/optional.hpp>
+#include <fmt/format.h>
 #include <set>
 
 #include "mongo/scripting/mozjs/idwrapper.h"
@@ -44,10 +45,16 @@
 namespace mongo {
 namespace mozjs {
 
+using namespace fmt::literals;
+
 const char* const BSONInfo::className = "BSON";
 
-const JSFunctionSpec BSONInfo::freeFunctions[3] = {
-    MONGO_ATTACH_JS_FUNCTION(bsonWoCompare), MONGO_ATTACH_JS_FUNCTION(bsonBinaryEqual), JS_FS_END,
+const JSFunctionSpec BSONInfo::freeFunctions[5] = {
+    MONGO_ATTACH_JS_FUNCTION(bsonWoCompare),
+    MONGO_ATTACH_JS_FUNCTION(bsonUnorderedFieldsCompare),
+    MONGO_ATTACH_JS_FUNCTION(bsonBinaryEqual),
+    MONGO_ATTACH_JS_FUNCTION(bsonObjToArray),
+    JS_FS_END,
 };
 
 
@@ -265,10 +272,21 @@ std::tuple<BSONObj*, bool> BSONInfo::originalBSON(JSContext* cx, JS::HandleObjec
     return out;
 }
 
+void BSONInfo::Functions::bsonObjToArray::call(JSContext* cx, JS::CallArgs args) {
+    uassert(ErrorCodes::BadValue, "bsonObjToArray needs 1 argument", args.length() == 1);
+    uassert(ErrorCodes::BadValue, "argument must be an object", args.get(0).isObject());
 
-void BSONInfo::Functions::bsonWoCompare::call(JSContext* cx, JS::CallArgs args) {
+    auto obj = ValueWriter(cx, args.get(0)).toBSON();
+    ValueReader(cx, args.rval()).fromBSONArray(obj, nullptr, false);
+}
+
+namespace {
+void bsonCompareCommon(JSContext* cx,
+                       JS::CallArgs args,
+                       StringData funcName,
+                       BSONObj::ComparisonRulesSet rules) {
     if (args.length() != 2)
-        uasserted(ErrorCodes::BadValue, "bsonWoCompare needs 2 arguments");
+        uasserted(ErrorCodes::BadValue, "{} needs 2 arguments"_format(funcName));
 
     // If either argument is not proper BSON, then we wrap both objects.
     auto scope = getScope(cx);
@@ -278,7 +296,20 @@ void BSONInfo::Functions::bsonWoCompare::call(JSContext* cx, JS::CallArgs args) 
     BSONObj bsonObject1 = getBSONFromArg(cx, args.get(0), isBSON);
     BSONObj bsonObject2 = getBSONFromArg(cx, args.get(1), isBSON);
 
-    args.rval().setInt32(bsonObject1.woCompare(bsonObject2));
+    args.rval().setInt32(bsonObject1.woCompare(bsonObject2, {}, rules));
+}
+}  // namespace
+
+void BSONInfo::Functions::bsonWoCompare::call(JSContext* cx, JS::CallArgs args) {
+    bsonCompareCommon(cx, args, "bsonWoCompare", BSONObj::ComparatorInterface::kConsiderFieldName);
+}
+
+void BSONInfo::Functions::bsonUnorderedFieldsCompare::call(JSContext* cx, JS::CallArgs args) {
+    bsonCompareCommon(cx,
+                      args,
+                      "bsonWoCompare",
+                      BSONObj::ComparatorInterface::kConsiderFieldName |
+                          BSONObj::ComparatorInterface::kIgnoreFieldOrder);
 }
 
 void BSONInfo::Functions::bsonBinaryEqual::call(JSContext* cx, JS::CallArgs args) {

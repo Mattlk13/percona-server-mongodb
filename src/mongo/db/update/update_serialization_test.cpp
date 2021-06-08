@@ -55,8 +55,9 @@ auto updateRoundTrip(const char* json, const std::vector<std::string> filterName
     std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> filters;
     for (const auto& name : filterNames)
         filters[name] = nullptr;
-    driver.parse(bson, filters);
-    return mongo::tojson(driver.serialize().getDocument().toBson());
+    driver.parse(write_ops::UpdateModification::parseFromClassicUpdate(bson), filters);
+    return mongo::tojson(driver.serialize().getDocument().toBson(),
+                         mongo::JsonStringFormat::LegacyStrict);
 }
 
 TEST(UpdateSerialization, DocumentReplacementSerializesExactly) {
@@ -248,4 +249,4 @@ TEST(UpdateSerialization, CompoundStatementsSerialize) {
 }
 
 }  // namespace
-}  // mongo
+}  // namespace mongo

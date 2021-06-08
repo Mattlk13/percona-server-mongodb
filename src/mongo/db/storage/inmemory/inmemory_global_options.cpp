@@ -31,12 +31,12 @@ Copyright (C) 2018-present Percona and/or its affiliates. All rights reserved.
     it in the license file.
 ======= */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/storage/inmemory/inmemory_global_options.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace moe = mongo::optionenvironment;
 
@@ -47,13 +47,13 @@ InMemoryGlobalOptions inMemoryGlobalOptions;
 Status InMemoryGlobalOptions::store(const moe::Environment& params) {
     // InMemory storage engine options
     if (!inMemoryGlobalOptions.engineConfig.empty()) {
-        log() << "Engine custom option: " << inMemoryGlobalOptions.engineConfig;
+        LOGV2(29025, "Engine custom option: {value}", "value"_attr = inMemoryGlobalOptions.engineConfig);
     }
     if (!inMemoryGlobalOptions.collectionConfig.empty()) {
-        log() << "Collection custom option: " << inMemoryGlobalOptions.collectionConfig;
+        LOGV2(29026, "Collection custom option: {value}", "value"_attr = inMemoryGlobalOptions.collectionConfig);
     }
     if (!inMemoryGlobalOptions.indexConfig.empty()) {
-        log() << "Index custom option: " << inMemoryGlobalOptions.indexConfig;
+        LOGV2(29027, "Index custom option: {value}", "value"_attr = inMemoryGlobalOptions.indexConfig);
     }
 
     return Status::OK();

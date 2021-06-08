@@ -29,12 +29,16 @@
 
 #pragma once
 
+#include <map>
+
+#include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/basic.h"
 #include "mongo/rpc/message.h"
 #include "mongo/util/concurrency/spin_lock.h"
 #include "mongo/util/processinfo.h"
+#include "mongo/util/string_map.h"
 #include "mongo/util/with_alignment.h"
 
 namespace mongo {
@@ -73,6 +77,24 @@ public:
 
     BSONObj getObj() const;
 
+    // These opcounters record operations that would fail if we were fully enforcing our consistency
+    // constraints in steady-state oplog application mode.
+    void gotInsertOnExistingDoc() {
+        _checkWrap(&OpCounters::_insertOnExistingDoc, 1);
+    }
+    void gotUpdateOnMissingDoc() {
+        _checkWrap(&OpCounters::_updateOnMissingDoc, 1);
+    }
+    void gotDeleteWasEmpty() {
+        _checkWrap(&OpCounters::_deleteWasEmpty, 1);
+    }
+    void gotDeleteFromMissingNamespace() {
+        _checkWrap(&OpCounters::_deleteFromMissingNamespace, 1);
+    }
+    void gotAcceptableErrorInCommand() {
+        _checkWrap(&OpCounters::_acceptableErrorInCommand, 1);
+    }
+
     // thse are used by snmp, and other things, do not remove
     const AtomicWord<long long>* getInsert() const {
         return &_insert;
@@ -92,6 +114,21 @@ public:
     const AtomicWord<long long>* getCommand() const {
         return &_command;
     }
+    const AtomicWord<long long>* getInsertOnExistingDoc() const {
+        return &_insertOnExistingDoc;
+    }
+    const AtomicWord<long long>* getUpdateOnMissingDoc() const {
+        return &_updateOnMissingDoc;
+    }
+    const AtomicWord<long long>* getDeleteWasEmpty() const {
+        return &_deleteWasEmpty;
+    }
+    const AtomicWord<long long>* getDeleteFromMissingNamespace() const {
+        return &_deleteFromMissingNamespace;
+    }
+    const AtomicWord<long long>* getAcceptableErrorInCommand() const {
+        return &_acceptableErrorInCommand;
+    }
 
 private:
     // Increment member `counter` by `n`, resetting all counters if it was > 2^60.
@@ -103,6 +140,12 @@ private:
     CacheAligned<AtomicWord<long long>> _delete;
     CacheAligned<AtomicWord<long long>> _getmore;
     CacheAligned<AtomicWord<long long>> _command;
+
+    CacheAligned<AtomicWord<long long>> _insertOnExistingDoc;
+    CacheAligned<AtomicWord<long long>> _updateOnMissingDoc;
+    CacheAligned<AtomicWord<long long>> _deleteWasEmpty;
+    CacheAligned<AtomicWord<long long>> _deleteFromMissingNamespace;
+    CacheAligned<AtomicWord<long long>> _acceptableErrorInCommand;
 };
 
 extern OpCounters globalOpCounters;
@@ -118,6 +161,27 @@ public:
     // server
     void hitLogicalIn(long long bytes);
     void hitLogicalOut(long long bytes);
+
+    // Increment the counter for the number of slow dns resolution operations.
+    void incrementNumSlowDNSOperations();
+
+    // Increment the counter for the number of slow ssl handshake operations.
+    void incrementNumSlowSSLOperations();
+
+    // TFO Counters and Status;
+    void acceptedTFOIngress();
+
+    void setTFOKernelSetting(std::int64_t val) {
+        _tfo.kernelSetting = val;
+    }
+
+    void setTFOServerSupport(bool val) {
+        _tfo.kernelSupportServer = val;
+    }
+
+    void setTFOClientSupport(bool val) {
+        _tfo.kernelSupportClient = val;
+    }
 
     void append(BSONObjBuilder& b);
 
@@ -136,7 +200,142 @@ private:
                   "cache line spill");
 
     CacheAligned<AtomicWord<long long>> _logicalBytesOut{0};
+
+    CacheAligned<AtomicWord<long long>> _numSlowDNSOperations{0};
+    CacheAligned<AtomicWord<long long>> _numSlowSSLOperations{0};
+
+    struct TFO {
+        // Counter of inbound connections at runtime.
+        AtomicWord<std::int64_t> accepted{0};
+
+        // Info determined at startup.
+        std::int64_t kernelSetting;
+        bool kernelSupportServer{false};
+        bool kernelSupportClient{false};
+    };
+    CacheAligned<TFO> _tfo{};
 };
 
 extern NetworkCounter networkCounter;
-}
+
+class AuthCounter {
+    struct MechanismData;
+
+public:
+    class MechanismCounterHandle {
+    public:
+        MechanismCounterHandle(MechanismData* data) : _data(data) {}
+
+        void incSpeculativeAuthenticateReceived();
+        void incSpeculativeAuthenticateSuccessful();
+
+        void incAuthenticateReceived();
+        void incAuthenticateSuccessful();
+
+        void incClusterAuthenticateReceived();
+        void incClusterAuthenticateSuccessful();
+
+    private:
+        MechanismData* _data;
+    };
+
+    MechanismCounterHandle getMechanismCounter(StringData mechanism);
+
+    void incSaslSupportedMechanismsReceived();
+
+    void append(BSONObjBuilder*);
+
+    void initializeMechanismMap(const std::vector<std::string>&);
+
+private:
+    struct MechanismData {
+        struct {
+            AtomicWord<long long> received;
+            AtomicWord<long long> successful;
+        } speculativeAuthenticate;
+        struct {
+            AtomicWord<long long> received;
+            AtomicWord<long long> successful;
+        } authenticate;
+        struct {
+            AtomicWord<long long> received;
+            AtomicWord<long long> successful;
+        } clusterAuthenticate;
+    };
+    using MechanismMap = std::map<std::string, MechanismData>;
+
+    AtomicWord<long long> _saslSupportedMechanismsReceived;
+
+    // Mechanism maps are initialized at startup to contain all
+    // mechanisms known to authenticationMechanisms setParam.
+    // After that they are kept to a fixed size.
+    MechanismMap _mechanisms;
+};
+extern AuthCounter authCounter;
+
+class AggStageCounters {
+public:
+    // Container for a stage count metric along with its corresponding counter.
+    struct StageCounter {
+        StageCounter(StringData name) : metric("aggStageCounters." + name, &counter) {}
+
+        Counter64 counter;
+        ServerStatusMetricField<Counter64> metric;
+    };
+
+    // Map of aggregation stages to the number of occurrences.
+    StringMap<std::unique_ptr<StageCounter>> stageCounterMap = {};
+};
+
+extern AggStageCounters aggStageCounters;
+
+class DotsAndDollarsFieldsCounters {
+public:
+    DotsAndDollarsFieldsCounters()
+        : insertMetric("dotsAndDollarsFields.inserts", &inserts),
+          updateMetric("dotsAndDollarsFields.updates", &updates) {}
+
+    void incrementForUpsert(bool didInsert) {
+        if (didInsert) {
+            inserts.increment();
+        } else {
+            updates.increment();
+        }
+    }
+
+    Counter64 inserts;
+    Counter64 updates;
+    ServerStatusMetricField<Counter64> insertMetric;
+    ServerStatusMetricField<Counter64> updateMetric;
+};
+
+extern DotsAndDollarsFieldsCounters dotsAndDollarsFieldsCounters;
+
+class OperatorCountersExpressions {
+private:
+    struct ExprCounter {
+        ExprCounter(StringData name) : metric("operatorCounters.expressions." + name, &counter) {}
+
+        Counter64 counter;
+        ServerStatusMetricField<Counter64> metric;
+    };
+
+public:
+    void addExpressionCounter(StringData name) {
+        operatorCountersExpressionMap[name] = std::make_unique<ExprCounter>(name);
+    }
+
+    void incrementExpressionCounter(StringData name) {
+        if (auto it = operatorCountersExpressionMap.find(name);
+            it != operatorCountersExpressionMap.end()) {
+            it->second->counter.increment(1);
+        }
+    }
+
+private:
+    // Map of aggregation expressions to the number of occurrences in aggregation pipelines.
+    StringMap<std::unique_ptr<ExprCounter>> operatorCountersExpressionMap = {};
+};
+
+extern OperatorCountersExpressions operatorCountersExpressions;
+}  // namespace mongo

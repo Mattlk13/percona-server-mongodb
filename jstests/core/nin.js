@@ -12,12 +12,11 @@ function checkEqual(name, key, value) {
 
     assert.eq(t.find().count(),
               i + n,
-              "checkEqual " + name + " $in + $nin != total | " + i + " + " + n + " != " +
-                  t.find().count());
+              "checkEqual " + name + " $in + $nin != total | " + i + " + " + n +
+                  " != " + t.find().count());
 }
 
 doTest = function(n) {
-
     t.save({a: [1, 2, 3]});
     t.save({a: [1, 2, 4]});
     t.save({a: [1, 8, 5]});
@@ -58,5 +57,5 @@ doTest = function(n) {
 
 doTest("no index");
 t.drop();
-t.ensureIndex({a: 1});
+t.createIndex({a: 1});
 doTest("with index");

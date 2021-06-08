@@ -38,7 +38,7 @@
 namespace mongo {
 
 class StringData;
-class NamespaceString;
+class NamespaceStringOrUUID;
 
 class Lock {
 public:
@@ -81,8 +81,11 @@ public:
             : _rid(rid), _locker(locker), _result(LOCK_INVALID) {}
 
         ResourceLock(Locker* locker, ResourceId rid, LockMode mode)
+            : ResourceLock(nullptr, locker, rid, mode) {}
+
+        ResourceLock(OperationContext* opCtx, Locker* locker, ResourceId rid, LockMode mode)
             : _rid(rid), _locker(locker), _result(LOCK_INVALID) {
-            lock(mode);
+            lock(opCtx, mode);
         }
 
         ResourceLock(ResourceLock&& otherLock)
@@ -98,7 +101,17 @@ public:
             }
         }
 
-        void lock(LockMode mode);
+        /**
+         * Acquires lock on this specified resource in the specified mode.
+         *
+         * If 'opCtx' is provided, it will be used to interrupt a LOCK_WAITING state.
+         * If 'deadline' is provided, we will wait until 'deadline' for the lock to be granted.
+         * Otherwise, this parameter defaults to an infinite deadline.
+         *
+         * This function may throw an exception if it is interrupted.
+         */
+        void lock(OperationContext* opCtx, LockMode mode, Date_t deadline = Date_t::max());
+
         void unlock();
 
         bool isLocked() const {
@@ -155,7 +168,23 @@ public:
     class ExclusiveLock : public ResourceLock {
     public:
         ExclusiveLock(Locker* locker, ResourceMutex mutex)
-            : ResourceLock(locker, mutex.rid(), MODE_X) {}
+            : ExclusiveLock(nullptr, locker, mutex) {}
+
+        /**
+         * Interruptible lock acquisition.
+         */
+        ExclusiveLock(OperationContext* opCtx, Locker* locker, ResourceMutex mutex)
+            : ResourceLock(opCtx, locker, mutex.rid(), MODE_X) {}
+
+        using ResourceLock::lock;
+
+        /**
+         * Parameterless overload to allow ExclusiveLock to be used with stdx::unique_lock and
+         * stdx::condition_variable_any
+         */
+        void lock() {
+            lock(nullptr, MODE_X);
+        }
     };
 
     /**
@@ -165,8 +194,13 @@ public:
      */
     class SharedLock : public ResourceLock {
     public:
-        SharedLock(Locker* locker, ResourceMutex mutex)
-            : ResourceLock(locker, mutex.rid(), MODE_IS) {}
+        SharedLock(Locker* locker, ResourceMutex mutex) : SharedLock(nullptr, locker, mutex) {}
+
+        /**
+         * Interruptible lock acquisition.
+         */
+        SharedLock(OperationContext* opCtx, Locker* locker, ResourceMutex mutex)
+            : ResourceLock(opCtx, locker, mutex.rid(), MODE_IS) {}
     };
 
     /**
@@ -188,8 +222,6 @@ public:
      */
     class GlobalLock {
     public:
-        class EnqueueOnly {};
-
         /**
          * A GlobalLock without a deadline defaults to Date_t::max() and an InterruptBehavior of
          * kThrow.
@@ -203,21 +235,10 @@ public:
         GlobalLock(OperationContext* opCtx,
                    LockMode lockMode,
                    Date_t deadline,
-                   InterruptBehavior behavior);
+                   InterruptBehavior behavior,
+                   bool skipRSTLLock = false);
 
         GlobalLock(GlobalLock&&);
-
-        /**
-         * Enqueues lock but does not block on lock acquisition.
-         * Call waitForLockUntil() to complete locking process.
-         *
-         * Does not set Locker::setGlobalLockTakenInMode(). Call waitForLockUntil to do so.
-         */
-        GlobalLock(OperationContext* opCtx,
-                   LockMode lockMode,
-                   Date_t deadline,
-                   InterruptBehavior behavior,
-                   EnqueueOnly enqueueOnly);
 
         ~GlobalLock() {
             // Preserve the original lock result which will be overridden by unlock().
@@ -233,28 +254,29 @@ public:
                 }
                 _unlock();
             }
-            if (lockResult == LOCK_OK || lockResult == LOCK_WAITING) {
+            if (!_skipRSTLLock && (lockResult == LOCK_OK || lockResult == LOCK_WAITING)) {
                 _opCtx->lockState()->unlock(resourceIdReplicationStateTransitionLock);
             }
         }
-
-        /**
-         * Waits for lock to be granted. Sets Locker::setGlobalLockTakenInMode().
-         */
-        void waitForLockUntil(Date_t deadline);
 
         bool isLocked() const {
             return _result == LOCK_OK;
         }
 
     private:
-        void _enqueue(LockMode lockMode, Date_t deadline);
+        /**
+         * Constructor helper functions, to handle skipping or taking the RSTL lock.
+         */
+        void _takeGlobalLockOnly(LockMode lockMode, Date_t deadline);
+        void _takeGlobalAndRSTLLocks(LockMode lockMode, Date_t deadline);
+
         void _unlock();
 
         OperationContext* const _opCtx;
         LockResult _result;
         ResourceLock _pbwm;
         InterruptBehavior _interruptBehavior;
+        bool _skipRSTLLock;
         const bool _isOutermostLock;
     };
 
@@ -289,7 +311,7 @@ public:
     };
 
     /**
-     * Database lock with support for collection- and document-level locking
+     * Database lock.
      *
      * This lock supports four modes (see Lock_Mode):
      *   MODE_IS: concurrent database access, requiring further collection read locks
@@ -342,18 +364,16 @@ public:
     };
 
     /**
-     * Collection lock with support for document-level locking
+     * Collection lock.
      *
      * This lock supports four modes (see Lock_Mode):
-     *   MODE_IS: concurrent collection access, requiring document level locking read locks
-     *   MODE_IX: concurrent collection access, requiring document level read or write locks
+     *   MODE_IS: concurrent collection access, requiring read locks
+     *   MODE_IX: concurrent collection access, requiring read or write locks
      *   MODE_S:  shared read access to the collection, blocking any writers
      *   MODE_X:  exclusive access to the collection, blocking all other readers and writers
      *
      * An appropriate DBLock must already be held before locking a collection: it is an error,
-     * checked with a dassert(), to not have a suitable database lock before locking the
-     * collection. For storage engines that do not support document-level locking, MODE_IS
-     * will be upgraded to MODE_S and MODE_IX will be upgraded to MODE_X.
+     * checked with a dassert(), to not have a suitable database lock before locking the collection.
      */
     class CollectionLock {
         CollectionLock(const CollectionLock&) = delete;
@@ -361,14 +381,15 @@ public:
 
     public:
         CollectionLock(OperationContext* opCtx,
-                       const NamespaceString& nss,
+                       const NamespaceStringOrUUID& nssOrUUID,
                        LockMode mode,
                        Date_t deadline = Date_t::max());
+
         CollectionLock(CollectionLock&&);
         ~CollectionLock();
 
     private:
-        const ResourceId _id;
+        ResourceId _id;
         OperationContext* _opCtx;
     };
 

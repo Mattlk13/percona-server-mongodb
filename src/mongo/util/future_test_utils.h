@@ -34,6 +34,8 @@
 #include "mongo/stdx/thread.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
+#include "mongo/util/concepts.h"
+#include "mongo/util/executor_test_util.h"
 
 #if !defined(__has_feature)
 #define __has_feature(x) 0
@@ -50,45 +52,17 @@ enum DoExecutorFuture : bool {
     kDoExecutorFuture = true,
 };
 
-class InlineCountingExecutor final : public OutOfLineExecutor {
-public:
-    void schedule(Task task) noexcept override {
-        // Relaxed to avoid adding synchronization where there otherwise wouldn't be. That would
-        // cause a false negative from TSAN.
-        tasksRun.fetch_add(1, std::memory_order_relaxed);
-        task(Status::OK());
-    }
-
-    static auto make() {
-        return std::make_shared<InlineCountingExecutor>();
-    }
-
-    std::atomic<int32_t> tasksRun{0};  // NOLINT
-};
-
-class RejectingExecutor final : public OutOfLineExecutor {
-public:
-    void schedule(Task task) noexcept override {
-        task(Status(ErrorCodes::ShutdownInProgress, ""));
-    }
-
-    static auto make() {
-        return std::make_shared<RejectingExecutor>();
-    }
-};
-
-class DummyInterruptable final : public Interruptible {
+class DummyInterruptible final : public Interruptible {
     StatusWith<stdx::cv_status> waitForConditionOrInterruptNoAssertUntil(
-        stdx::condition_variable& cv,
-        stdx::unique_lock<stdx::mutex>& m,
-        Date_t deadline) noexcept override {
+        stdx::condition_variable& cv, BasicLockableAdapter m, Date_t deadline) noexcept override {
         return Status(ErrorCodes::Interrupted, "");
     }
     Date_t getDeadline() const override {
         MONGO_UNREACHABLE;
     }
     Status checkForInterruptNoAssert() noexcept override {
-        MONGO_UNREACHABLE;
+        // Must be implemented because it's called by Interruptible::waitForConditionOrInterrupt.
+        return Status::OK();
     }
     IgnoreInterruptsState pushIgnoreInterrupts() override {
         MONGO_UNREACHABLE;
@@ -103,7 +77,7 @@ class DummyInterruptable final : public Interruptible {
         MONGO_UNREACHABLE;
     }
     Date_t getExpirationDateForWaitForValue(Milliseconds waitFor) override {
-        MONGO_UNREACHABLE;
+        return Date_t::now() + waitFor;
     }
 };
 
@@ -127,18 +101,19 @@ inline void sleepIfShould() {
 #endif
 }
 
-template <typename Func, typename Result = std::result_of_t<Func && ()>>
+template <typename Func, typename Result = std::invoke_result_t<Func&&>>
 Future<Result> async(Func&& func) {
     auto pf = makePromiseFuture<Result>();
 
-    stdx::thread([ promise = std::move(pf.promise), func = std::forward<Func>(func) ]() mutable {
+    stdx::thread([promise = std::move(pf.promise), func = std::forward<Func>(func)]() mutable {
         sleepIfShould();
         try {
             completePromise(&promise, func);
         } catch (const DBException& ex) {
             promise.setError(ex.toStatus());
         }
-    }).detach();
+    })
+        .detach();
 
     return std::move(pf.future);
 }
@@ -159,7 +134,7 @@ inline Status failStatus() {
 template <DoExecutorFuture doExecutorFuture = kDoExecutorFuture,
           typename CompletionFunc,
           typename TestFunc,
-          typename = std::enable_if_t<!std::is_void<std::result_of_t<CompletionFunc()>>::value>>
+          typename = std::enable_if_t<!std::is_void<std::invoke_result_t<CompletionFunc>>::value>>
 void FUTURE_SUCCESS_TEST(const CompletionFunc& completion, const TestFunc& test) {
     using CompletionType = decltype(completion());
     {  // immediate future
@@ -175,8 +150,8 @@ void FUTURE_SUCCESS_TEST(const CompletionFunc& completion, const TestFunc& test)
         test(async([&] { return completion(); }));
     }
 
-    IF_CONSTEXPR(doExecutorFuture) {  // immediate executor future
-        auto exec = InlineCountingExecutor::make();
+    if constexpr (doExecutorFuture) {  // immediate executor future
+        auto exec = InlineQueuedCountingExecutor::make();
         test(Future<CompletionType>::makeReady(completion()).thenRunOn(exec));
     }
 }
@@ -184,7 +159,7 @@ void FUTURE_SUCCESS_TEST(const CompletionFunc& completion, const TestFunc& test)
 template <DoExecutorFuture doExecutorFuture = kDoExecutorFuture,
           typename CompletionFunc,
           typename TestFunc,
-          typename = std::enable_if_t<std::is_void<std::result_of_t<CompletionFunc()>>::value>,
+          typename = std::enable_if_t<std::is_void<std::invoke_result_t<CompletionFunc>>::value>,
           typename = void>
 void FUTURE_SUCCESS_TEST(const CompletionFunc& completion, const TestFunc& test) {
     using CompletionType = decltype(completion());
@@ -203,9 +178,9 @@ void FUTURE_SUCCESS_TEST(const CompletionFunc& completion, const TestFunc& test)
         test(async([&] { return completion(); }));
     }
 
-    IF_CONSTEXPR(doExecutorFuture) {  // immediate executor future
+    if constexpr (doExecutorFuture) {  // immediate executor future
         completion();
-        auto exec = InlineCountingExecutor::make();
+        auto exec = InlineQueuedCountingExecutor::make();
         test(Future<CompletionType>::makeReady().thenRunOn(exec));
     }
 }
@@ -229,9 +204,27 @@ void FUTURE_FAIL_TEST(const TestFunc& test) {
             MONGO_UNREACHABLE;
         }));
     }
-    IF_CONSTEXPR(doExecutorFuture) {  // immediate executor future
-        auto exec = InlineCountingExecutor::make();
+    if constexpr (doExecutorFuture) {  // immediate executor future
+        auto exec = InlineQueuedCountingExecutor::make();
         test(Future<CompletionType>::makeReady(failStatus()).thenRunOn(exec));
     }
 }
+
+/**
+ * True if PromiseT::setFrom(ArgT) is valid.
+ */
+template <typename PromiseT, typename ArgT, typename = void>
+inline constexpr bool canSetFrom = false;
+
+template <typename PromiseT>
+inline constexpr bool canSetFrom<PromiseT,  //
+                                 void,      //
+                                 decltype(std::declval<PromiseT&>().setFrom())> = true;
+
+template <typename PromiseT, typename ArgT>
+inline constexpr bool
+    canSetFrom<PromiseT,  //
+               ArgT,      //
+               decltype(std::declval<PromiseT&>().setFrom(std::declval<ArgT>()))> = true;
+
 }  // namespace mongo

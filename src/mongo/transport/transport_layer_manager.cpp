@@ -27,50 +27,55 @@
  *    it in the license file.
  */
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
+
 #include "mongo/platform/basic.h"
 
 #include "mongo/transport/transport_layer_manager.h"
 
+#include <iostream>
+#include <limits>
+#include <memory>
+
 #include "mongo/base/status.h"
+#include "mongo/config.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/transport/service_executor_adaptive.h"
+#include "mongo/logv2/log.h"
 #include "mongo/transport/service_executor_synchronous.h"
 #include "mongo/transport/session.h"
 #include "mongo/transport/transport_layer_asio.h"
 #include "mongo/util/net/ssl_types.h"
 #include "mongo/util/time_support.h"
-#include <limits>
-
-#include <iostream>
 
 namespace mongo {
 namespace transport {
 
-TransportLayerManager::TransportLayerManager() = default;
-
 template <typename Callable>
 void TransportLayerManager::_foreach(Callable&& cb) const {
     {
-        stdx::lock_guard<stdx::mutex> lk(_tlsMutex);
+        stdx::lock_guard<Latch> lk(_tlsMutex);
         for (auto&& tl : _tls) {
             cb(tl.get());
         }
     }
 }
 
-StatusWith<SessionHandle> TransportLayerManager::connect(HostAndPort peer,
-                                                         ConnectSSLMode sslMode,
-                                                         Milliseconds timeout) {
-    return _tls.front()->connect(peer, sslMode, timeout);
+StatusWith<SessionHandle> TransportLayerManager::connect(
+    HostAndPort peer,
+    ConnectSSLMode sslMode,
+    Milliseconds timeout,
+    boost::optional<TransientSSLParams> transientSSLParams) {
+    return _tls.front()->connect(peer, sslMode, timeout, transientSSLParams);
 }
 
-Future<SessionHandle> TransportLayerManager::asyncConnect(HostAndPort peer,
-                                                          ConnectSSLMode sslMode,
-                                                          const ReactorHandle& reactor,
-                                                          Milliseconds timeout) {
-    return _tls.front()->asyncConnect(peer, sslMode, reactor, timeout);
+Future<SessionHandle> TransportLayerManager::asyncConnect(
+    HostAndPort peer,
+    ConnectSSLMode sslMode,
+    const ReactorHandle& reactor,
+    Milliseconds timeout,
+    std::shared_ptr<const SSLConnectionContext> transientSSLContext) {
+    return _tls.front()->asyncConnect(peer, sslMode, reactor, timeout, transientSSLContext);
 }
 
 ReactorHandle TransportLayerManager::getReactor(WhichReactor which) {
@@ -111,7 +116,7 @@ Status TransportLayerManager::setup() {
 Status TransportLayerManager::addAndStartTransportLayer(std::unique_ptr<TransportLayer> tl) {
     auto ptr = tl.get();
     {
-        stdx::lock_guard<stdx::mutex> lk(_tlsMutex);
+        stdx::lock_guard<Latch> lk(_tlsMutex);
         _tls.emplace_back(std::move(tl));
     }
     return ptr->start();
@@ -122,7 +127,7 @@ std::unique_ptr<TransportLayer> TransportLayerManager::makeAndStartDefaultEgress
     opts.mode = transport::TransportLayerASIO::Options::kEgress;
     opts.ipList.clear();
 
-    auto ret = stdx::make_unique<transport::TransportLayerASIO>(opts, nullptr);
+    auto ret = std::make_unique<transport::TransportLayerASIO>(opts, nullptr);
     uassertStatusOK(ret->setup());
     uassertStatusOK(ret->start());
     return std::unique_ptr<TransportLayer>(std::move(ret));
@@ -130,33 +135,44 @@ std::unique_ptr<TransportLayer> TransportLayerManager::makeAndStartDefaultEgress
 
 std::unique_ptr<TransportLayer> TransportLayerManager::createWithConfig(
     const ServerGlobalParams* config, ServiceContext* ctx) {
-    std::unique_ptr<TransportLayer> transportLayer;
     auto sep = ctx->getServiceEntryPoint();
 
     transport::TransportLayerASIO::Options opts(config);
-    if (config->serviceExecutor == "adaptive") {
-        opts.transportMode = transport::Mode::kAsynchronous;
-    } else if (config->serviceExecutor == "synchronous") {
-        opts.transportMode = transport::Mode::kSynchronous;
-    } else {
-        MONGO_UNREACHABLE;
-    }
-
-    auto transportLayerASIO = stdx::make_unique<transport::TransportLayerASIO>(opts, sep);
-
-    if (config->serviceExecutor == "adaptive") {
-        auto reactor = transportLayerASIO->getReactor(TransportLayer::kIngress);
-        ctx->setServiceExecutor(
-            stdx::make_unique<ServiceExecutorAdaptive>(ctx, std::move(reactor)));
-    } else if (config->serviceExecutor == "synchronous") {
-        ctx->setServiceExecutor(stdx::make_unique<ServiceExecutorSynchronous>(ctx));
-    }
-    transportLayer = std::move(transportLayerASIO);
+    opts.transportMode = transport::Mode::kSynchronous;
 
     std::vector<std::unique_ptr<TransportLayer>> retVector;
-    retVector.emplace_back(std::move(transportLayer));
-    return stdx::make_unique<TransportLayerManager>(std::move(retVector));
+    retVector.emplace_back(std::make_unique<transport::TransportLayerASIO>(opts, sep));
+    return std::make_unique<TransportLayerManager>(std::move(retVector));
 }
+
+#ifdef MONGO_CONFIG_SSL
+Status TransportLayerManager::rotateCertificates(std::shared_ptr<SSLManagerInterface> manager,
+                                                 bool asyncOCSPStaple) {
+    for (auto&& tl : _tls) {
+        auto status = tl->rotateCertificates(manager, asyncOCSPStaple);
+        if (!status.isOK()) {
+            return status;
+        }
+    }
+    return Status::OK();
+}
+
+StatusWith<std::shared_ptr<const transport::SSLConnectionContext>>
+TransportLayerManager::createTransientSSLContext(const TransientSSLParams& transientSSLParams) {
+
+    Status firstError(ErrorCodes::InvalidSSLConfiguration,
+                      "Failure creating transient SSL context");
+    for (auto&& tl : _tls) {
+        auto statusOrContext = tl->createTransientSSLContext(transientSSLParams);
+        if (statusOrContext.isOK()) {
+            return std::move(statusOrContext.getValue());
+        }
+        firstError = statusOrContext.getStatus();
+    }
+    return firstError;
+}
+
+#endif
 
 }  // namespace transport
 }  // namespace mongo

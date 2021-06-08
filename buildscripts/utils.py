@@ -8,47 +8,6 @@ import subprocess
 import sys
 
 
-def get_all_source_files(arr=None, prefix="."):
-    """Return source files."""
-    if arr is None:
-        arr = []
-
-    if not os.path.isdir(prefix):
-        # assume a file
-        arr.append(prefix)
-        return arr
-
-    for fx in os.listdir(prefix):
-        # pylint: disable=too-many-boolean-expressions
-        if (fx.startswith(".") or fx.startswith("pcre-") or fx.startswith("32bit")
-                or fx.startswith("mongodb-") or fx.startswith("debian")
-                or fx.startswith("mongo-cxx-driver") or fx.startswith("sqlite") or "gotools" in fx
-                or fx.find("mozjs") != -1):
-            continue
-        # pylint: enable=too-many-boolean-expressions
-
-        def is_followable_dir(prefix, full):
-            """Return True if 'full' is a followable directory."""
-            if not os.path.isdir(full):
-                return False
-            if not os.path.islink(full):
-                return True
-            # Follow softlinks in the modules directory (e.g: enterprise).
-            if os.path.split(prefix)[1] == "modules":
-                return True
-            return False
-
-        full = prefix + "/" + fx
-        if is_followable_dir(prefix, full):
-            get_all_source_files(arr, full)
-        else:
-            if full.endswith(".cpp") or full.endswith(".h") or full.endswith(".c"):
-                full = full.replace("//", "/")
-                arr.append(full)
-
-    return arr
-
-
 def get_git_branch():
     """Return the git branch version."""
     if not os.path.exists(".git") or not os.path.isdir(".git"):
@@ -128,33 +87,6 @@ def which(executable):
             return executable_path
 
     return executable
-
-
-def find_python(min_version=(3, 7)):
-    """Return path of python."""
-    try:
-        return sys.executable
-    except AttributeError:
-        # In case the version of Python is somehow missing sys.version_info or sys.executable.
-        pass
-
-    version = re.compile(r"[Pp]ython ([\d\.]+)", re.MULTILINE)
-    binaries = ("python37", "python3.7", "python36", "python3.6", "python35", "python3.5", "python")
-    for binary in binaries:
-        try:
-            out, err = subprocess.Popen([binary, "-V"], stdout=subprocess.PIPE,
-                                        stderr=subprocess.PIPE).communicate()
-            for stream in (out, err):
-                match = version.search(stream)
-                if match:
-                    versiontuple = tuple(map(int, match.group(1).split(".")))
-                    if versiontuple >= min_version:
-                        return which(binary)
-        except Exception:  # pylint: disable=broad-except
-            pass
-
-    raise Exception(
-        "could not find suitable Python (version >= %s)" % ".".join(str(v) for v in min_version))
 
 
 def replace_with_repr(unicode_error):

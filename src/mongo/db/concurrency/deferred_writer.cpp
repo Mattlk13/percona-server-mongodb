@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kWrite
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kWrite
 
 #include "mongo/db/concurrency/deferred_writer.h"
 #include "mongo/db/catalog/create_collection.h"
@@ -35,9 +35,9 @@
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/concurrency/idle_thread_block.h"
 #include "mongo/util/concurrency/thread_pool.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -47,7 +47,11 @@ auto kLogInterval = stdx::chrono::minutes(1);
 
 void DeferredWriter::_logFailure(const Status& status) {
     if (TimePoint::clock::now() - _lastLogged > kLogInterval) {
-        log() << "Unable to write to collection " << _nss.toString() << ": " << status.toString();
+        LOGV2(20516,
+              "Unable to write to collection {namespace}: {error}",
+              "Unable to write to collection",
+              "namespace"_attr = _nss.toString(),
+              "error"_attr = status);
         _lastLogged = stdx::chrono::system_clock::now();
     }
 }
@@ -55,8 +59,11 @@ void DeferredWriter::_logFailure(const Status& status) {
 void DeferredWriter::_logDroppedEntry() {
     _droppedEntries += 1;
     if (TimePoint::clock::now() - _lastLoggedDrop > kLogInterval) {
-        log() << "Deferred write buffer for " << _nss.toString() << " is full. " << _droppedEntries
-              << " entries have been dropped.";
+        LOGV2(
+            20517,
+            "Deferred write buffer for {nss} is full. {droppedEntries} entries have been dropped.",
+            "nss"_attr = _nss.toString(),
+            "droppedEntries"_attr = _droppedEntries);
         _lastLoggedDrop = stdx::chrono::system_clock::now();
         _droppedEntries = 0;
     }
@@ -76,7 +83,7 @@ Status DeferredWriter::_makeCollection(OperationContext* opCtx) {
 StatusWith<std::unique_ptr<AutoGetCollection>> DeferredWriter::_getCollection(
     OperationContext* opCtx) {
     std::unique_ptr<AutoGetCollection> agc;
-    agc = stdx::make_unique<AutoGetCollection>(opCtx, _nss, MODE_IX);
+    agc = std::make_unique<AutoGetCollection>(opCtx, _nss, MODE_IX);
 
     while (!agc->getCollection()) {
         // Release the previous AGC's lock before trying to rebuild the collection.
@@ -87,7 +94,7 @@ StatusWith<std::unique_ptr<AutoGetCollection>> DeferredWriter::_getCollection(
             return status;
         }
 
-        agc = stdx::make_unique<AutoGetCollection>(opCtx, _nss, MODE_IX);
+        agc = std::make_unique<AutoGetCollection>(opCtx, _nss, MODE_IX);
     }
 
     return std::move(agc);
@@ -105,11 +112,11 @@ void DeferredWriter::_worker(InsertStatement stmt) {
 
     auto agc = std::move(result.getValue());
 
-    Collection& collection = *agc->getCollection();
+    const CollectionPtr& collection = agc->getCollection();
 
     Status status = writeConflictRetry(opCtx, "deferred insert", _nss.ns(), [&] {
         WriteUnitOfWork wuow(opCtx);
-        Status status = collection.insertDocument(opCtx, stmt, nullptr, false);
+        Status status = collection->insertDocument(opCtx, stmt, nullptr, false);
         if (!status.isOK()) {
             return status;
         }
@@ -118,7 +125,7 @@ void DeferredWriter::_worker(InsertStatement stmt) {
         return Status::OK();
     });
 
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    stdx::lock_guard<Latch> lock(_mutex);
 
     _numBytes -= stmt.doc.objsize();
 
@@ -147,7 +154,7 @@ void DeferredWriter::startup(std::string workerName) {
     options.minThreads = 0;
     options.maxThreads = 1;
     options.onCreateThread = [](const std::string& name) { Client::initThread(name); };
-    _pool = stdx::make_unique<ThreadPool>(options);
+    _pool = std::make_unique<ThreadPool>(options);
     _pool->startup();
 }
 
@@ -166,7 +173,7 @@ bool DeferredWriter::insertDocument(BSONObj obj) {
     // We can't insert documents if we haven't been started up.
     invariant(_pool);
 
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    stdx::lock_guard<Latch> lock(_mutex);
 
     // Check if we're allowed to insert this object.
     if (_numBytes + obj.objsize() >= _maxNumBytes) {

@@ -13,8 +13,8 @@ for (var i = 0; i < N; ++i) {
     t.insert({foo: i, bar: N - i, baz: i});
 }
 
-t.ensureIndex({foo: 1});
-t.ensureIndex({foo: 1, baz: 1});
+t.createIndex({foo: 1});
+t.createIndex({foo: 1, baz: 1});
 
 // Test that stageDebug fails if neither the keyPattern nor the index name are present.
 assert.commandFailed(db.runCommand({
@@ -182,7 +182,7 @@ var ixscanName = {
     }
 };
 
-assert.writeOK(t.insert([{a: "1234"}, {a: "124"}]));
+assert.commandWorked(t.insert([{a: "1234"}, {a: "124"}]));
 var res = db.runCommand({stageDebug: {collection: collname, plan: ixscanName}});
 assert.commandWorked(res);
 assert.eq(res.results.map((doc) => doc.a), ["124", "1234"]);

@@ -32,6 +32,8 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/commands/server_status.h"
 #include "mongo/db/s/active_migrations_registry.h"
+#include "mongo/db/s/collection_sharding_state.h"
+#include "mongo/db/s/resharding/resharding_metrics.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/s/sharding_statistics.h"
 #include "mongo/s/balancer_configuration.h"
@@ -39,6 +41,7 @@
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/is_mongos.h"
+#include "mongo/s/resharding/resharding_feature_flag_gen.h"
 
 namespace mongo {
 namespace {
@@ -101,16 +104,24 @@ public:
         if (!isClusterNode())
             return {};
 
-        auto const shardingState = ShardingState::get(opCtx);
-        if (!shardingState->enabled())
-            return {};
-
-        auto const grid = Grid::get(opCtx);
-        auto const catalogCache = grid->catalogCache();
-
         BSONObjBuilder result;
-        ShardingStatistics::get(opCtx).report(&result);
-        catalogCache->report(&result);
+        if (auto const shardingState = ShardingState::get(opCtx); shardingState->enabled()) {
+            auto const grid = Grid::get(opCtx);
+            auto const catalogCache = grid->catalogCache();
+
+            ShardingStatistics::get(opCtx).report(&result);
+            catalogCache->report(&result);
+            CollectionShardingState::appendInfoForServerStatus(opCtx, &result);
+        }
+
+        // The serverStatus command is run before the FCV is initialized so we ignore it when
+        // checking whether the resharding feature is enabled here.
+        if (resharding::gFeatureFlagResharding.isEnabledAndIgnoreFCV()) {
+            BSONObjBuilder subObjBuilder(result.subobjStart("resharding"));
+            ReshardingMetrics::get(opCtx->getServiceContext())
+                ->serializeCumulativeOpMetrics(&subObjBuilder);
+        }
+
         return result.obj();
     }
 

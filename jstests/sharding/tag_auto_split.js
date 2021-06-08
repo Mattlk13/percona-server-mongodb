@@ -1,35 +1,37 @@
 // Test to make sure that tag ranges get split when full keys are used for the tag ranges
 (function() {
-    'use strict';
+'use strict';
 
-    var s = new ShardingTest({shards: 2, mongos: 1});
+load("jstests/sharding/libs/find_chunks_util.js");
 
-    assert.commandWorked(s.s0.adminCommand({enablesharding: "test"}));
-    s.ensurePrimaryShard('test', s.shard1.shardName);
-    assert.commandWorked(s.s0.adminCommand({shardcollection: "test.foo", key: {_id: 1}}));
+var s = new ShardingTest({shards: 2, mongos: 1});
 
-    assert.eq(1, s.config.chunks.find({"ns": "test.foo"}).itcount());
+assert.commandWorked(s.s0.adminCommand({enablesharding: "test"}));
+s.ensurePrimaryShard('test', s.shard1.shardName);
+assert.commandWorked(s.s0.adminCommand({shardcollection: "test.foo", key: {_id: 1}}));
 
-    s.addShardTag(s.shard0.shardName, "a");
-    s.addShardTag(s.shard0.shardName, "b");
+assert.eq(1, findChunksUtil.findChunksByNs(s.config, "test.foo").itcount());
 
-    s.addTagRange("test.foo", {_id: 5}, {_id: 10}, "a");
-    s.addTagRange("test.foo", {_id: 10}, {_id: 15}, "b");
+s.addShardTag(s.shard0.shardName, "a");
+s.addShardTag(s.shard0.shardName, "b");
 
-    s.startBalancer();
+s.addTagRange("test.foo", {_id: 5}, {_id: 10}, "a");
+s.addTagRange("test.foo", {_id: 10}, {_id: 15}, "b");
 
-    assert.soon(function() {
-        return s.config.chunks.find({"ns": "test.foo"}).itcount() == 4;
-    }, 'Split did not occur', 3 * 60 * 1000);
+s.startBalancer();
 
-    s.awaitBalancerRound();
-    s.printShardingStatus(true);
-    assert.eq(4, s.config.chunks.find({"ns": "test.foo"}).itcount(), 'Split points changed');
+assert.soon(function() {
+    return findChunksUtil.findChunksByNs(s.config, "test.foo").itcount() == 4;
+}, 'Split did not occur', 3 * 60 * 1000);
 
-    assert.eq(1, s.config.chunks.find({"ns": "test.foo", min: {_id: MinKey}}).itcount());
-    assert.eq(1, s.config.chunks.find({"ns": "test.foo", min: {_id: 5}}).itcount());
-    assert.eq(1, s.config.chunks.find({"ns": "test.foo", min: {_id: 10}}).itcount());
-    assert.eq(1, s.config.chunks.find({"ns": "test.foo", min: {_id: 15}}).itcount());
+s.awaitBalancerRound();
+s.printShardingStatus(true);
+assert.eq(4, findChunksUtil.findChunksByNs(s.config, "test.foo").itcount(), 'Split points changed');
 
-    s.stop();
+assert.eq(1, findChunksUtil.findChunksByNs(s.config, "test.foo", {min: {_id: MinKey}}).itcount());
+assert.eq(1, findChunksUtil.findChunksByNs(s.config, "test.foo", {min: {_id: 5}}).itcount());
+assert.eq(1, findChunksUtil.findChunksByNs(s.config, "test.foo", {min: {_id: 10}}).itcount());
+assert.eq(1, findChunksUtil.findChunksByNs(s.config, "test.foo", {min: {_id: 15}}).itcount());
+
+s.stop();
 })();

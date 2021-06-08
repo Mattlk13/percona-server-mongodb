@@ -35,6 +35,7 @@
 #include "mongo/db/curop.h"
 #include "mongo/db/query/query_test_service_context.h"
 #include "mongo/unittest/unittest.h"
+#include "mongo/util/tick_source_mock.h"
 
 namespace mongo {
 namespace {
@@ -72,6 +73,8 @@ TEST(CurOpTest, AddingAdditiveMetricsObjectsTogetherShouldAddFieldsTogether) {
     additiveMetricsToAdd.ninserted = 0;
     currentAdditiveMetrics.ndeleted = 3;
     additiveMetricsToAdd.ndeleted = 2;
+    currentAdditiveMetrics.nUpserted = 7;
+    additiveMetricsToAdd.nUpserted = 8;
     currentAdditiveMetrics.keysInserted = 6;
     additiveMetricsToAdd.keysInserted = 5;
     currentAdditiveMetrics.keysDeleted = 4;
@@ -99,6 +102,8 @@ TEST(CurOpTest, AddingAdditiveMetricsObjectsTogetherShouldAddFieldsTogether) {
               *additiveMetricsBeforeAdd.ninserted + *additiveMetricsToAdd.ninserted);
     ASSERT_EQ(*currentAdditiveMetrics.ndeleted,
               *additiveMetricsBeforeAdd.ndeleted + *additiveMetricsToAdd.ndeleted);
+    ASSERT_EQ(*currentAdditiveMetrics.nUpserted,
+              *additiveMetricsBeforeAdd.nUpserted + *additiveMetricsToAdd.nUpserted);
     ASSERT_EQ(*currentAdditiveMetrics.keysInserted,
               *additiveMetricsBeforeAdd.keysInserted + *additiveMetricsToAdd.keysInserted);
     ASSERT_EQ(*currentAdditiveMetrics.keysDeleted,
@@ -146,6 +151,10 @@ TEST(CurOpTest, AddingUninitializedAdditiveMetricsFieldsShouldBeTreatedAsZero) {
     // object to add were not initialized, so nMatched should still be uninitialized after the add.
     ASSERT_EQ(currentAdditiveMetrics.nMatched, boost::none);
 
+    // The 'nUpserted' field for both the current AdditiveMetrics object and the AdditiveMetrics
+    // object to add were not initialized, so nUpserted should still be uninitialized after the add.
+    ASSERT_EQ(currentAdditiveMetrics.nUpserted, boost::none);
+
     // The following field values should have changed after adding.
     ASSERT_EQ(*currentAdditiveMetrics.keysInserted,
               *additiveMetricsBeforeAdd.keysInserted + *additiveMetricsToAdd.keysInserted);
@@ -172,12 +181,14 @@ TEST(CurOpTest, AdditiveMetricsFieldsShouldIncrementByN) {
     additiveMetrics.incrementKeysInserted(5);
     additiveMetrics.incrementKeysDeleted(0);
     additiveMetrics.incrementNinserted(3);
+    additiveMetrics.incrementNUpserted(6);
     additiveMetrics.incrementPrepareReadConflicts(2);
 
     ASSERT_EQ(additiveMetrics.writeConflicts.load(), 2);
     ASSERT_EQ(*additiveMetrics.keysInserted, 7);
     ASSERT_EQ(*additiveMetrics.keysDeleted, 0);
     ASSERT_EQ(*additiveMetrics.ninserted, 3);
+    ASSERT_EQ(*additiveMetrics.nUpserted, 6);
     ASSERT_EQ(additiveMetrics.prepareReadConflicts.load(), 8);
 }
 
@@ -201,7 +212,7 @@ TEST(CurOpTest, OptionalAdditiveMetricsNotDisplayedIfUninitialized) {
         opCtx.get(), NamespaceString("myDb.coll"), nullptr, command, NetworkOp::dbQuery);
 
     BSONObjBuilder builder;
-    od.append(*curop, ls, {}, builder);
+    od.append(opCtx.get(), ls, {}, builder);
     auto bs = builder.done();
 
     // Append should always include these basic fields.
@@ -213,10 +224,53 @@ TEST(CurOpTest, OptionalAdditiveMetricsNotDisplayedIfUninitialized) {
     ASSERT_EQ(static_cast<size_t>(bs.nFields()), basicFields.size());
 
     // 'reportString' should only contain basic fields.
-    std::string reportString = od.report(serviceContext.getClient(), *curop, nullptr, {});
+    std::string reportString = od.report(opCtx.get(), nullptr);
     std::string expectedReportString = "query myDb.coll command: { a: 3 } numYields:0 0ms";
 
     ASSERT_EQ(reportString, expectedReportString);
 }
+
+TEST(CurOpTest, ShouldNotReportFailpointMsgIfNotSet) {
+    QueryTestServiceContext serviceContext;
+    auto opCtx = serviceContext.makeOperationContext();
+
+    auto curop = CurOp::get(*opCtx);
+
+    // Test the reported state should _not_ contain 'failpointMsg'.
+    BSONObjBuilder reportedStateWithoutFailpointMsg;
+    curop->reportState(opCtx.get(), &reportedStateWithoutFailpointMsg);
+    auto bsonObj = reportedStateWithoutFailpointMsg.done();
+
+    // bsonObj should _not_ contain 'failpointMsg' if a fail point is not set.
+    ASSERT_FALSE(bsonObj.hasField("failpointMsg"));
+}
+
+TEST(CurOpTest, ElapsedTimeReflectsTickSource) {
+    QueryTestServiceContext serviceContext;
+
+    auto tickSourceMock = std::make_unique<TickSourceMock<Microseconds>>();
+    // The tick source is initialized to a non-zero value as CurOp equates a value of 0 with a
+    // not-started timer.
+    tickSourceMock->advance(Milliseconds{100});
+
+    auto opCtx = serviceContext.makeOperationContext();
+    auto curop = CurOp::get(*opCtx);
+    curop->setTickSource_forTest(tickSourceMock.get());
+
+    ASSERT_FALSE(curop->isStarted());
+
+    curop->ensureStarted();
+    ASSERT_TRUE(curop->isStarted());
+
+    tickSourceMock->advance(Milliseconds{20});
+
+    ASSERT_FALSE(curop->isDone());
+
+    curop->done();
+    ASSERT_TRUE(curop->isDone());
+
+    ASSERT_EQ(Milliseconds{20}, duration_cast<Milliseconds>(curop->elapsedTimeTotal()));
+}
+
 }  // namespace
 }  // namespace mongo

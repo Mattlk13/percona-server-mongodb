@@ -30,61 +30,33 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/catalog/collection.h"
 #include "mongo/db/commands/killcursors_common.h"
-#include "mongo/db/curop.h"
 #include "mongo/db/cursor_manager.h"
 #include "mongo/db/db_raii.h"
-#include "mongo/db/query/killcursors_request.h"
+#include "mongo/db/query/kill_cursors_gen.h"
 #include "mongo/db/stats/top.h"
-#include "mongo/util/scopeguard.h"
 
 namespace mongo {
 
-class KillCursorsCmd final : public KillCursorsCmdBase {
-    KillCursorsCmd(const KillCursorsCmd&) = delete;
-    KillCursorsCmd& operator=(const KillCursorsCmd&) = delete;
-
-public:
-    KillCursorsCmd() = default;
-
-    bool supportsReadConcern(const std::string& dbName,
-                             const BSONObj& cmdObj,
-                             repl::ReadConcernLevel level) const final {
-        // killCursors must support snapshot read concern in order to be run in transactions.
-        return level == repl::ReadConcernLevel::kLocalReadConcern ||
-            level == repl::ReadConcernLevel::kSnapshotReadConcern;
-    }
-
-    bool run(OperationContext* opCtx,
-             const std::string& dbname,
-             const BSONObj& cmdObj,
-             BSONObjBuilder& result) final {
-        return runImpl(opCtx, dbname, cmdObj, result);
-    }
-
-private:
-    Status _checkAuth(Client* client, const NamespaceString& nss, CursorId id) const final {
-        auto opCtx = client->getOperationContext();
+struct KillCursorsCmd {
+    static constexpr bool supportsReadConcern = false;
+    static Status doCheckAuth(OperationContext* opCtx, const NamespaceString& nss, CursorId id) {
         return CursorManager::get(opCtx)->checkAuthForKillCursors(opCtx, id);
     }
-
-    Status _killCursor(OperationContext* opCtx,
-                       const NamespaceString& nss,
-                       CursorId id) const final {
+    static Status doKillCursor(OperationContext* opCtx, const NamespaceString& nss, CursorId id) {
         boost::optional<AutoStatsTracker> statsTracker;
         if (!nss.isCollectionlessCursorNamespace()) {
-            const boost::optional<int> dbProfilingLevel = boost::none;
             statsTracker.emplace(opCtx,
                                  nss,
                                  Top::LockType::NotLocked,
-                                 AutoStatsTracker::LogMode::kUpdateTopAndCurop,
-                                 dbProfilingLevel);
+                                 AutoStatsTracker::LogMode::kUpdateTopAndCurOp,
+                                 CollectionCatalog::get(opCtx)->getDatabaseProfileLevel(nss.db()));
         }
 
         auto cursorManager = CursorManager::get(opCtx);
-        return cursorManager->killCursor(opCtx, id, true /* shouldAudit */);
+        return cursorManager->killCursor(opCtx, id);
     }
-} killCursorsCmd;
+};
+KillCursorsCmdBase<KillCursorsCmd> cmdKillCursors;
 
 }  // namespace mongo

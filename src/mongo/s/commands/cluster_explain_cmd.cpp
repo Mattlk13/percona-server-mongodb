@@ -29,9 +29,10 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/db/command_generic_argument.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/explain_gen.h"
 #include "mongo/db/query/explain.h"
+#include "mongo/idl/command_generic_argument.h"
 #include "mongo/s/query/cluster_find.h"
 
 namespace mongo {
@@ -53,6 +54,10 @@ namespace {
 class ClusterExplainCmd final : public Command {
 public:
     ClusterExplainCmd() : Command("explain") {}
+
+    const std::set<std::string>& apiVersions() const {
+        return kApiVersions1;
+    }
 
     std::unique_ptr<CommandInvocation> parse(OperationContext* opCtx,
                                              const OpMsgRequest& request) override;
@@ -148,8 +153,7 @@ BSONObj makeExplainedObj(const BSONObj& outerObj, StringData dbName) {
     if (auto innerDb = innerObj["$db"]) {
         uassert(ErrorCodes::InvalidNamespace,
                 str::stream() << "Mismatched $db in explain command. Expected " << dbName
-                              << " but got "
-                              << innerDb.checkAndGetStringData(),
+                              << " but got " << innerDb.checkAndGetStringData(),
                 innerDb.checkAndGetStringData() == dbName);
     }
 
@@ -169,22 +173,33 @@ BSONObj makeExplainedObj(const BSONObj& outerObj, StringData dbName) {
 std::unique_ptr<CommandInvocation> ClusterExplainCmd::parse(OperationContext* opCtx,
                                                             const OpMsgRequest& request) {
     CommandHelpers::uassertNoDocumentSequences(getName(), request);
-    std::string dbName = request.getDatabase().toString();
-    const BSONObj& cmdObj = request.body;
-    ExplainOptions::Verbosity verbosity = uassertStatusOK(ExplainOptions::parseCmdBSON(cmdObj));
 
+    // To enforce API versioning
+    auto cmdObj = ExplainCommandRequest::parse(
+        IDLParserErrorContext(ExplainCommandRequest::kCommandName,
+                              APIParameters::get(opCtx).getAPIStrict().value_or(false)),
+        request.body);
+    std::string dbName = cmdObj.getDbName().toString();
+    ExplainOptions::Verbosity verbosity = cmdObj.getVerbosity();
     // This is the nested command which we are explaining. We need to propagate generic
     // arguments into the inner command since it is what is passed to the virtual
     // CommandInvocation::explain() method.
-    const BSONObj explainedObj = makeExplainedObj(cmdObj, dbName);
+    const BSONObj explainedObj = makeExplainedObj(request.body, dbName);
+
+    // Extract 'comment' field from the 'explainedObj' only if there is no top-level comment.
+    auto commentField = explainedObj["comment"];
+    if (!opCtx->getComment() && commentField) {
+        opCtx->setComment(commentField.wrap());
+    }
+
     const std::string cmdName = explainedObj.firstElementFieldName();
     auto explainedCommand = CommandHelpers::findCommand(cmdName);
     uassert(ErrorCodes::CommandNotFound,
             str::stream() << "Explain failed due to unknown command: " << cmdName,
             explainedCommand);
     auto innerRequest = std::make_unique<OpMsgRequest>(OpMsg{explainedObj});
-    auto innerInvocation = explainedCommand->parse(opCtx, *innerRequest);
-    return stdx::make_unique<Invocation>(
+    auto innerInvocation = explainedCommand->parseForExplain(opCtx, *innerRequest, verbosity);
+    return std::make_unique<Invocation>(
         this, request, std::move(verbosity), std::move(innerRequest), std::move(innerInvocation));
 }
 

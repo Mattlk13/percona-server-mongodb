@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include <cstdlib>
 #include <ctime>
@@ -35,7 +35,7 @@
 
 #include "mongo/base/init.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/log.h"
+#include "mongo/util/errno_util.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -59,10 +59,9 @@ char tzEnvString[] = "TZ=America/New_York";
 #pragma warning(disable : 4996)
 MONGO_INITIALIZER(SetTimeZoneToEasternForTest)(InitializerContext*) {
     if (-1 == putenv(tzEnvString)) {
-        return Status(ErrorCodes::BadValue, errnoWithDescription());
+        uasserted(ErrorCodes::BadValue, errnoWithDescription());
     }
     tzset();
-    return Status::OK();
 }
 #pragma warning(pop)
 
@@ -70,21 +69,23 @@ TEST(TimeFormatting, DateAsISO8601UTCString) {
     ASSERT_EQUALS(std::string("1970-01-01T00:00:00.000Z"), dateToISOStringUTC(Date_t()));
     ASSERT_EQUALS(std::string("1970-06-30T01:06:40.981Z"),
                   dateToISOStringUTC(Date_t::fromMillisSinceEpoch(15556000981LL)));
-    if (!isTimeTSmall)
+    if (!isTimeTSmall) {
         ASSERT_EQUALS(std::string("2058-02-20T18:29:11.100Z"),
                       dateToISOStringUTC(Date_t::fromMillisSinceEpoch(2781455351100LL)));
+    }
     ASSERT_EQUALS(std::string("2013-02-20T18:29:11.100Z"),
                   dateToISOStringUTC(Date_t::fromMillisSinceEpoch(1361384951100LL)));
 }
 
 TEST(TimeFormatting, DateAsISO8601LocalString) {
-    ASSERT_EQUALS(std::string("1969-12-31T19:00:00.000-0500"), dateToISOStringLocal(Date_t()));
-    ASSERT_EQUALS(std::string("1970-06-29T21:06:40.981-0400"),
+    ASSERT_EQUALS(std::string("1969-12-31T19:00:00.000-05:00"), dateToISOStringLocal(Date_t()));
+    ASSERT_EQUALS(std::string("1970-06-29T21:06:40.981-04:00"),
                   dateToISOStringLocal(Date_t::fromMillisSinceEpoch(15556000981LL)));
-    if (!isTimeTSmall)
-        ASSERT_EQUALS(std::string("2058-02-20T13:29:11.100-0500"),
+    if (!isTimeTSmall) {
+        ASSERT_EQUALS(std::string("2058-02-20T13:29:11.100-05:00"),
                       dateToISOStringLocal(Date_t::fromMillisSinceEpoch(2781455351100LL)));
-    ASSERT_EQUALS(std::string("2013-02-20T13:29:11.100-0500"),
+    }
+    ASSERT_EQUALS(std::string("2013-02-20T13:29:11.100-05:00"),
                   dateToISOStringLocal(Date_t::fromMillisSinceEpoch(1361384951100LL)));
 }
 
@@ -92,9 +93,10 @@ TEST(TimeFormatting, DateAsCtimeString) {
     ASSERT_EQUALS(std::string("Wed Dec 31 19:00:00.000"), dateToCtimeString(Date_t()));
     ASSERT_EQUALS(std::string("Mon Jun 29 21:06:40.981"),
                   dateToCtimeString(Date_t::fromMillisSinceEpoch(15556000981LL)));
-    if (!isTimeTSmall)
+    if (!isTimeTSmall) {
         ASSERT_EQUALS(std::string("Wed Feb 20 13:29:11.100"),
                       dateToCtimeString(Date_t::fromMillisSinceEpoch(2781455351100LL)));
+    }
     ASSERT_EQUALS(std::string("Wed Feb 20 13:29:11.100"),
                   dateToCtimeString(Date_t::fromMillisSinceEpoch(1361384951100LL)));
 }
@@ -111,26 +113,28 @@ TEST(TimeFormatting, DateAsISO8601UTCStream) {
     ASSERT_EQUALS(
         std::string("1970-06-30T01:06:40.981Z"),
         stringstreamDate(outputDateAsISOStringUTC, Date_t::fromMillisSinceEpoch(15556000981LL)));
-    if (!isTimeTSmall)
+    if (!isTimeTSmall) {
         ASSERT_EQUALS(std::string("2058-02-20T18:29:11.100Z"),
                       stringstreamDate(outputDateAsISOStringUTC,
                                        Date_t::fromMillisSinceEpoch(2781455351100LL)));
+    }
     ASSERT_EQUALS(
         std::string("2013-02-20T18:29:11.100Z"),
         stringstreamDate(outputDateAsISOStringUTC, Date_t::fromMillisSinceEpoch(1361384951100LL)));
 }
 
 TEST(TimeFormatting, DateAsISO8601LocalStream) {
-    ASSERT_EQUALS(std::string("1969-12-31T19:00:00.000-0500"),
+    ASSERT_EQUALS(std::string("1969-12-31T19:00:00.000-05:00"),
                   stringstreamDate(outputDateAsISOStringLocal, Date_t()));
     ASSERT_EQUALS(
-        std::string("1970-06-29T21:06:40.981-0400"),
+        std::string("1970-06-29T21:06:40.981-04:00"),
         stringstreamDate(outputDateAsISOStringLocal, Date_t::fromMillisSinceEpoch(15556000981LL)));
-    if (!isTimeTSmall)
-        ASSERT_EQUALS(std::string("2058-02-20T13:29:11.100-0500"),
+    if (!isTimeTSmall) {
+        ASSERT_EQUALS(std::string("2058-02-20T13:29:11.100-05:00"),
                       stringstreamDate(outputDateAsISOStringLocal,
                                        Date_t::fromMillisSinceEpoch(2781455351100LL)));
-    ASSERT_EQUALS(std::string("2013-02-20T13:29:11.100-0500"),
+    }
+    ASSERT_EQUALS(std::string("2013-02-20T13:29:11.100-05:00"),
                   stringstreamDate(outputDateAsISOStringLocal,
                                    Date_t::fromMillisSinceEpoch(1361384951100LL)));
 }
@@ -140,10 +144,11 @@ TEST(TimeFormatting, DateAsCtimeStream) {
                   stringstreamDate(outputDateAsCtime, Date_t::fromMillisSinceEpoch(0)));
     ASSERT_EQUALS(std::string("Mon Jun 29 21:06:40.981"),
                   stringstreamDate(outputDateAsCtime, Date_t::fromMillisSinceEpoch(15556000981LL)));
-    if (!isTimeTSmall)
+    if (!isTimeTSmall) {
         ASSERT_EQUALS(
             std::string("Wed Feb 20 13:29:11.100"),
             stringstreamDate(outputDateAsCtime, Date_t::fromMillisSinceEpoch(2781455351100LL)));
+    }
     ASSERT_EQUALS(
         std::string("Wed Feb 20 13:29:11.100"),
         stringstreamDate(outputDateAsCtime, Date_t::fromMillisSinceEpoch(1361384951100LL)));
@@ -200,27 +205,28 @@ TEST(TimeParsing, DateAsISO8601UTC) {
 
 TEST(TimeParsing, DateAsISO8601Local) {
     // Allowed date format:
-    // YYYY-MM-DDTHH:MM[:SS[.m[m[m]]]]+HHMM
+    // YYYY-MM-DDTHH:MM[:SS[.m[m[m]]]]+HH[:]MM
     // Year, month, day, hour, and minute are required, while the seconds component and one to
     // three milliseconds are optional.  The time zone offset must be four digits.
+    // Test with colon in timezone offset, new for mongod version 4.4
 
-    StatusWith<Date_t> swull = dateFromISOString("1971-02-03T09:16:06.789+0511");
+    StatusWith<Date_t> swull = dateFromISOString("1971-02-03T09:16:06.789+05:11");
     ASSERT_OK(swull.getStatus());
     ASSERT_EQUALS(swull.getValue().asInt64(), 34401906789LL);
 
-    swull = dateFromISOString("1971-02-03T09:16:06.78+0511");
+    swull = dateFromISOString("1971-02-03T09:16:06.78+05:11");
     ASSERT_OK(swull.getStatus());
     ASSERT_EQUALS(swull.getValue().asInt64(), 34401906780LL);
 
-    swull = dateFromISOString("1971-02-03T09:16:06.7+0511");
+    swull = dateFromISOString("1971-02-03T09:16:06.7+05:11");
     ASSERT_OK(swull.getStatus());
     ASSERT_EQUALS(swull.getValue().asInt64(), 34401906700LL);
 
-    swull = dateFromISOString("1971-02-03T09:16:06+0511");
+    swull = dateFromISOString("1971-02-03T09:16:06+05:11");
     ASSERT_OK(swull.getStatus());
     ASSERT_EQUALS(swull.getValue().asInt64(), 34401906000LL);
 
-    swull = dateFromISOString("1971-02-03T09:16+0511");
+    swull = dateFromISOString("1971-02-03T09:16+05:11");
     ASSERT_OK(swull.getStatus());
     ASSERT_EQUALS(swull.getValue().asInt64(), 34401900000LL);
 
@@ -253,12 +259,12 @@ TEST(TimeParsing, DateAsISO8601Local) {
     // ASSERT_OK(swull.getStatus());
     // ASSERT_EQUALS(swull.getValue().asInt64(), 18060000LL);
 
-    swull = dateFromISOString("1970-06-29T21:06:40.981-0400");
+    swull = dateFromISOString("1970-06-29T21:06:40.981-04:00");
     ASSERT_OK(swull.getStatus());
     ASSERT_EQUALS(swull.getValue().asInt64(), 15556000981LL);
 
     if (!isTimeTSmall) {
-        swull = dateFromISOString("2058-02-20T13:29:11.100-0500");
+        swull = dateFromISOString("2058-02-20T13:29:11.100-05:00");
         ASSERT_OK(swull.getStatus());
         ASSERT_EQUALS(swull.getValue().asInt64(), 2781455351100LL);
 
@@ -269,6 +275,52 @@ TEST(TimeParsing, DateAsISO8601Local) {
         swull = dateFromISOString("2038-01-19T03:14:07Z");
         ASSERT_OK(swull.getStatus());
         ASSERT_EQUALS(swull.getValue().asInt64(), 2147483647000LL);
+    }
+
+    swull = dateFromISOString("2013-02-20T13:29:11.100-05:00");
+    ASSERT_OK(swull.getStatus());
+    ASSERT_EQUALS(swull.getValue().asInt64(), 1361384951100LL);
+
+    swull = dateFromISOString("2013-02-20T13:29:11.100-05:01");
+    ASSERT_OK(swull.getStatus());
+    ASSERT_EQUALS(swull.getValue().asInt64(), 1361385011100LL);
+}
+
+TEST(TimeParsing, DateAsISO8601LocalNoColon) {
+    // Allowed date format:
+    // YYYY-MM-DDTHH:MM[:SS[.m[m[m]]]]+HH[:]MM
+    // Year, month, day, hour, and minute are required, while the seconds component and one to
+    // three milliseconds are optional.  The time zone offset must be four digits.
+    // Test with colon in timezone offset, the format used by mongod version < 4.4
+
+    StatusWith<Date_t> swull = dateFromISOString("1971-02-03T09:16:06.789+0511");
+    ASSERT_OK(swull.getStatus());
+    ASSERT_EQUALS(swull.getValue().asInt64(), 34401906789LL);
+
+    swull = dateFromISOString("1971-02-03T09:16:06.78+0511");
+    ASSERT_OK(swull.getStatus());
+    ASSERT_EQUALS(swull.getValue().asInt64(), 34401906780LL);
+
+    swull = dateFromISOString("1971-02-03T09:16:06.7+0511");
+    ASSERT_OK(swull.getStatus());
+    ASSERT_EQUALS(swull.getValue().asInt64(), 34401906700LL);
+
+    swull = dateFromISOString("1971-02-03T09:16:06+0511");
+    ASSERT_OK(swull.getStatus());
+    ASSERT_EQUALS(swull.getValue().asInt64(), 34401906000LL);
+
+    swull = dateFromISOString("1971-02-03T09:16+0511");
+    ASSERT_OK(swull.getStatus());
+    ASSERT_EQUALS(swull.getValue().asInt64(), 34401900000LL);
+
+    swull = dateFromISOString("1970-06-29T21:06:40.981-0400");
+    ASSERT_OK(swull.getStatus());
+    ASSERT_EQUALS(swull.getValue().asInt64(), 15556000981LL);
+
+    if (!isTimeTSmall) {
+        swull = dateFromISOString("2058-02-20T13:29:11.100-0500");
+        ASSERT_OK(swull.getStatus());
+        ASSERT_EQUALS(swull.getValue().asInt64(), 2781455351100LL);
     }
 
     swull = dateFromISOString("2013-02-20T13:29:11.100-0500");

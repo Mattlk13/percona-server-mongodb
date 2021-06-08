@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -44,48 +44,48 @@ const char kCursorsField[] = "cursors";
 const char kCursorField[] = "cursor";
 const char kIdField[] = "id";
 const char kNsField[] = "ns";
+const char kAtClusterTimeField[] = "atClusterTime";
 const char kBatchField[] = "nextBatch";
 const char kBatchFieldInitial[] = "firstBatch";
 const char kBatchDocSequenceField[] = "cursor.nextBatch";
 const char kBatchDocSequenceFieldInitial[] = "cursor.firstBatch";
-const char kInternalLatestOplogTimestampField[] = "$_internalLatestOplogTimestamp";
 const char kPostBatchResumeTokenField[] = "postBatchResumeToken";
+const char kPartialResultsReturnedField[] = "partialResultsReturned";
+const char kInvalidatedField[] = "invalidated";
 
 }  // namespace
 
 CursorResponseBuilder::CursorResponseBuilder(rpc::ReplyBuilderInterface* replyBuilder,
                                              Options options = Options())
     : _options(options), _replyBuilder(replyBuilder) {
-    if (_options.useDocumentSequences) {
-        _docSeqBuilder.emplace(_replyBuilder->getDocSequenceBuilder(
-            _options.isInitialResponse ? kBatchDocSequenceFieldInitial : kBatchDocSequenceField));
-    } else {
-        _bodyBuilder.emplace(_replyBuilder->getBodyBuilder());
-        _cursorObject.emplace(_bodyBuilder->subobjStart(kCursorField));
-        _batch.emplace(_cursorObject->subarrayStart(_options.isInitialResponse ? kBatchFieldInitial
-                                                                               : kBatchField));
-    }
+    _bodyBuilder.emplace(_replyBuilder->getBodyBuilder());
+    _cursorObject.emplace(_bodyBuilder->subobjStart(kCursorField));
+    _batch.emplace(_cursorObject->subarrayStart(_options.isInitialResponse ? kBatchFieldInitial
+                                                                           : kBatchField));
 }
 
 void CursorResponseBuilder::done(CursorId cursorId, StringData cursorNamespace) {
     invariant(_active);
-    if (_options.useDocumentSequences) {
-        _docSeqBuilder.reset();
-        _bodyBuilder.emplace(_replyBuilder->getBodyBuilder());
-        _cursorObject.emplace(_bodyBuilder->subobjStart(kCursorField));
-    } else {
-        _batch.reset();
-    }
+
+    _batch.reset();
     if (!_postBatchResumeToken.isEmpty()) {
         _cursorObject->append(kPostBatchResumeTokenField, _postBatchResumeToken);
     }
+    if (_partialResultsReturned) {
+        _cursorObject->append(kPartialResultsReturnedField, true);
+    }
+
+    if (_invalidated) {
+        _cursorObject->append(kInvalidatedField, _invalidated);
+    }
+
     _cursorObject->append(kIdField, cursorId);
     _cursorObject->append(kNsField, cursorNamespace);
+    if (_options.atClusterTime) {
+        _cursorObject->append(kAtClusterTimeField, _options.atClusterTime->asTimestamp());
+    }
     _cursorObject.reset();
 
-    if (!_latestOplogTimestamp.isNull()) {
-        _bodyBuilder->append(kInternalLatestOplogTimestampField, _latestOplogTimestamp);
-    }
     _bodyBuilder.reset();
     _active = false;
 }
@@ -125,17 +125,21 @@ void appendGetMoreResponseObject(long long cursorId,
 CursorResponse::CursorResponse(NamespaceString nss,
                                CursorId cursorId,
                                std::vector<BSONObj> batch,
+                               boost::optional<Timestamp> atClusterTime,
                                boost::optional<long long> numReturnedSoFar,
-                               boost::optional<Timestamp> latestOplogTimestamp,
                                boost::optional<BSONObj> postBatchResumeToken,
-                               boost::optional<BSONObj> writeConcernError)
+                               boost::optional<BSONObj> writeConcernError,
+                               bool partialResultsReturned,
+                               bool invalidated)
     : _nss(std::move(nss)),
       _cursorId(cursorId),
       _batch(std::move(batch)),
+      _atClusterTime(std::move(atClusterTime)),
       _numReturnedSoFar(numReturnedSoFar),
-      _latestOplogTimestamp(latestOplogTimestamp),
       _postBatchResumeToken(std::move(postBatchResumeToken)),
-      _writeConcernError(std::move(writeConcernError)) {}
+      _writeConcernError(std::move(writeConcernError)),
+      _partialResultsReturned(partialResultsReturned),
+      _invalidated(invalidated) {}
 
 std::vector<StatusWith<CursorResponse>> CursorResponse::parseFromBSONMany(
     const BSONObj& cmdResponse) {
@@ -175,24 +179,24 @@ StatusWith<CursorResponse> CursorResponse::parseFromBSON(const BSONObj& cmdRespo
     BSONElement cursorElt = cmdResponse[kCursorField];
     if (cursorElt.type() != BSONType::Object) {
         return {ErrorCodes::TypeMismatch,
-                str::stream() << "Field '" << kCursorField << "' must be a nested object in: "
-                              << cmdResponse};
+                str::stream() << "Field '" << kCursorField
+                              << "' must be a nested object in: " << cmdResponse};
     }
     BSONObj cursorObj = cursorElt.Obj();
 
     BSONElement idElt = cursorObj[kIdField];
     if (idElt.type() != BSONType::NumberLong) {
-        return {
-            ErrorCodes::TypeMismatch,
-            str::stream() << "Field '" << kIdField << "' must be of type long in: " << cmdResponse};
+        return {ErrorCodes::TypeMismatch,
+                str::stream() << "Field '" << kIdField
+                              << "' must be of type long in: " << cmdResponse};
     }
     cursorId = idElt.Long();
 
     BSONElement nsElt = cursorObj[kNsField];
     if (nsElt.type() != BSONType::String) {
         return {ErrorCodes::TypeMismatch,
-                str::stream() << "Field '" << kNsField << "' must be of type string in: "
-                              << cmdResponse};
+                str::stream() << "Field '" << kNsField
+                              << "' must be of type string in: " << cmdResponse};
     }
     fullns = nsElt.String();
 
@@ -204,9 +208,7 @@ StatusWith<CursorResponse> CursorResponse::parseFromBSON(const BSONObj& cmdRespo
     if (batchElt.type() != BSONType::Array) {
         return {ErrorCodes::TypeMismatch,
                 str::stream() << "Must have array field '" << kBatchFieldInitial << "' or '"
-                              << kBatchField
-                              << "' in: "
-                              << cmdResponse};
+                              << kBatchField << "' in: " << cmdResponse};
     }
     batchObj = batchElt.Obj();
 
@@ -233,13 +235,33 @@ StatusWith<CursorResponse> CursorResponse::parseFromBSON(const BSONObj& cmdRespo
                               << postBatchResumeTokenElem.type()};
     }
 
-    auto latestOplogTimestampElem = cmdResponse[kInternalLatestOplogTimestampField];
-    if (latestOplogTimestampElem && latestOplogTimestampElem.type() != BSONType::bsonTimestamp) {
-        return {
-            ErrorCodes::BadValue,
-            str::stream()
-                << "invalid _internalLatestOplogTimestamp format; expected timestamp but found: "
-                << latestOplogTimestampElem.type()};
+    auto atClusterTimeElem = cursorObj[kAtClusterTimeField];
+    if (atClusterTimeElem && atClusterTimeElem.type() != BSONType::bsonTimestamp) {
+        return {ErrorCodes::BadValue,
+                str::stream() << kAtClusterTimeField
+                              << " format is invalid; expected Timestamp, but found: "
+                              << atClusterTimeElem.type()};
+    }
+
+    auto partialResultsReturned = cursorObj[kPartialResultsReturnedField];
+
+    if (partialResultsReturned) {
+        if (partialResultsReturned.type() != BSONType::Bool) {
+            return {ErrorCodes::BadValue,
+                    str::stream() << kPartialResultsReturnedField
+                                  << " format is invalid; expected Bool, but found: "
+                                  << partialResultsReturned.type()};
+        }
+    }
+
+    auto invalidatedElem = cursorObj[kInvalidatedField];
+    if (invalidatedElem) {
+        if (invalidatedElem.type() != BSONType::Bool) {
+            return {ErrorCodes::BadValue,
+                    str::stream() << kInvalidatedField
+                                  << " format is invalid; expected Bool, but found: "
+                                  << invalidatedElem.type()};
+        }
     }
 
     auto writeConcernError = cmdResponse["writeConcernError"];
@@ -253,12 +275,13 @@ StatusWith<CursorResponse> CursorResponse::parseFromBSON(const BSONObj& cmdRespo
     return {{NamespaceString(fullns),
              cursorId,
              std::move(batch),
+             atClusterTimeElem ? atClusterTimeElem.timestamp() : boost::optional<Timestamp>{},
              boost::none,
-             latestOplogTimestampElem ? latestOplogTimestampElem.timestamp()
-                                      : boost::optional<Timestamp>{},
              postBatchResumeTokenElem ? postBatchResumeTokenElem.Obj().getOwned()
                                       : boost::optional<BSONObj>{},
-             writeConcernError ? writeConcernError.Obj().getOwned() : boost::optional<BSONObj>{}}};
+             writeConcernError ? writeConcernError.Obj().getOwned() : boost::optional<BSONObj>{},
+             partialResultsReturned.trueValue(),
+             invalidatedElem.trueValue()}};
 }
 
 void CursorResponse::addToBSON(CursorResponse::ResponseType responseType,
@@ -280,11 +303,20 @@ void CursorResponse::addToBSON(CursorResponse::ResponseType responseType,
         cursorBuilder.append(kPostBatchResumeTokenField, *_postBatchResumeToken);
     }
 
+    if (_atClusterTime) {
+        cursorBuilder.append(kAtClusterTimeField, *_atClusterTime);
+    }
+
+    if (_partialResultsReturned) {
+        cursorBuilder.append(kPartialResultsReturnedField, true);
+    }
+
+    if (_invalidated) {
+        cursorBuilder.append(kInvalidatedField, _invalidated);
+    }
+
     cursorBuilder.doneFast();
 
-    if (_latestOplogTimestamp) {
-        builder->append(kInternalLatestOplogTimestampField, *_latestOplogTimestamp);
-    }
     builder->append("ok", 1.0);
 
     if (_writeConcernError) {

@@ -13,7 +13,6 @@ load('jstests/concurrency/fsm_workloads/multi_statement_transaction_simple.js');
 load('jstests/concurrency/fsm_workload_helpers/server_types.js');                 // for isMongos
 
 var $config = extendWorkload($config, function($config, $super) {
-
     $config.data.majorityWriteCollName = 'majority_writes';
     $config.data.counter = 0;
 
@@ -24,7 +23,7 @@ var $config = extendWorkload($config, function($config, $super) {
     $config.states.init = function init(db, collName) {
         $super.states.init.apply(this, arguments);
 
-        assertWhenOwnColl.writeOK(db[this.majorityWriteCollName].insert(
+        assertWhenOwnColl.commandWorked(db[this.majorityWriteCollName].insert(
             {_id: this.tid, counter: this.counter}, {writeConcern: {w: 'majority'}}));
     };
 
@@ -35,7 +34,7 @@ var $config = extendWorkload($config, function($config, $super) {
      */
     $config.states.majorityWriteUnrelatedDoc = function majorityWriteUnrelatedDoc(db, collName) {
         this.counter += 1;
-        assertWhenOwnColl.writeOK(db[this.majorityWriteCollName].update(
+        assertWhenOwnColl.commandWorked(db[this.majorityWriteCollName].update(
             {_id: this.tid}, {$set: {counter: this.counter}}, {writeConcern: {w: 'majority'}}));
 
         // As soon as the write returns, its effects should be visible in the majority snapshot.
@@ -57,9 +56,10 @@ var $config = extendWorkload($config, function($config, $super) {
         // based on the thread's id, since threads may concurrently write to the same document.
         const transactionDocId = Random.randInt(this.numAccounts);
         const threadUniqueField = 'thread' + this.tid;
-        assertWhenOwnColl.writeOK(db[collName].update({_id: transactionDocId},
-                                                      {$set: {[threadUniqueField]: this.counter}},
-                                                      {writeConcern: {w: 'majority'}}));
+        assertWhenOwnColl.commandWorked(
+            db[collName].update({_id: transactionDocId},
+                                {$set: {[threadUniqueField]: this.counter}},
+                                {writeConcern: {w: 'majority'}}));
 
         // As soon as the write returns, its effects should be visible in the majority snapshot.
         const doc = db[collName].findOne({_id: transactionDocId});

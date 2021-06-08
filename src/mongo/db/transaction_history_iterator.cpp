@@ -29,15 +29,15 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/query/get_executor.h"
-#include "mongo/db/query/query_request.h"
 #include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/transaction_history_iterator.h"
-#include "mongo/logger/redaction.h"
+#include "mongo/logv2/redaction.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -54,19 +54,19 @@ BSONObj findOneOplogEntry(OperationContext* opCtx,
     BSONObj oplogBSON;
     invariant(!opTime.isNull());
 
-    auto qr = std::make_unique<QueryRequest>(NamespaceString::kRsOplogNamespace);
-    qr->setFilter(opTime.asQuery());
-    qr->setOplogReplay(true);  // QueryOption_OplogReplay
+    auto findCommand = std::make_unique<FindCommandRequest>(NamespaceString::kRsOplogNamespace);
+    findCommand->setFilter(opTime.asQuery());
 
     if (prevOpOnly) {
-        qr->setProj(
+        findCommand->setProjection(
             BSON("_id" << 0 << repl::OplogEntry::kPrevWriteOpTimeInTransactionFieldName << 1LL));
     }
 
     const boost::intrusive_ptr<ExpressionContext> expCtx;
 
     auto statusWithCQ = CanonicalQuery::canonicalize(opCtx,
-                                                     std::move(qr),
+                                                     std::move(findCommand),
+                                                     false,
                                                      expCtx,
                                                      ExtensionsCallbackNoop(),
                                                      MatchExpressionParser::kBanAllSpecialFeatures);
@@ -75,28 +75,39 @@ BSONObj findOneOplogEntry(OperationContext* opCtx,
                             << causedBy(statusWithCQ.getStatus()));
     std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
-    AutoGetCollectionForReadCommand ctx(opCtx,
-                                        NamespaceString::kRsOplogNamespace,
-                                        AutoGetCollection::ViewMode::kViewsForbidden,
-                                        Date_t::max(),
-                                        AutoStatsTracker::LogMode::kUpdateTop);
+    AutoGetOplog oplogRead(opCtx, OplogAccessMode::kRead);
+    const auto localDb = DatabaseHolder::get(opCtx)->getDb(opCtx, NamespaceString::kLocalDb);
+    invariant(localDb);
+    AutoStatsTracker statsTracker(
+        opCtx,
+        NamespaceString::kRsOplogNamespace,
+        Top::LockType::ReadLocked,
+        AutoStatsTracker::LogMode::kUpdateTop,
+        CollectionCatalog::get(opCtx)->getDatabaseProfileLevel(NamespaceString::kLocalDb),
+        Date_t::max());
 
     auto exec =
-        uassertStatusOK(getExecutorFind(opCtx, ctx.getCollection(), std::move(cq), permitYield));
+        uassertStatusOK(getExecutorFind(opCtx,
+                                        &oplogRead.getCollection(),
+                                        std::move(cq),
+                                        permitYield,
+                                        QueryPlannerParams::OMIT_REPL_STATE_PERMITS_READS_CHECK));
 
-    auto getNextResult = exec->getNext(&oplogBSON, nullptr);
+    PlanExecutor::ExecState getNextResult;
+    try {
+        getNextResult = exec->getNext(&oplogBSON, nullptr);
+    } catch (DBException& exception) {
+        exception.addContext("PlanExecutor error in TransactionHistoryIterator");
+        throw;
+    }
+
     uassert(ErrorCodes::IncompleteTransactionHistory,
             str::stream() << "oplog no longer contains the complete write history of this "
                              "transaction, log with opTime "
-                          << opTime.toBSON()
-                          << " cannot be found",
+                          << opTime.toBSON() << " cannot be found",
             getNextResult != PlanExecutor::IS_EOF);
-    if (getNextResult != PlanExecutor::ADVANCED) {
-        uassertStatusOKWithContext(WorkingSetCommon::getMemberObjectStatus(oplogBSON),
-                                   "PlanExecutor error in TransactionHistoryIterator");
-    }
 
-    return oplogBSON;
+    return oplogBSON.getOwned();
 }
 
 }  // namespace
@@ -123,6 +134,12 @@ repl::OplogEntry TransactionHistoryIterator::next(OperationContext* opCtx) {
     _nextOpTime = oplogPrevTsOption.value();
 
     return oplogEntry;
+}
+
+repl::OplogEntry TransactionHistoryIterator::nextFatalOnErrors(OperationContext* opCtx) try {
+    return next(opCtx);
+} catch (const DBException& ex) {
+    fassertFailedWithStatus(31145, ex.toStatus());
 }
 
 repl::OpTime TransactionHistoryIterator::nextOpTime(OperationContext* opCtx) {

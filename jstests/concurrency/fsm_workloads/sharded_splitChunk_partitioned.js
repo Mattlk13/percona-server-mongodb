@@ -13,7 +13,6 @@ load('jstests/concurrency/fsm_libs/extend_workload.js');                // for e
 load('jstests/concurrency/fsm_workloads/sharded_base_partitioned.js');  // for $config
 
 var $config = extendWorkload($config, function($config, $super) {
-
     $config.iterations = 5;
     $config.threadCount = 5;
 
@@ -23,13 +22,12 @@ var $config = extendWorkload($config, function($config, $super) {
     // in the cluster affected by the splitChunk operation sees the appropriate
     // after-state regardless of whether the operation succeeded or failed.
     $config.states.splitChunk = function splitChunk(db, collName, connCache) {
-
         var dbName = db.getName();
         var ns = db[collName].getFullName();
         var config = ChunkHelper.getPrimary(connCache.config);
 
         // Choose a random chunk in our partition to split.
-        var chunk = this.getRandomChunkInPartition(config);
+        var chunk = this.getRandomChunkInPartition(collName, config);
 
         // Save the number of documents found in this chunk's range before the splitChunk
         // operation. This will be used to verify that the same number of documents in that
@@ -61,9 +59,9 @@ var $config = extendWorkload($config, function($config, $super) {
         // Verify that all config servers have the correct after-state.
         // (see comments below for specifics).
         for (var conn of connCache.config) {
-            var res = conn.adminCommand({isMaster: 1});
+            var res = conn.adminCommand({hello: 1});
             assertAlways.commandWorked(res);
-            if (res.ismaster) {
+            if (res.isWritablePrimary) {
                 // If the splitChunk operation succeeded, verify that there are now
                 // two chunks between the old chunk's lower and upper bounds.
                 // If the operation failed, verify that there is still only one chunk

@@ -26,8 +26,21 @@ selector:
   # Performs direct writes to system.views
   - jstests/concurrency/fsm_workloads/view_catalog_direct_system_writes.js
 
+  # Extracts error code from write error, which is obscured by runInsideTransaction.
+  - jstests/concurrency/fsm_workloads/access_collection_in_transaction_after_catalog_changes.js
+
+  # Induces non-blindly-retriable errors (see SERVER-45767).
+  - jstests/concurrency/fsm_workloads/create_database.js
+
+  # These workloads run the reIndex command, which is only allowed on a standalone node.
+  - jstests/concurrency/fsm_workloads/reindex.js
+  - jstests/concurrency/fsm_workloads/reindex_background.js
+  - jstests/concurrency/fsm_workloads/reindex_writeconflict.js
+
   exclude_with_any_tags:
   - does_not_support_causal_consistency
+  # Snapshot reads in transactions are banned on capped collections.
+  - requires_capped
   - requires_sharding
   # Sharing cursors between state functions will fail in this suite because it will attempt to use
   # the same cursor in multiple transactions.
@@ -35,11 +48,17 @@ selector:
   # These start a transaction in one state function and use it in other state functions. This suite
   # would instead execute each state function as its own transaction.
   - state_functions_share_transaction
+  # Tests which expect commands to fail and catch the error can cause transactions to abort and
+  # retry indefinitely.
+  - catches_command_failures
+  # time-series collections do not support write transactions
+  - requires_timeseries
 
 executor:
   archive:
     hooks:
       - CheckReplDBHashInBackground
+      - ValidateCollectionsInBackground
       - CheckReplDBHash
       - ValidateCollections
     tests: true
@@ -58,6 +77,7 @@ executor:
   #
   # TODO SERVER-26466: Add CheckReplOplogs hook to the concurrency suite.
   - class: CheckReplDBHashInBackground
+  - class: ValidateCollectionsInBackground
   - class: CheckReplDBHash
   - class: ValidateCollections
   - class: CleanEveryN
@@ -68,4 +88,5 @@ executor:
       oplogSize: 1024
       set_parameters:
         enableTestCommands: 1
+        roleGraphInvalidationIsFatal: 1
     num_nodes: 3

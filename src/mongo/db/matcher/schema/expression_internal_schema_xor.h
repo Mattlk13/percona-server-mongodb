@@ -41,25 +41,42 @@ class InternalSchemaXorMatchExpression final : public ListOfMatchExpression {
 public:
     static constexpr StringData kName = "$_internalSchemaXor"_sd;
 
-    InternalSchemaXorMatchExpression() : ListOfMatchExpression(INTERNAL_SCHEMA_XOR) {}
+    InternalSchemaXorMatchExpression(clonable_ptr<ErrorAnnotation> annotation = nullptr)
+        : ListOfMatchExpression(INTERNAL_SCHEMA_XOR, std::move(annotation), {}) {}
+    InternalSchemaXorMatchExpression(std::vector<std::unique_ptr<MatchExpression>> expressions,
+                                     clonable_ptr<ErrorAnnotation> annotation = nullptr)
+        : ListOfMatchExpression(
+              INTERNAL_SCHEMA_XOR, std::move(annotation), std::move(expressions)) {}
+    InternalSchemaXorMatchExpression(std::unique_ptr<MatchExpression> expression,
+                                     clonable_ptr<ErrorAnnotation> annotation = nullptr)
+        : ListOfMatchExpression(
+              INTERNAL_SCHEMA_XOR, std::move(annotation), makeVector(std::move(expression))) {}
 
     bool matches(const MatchableDocument* doc, MatchDetails* details = nullptr) const final;
 
     bool matchesSingleElement(const BSONElement&, MatchDetails* details = nullptr) const final;
 
     virtual std::unique_ptr<MatchExpression> shallowClone() const {
-        auto xorCopy = stdx::make_unique<InternalSchemaXorMatchExpression>();
+        auto xorCopy = std::make_unique<InternalSchemaXorMatchExpression>(_errorAnnotation);
         for (size_t i = 0; i < numChildren(); ++i) {
-            xorCopy->add(getChild(i)->shallowClone().release());
+            xorCopy->add(getChild(i)->shallowClone());
         }
         if (getTag()) {
             xorCopy->setTag(getTag()->clone());
         }
-        return std::move(xorCopy);
+        return xorCopy;
     }
 
     void debugString(StringBuilder& debug, int indentationLevel = 0) const final;
 
-    void serialize(BSONObjBuilder* out) const final;
+    void serialize(BSONObjBuilder* out, bool includePath) const final;
+
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
 };
 }  // namespace mongo

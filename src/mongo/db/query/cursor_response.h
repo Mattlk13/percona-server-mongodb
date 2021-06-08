@@ -41,8 +41,7 @@
 namespace mongo {
 
 /**
- * Builds the cursor field and the _latestOplogTimestamp field for a reply to a cursor-generating
- * command in place.
+ * Builds the cursor field for a reply to a cursor-generating command in-place.
  */
 class CursorResponseBuilder {
     CursorResponseBuilder(const CursorResponseBuilder&) = delete;
@@ -50,11 +49,14 @@ class CursorResponseBuilder {
 
 public:
     /**
-     * Structure used to confiugre the CursorResponseBuilder.
+     * Structure used to configure the CursorResponseBuilder.
+     *
+     * If we selected atClusterTime or received it from the client, transmit it back to the client
+     * in the cursor reply document by setting it here.
      */
     struct Options {
         bool isInitialResponse = false;
-        bool useDocumentSequences = false;
+        boost::optional<LogicalTime> atClusterTime = boost::none;
     };
 
     /**
@@ -75,25 +77,26 @@ public:
 
     size_t bytesUsed() const {
         invariant(_active);
-        return _options.useDocumentSequences ? _docSeqBuilder->len() : _batch->len();
+        return _batch->len();
     }
 
     void append(const BSONObj& obj) {
         invariant(_active);
-        if (_options.useDocumentSequences) {
-            _docSeqBuilder->append(obj);
-        } else {
-            _batch->append(obj);
-        }
-        _numDocs++;
-    }
 
-    void setLatestOplogTimestamp(Timestamp ts) {
-        _latestOplogTimestamp = ts;
+        _batch->append(obj);
+        _numDocs++;
     }
 
     void setPostBatchResumeToken(BSONObj token) {
         _postBatchResumeToken = token.getOwned();
+    }
+
+    void setPartialResultsReturned(bool partialResults) {
+        _partialResultsReturned = partialResults;
+    }
+
+    void setInvalidated() {
+        _invalidated = true;
     }
 
     long long numDocs() const {
@@ -120,12 +123,12 @@ private:
     boost::optional<BSONObjBuilder> _bodyBuilder;
     boost::optional<BSONObjBuilder> _cursorObject;
     boost::optional<BSONArrayBuilder> _batch;
-    boost::optional<OpMsgBuilder::DocSequenceBuilder> _docSeqBuilder;
 
     bool _active = true;
     long long _numDocs = 0;
-    Timestamp _latestOplogTimestamp;
     BSONObj _postBatchResumeToken;
+    bool _partialResultsReturned = false;
+    bool _invalidated = false;
 };
 
 /**
@@ -157,15 +160,6 @@ void appendGetMoreResponseObject(long long cursorId,
                                  BSONObjBuilder* builder);
 
 class CursorResponse {
-// In order to work around a bug in the compiler on the s390x platform, the IDL needs to invoke the
-// copy constructor on that platform.
-// TODO SERVER-32467 Remove this ifndef once the compiler has been fixed and the workaround has been
-// removed.
-#ifndef __s390x__
-    CursorResponse(const CursorResponse&) = delete;
-    CursorResponse& operator=(const CursorResponse&) = delete;
-#endif
-
 public:
     enum class ResponseType {
         InitialResponse,
@@ -201,22 +195,15 @@ public:
     CursorResponse(NamespaceString nss,
                    CursorId cursorId,
                    std::vector<BSONObj> batch,
+                   boost::optional<Timestamp> atClusterTime = boost::none,
                    boost::optional<long long> numReturnedSoFar = boost::none,
-                   boost::optional<Timestamp> latestOplogTimestamp = boost::none,
                    boost::optional<BSONObj> postBatchResumeToken = boost::none,
-                   boost::optional<BSONObj> writeConcernError = boost::none);
+                   boost::optional<BSONObj> writeConcernError = boost::none,
+                   bool partialResultsReturned = false,
+                   bool invalidated = false);
 
     CursorResponse(CursorResponse&& other) = default;
     CursorResponse& operator=(CursorResponse&& other) = default;
-
-// In order to work around a bug in the compiler on the s390x platform, the IDL needs to invoke the
-// copy constructor on that platform.
-// TODO SERVER-32467 Remove this ifndef once the compiler has been fixed and the workaround has been
-// removed.
-#ifdef __s390x__
-    CursorResponse(const CursorResponse& other) = default;
-    CursorResponse& operator=(const CursorResponse& other) = default;
-#endif
 
     //
     // Accessors.
@@ -242,16 +229,24 @@ public:
         return _numReturnedSoFar;
     }
 
-    boost::optional<Timestamp> getLastOplogTimestamp() const {
-        return _latestOplogTimestamp;
-    }
-
     boost::optional<BSONObj> getPostBatchResumeToken() const {
         return _postBatchResumeToken;
     }
 
     boost::optional<BSONObj> getWriteConcernError() const {
         return _writeConcernError;
+    }
+
+    boost::optional<Timestamp> getAtClusterTime() const {
+        return _atClusterTime;
+    }
+
+    bool getPartialResultsReturned() const {
+        return _partialResultsReturned;
+    }
+
+    bool getInvalidated() const {
+        return _invalidated;
     }
 
     /**
@@ -267,10 +262,12 @@ private:
     NamespaceString _nss;
     CursorId _cursorId;
     std::vector<BSONObj> _batch;
+    boost::optional<Timestamp> _atClusterTime;
     boost::optional<long long> _numReturnedSoFar;
-    boost::optional<Timestamp> _latestOplogTimestamp;
     boost::optional<BSONObj> _postBatchResumeToken;
     boost::optional<BSONObj> _writeConcernError;
+    bool _partialResultsReturned = false;
+    bool _invalidated = false;
 };
 
 }  // namespace mongo

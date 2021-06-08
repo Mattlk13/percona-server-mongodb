@@ -90,7 +90,7 @@ inline ElementType findElementNamed(ElementType first, StringData fieldName) {
  */
 template <typename ElementType, typename Predicate>
 inline ElementType findFirstChild(ElementType parent, Predicate predicate) {
-    return findElement(parent.leftchild(), predicate);
+    return findElement(parent.leftChild(), predicate);
 }
 
 /** An overload of findFirstChild that delegates to the special implementation

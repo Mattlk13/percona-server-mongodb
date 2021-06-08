@@ -29,6 +29,8 @@
 
 #pragma once
 
+#include <boost/optional.hpp>
+
 #include "mongo/bson/unordered_fields_bsonelement_comparator.h"
 #include "mongo/db/matcher/expression_leaf.h"
 
@@ -46,7 +48,9 @@ class InternalSchemaEqMatchExpression final : public LeafMatchExpression {
 public:
     static constexpr StringData kName = "$_internalSchemaEq"_sd;
 
-    InternalSchemaEqMatchExpression(StringData path, BSONElement rhs);
+    InternalSchemaEqMatchExpression(StringData path,
+                                    BSONElement rhs,
+                                    clonable_ptr<ErrorAnnotation> annotation = nullptr);
 
     std::unique_ptr<MatchExpression> shallowClone() const final;
 
@@ -66,8 +70,12 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    std::vector<MatchExpression*>* getChildVector() final {
-        return nullptr;
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
     }
 
 private:

@@ -44,12 +44,14 @@ namespace mongo {
 enum StorageEngineInitFlags {
     kNone = 0,
     kAllowNoLockFile = 1 << 0,
+    kSkipMetadataFile = 1 << 1,
 };
 
 /**
  * Initializes the storage engine on "service".
  */
-void initializeStorageEngine(ServiceContext* service, StorageEngineInitFlags initFlags);
+StorageEngine::LastShutdownState initializeStorageEngine(OperationContext* opCtx,
+                                                         StorageEngineInitFlags initFlags);
 
 /**
  * Shuts down storage engine cleanly and releases any locks on mongod.lock.
@@ -87,7 +89,7 @@ StorageEngine::Factory* getFactoryForStorageEngine(ServiceContext* context, Stri
 Status validateStorageOptions(
     ServiceContext* service,
     const BSONObj& storageEngineOptions,
-    stdx::function<Status(const StorageEngine::Factory* const, const BSONObj&)> validateFunc);
+    std::function<Status(const StorageEngine::Factory* const, const BSONObj&)> validateFunc);
 
 /*
  * Appends a the list of available storage engines to a BSONObjBuilder for reporting purposes.

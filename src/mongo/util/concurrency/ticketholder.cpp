@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -35,7 +35,7 @@
 
 #include <iostream>
 
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -47,8 +47,9 @@ namespace {
  * Accepts an errno code, prints its error message, and exits.
  */
 void failWithErrno(int err) {
-    severe() << "error in Ticketholder: " << errnoWithDescription(err);
-    fassertFailed(28604);
+    LOGV2_FATAL(28604,
+                "error in Ticketholder: {errnoWithDescription_err}",
+                "errnoWithDescription_err"_attr = errnoWithDescription(err));
 }
 
 /*
@@ -93,6 +94,11 @@ void TicketHolder::waitForTicket(OperationContext* opCtx) {
 }
 
 bool TicketHolder::waitForTicketUntil(OperationContext* opCtx, Date_t until) {
+    // Attempt to get a ticket without waiting in order to avoid expensive time calculations.
+    if (sem_trywait(&_sem) == 0) {
+        return true;
+    }
+
     const Milliseconds intervalMs(500);
     struct timespec ts;
 
@@ -128,7 +134,7 @@ void TicketHolder::release() {
 }
 
 Status TicketHolder::resize(int newSize) {
-    stdx::lock_guard<stdx::mutex> lk(_resizeMutex);
+    stdx::lock_guard<Latch> lk(_resizeMutex);
 
     if (newSize < 5)
         return Status(ErrorCodes::BadValue,
@@ -137,8 +143,7 @@ Status TicketHolder::resize(int newSize) {
     if (newSize > SEM_VALUE_MAX)
         return Status(ErrorCodes::BadValue,
                       str::stream() << "Maximum value for semaphore is " << SEM_VALUE_MAX
-                                    << "; given "
-                                    << newSize);
+                                    << "; given " << newSize);
 
     while (_outof.load() < newSize) {
         release();
@@ -175,12 +180,12 @@ TicketHolder::TicketHolder(int num) : _outof(num), _num(num) {}
 TicketHolder::~TicketHolder() = default;
 
 bool TicketHolder::tryAcquire() {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     return _tryAcquire();
 }
 
 void TicketHolder::waitForTicket(OperationContext* opCtx) {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    stdx::unique_lock<Latch> lk(_mutex);
 
     if (opCtx) {
         opCtx->waitForConditionOrInterrupt(_newTicket, lk, [this] { return _tryAcquire(); });
@@ -190,7 +195,7 @@ void TicketHolder::waitForTicket(OperationContext* opCtx) {
 }
 
 bool TicketHolder::waitForTicketUntil(OperationContext* opCtx, Date_t until) {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    stdx::unique_lock<Latch> lk(_mutex);
 
     if (opCtx) {
         return opCtx->waitForConditionOrInterruptUntil(
@@ -203,14 +208,14 @@ bool TicketHolder::waitForTicketUntil(OperationContext* opCtx, Date_t until) {
 
 void TicketHolder::release() {
     {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        stdx::lock_guard<Latch> lk(_mutex);
         _num++;
     }
     _newTicket.notify_one();
 }
 
 Status TicketHolder::resize(int newSize) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
 
     int used = _outof.load() - _num;
     if (used > newSize) {
@@ -219,7 +224,7 @@ Status TicketHolder::resize(int newSize) {
            << "more than newSize(" << newSize << ")";
 
         std::string errmsg = ss.str();
-        log() << errmsg;
+        LOGV2(23120, "{errmsg}", "errmsg"_attr = errmsg);
         return Status(ErrorCodes::BadValue, errmsg);
     }
 
@@ -254,4 +259,4 @@ bool TicketHolder::_tryAcquire() {
     return true;
 }
 #endif
-}
+}  // namespace mongo

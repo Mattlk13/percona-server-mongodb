@@ -1,5 +1,6 @@
 // Test that initial sync aborts when it encounters auth data from unsupported
 // auth schemas (see: SERVER-17671)
+// @tags: [live_record_incompatible]
 
 function testInitialSyncAbortsWithUnsupportedAuthSchema(schema) {
     'use strict';
@@ -16,10 +17,11 @@ function testInitialSyncAbortsWithUnsupportedAuthSchema(schema) {
     // invalid or outdated version
     var versionColl = rst.getPrimary().getDB('admin').system.version;
     var res = versionColl.insert(schema);
-    assert.writeOK(res);
+    assert.commandWorked(res);
 
     // Add another node to the replica set to allow an initial sync to occur
-    var initSyncNode = rst.add({setParameter: 'numInitialSyncAttempts=1'});
+    var initSyncNode =
+        rst.add({setParameter: 'numInitialSyncAttempts=1', rsConfig: {votes: 0, priority: 0}});
     var initSyncNodeAdminDB = initSyncNode.getDB("admin");
 
     clearRawMongoProgramOutput();
@@ -63,10 +65,11 @@ function testInitialSyncAbortsWithExistingUserAndNoAuthSchema() {
     // a corresponding auth schema
     var userColl = rst.getPrimary().getDB('admin').system.users;
     var res = userColl.insert({});
-    assert.writeOK(res);
+    assert.commandWorked(res);
 
     // Add another node to the replica set to allow an initial sync to occur
-    var initSyncNode = rst.add({setParameter: 'numInitialSyncAttempts=1'});
+    var initSyncNode =
+        rst.add({setParameter: 'numInitialSyncAttempts=1', rsConfig: {votes: 0, priority: 0}});
     var initSyncNodeAdminDB = initSyncNode.getDB("admin");
 
     clearRawMongoProgramOutput();

@@ -54,7 +54,8 @@ static const NamespaceString nss{"unittests.QueryStageDistinct"};
 
 class DistinctBase {
 public:
-    DistinctBase() : _client(&_opCtx) {}
+    DistinctBase()
+        : _expCtx(make_intrusive<ExpressionContext>(&_opCtx, nullptr, nss)), _client(&_opCtx) {}
 
     virtual ~DistinctBase() {
         _client.dropCollection(nss.ns());
@@ -82,7 +83,7 @@ public:
         WorkingSetID invalid = WorkingSet::INVALID_ID;
         ASSERT_NOT_EQUALS(invalid, wsid);
 
-        WorkingSetMember* member = ws.get(wsid);
+        auto member = ws.get(wsid);
 
         // Distinct hack execution is always covered.
         // Key value is retrieved from working set key data
@@ -98,6 +99,7 @@ public:
 protected:
     const ServiceContext::UniqueOperationContext _txnPtr = cc().makeOperationContext();
     OperationContext& _opCtx = *_txnPtr;
+    boost::intrusive_ptr<ExpressionContext> _expCtx;
 
 private:
     DBDirectClient _client;
@@ -124,7 +126,7 @@ public:
         addIndex(BSON("a" << 1));
 
         AutoGetCollectionForReadCommand ctx(&_opCtx, nss);
-        Collection* coll = ctx.getCollection();
+        const CollectionPtr& coll = ctx.getCollection();
 
         // Set up the distinct stage.
         std::vector<const IndexDescriptor*> indexes;
@@ -142,7 +144,7 @@ public:
         params.bounds.fields.push_back(oil);
 
         WorkingSet ws;
-        DistinctScan distinct(&_opCtx, std::move(params), &ws);
+        DistinctScan distinct(_expCtx.get(), coll, std::move(params), &ws);
 
         WorkingSetID wsid;
         // Get our first result.
@@ -190,7 +192,7 @@ public:
         addIndex(BSON("a" << 1));
 
         AutoGetCollectionForReadCommand ctx(&_opCtx, nss);
-        Collection* coll = ctx.getCollection();
+        const CollectionPtr& coll = ctx.getCollection();
 
         // Set up the distinct stage.
         std::vector<const IndexDescriptor*> indexes;
@@ -210,7 +212,7 @@ public:
         params.bounds.fields.push_back(oil);
 
         WorkingSet ws;
-        DistinctScan distinct(&_opCtx, std::move(params), &ws);
+        DistinctScan distinct(_expCtx.get(), coll, std::move(params), &ws);
 
         // We should see each number in the range [1, 6] exactly once.
         std::set<int> seen;
@@ -257,7 +259,7 @@ public:
         addIndex(BSON("a" << 1 << "b" << 1));
 
         AutoGetCollectionForReadCommand ctx(&_opCtx, nss);
-        Collection* coll = ctx.getCollection();
+        const CollectionPtr& coll = ctx.getCollection();
 
         std::vector<const IndexDescriptor*> indices;
         coll->getIndexCatalog()->findIndexesByKeyPattern(
@@ -279,7 +281,7 @@ public:
         params.bounds.fields.push_back(bOil);
 
         WorkingSet ws;
-        DistinctScan distinct(&_opCtx, std::move(params), &ws);
+        DistinctScan distinct(_expCtx.get(), coll, std::move(params), &ws);
 
         WorkingSetID wsid;
         PlanStage::StageState state;
@@ -287,7 +289,6 @@ public:
         std::vector<int> seen;
 
         while (PlanStage::IS_EOF != (state = distinct.work(&wsid))) {
-            ASSERT_NE(PlanStage::FAILURE, state);
             if (PlanStage::ADVANCED == state) {
                 seen.push_back(getIntFieldDotted(ws, wsid, "b"));
             }
@@ -304,9 +305,9 @@ public:
 // XXX: add a test case with bounds where skipping to the next key gets us a result that's not
 // valid w.r.t. our query.
 
-class All : public Suite {
+class All : public OldStyleSuiteSpecification {
 public:
-    All() : Suite("query_stage_distinct") {}
+    All() : OldStyleSuiteSpecification("query_stage_distinct") {}
 
     void setupTests() {
         add<QueryStageDistinctBasic>();
@@ -315,6 +316,6 @@ public:
     }
 };
 
-SuiteInstance<All> queryStageDistinctAll;
+OldStyleSuiteInitializer<All> queryStageDistinctAll;
 
 }  // namespace QueryStageDistinct

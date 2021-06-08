@@ -39,41 +39,36 @@
 #include "mongo/db/index/multikey_paths.h"
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/record_id.h"
-#include "mongo/db/storage/kv/kv_prefix.h"
 #include "mongo/platform/atomic_word.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 
 namespace mongo {
 
 class CollatorInterface;
-class CollectionCatalogEntry;
-class CollectionInfoCache;
 class IndexAccessMethod;
 class IndexDescriptor;
 class MatchExpression;
 class OperationContext;
+class ExpressionContext;
 
 class IndexCatalogEntryImpl : public IndexCatalogEntry {
     IndexCatalogEntryImpl(const IndexCatalogEntryImpl&) = delete;
     IndexCatalogEntryImpl& operator=(const IndexCatalogEntryImpl&) = delete;
 
 public:
-    explicit IndexCatalogEntryImpl(
-        OperationContext* opCtx,
-        StringData ns,
-        CollectionCatalogEntry* collection,           // not owned
-        std::unique_ptr<IndexDescriptor> descriptor,  // ownership passes to me
-        CollectionInfoCache* infoCache);              // not owned, optional
-
-    ~IndexCatalogEntryImpl() final;
-
-    const NamespaceString& ns() const final {
-        return _ns;
-    }
-
-    void setNs(NamespaceString ns) final;
+    IndexCatalogEntryImpl(OperationContext* opCtx,
+                          RecordId catalogId,
+                          const std::string& ident,
+                          std::unique_ptr<IndexDescriptor> descriptor,  // ownership passes to me
+                          bool isFrozen);
 
     void init(std::unique_ptr<IndexAccessMethod> accessMethod) final;
+
+    const std::string& getIdent() const final {
+        return _ident;
+    }
+
+    std::shared_ptr<Ident> getSharedIdent() const final;
 
     IndexDescriptor* descriptor() final {
         return _descriptor.get();
@@ -93,11 +88,7 @@ public:
         return _indexBuildInterceptor != nullptr;
     }
 
-    IndexBuildInterceptor* indexBuildInterceptor() final {
-        return _indexBuildInterceptor;
-    }
-
-    const IndexBuildInterceptor* indexBuildInterceptor() const final {
+    IndexBuildInterceptor* indexBuildInterceptor() const final {
         return _indexBuildInterceptor;
     }
 
@@ -117,16 +108,26 @@ public:
         return _collator.get();
     }
 
+    NamespaceString getNSSFromCatalog(OperationContext* opCtx) const final;
+
     /// ---------------------
 
     void setIsReady(bool newIsReady) final;
+
+    void setDropped() final {
+        _isDropped.store(true);
+    }
+
+    bool isDropped() const final {
+        return _isDropped.load();
+    }
 
     // --
 
     /**
      * Returns true if this index is multikey, and returns false otherwise.
      */
-    bool isMultikey(OperationContext* opCtx) const final;
+    bool isMultikey() const final;
 
     /**
      * Returns the path components that cause this index to be multikey if this index supports
@@ -154,24 +155,29 @@ public:
      * namespace, index name, and multikey paths on the OperationContext rather than set the index
      * as multikey here.
      */
-    void setMultikey(OperationContext* opCtx, const MultikeyPaths& multikeyPaths) final;
+    void setMultikey(OperationContext* opCtx,
+                     const CollectionPtr& coll,
+                     const KeyStringSet& multikeyMetadataKeys,
+                     const MultikeyPaths& multikeyPaths) final;
 
-    // TODO SERVER-36385 Remove this function: we don't set the feature tracker bit in 4.4 because
-    // 4.4 can only downgrade to 4.2 which can read long TypeBits.
-    void setIndexKeyStringWithLongTypeBitsExistsOnDisk(OperationContext* opCtx) final;
+    void forceSetMultikey(OperationContext* const opCtx,
+                          const CollectionPtr& coll,
+                          bool isMultikey,
+                          const MultikeyPaths& multikeyPaths) final;
 
-    // if this ready is ready for queries
     bool isReady(OperationContext* opCtx) const final;
 
-    KVPrefix getPrefix() const final {
-        return _prefix;
-    }
+    bool isFrozen() const final;
+
+    bool isPresentInMySnapshot(OperationContext* opCtx) const final;
+
+    bool isReadyInMySnapshot(OperationContext* opCtx) const final;
 
     /**
      * If return value is not boost::none, reads with majority read concern using an older snapshot
      * must treat this index as unfinished.
      */
-    boost::optional<Timestamp> getMinimumVisibleSnapshot() final {
+    boost::optional<Timestamp> getMinimumVisibleSnapshot() const final {
         return _minVisibleSnapshot;
     }
 
@@ -182,10 +188,13 @@ public:
     void setMinimumVisibleSnapshot(Timestamp newMinimumVisibleSnapshot) final;
 
 private:
-    class SetMultikeyChange;
-
-    bool _catalogIsReady(OperationContext* opCtx) const;
-    bool _catalogIsPresent(OperationContext* opCtx) const;
+    /**
+     * Sets this index to be multikey when we are running inside a multi-document transaction.
+     * Used by setMultikey() only.
+     */
+    Status _setMultikeyInMultiDocumentTransaction(OperationContext* opCtx,
+                                                  const CollectionPtr& collection,
+                                                  const MultikeyPaths& multikeyPaths);
 
     /**
      * Retrieves the multikey information associated with this index from '_collection',
@@ -194,17 +203,18 @@ private:
      */
     bool _catalogIsMultikey(OperationContext* opCtx, MultikeyPaths* multikeyPaths) const;
 
-    KVPrefix _catalogGetPrefix(OperationContext* opCtx) const;
+    /**
+     * Sets on-disk multikey flag for this index.
+     */
+    void _catalogSetMultikey(OperationContext* opCtx,
+                             const CollectionPtr& collection,
+                             const MultikeyPaths& multikeyPaths);
 
     // -----
 
-    NamespaceString _ns;
-
-    CollectionCatalogEntry* _collection;  // not owned here
+    const std::string _ident;
 
     std::unique_ptr<IndexDescriptor> _descriptor;  // owned here
-
-    CollectionInfoCache* _infoCache;  // not owned here
 
     std::unique_ptr<IndexAccessMethod> _accessMethod;
 
@@ -212,25 +222,34 @@ private:
 
     std::unique_ptr<CollatorInterface> _collator;
     std::unique_ptr<MatchExpression> _filterExpression;
+    // Special ExpressionContext used to evaluate the partial filter expression.
+    boost::intrusive_ptr<ExpressionContext> _expCtxForFilter;
 
     // cached stuff
 
-    Ordering _ordering;  // TODO: this might be b-tree specific
-    bool _isReady;       // cache of NamespaceDetails info
+    const RecordId _catalogId;  // Location in the durable catalog of the collection entry
+                                // containing this index entry.
+    Ordering _ordering;         // TODO: this might be b-tree specific
+    bool _isReady;              // cache of NamespaceDetails info
+    bool _isFrozen;
+    AtomicWord<bool> _isDropped;  // Whether the index drop is committed.
 
-    // Set to true if this index supports path-level multikey tracking.
-    // '_indexTracksPathLevelMultikeyInfo' is effectively const after IndexCatalogEntry::init() is
-    // called.
-    bool _indexTracksPathLevelMultikeyInfo = false;
+    // Set to true if this index can track path-level multikey information in the catalog. This
+    // member is effectively const after IndexCatalogEntry::init() is called.
+    bool _indexTracksMultikeyPathsInCatalog = false;
 
-    // Set to true if this index is multikey. '_isMultikey' serves as a cache of the information
-    // stored in the NamespaceDetails or KVCatalog.
-    AtomicWord<bool> _isMultikey;
+    // Set to true if this index may contain multikey data.
+    AtomicWord<bool> _isMultikeyForRead;
+
+    // Set to true after a transaction commit successfully updates multikey on the catalog data. At
+    // this point, future writers do not need to update the catalog.
+    AtomicWord<bool> _isMultikeyForWrite;
 
     // Controls concurrent access to '_indexMultikeyPaths'. We acquire this mutex rather than the
     // RESOURCE_METADATA lock as a performance optimization so that it is cheaper to detect whether
     // there is actually any path-level multikey information to update or not.
-    mutable stdx::mutex _indexMultikeyPathsMutex;
+    mutable Mutex _indexMultikeyPathsMutex =
+        MONGO_MAKE_LATCH("IndexCatalogEntryImpl::_indexMultikeyPathsMutex");
 
     // Non-empty only if '_indexTracksPathLevelMultikeyInfo' is true.
     //
@@ -239,10 +258,6 @@ private:
     // at 0) into the corresponding indexed field that represent what prefixes of the indexed field
     // causes the index to be multikey.
     MultikeyPaths _indexMultikeyPaths;
-
-    // KVPrefix used to differentiate between index entries in different logical indexes sharing the
-    // same underlying sorted data interface.
-    const KVPrefix _prefix;
 
     // The earliest snapshot that is allowed to read this index.
     boost::optional<Timestamp> _minVisibleSnapshot;

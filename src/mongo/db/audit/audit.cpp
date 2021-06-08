@@ -41,6 +41,8 @@ Copyright (C) 2018-present Percona and/or its affiliates. All rights reserved.
 #include <syslog.h>
 
 #include <boost/filesystem/path.hpp>
+#include <boost/iostreams/device/file_descriptor.hpp>
+#include <boost/iostreams/stream.hpp>
 #include <boost/scoped_ptr.hpp>
 
 #include "mongo/util/debug_util.h"
@@ -50,30 +52,30 @@ Copyright (C) 2018-present Percona and/or its affiliates. All rights reserved.
  * See this link for explanation of the MONGO_LOG macro:
  * http://www.mongodb.org/about/contributors/reference/server-logging-rules/
  */
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/base/init.h"
 #include "mongo/bson/bson_field.h"
 #include "mongo/db/audit.h"
 #include "mongo/db/audit/audit_parameters_gen.h"
-#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/matcher.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/logger/auditlog.h"
+#include "mongo/logv2/log.h"
+#include "mongo/logv2/log_util.h"
+#include "mongo/platform/mutex.h"
+#include "mongo/rpc/metadata/impersonated_user_metadata.h"
 #include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/exit_code.h"
-#include "mongo/util/log.h"
 #include "mongo/util/net/sock.h"
 #include "mongo/util/string_map.h"
-#include "mongo/util/time_support.h"
 
 #include "audit_options.h"
-#include "audit_file.h"
 
 #define PERCONA_AUDIT_STUB {}
 
@@ -81,11 +83,14 @@ namespace mongo {
 
 namespace audit {
 
-    NOINLINE_DECL void realexit( ExitCode rc ) {
+    // JsonStringFormat used by audit logs
+    const JsonStringFormat auditJsonFormat = LegacyStrict;
+
+    MONGO_COMPILER_NOINLINE void realexit( ExitCode rc ) {
 #ifdef _COVERAGE
         // Need to make sure coverage data is properly flushed before exit.
         // It appears that ::_exit() does not do this.
-        log() << "calling regular ::exit() so coverage data may flush..." << std::endl;
+        LOGV2(29013, "calling regular ::exit() so coverage data may flush...");
         ::exit( rc );
 #else
         ::_exit( rc );
@@ -101,25 +106,37 @@ namespace audit {
     };
 
     // Writable interface for audit events
-    class WritableAuditLog : public logger::AuditLog {
+    class WritableAuditLog : public logv2::AuditLog {
     public:
         WritableAuditLog(const BSONObj &filter)
-            : _matcher(filter.getOwned(), new ExpressionContext(nullptr, nullptr)) {
+            : _matcher(filter.getOwned(), new ExpressionContext(nullptr, nullptr, NamespaceString())) {
         }
         virtual ~WritableAuditLog() {}
 
-        void append(const BSONObj &obj) {
+        void append(const BSONObj &obj, const bool affects_durable_state) {
             if (_matcher.matches(obj)) {
-                appendMatched(obj);
+                appendMatched(obj, affects_durable_state);
             }
         }
-        virtual void rotate() {
+        virtual Status rotate(bool rename, StringData renameSuffix) override {
             // No need to override this method if there is nothing to rotate
+            // like it is for 'console' and 'syslog' destinations
+            return Status::OK();
+        }
+
+        virtual void flush() {
+            // No need to override this method if there is nothing to flush
+            // like it is for 'console' and 'syslog' destinations
+
+        }
+
+        virtual void fsync() {
+            // No need to override this method if there is nothing to fsync
             // like it is for 'console' and 'syslog' destinations
         }
 
     protected:
-        virtual void appendMatched(const BSONObj &obj) = 0;
+        virtual void appendMatched(const BSONObj &obj, const bool affects_durable_state) = 0;
 
     private:
         const Matcher _matcher;
@@ -134,12 +151,21 @@ namespace audit {
                     errcode == EINTR);
         }
 
+        typedef boost::iostreams::stream<boost::iostreams::file_descriptor_sink> Sink;
+
     public:
         FileAuditLog(const std::string &file, const BSONObj &filter)
             : WritableAuditLog(filter),
-              _file(new AuditFile),
+              _file(new Sink),
               _fileName(file) {
-            _file->open(file.c_str(), false, false);
+            _file->open(file.c_str(), std::ios_base::out | std::ios_base::app | std::ios_base::binary);
+        }
+
+        virtual ~FileAuditLog() {
+            if (_dirty) {
+                flush_inlock();
+                _dirty = false;
+            }
         }
 
     protected:
@@ -147,7 +173,7 @@ namespace audit {
         // and passess ownership to caller
         virtual AuditLogFormatAdapter *createAdapter(const BSONObj &obj) const = 0;
 
-        virtual void appendMatched(const BSONObj &obj) {
+        virtual void appendMatched(const BSONObj &obj, const bool affects_durable_state) override {
             boost::scoped_ptr<AuditLogFormatAdapter> adapter(createAdapter(obj));
 
             // mongo::File does not have an "atomic append" operation.
@@ -166,94 +192,165 @@ namespace audit {
             // logRotate destroying our pointer.  Welp.
             stdx::lock_guard<SimpleMutex> lck(_mutex);
 
+            _dirty = true;
+            if (affects_durable_state)
+                _fsync_pending = true;
+
+            invariant(_membuf.write(adapter->data(), adapter->size()));
+        }
+
+        virtual Status rotate(bool rename, StringData renameSuffix) override {
+            stdx::lock_guard<SimpleMutex> lck(_mutex);
+
+            // Close the current file.
+            _file.reset();
+
+            if (rename) {
+                // Rename the current file
+                // Note: we append a timestamp to the file name.
+                std::stringstream ss;
+                ss << _fileName << "." << renameSuffix;
+                std::string s = ss.str();
+                int r = std::rename(_fileName.c_str(), s.c_str());
+                if (r != 0) {
+                    LOGV2_ERROR(29016,
+                                "Could not rotate audit log, but continuing normally "
+                                "(error desc: {err_desc})",
+                                "err_desc"_attr = errnoWithDescription());
+                }
+            }
+
+            // Open a new file, with the same name as the original.
+            _file.reset(new Sink);
+            _file->open(_fileName.c_str());
+
+            return Status::OK();
+        }
+
+        virtual void flush() override {
+            stdx::lock_guard<SimpleMutex> lck(_mutex);
+
+            if (_dirty) {
+                flush_inlock();
+                _dirty = false;
+            }
+        }
+
+        virtual void fsync() override {
+            stdx::lock_guard<SimpleMutex> lck(_mutex);
+
+            if (_fsync_pending) {
+                if (_dirty) {
+                    flush_inlock();
+                    _dirty = false;
+                }
+
+                fsync_inlock();
+                _fsync_pending = false;
+            }
+        }
+
+    private:
+        std::ostringstream _membuf;
+        boost::scoped_ptr<Sink> _file;
+        const std::string _fileName;
+        SimpleMutex _mutex;
+        bool _dirty = false;
+        bool _fsync_pending = false;
+
+        void flush_inlock() {
             // If pwrite performs a partial write, we don't want to
             // muck about figuring out how much it did write (hard to
             // get out of the File abstraction) and then carefully
             // writing the rest.  Easier to calculate the position
             // first, then repeatedly write to that position if we
             // have to retry.
-            fileofs pos = _file->len();
+            auto pos = _file->tellp();
+            auto data = _membuf.str();
+            _membuf.str({});
 
             int writeRet;
             for (int retries = 10; retries > 0; --retries) {
-                writeRet = _file->writeReturningError(pos, adapter->data(), adapter->size());
-                if (writeRet == 0) {
+                writeRet = 0;
+                _file->seekp(pos);
+                if (_file->write(data.c_str(), data.length()))
                     break;
-                } else if (!ioErrorShouldRetry(writeRet)) {
-                    error() << "Audit system cannot write event " << redact(obj) << " to log file " << _fileName << std::endl;
-                    error() << "Write failed with fatal error " << errnoWithDescription(writeRet) << std::endl;
-                    error() << "As audit cannot make progress, the server will now shut down." << std::endl;
+                writeRet = errno;
+                if (!ioErrorShouldRetry(writeRet)) {
+                    LOGV2_ERROR(29017,
+                        "Audit system cannot write {datalen} bytes to log file {file}. "
+                        "Write failed with fatal error {err_desc}. "
+                        "As audit cannot make progress, the server will now shut down.",
+                        "datalen"_attr = data.length(),
+                        "file"_attr = _fileName,
+                        "err_desc"_attr = errnoWithDescription(writeRet));
                     realexit(EXIT_AUDIT_ERROR);
                 }
-                warning() << "Audit system cannot write event " << redact(obj) << " to log file " << _fileName << std::endl;
-                warning() << "Write failed with retryable error " << errnoWithDescription(writeRet) << std::endl;
-                warning() << "Audit system will retry this write another " << retries - 1 << " times." << std::endl;
+                LOGV2_WARNING(29018,
+                    "Audit system cannot write {datalen} bytes to log file {file}. "
+                    "Write failed with retryable error {err_desc}. "
+                    "Audit system will retry this write another {retries} times.",
+                    "datalen"_attr = data.length(),
+                    "file"_attr = _fileName,
+                    "err_desc"_attr = errnoWithDescription(writeRet),
+                    "retries"_attr = retries - 1);
                 if (retries <= 7 && retries > 0) {
                     sleepmillis(1 << ((7 - retries) * 2));
                 }
+                _file->clear();
             }
 
             if (writeRet != 0) {
-                error() << "Audit system cannot write event " << redact(obj) << " to log file " << _fileName << std::endl;
-                error() << "Write failed with fatal error " << errnoWithDescription(writeRet) << std::endl;
-                error() << "As audit cannot make progress, the server will now shut down." << std::endl;
+                LOGV2_ERROR(29019,
+                    "Audit system cannot write {datalen} bytes to log file {file}. "
+                    "Write failed with fatal error {err_desc}. "
+                    "As audit cannot make progress, the server will now shut down.",
+                    "datalen"_attr = data.length(),
+                    "file"_attr = _fileName,
+                    "err_desc"_attr = errnoWithDescription(writeRet));
                 realexit(EXIT_AUDIT_ERROR);
             }
 
+            _file->flush();
+        }
+
+        void fsync_inlock() {
             int fsyncRet;
             for (int retries = 10; retries > 0; --retries) {
-                fsyncRet = _file->fsyncReturningError();
+                fsyncRet = ::fsync((*_file)->handle());
                 if (fsyncRet == 0) {
                     break;
                 } else if (!ioErrorShouldRetry(fsyncRet)) {
-                    error() << "Audit system cannot fsync event " << redact(obj) << " to log file " << _fileName << std::endl;
-                    error() << "Fsync failed with fatal error " << errnoWithDescription(fsyncRet) << std::endl;
-                    error() << "As audit cannot make progress, the server will now shut down." << std::endl;
+                    LOGV2_ERROR(29020,
+                        "Audit system cannot fsync log file {file}. "
+                        "Fsync failed with fatal error {err_desc}. "
+                        "As audit cannot make progress, the server will now shut down.",
+                        "file"_attr = _fileName,
+                        "err_desc"_attr = errnoWithDescription(fsyncRet));
                     realexit(EXIT_AUDIT_ERROR);
                 }
-                warning() << "Audit system cannot fsync event " << redact(obj) << " to log file " << _fileName << std::endl;
-                warning() << "Fsync failed with retryable error " << errnoWithDescription(fsyncRet) << std::endl;
-                warning() << "Audit system will retry this fsync another " << retries - 1 << " times." << std::endl;
+                LOGV2_WARNING(29021,
+                    "Audit system cannot fsync log file {file}. "
+                    "Fsync failed with retryable error {err_desc}. "
+                    "Audit system will retry this fsync another {retries} times.",
+                    "file"_attr = _fileName,
+                    "err_desc"_attr = errnoWithDescription(fsyncRet),
+                    "retries"_attr = retries - 1);
                 if (retries <= 7 && retries > 0) {
                     sleepmillis(1 << ((7 - retries) * 2));
                 }
             }
 
             if (fsyncRet != 0) {
-                error() << "Audit system cannot fsync event " << redact(obj) << " to log file " << _fileName << std::endl;
-                error() << "Fsync failed with fatal error " << errnoWithDescription(fsyncRet) << std::endl;
-                error() << "As audit cannot make progress, the server will now shut down." << std::endl;
+                LOGV2_ERROR(29022,
+                    "Audit system cannot fsync log file {file}. "
+                    "Fsync failed with fatal error {err_desc}. "
+                    "As audit cannot make progress, the server will now shut down.",
+                    "file"_attr = _fileName,
+                    "err_desc"_attr = errnoWithDescription(fsyncRet));
                 realexit(EXIT_AUDIT_ERROR);
             }
         }
-
-        virtual void rotate() {
-            stdx::lock_guard<SimpleMutex> lck(_mutex);
-
-            // Close the current file.
-            _file.reset();
-
-            // Rename the current file
-            // Note: we append a timestamp to the file name.
-            std::stringstream ss;
-            ss << _fileName << "." << terseCurrentTime(false);
-            std::string s = ss.str();
-            int r = std::rename(_fileName.c_str(), s.c_str());
-            if (r != 0) {
-                error() << "Could not rotate audit log, but continuing normally "
-                        << "(error desc: " << errnoWithDescription() << ")"
-                        << std::endl;
-            }
-
-            // Open a new file, with the same name as the original.
-            _file.reset(new AuditFile);
-            _file->open(_fileName.c_str(), false, false);
-        }
-
-    private:
-        boost::scoped_ptr<AuditFile> _file;
-        const std::string _fileName;
-        SimpleMutex _mutex;
     };    
 
     // Writes audit events to a json file
@@ -264,7 +361,7 @@ namespace audit {
 
         public:
             Adapter(const BSONObj &obj)
-                : str(obj.jsonString() + '\n') {}
+                : str(obj.jsonString(auditJsonFormat) + '\n') {}
 
             virtual const char *data() const override {
                 return str.c_str();
@@ -319,8 +416,8 @@ namespace audit {
         }
 
     private:
-        virtual void appendMatched(const BSONObj &obj) {
-            std::cout << obj.jsonString() << std::endl;
+        virtual void appendMatched(const BSONObj &obj, const bool affects_durable_state) override {
+            std::cout << obj.jsonString(auditJsonFormat) << std::endl;
         }
 
     };
@@ -333,8 +430,8 @@ namespace audit {
         }
 
     private:
-        virtual void appendMatched(const BSONObj &obj) {
-            syslog(LOG_MAKEPRI(LOG_USER, LOG_INFO), "%s", obj.jsonString().c_str());
+        virtual void appendMatched(const BSONObj &obj, const bool affects_durable_state) override {
+            syslog(LOG_MAKEPRI(LOG_USER, LOG_INFO), "%s", obj.jsonString(auditJsonFormat).c_str());
         }
 
     };
@@ -350,8 +447,8 @@ namespace audit {
         }
 
     protected:
-        void appendMatched(const BSONObj &obj) {
-            verify(!obj.jsonString().empty());
+        void appendMatched(const BSONObj &obj, const bool affects_durable_state) override {
+            verify(!obj.jsonString(auditJsonFormat).empty());
         }
 
     };
@@ -359,11 +456,10 @@ namespace audit {
     static std::shared_ptr<WritableAuditLog> _auditLog;
 
     static void _setGlobalAuditLog(WritableAuditLog *log) {
+        // Must be the last line because this function is also used
+        // for cleanup (log can be nullptr)
+        // Otherwise race condition exists during cleanup.
         _auditLog.reset(log);
-
-        // Sets the audit log in the general logging framework which
-        // will rotate() the audit log when the server log rotates.
-        setAuditLog(log);
     }
 
     static bool _auditEnabledOnCommandLine() {
@@ -374,14 +470,14 @@ namespace audit {
         if (!_auditEnabledOnCommandLine()) {
             // Write audit events into the void for debug builds, so we get
             // coverage on the code that generates audit log objects.
-            DEV {
-                log() << "Initializing dev null audit..." << std::endl;
+            if (kDebugBuild) {
+                LOGV2(29014, "Initializing dev null audit...");
                 _setGlobalAuditLog(new VoidAuditLog(fromjson(auditOptions.filter)));
             }
             return Status::OK();
         }
 
-        log() << "Initializing audit..." << std::endl;
+        LOGV2(29015, "Initializing audit...");
         const BSONObj filter = fromjson(auditOptions.filter);
         if (auditOptions.destination == "console")
             _setGlobalAuditLog(new ConsoleAuditLog(filter));
@@ -398,11 +494,19 @@ namespace audit {
     MONGO_INITIALIZER_WITH_PREREQUISITES(AuditInit,
                                          ("default", "PathlessOperatorMap", "MatchExpressionParser"))
         (InitializerContext *context) {
-        return initialize();
+        // Sets the audit log in the general logging framework which
+        // will rotate() the audit log when the server log rotates.
+        logv2::addLogRotator(logv2::kAuditLogTag, [](bool renameFiles, StringData suffix) {
+            if (_auditLog) {
+                return _auditLog->rotate(renameFiles, suffix);
+            }
+            return Status::OK();
+        });
+        uassertStatusOK(initialize());
     }
 
 ///////////////////////// audit.h functions ////////////////////////////
-    
+
     namespace AuditFields {
         // Common fields
         BSONField<StringData> type("atype");
@@ -449,16 +553,16 @@ namespace audit {
         }
 
         static StringMap<std::string> hostToIpCache;
-        static stdx::mutex cacheMutex;
+        static auto cacheMutex = MONGO_MAKE_LATCH("audit::getIpByHost::cacheMutex");
 
         std::string ip;
         {
-            stdx::lock_guard<stdx::mutex> lk(cacheMutex);
+            stdx::lock_guard<Latch> lk(cacheMutex);
             ip = hostToIpCache[host];
         }
         if (ip.empty()) {
             ip = hostbyname(host.c_str());
-            stdx::lock_guard<stdx::mutex> lk(cacheMutex);
+            stdx::lock_guard<Latch> lk(cacheMutex);
             hostToIpCache[host] = ip;
         }
         return ip;
@@ -509,12 +613,13 @@ namespace audit {
     static void _auditEvent(Client* client,
                             StringData atype,
                             const BSONObj& params,
-                            ErrorCodes::Error result = ErrorCodes::OK) {
+                            ErrorCodes::Error result = ErrorCodes::OK,
+                            const bool affects_durable_state = true) {
         BSONObjBuilder builder;
         appendCommonInfo(builder, atype, client);
         builder << AuditFields::param(params);
         builder << AuditFields::result(static_cast<int>(result));
-        _auditLog->append(builder.done());
+        _auditLog->append(builder.done(), affects_durable_state);
     }
 
     static void _auditAuthz(Client* client,
@@ -527,7 +632,7 @@ namespace audit {
             const BSONObj params = !ns.empty() ?
                 BSON("command" << command << "ns" << ns << "args" << args) :
                 BSON("command" << command << "args" << args);
-            _auditEvent(client, "authCheck", params, result);
+            _auditEvent(client, "authCheck", params, result, false);
         }
     }
 
@@ -542,18 +647,29 @@ namespace audit {
 
     }
 
-    void logAuthentication(Client* client,
-                           StringData mechanism,
-                           const UserName& user,
-                           ErrorCodes::Error result) {
+    ImpersonatedClientAttrs::ImpersonatedClientAttrs(Client* client) {
+        auto optAttrs = rpc::getImpersonatedUserMetadata(client->getOperationContext());
+        if (optAttrs) {
+            userNames = optAttrs->getUsers();
+            roleNames = optAttrs->getRoles();
+        }
+    }
+
+    void logClientMetadata(Client* client) {
         if (!_auditLog) {
             return;
         }
 
-        const BSONObj params = BSON("user" << user.getUser() <<
-                                    "db" << user.getDB() <<
-                                    "mechanism" << mechanism);
-        _auditEvent(client, "authenticate", params, result);
+        _auditEvent(client, "clientMetadata", BSONObj{}, ErrorCodes::OK, false);
+    }
+    void logAuthentication(Client* client, const AuthenticateEvent& event) {
+        if (!_auditLog) {
+            return;
+        }
+
+        const BSONObj params = BSON("user" << event.getUser() << "db" << event.getDatabase()
+                                           << "mechanism" << event.getMechanism());
+        _auditEvent(client, "authenticate", params, event.getResult(), false);
     }
 
     void logCommandAuthzCheck(Client* client,
@@ -679,7 +795,15 @@ namespace audit {
         }
 
         const BSONObj params = BSON("msg" << msg);
-        _auditEvent(client, "applicationMessage", params);
+        _auditEvent(client, "applicationMessage", params, ErrorCodes::OK, false);
+    }
+
+    void logStartupOptions(Client* client, const BSONObj& startupOptions) {
+        if (!_auditLog) {
+            return;
+        }
+
+        _auditEvent(client, "startupOptions", startupOptions, ErrorCodes::OK, false);
     }
 
     void logShutdown(Client* client) {
@@ -689,30 +813,73 @@ namespace audit {
 
         const BSONObj params = BSONObj();
         _auditEvent(client, "shutdown", params);
+
+        // This is always the last event
+        // Destroy audit log here
+        _setGlobalAuditLog(nullptr);
+    }
+
+    void logLogout(Client* client,
+                   StringData reason,
+                   const BSONArray& initialUsers,
+                   const BSONArray& updatedUsers) {
+        if (!_auditLog) {
+            return;
+        }
+
+        const BSONObj params = BSON("reason" << reason << "initialUsers" << initialUsers
+                                             << "updatedUsers" << updatedUsers);
+        _auditEvent(client, "logout", params, ErrorCodes::OK, false);
     }
 
     void logCreateIndex(Client* client,
                         const BSONObj* indexSpec,
                         StringData indexname,
-                        StringData nsname) {
+                        const NamespaceString& nsname,
+                        StringData indexBuildState,
+                        ErrorCodes::Error result) {
         if (!_auditLog) {
             return;
         }
 
-        const BSONObj params = BSON("ns" << nsname <<
-                                    "indexName" << indexname <<
-                                    "indexSpec" << *indexSpec);
-        _auditEvent(client, "createIndex", params);
+        BSONObjBuilder params;
+        params.append("ns", nsname.ns());
+        params.append("indexName", indexname);
+        params.append("indexSpec", *indexSpec);
+        params.append("indexBuildState", indexBuildState);
+        _auditEvent(client, "createIndex", params.done(), result);
     }
 
-    void logCreateCollection(Client* client,
-                             StringData nsname) { 
+    void logCreateCollection(Client* client, const NamespaceString& nsname) {
         if (!_auditLog) {
             return;
         }
 
-        const BSONObj params = BSON("ns" << nsname);
+        const BSONObj params = BSON("ns" << nsname.ns());
         _auditEvent(client, "createCollection", params);
+    }
+
+    void logCreateView(Client* client,
+                       const NamespaceString& nsname,
+                       StringData viewOn,
+                       BSONArray pipeline,
+                       ErrorCodes::Error code) {
+        if (!_auditLog) {
+            return;
+        }
+
+        const BSONObj params =
+            BSON("ns" << nsname.ns() << "viewOn" << viewOn << "pipeline" << pipeline);
+        _auditEvent(client, "createView", params, code);
+    }
+
+    void logImportCollection(Client* client, const NamespaceString& nsname) {
+        if (!_auditLog) {
+            return;
+        }
+
+        const BSONObj params = BSON("ns" << nsname.ns());
+        _auditEvent(client, "importCollection", params);
     }
 
     void logCreateDatabase(Client* client,
@@ -725,25 +892,38 @@ namespace audit {
         _auditEvent(client, "createDatabase", params);
     }
 
-    void logDropIndex(Client* client,
-                      StringData indexname,
-                      StringData nsname) {
+    void logDropIndex(Client* client, StringData indexname, const NamespaceString& nsname) {
         if (!_auditLog) {
             return;
         }
 
-        const BSONObj params = BSON("ns" << nsname << "indexName" << indexname);
+        const BSONObj params = BSON("ns" << nsname.ns() << "indexName" << indexname);
         _auditEvent(client, "dropIndex", params);
     }
 
-    void logDropCollection(Client* client,
-                           StringData nsname) { 
+    void logDropCollection(Client* client, const NamespaceString& nsname) {
         if (!_auditLog) {
             return;
         }
 
-        const BSONObj params = BSON("ns" << nsname);
+        const BSONObj params = BSON("ns" << nsname.ns());
         _auditEvent(client, "dropCollection", params);
+    }
+
+    void logDropView(Client* client,
+                     const NamespaceString& nsname,
+                     StringData viewOn,
+                     const std::vector<BSONObj>& pipeline,
+                     ErrorCodes::Error code) {
+        if (!_auditLog) {
+            return;
+        }
+
+        BSONObjBuilder params;
+        params.append("ns", nsname.ns());
+        params.append("viewOn", viewOn);
+        params.append("pipeline", pipeline);
+        _auditEvent(client, "dropView", params.done(), code);
     }
 
     void logDropDatabase(Client* client,
@@ -757,13 +937,13 @@ namespace audit {
     }
 
     void logRenameCollection(Client* client,
-                             StringData source,
-                             StringData target) {
+                             const NamespaceString& source,
+                             const NamespaceString& target) {
         if (!_auditLog) {
             return;
         }
 
-        const BSONObj params = BSON("old" << source << "new" << target);
+        const BSONObj params = BSON("old" << nssToString(source) << "new" << nssToString(target));
         _auditEvent(client, "renameCollection", params);
     }
 
@@ -1018,6 +1198,45 @@ namespace audit {
         _auditEvent(client, "revokePrivilegesFromRole", params.done());
     }
 
+    void logRefineCollectionShardKey(Client* client,
+                                     StringData ns,
+                                     const BSONObj& keyPattern) {
+        if (!_auditLog) {
+            return;
+        }
+
+        const BSONObj params = BSON("ns" << ns <<
+                                    "key" << keyPattern);
+        _auditEvent(client, "refineCollectionShardKey", params);
+    }
+
+    void logInsertOperation(Client* client, const NamespaceString& nss, const BSONObj& doc) {
+        if (!_auditLog) {
+            return;
+        }
+
+        const BSONObj params = BSON("ns" << nssToString(nss) << "doc" << doc);
+        _auditEvent(client, "insertOperation", params);
+    }
+
+    void logUpdateOperation(Client* client, const NamespaceString& nss, const BSONObj& doc) {
+        if (!_auditLog) {
+            return;
+        }
+
+        const BSONObj params = BSON("ns" << nssToString(nss) << "doc" << doc);
+        _auditEvent(client, "updateOperation", params);
+    }
+
+    void logRemoveOperation(Client* client, const NamespaceString& nss, const BSONObj& doc) {
+        if (!_auditLog) {
+            return;
+        }
+
+        const BSONObj params = BSON("ns" << nssToString(nss) << "doc" << doc);
+        _auditEvent(client, "removeOperation", params);
+    }
+
     void writeImpersonatedUsersToMetadata(OperationContext* txn,
                                           BSONObjBuilder* metadata) PERCONA_AUDIT_STUB
 
@@ -1032,6 +1251,23 @@ namespace audit {
             AuthorizationSession* authSession,
             std::vector<RoleName>* parsedRoleNames,
             bool* fieldIsPresent) PERCONA_AUDIT_STUB
+
+
+    void flushAuditLog() {
+        if (!_auditLog) {
+            return;
+        }
+
+        _auditLog->flush();
+    }
+
+    void fsyncAuditLog() {
+        if (!_auditLog) {
+            return;
+        }
+
+        _auditLog->fsync();
+    }
 
 }  // namespace audit
 }  // namespace mongo

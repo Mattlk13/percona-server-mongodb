@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kIndex
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kIndex
 
 #include "mongo/platform/basic.h"
 
@@ -36,7 +36,6 @@
 #include <vector>
 
 #include "mongo/bson/bsonobj.h"
-#include "mongo/db/catalog/index_timestamp_helper.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
@@ -46,36 +45,73 @@
 #include "mongo/db/multi_key_path_tracker.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
-#include "mongo/util/fail_point_service.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/progress_meter.h"
 #include "mongo/util/uuid.h"
 
 namespace mongo {
 
 MONGO_FAIL_POINT_DEFINE(hangDuringIndexBuildDrainYield);
+MONGO_FAIL_POINT_DEFINE(hangDuringIndexBuildDrainYieldSecond);
+MONGO_FAIL_POINT_DEFINE(hangIndexBuildDuringDrainWritesPhase);
+MONGO_FAIL_POINT_DEFINE(hangIndexBuildDuringDrainWritesPhaseSecond);
 
 IndexBuildInterceptor::IndexBuildInterceptor(OperationContext* opCtx, IndexCatalogEntry* entry)
     : _indexCatalogEntry(entry),
       _sideWritesTable(
-          opCtx->getServiceContext()->getStorageEngine()->makeTemporaryRecordStore(opCtx)) {
+          opCtx->getServiceContext()->getStorageEngine()->makeTemporaryRecordStore(opCtx)),
+      _skippedRecordTracker(opCtx, entry, boost::none) {
 
     if (entry->descriptor()->unique()) {
         _duplicateKeyTracker = std::make_unique<DuplicateKeyTracker>(opCtx, entry);
     }
 }
 
-void IndexBuildInterceptor::deleteTemporaryTables(OperationContext* opCtx) {
-    _sideWritesTable->deleteTemporaryTable(opCtx);
-    if (_duplicateKeyTracker) {
-        _duplicateKeyTracker->deleteTemporaryTable(opCtx);
+IndexBuildInterceptor::IndexBuildInterceptor(OperationContext* opCtx,
+                                             IndexCatalogEntry* entry,
+                                             StringData sideWritesIdent,
+                                             boost::optional<StringData> duplicateKeyTrackerIdent,
+                                             boost::optional<StringData> skippedRecordTrackerIdent)
+    : _indexCatalogEntry(entry),
+      _sideWritesTable(
+          opCtx->getServiceContext()->getStorageEngine()->makeTemporaryRecordStoreFromExistingIdent(
+              opCtx, sideWritesIdent)),
+      _skippedRecordTracker(opCtx, entry, skippedRecordTrackerIdent),
+      _skipNumAppliedCheck(true) {
+
+    auto finalizeTableOnFailure = makeGuard([&] {
+        _sideWritesTable->finalizeTemporaryTable(opCtx,
+                                                 TemporaryRecordStore::FinalizationAction::kDelete);
+    });
+
+    auto dupKeyTrackerIdentExists = duplicateKeyTrackerIdent ? true : false;
+    uassert(ErrorCodes::BadValue,
+            str::stream() << "Resume info must contain the duplicate key tracker ident ["
+                          << duplicateKeyTrackerIdent
+                          << "] if and only if the index is unique: " << entry->descriptor(),
+            entry->descriptor()->unique() == dupKeyTrackerIdentExists);
+    if (duplicateKeyTrackerIdent) {
+        _duplicateKeyTracker =
+            std::make_unique<DuplicateKeyTracker>(opCtx, entry, duplicateKeyTrackerIdent.get());
     }
+
+    finalizeTableOnFailure.dismiss();
 }
 
-Status IndexBuildInterceptor::recordDuplicateKeys(OperationContext* opCtx,
-                                                  const std::vector<BSONObj>& keys) {
+void IndexBuildInterceptor::finalizeTemporaryTables(
+    OperationContext* opCtx, TemporaryRecordStore::FinalizationAction action) {
+    _sideWritesTable->finalizeTemporaryTable(opCtx, action);
+    if (_duplicateKeyTracker) {
+        _duplicateKeyTracker->finalizeTemporaryTable(opCtx, action);
+    }
+    _skippedRecordTracker.finalizeTemporaryTable(opCtx, action);
+}
+
+Status IndexBuildInterceptor::recordDuplicateKey(OperationContext* opCtx,
+                                                 const KeyString::Value& key) const {
     invariant(_indexCatalogEntry->descriptor()->unique());
-    return _duplicateKeyTracker->recordKeys(opCtx, keys);
+    return _duplicateKeyTracker->recordKey(opCtx, key);
 }
 
 Status IndexBuildInterceptor::checkDuplicateKeyConstraints(OperationContext* opCtx) const {
@@ -85,28 +121,12 @@ Status IndexBuildInterceptor::checkDuplicateKeyConstraints(OperationContext* opC
     return _duplicateKeyTracker->checkConstraints(opCtx);
 }
 
-bool IndexBuildInterceptor::areAllConstraintsChecked(OperationContext* opCtx) const {
-    if (!_duplicateKeyTracker) {
-        return true;
-    }
-    return _duplicateKeyTracker->areAllConstraintsChecked(opCtx);
-}
-
-const std::string& IndexBuildInterceptor::getSideWritesTableIdent() const {
-    return _sideWritesTable->rs()->getIdent();
-}
-
-const std::string& IndexBuildInterceptor::getConstraintViolationsTableIdent() const {
-    return _duplicateKeyTracker->getConstraintsTableIdent();
-}
-
-
 Status IndexBuildInterceptor::drainWritesIntoIndex(OperationContext* opCtx,
+                                                   const CollectionPtr& coll,
                                                    const InsertDeleteOptions& options,
-                                                   RecoveryUnit::ReadSource readSource) {
+                                                   TrackDuplicates trackDuplicates,
+                                                   DrainYieldPolicy drainYieldPolicy) {
     invariant(!opCtx->lockState()->inAWriteUnitOfWork());
-    // Reading at a timestamp during hybrid index builds is not supported.
-    invariant(readSource == RecoveryUnit::ReadSource::kUnset);
 
     // These are used for logging only.
     int64_t totalDeleted = 0;
@@ -127,7 +147,7 @@ Status IndexBuildInterceptor::drainWritesIntoIndex(OperationContext* opCtx,
     // Force the progress meter to log at the end of every batch. By default, the progress meter
     // only logs after a large number of calls to hit(), but since we use such large batch sizes,
     // progress would rarely be displayed.
-    progress->reset(_sideWritesCounter.load() - appliedAtStart /* total */,
+    progress->reset(_sideWritesCounter->load() - appliedAtStart /* total */,
                     3 /* secondsBetween */,
                     1 /* checkInterval */);
 
@@ -143,12 +163,11 @@ Status IndexBuildInterceptor::drainWritesIntoIndex(OperationContext* opCtx,
     invariant(kBatchMaxMB <= std::numeric_limits<int32_t>::max() / kMB);
     const int32_t kBatchMaxBytes = kBatchMaxMB * kMB;
 
-    // Indicates that there are no more visible records in the side table.
-    bool atEof = false;
-
     // In a single WriteUnitOfWork, scan the side table up to the batch or memory limit, apply the
     // keys to the index, and delete the side table records.
-    auto applySingleBatch = [&] {
+    // Returns true if the cursor has reached the end of the table, false if there are more records,
+    // and an error Status otherwise.
+    auto applySingleBatch = [&]() -> StatusWith<bool> {
         WriteUnitOfWork wuow(opCtx);
 
         int32_t batchSize = 0;
@@ -160,14 +179,9 @@ Status IndexBuildInterceptor::drainWritesIntoIndex(OperationContext* opCtx,
         // table matters.
         std::vector<RecordId> recordsAddedToIndex;
 
-        while (!atEof) {
+        auto record = cursor->next();
+        while (record) {
             opCtx->checkForInterrupt();
-
-            auto record = cursor->next();
-            if (!record) {
-                atEof = true;
-                break;
-            }
 
             RecordId currentRecordId = record->id;
             BSONObj unownedDoc = record->data.toBson();
@@ -178,11 +192,21 @@ Status IndexBuildInterceptor::drainWritesIntoIndex(OperationContext* opCtx,
                 break;
             }
 
+            const long long iteration = _numApplied + batchSize;
+            _checkDrainPhaseFailPoint(opCtx, &hangIndexBuildDuringDrainWritesPhase, iteration);
+            _checkDrainPhaseFailPoint(
+                opCtx, &hangIndexBuildDuringDrainWritesPhaseSecond, iteration);
+
             batchSize += 1;
             batchSizeBytes += objSize;
 
-            if (auto status =
-                    _applyWrite(opCtx, unownedDoc, options, &totalInserted, &totalDeleted);
+            if (auto status = _applyWrite(opCtx,
+                                          coll,
+                                          unownedDoc,
+                                          options,
+                                          trackDuplicates,
+                                          &totalInserted,
+                                          &totalDeleted);
                 !status.isOK()) {
                 return status;
             }
@@ -195,6 +219,8 @@ Status IndexBuildInterceptor::drainWritesIntoIndex(OperationContext* opCtx,
             if (batchSize == kBatchMaxSize) {
                 break;
             }
+
+            record = cursor->next();
         }
 
         // Delete documents from the side table as soon as they have been inserted into the index.
@@ -204,8 +230,8 @@ Status IndexBuildInterceptor::drainWritesIntoIndex(OperationContext* opCtx,
         }
 
         if (batchSize == 0) {
-            invariant(atEof);
-            return Status::OK();
+            invariant(!record);
+            return true;
         }
 
         wuow.commit();
@@ -213,77 +239,108 @@ Status IndexBuildInterceptor::drainWritesIntoIndex(OperationContext* opCtx,
         progress->hit(batchSize);
         _numApplied += batchSize;
 
-        // Lock yielding will only happen if we are holding intent locks.
-        _tryYield(opCtx);
+        // Lock yielding will be directed by the yield policy provided.
+        // We will typically yield locks during the draining phase if we are holding intent locks.
+        if (DrainYieldPolicy::kYield == drainYieldPolicy) {
+            _yield(opCtx, &coll);
+        }
 
         // Account for more writes coming in during a batch.
-        progress->setTotalWhileRunning(_sideWritesCounter.loadRelaxed() - appliedAtStart);
-        return Status::OK();
+        progress->setTotalWhileRunning(_sideWritesCounter->loadRelaxed() - appliedAtStart);
+        return false;
     };
+
+    // Indicates that there are no more visible records in the side table.
+    bool atEof = false;
 
     // Apply batches of side writes until the last record in the table is seen.
     while (!atEof) {
-        if (auto status = writeConflictRetry(
-                opCtx, "index build drain", _indexCatalogEntry->ns().ns(), applySingleBatch);
-            !status.isOK()) {
-            return status;
+        auto swAtEof =
+            writeConflictRetry(opCtx, "index build drain", coll->ns().ns(), applySingleBatch);
+        if (!swAtEof.isOK()) {
+            return swAtEof.getStatus();
         }
+        atEof = swAtEof.getValue();
     }
 
     progress->finished();
 
     int logLevel = (_numApplied - appliedAtStart > 0) ? 0 : 1;
-    LOG(logLevel) << "index build: drain applied " << (_numApplied - appliedAtStart)
-                  << " side writes (inserted: " << totalInserted << ", deleted: " << totalDeleted
-                  << ") for '" << _indexCatalogEntry->descriptor()->indexName() << "' in "
-                  << timer.millis() << " ms";
+    LOGV2_DEBUG(20689,
+                logLevel,
+                "Index build: drained side writes",
+                "index"_attr = _indexCatalogEntry->descriptor()->indexName(),
+                "collectionUUID"_attr = coll->uuid(),
+                logAttrs(coll->ns()),
+                "numApplied"_attr = (_numApplied - appliedAtStart),
+                "totalInserted"_attr = totalInserted,
+                "totalDeleted"_attr = totalDeleted,
+                "durationMillis"_attr = timer.millis());
 
     return Status::OK();
 }
 
 Status IndexBuildInterceptor::_applyWrite(OperationContext* opCtx,
+                                          const CollectionPtr& coll,
                                           const BSONObj& operation,
                                           const InsertDeleteOptions& options,
+                                          TrackDuplicates trackDups,
                                           int64_t* const keysInserted,
                                           int64_t* const keysDeleted) {
-    const BSONObj key = operation["key"].Obj();
-    const RecordId opRecordId = RecordId(operation["recordId"].Long());
+    // Deserialize the encoded KeyString::Value.
+    int keyLen;
+    const char* binKey = operation["key"].binData(keyLen);
+    BufReader reader(binKey, keyLen);
+    const KeyString::Value keyString = KeyString::Value::deserialize(
+        reader,
+        _indexCatalogEntry->accessMethod()->getSortedDataInterface()->getKeyStringVersion());
+
     const Op opType =
         (strcmp(operation.getStringField("op"), "i") == 0) ? Op::kInsert : Op::kDelete;
-    const BSONObjSet keySet = SimpleBSONObjComparator::kInstance.makeBSONObjSet({key});
+
+    const KeyStringSet keySet{keyString};
+    const RecordId opRecordId = [&]() {
+        auto keyFormat = coll->getRecordStore()->keyFormat();
+        if (keyFormat == KeyFormat::Long) {
+            return KeyString::decodeRecordIdLongAtEnd(keyString.getBuffer(), keyString.getSize());
+        } else {
+            invariant(keyFormat == KeyFormat::String);
+            return KeyString::decodeRecordIdStrAtEnd(keyString.getBuffer(), keyString.getSize());
+        }
+    }();
 
     auto accessMethod = _indexCatalogEntry->accessMethod();
     if (opType == Op::kInsert) {
-        InsertResult result;
-        auto status = accessMethod->insertKeys(opCtx,
-                                               keySet,
-                                               SimpleBSONObjComparator::kInstance.makeBSONObjSet(),
-                                               MultikeyPaths{},
-                                               opRecordId,
-                                               options,
-                                               &result);
+        int64_t numInserted;
+        auto status = accessMethod->insertKeysAndUpdateMultikeyPaths(
+            opCtx,
+            coll,
+            {keySet.begin(), keySet.end()},
+            {},
+            MultikeyPaths{},
+            opRecordId,
+            options,
+            [=](const KeyString::Value& duplicateKey) {
+                return trackDups == TrackDuplicates::kTrack
+                    ? recordDuplicateKey(opCtx, duplicateKey)
+                    : Status::OK();
+            },
+            &numInserted);
         if (!status.isOK()) {
             return status;
         }
 
-        if (result.dupsInserted.size() &&
-            options.getKeysMode == IndexAccessMethod::GetKeysMode::kEnforceConstraints) {
-            status = recordDuplicateKeys(opCtx, result.dupsInserted);
-            if (!status.isOK()) {
-                return status;
-            }
-        }
-
-        int64_t numInserted = result.numInserted;
         *keysInserted += numInserted;
         opCtx->recoveryUnit()->onRollback(
             [keysInserted, numInserted] { *keysInserted -= numInserted; });
     } else {
         invariant(opType == Op::kDelete);
-        DEV invariant(strcmp(operation.getStringField("op"), "d") == 0);
+        if (kDebugBuild)
+            invariant(strcmp(operation.getStringField("op"), "d") == 0);
 
         int64_t numDeleted;
-        Status s = accessMethod->removeKeys(opCtx, keySet, opRecordId, options, &numDeleted);
+        Status s = accessMethod->removeKeys(
+            opCtx, {keySet.begin(), keySet.end()}, opRecordId, options, &numDeleted);
         if (!s.isOK()) {
             return s;
         }
@@ -295,21 +352,10 @@ Status IndexBuildInterceptor::_applyWrite(OperationContext* opCtx,
     return Status::OK();
 }
 
-void IndexBuildInterceptor::_tryYield(OperationContext* opCtx) {
-    // Never yield while holding locks that prevent writes to the collection: only yield while
-    // holding intent locks. This check considers all locks in the hierarchy that would cover this
-    // mode.
-    const NamespaceString nss(_indexCatalogEntry->ns());
-    if (opCtx->lockState()->isCollectionLockedForMode(nss, MODE_S)) {
-        return;
-    }
-    DEV {
-        invariant(!opCtx->lockState()->isCollectionLockedForMode(nss, MODE_X));
-        invariant(!opCtx->lockState()->isDbLockedForMode(nss.db(), MODE_X));
-    }
-
+void IndexBuildInterceptor::_yield(OperationContext* opCtx, const Yieldable* yieldable) {
     // Releasing locks means a new snapshot should be acquired when restored.
     opCtx->recoveryUnit()->abandonSnapshot();
+    yieldable->yield();
 
     auto locker = opCtx->lockState();
     Locker::LockSnapshot snapshot;
@@ -319,74 +365,81 @@ void IndexBuildInterceptor::_tryYield(OperationContext* opCtx) {
     // Track the number of yields in CurOp.
     CurOp::get(opCtx)->yielded();
 
-    MONGO_FAIL_POINT_BLOCK(hangDuringIndexBuildDrainYield, config) {
-        StringData ns{config.getData().getStringField("namespace")};
-        if (ns == _indexCatalogEntry->ns().ns()) {
-            log() << "Hanging index build during drain yield";
-            MONGO_FAIL_POINT_PAUSE_WHILE_SET(hangDuringIndexBuildDrainYield);
-        }
-    }
+    auto failPointHang = [opCtx, indexCatalogEntry = _indexCatalogEntry](FailPoint* fp) {
+        fp->executeIf(
+            [fp](auto&&) {
+                LOGV2(20690, "Hanging index build during drain yield");
+                fp->pauseWhileSet();
+            },
+            [opCtx, indexCatalogEntry](auto&& config) {
+                return config.getStringField("namespace") ==
+                    indexCatalogEntry->getNSSFromCatalog(opCtx).ns();
+            });
+    };
+    failPointHang(&hangDuringIndexBuildDrainYield);
+    failPointHang(&hangDuringIndexBuildDrainYieldSecond);
 
     locker->restoreLockState(opCtx, snapshot);
+    yieldable->restore();
 }
 
 bool IndexBuildInterceptor::areAllWritesApplied(OperationContext* opCtx) const {
     invariant(_sideWritesTable);
-    auto cursor = _sideWritesTable->rs()->getCursor(opCtx);
-    auto record = cursor->next();
 
     // The table is empty only when all writes are applied.
-    if (!record) {
-        auto writesRecorded = _sideWritesCounter.load();
-        invariant(writesRecorded == _numApplied,
-                  str::stream() << "The number of side writes recorded does not match the number "
-                                   "applied, despite the table appearing empty. Writes recorded: "
-                                << writesRecorded
-                                << ", applied: "
-                                << _numApplied);
+    if (_sideWritesTable->rs()->getCursor(opCtx)->next()) {
+        return false;
+    }
+
+    if (_skipNumAppliedCheck) {
         return true;
     }
 
-    return false;
+    auto writesRecorded = _sideWritesCounter->load();
+    if (writesRecorded != _numApplied) {
+        dassert(writesRecorded == _numApplied,
+                (str::stream() << "The number of side writes recorded does not match the number "
+                                  "applied, despite the table appearing empty. Writes recorded: "
+                               << writesRecorded << ", applied: " << _numApplied));
+        LOGV2_WARNING(20692,
+                      "The number of side writes recorded does not match the number applied, "
+                      "despite the table appearing empty",
+                      "writesRecorded"_attr = writesRecorded,
+                      "applied"_attr = _numApplied);
+    }
+
+    return true;
 }
 
 boost::optional<MultikeyPaths> IndexBuildInterceptor::getMultikeyPaths() const {
-    stdx::unique_lock<stdx::mutex> lk(_multikeyPathMutex);
+    stdx::unique_lock<Latch> lk(_multikeyPathMutex);
     return _multikeyPaths;
 }
 
 Status IndexBuildInterceptor::sideWrite(OperationContext* opCtx,
-                                        IndexAccessMethod* indexAccessMethod,
-                                        const BSONObj* obj,
-                                        const InsertDeleteOptions& options,
+                                        const KeyStringSet& keys,
+                                        const KeyStringSet& multikeyMetadataKeys,
+                                        const MultikeyPaths& multikeyPaths,
                                         RecordId loc,
                                         Op op,
                                         int64_t* const numKeysOut) {
     invariant(opCtx->lockState()->inAWriteUnitOfWork());
 
-    *numKeysOut = 0;
-    BSONObjSet keys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
-    BSONObjSet multikeyMetadataKeys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
-    MultikeyPaths multikeyPaths;
-
-    // Override key constraints when generating keys for removal. This is the same behavior as
-    // IndexAccessMethod::remove and only applies to keys that do not apply to a partial filter
-    // expression.
-    const auto getKeysMode = op == Op::kInsert
-        ? options.getKeysMode
-        : IndexAccessMethod::GetKeysMode::kRelaxConstraintsUnfiltered;
-    indexAccessMethod->getKeys(*obj, getKeysMode, &keys, &multikeyMetadataKeys, &multikeyPaths);
-
     // Maintain parity with IndexAccessMethods handling of key counting. Only include
     // `multikeyMetadataKeys` when inserting.
     *numKeysOut = keys.size() + (op == Op::kInsert ? multikeyMetadataKeys.size() : 0);
 
-    if (*numKeysOut == 0) {
-        return Status::OK();
-    }
+    // Maintain parity with IndexAccessMethod's handling of whether keys could change the multikey
+    // state on the index.
+    bool isMultikey = _indexCatalogEntry->accessMethod()->shouldMarkIndexAsMultikey(
+        keys.size(), multikeyMetadataKeys, multikeyPaths);
 
-    {
-        stdx::unique_lock<stdx::mutex> lk(_multikeyPathMutex);
+    // No need to take the multikeyPaths mutex if this would not change any multikey state.
+    if (op == Op::kInsert && isMultikey) {
+        // SERVER-39705: It's worth noting that a document may not generate any keys, but be
+        // described as being multikey. This step must be done to maintain parity with `validate`s
+        // expectations.
+        stdx::unique_lock<Latch> lk(_multikeyPathMutex);
         if (_multikeyPaths) {
             MultikeyPathTracker::mergeMultikeyPaths(&_multikeyPaths.get(), multikeyPaths);
         } else {
@@ -396,38 +449,50 @@ Status IndexBuildInterceptor::sideWrite(OperationContext* opCtx,
         }
     }
 
+    if (*numKeysOut == 0) {
+        return Status::OK();
+    }
+
+    // Reuse the same builder to avoid an allocation per key.
+    BufBuilder builder;
     std::vector<BSONObj> toInsert;
-    for (const auto& key : keys) {
+    for (const auto& keyString : keys) {
         // Documents inserted into this table must be consumed in insert-order.
         // Additionally, these writes should be timestamped with the same timestamps that the
         // other writes making up this operation are given. When index builds can cope with
         // replication rollbacks, side table writes associated with a CUD operation should
         // remain/rollback along with the corresponding oplog entry.
-        toInsert.emplace_back(BSON(
-            "op" << (op == Op::kInsert ? "i" : "d") << "key" << key << "recordId" << loc.repr()));
+
+        // Serialize the KeyString::Value into a binary format for storage. Since the
+        // KeyString::Value also contains TypeBits information, it is not sufficient to just read
+        // from getBuffer().
+        builder.reset();
+        keyString.serialize(builder);
+        BSONBinData binData(builder.buf(), builder.getSize(), BinDataGeneral);
+        toInsert.emplace_back(BSON("op" << (op == Op::kInsert ? "i" : "d") << "key" << binData));
     }
 
     if (op == Op::kInsert) {
         // Wildcard indexes write multikey path information, typically part of the catalog
         // document, to the index itself. Multikey information is never deleted, so we only need
         // to add this data on the insert path.
-        for (const auto& key : multikeyMetadataKeys) {
+        for (const auto& keyString : multikeyMetadataKeys) {
+            builder.reset();
+            keyString.serialize(builder);
+            BSONBinData binData(builder.buf(), builder.getSize(), BinDataGeneral);
             toInsert.emplace_back(BSON("op"
                                        << "i"
-                                       << "key"
-                                       << key
-                                       << "recordId"
-                                       << static_cast<int64_t>(
-                                              RecordId::ReservedId::kWildcardMultikeyMetadataId)));
+                                       << "key" << binData));
         }
     }
 
-    _sideWritesCounter.fetchAndAdd(toInsert.size());
+    _sideWritesCounter->fetchAndAdd(toInsert.size());
     // This insert may roll back, but not necessarily from inserting into this table. If other write
     // operations outside this table and in the same transaction are rolled back, this counter also
     // needs to be rolled back.
-    opCtx->recoveryUnit()->onRollback(
-        [ this, size = toInsert.size() ] { _sideWritesCounter.fetchAndSubtract(size); });
+    opCtx->recoveryUnit()->onRollback([sharedCounter = _sideWritesCounter, size = toInsert.size()] {
+        sharedCounter->fetchAndSubtract(size);
+    });
 
     std::vector<Record> records;
     for (auto& doc : toInsert) {
@@ -436,13 +501,45 @@ Status IndexBuildInterceptor::sideWrite(OperationContext* opCtx,
                                     RecordData(doc.objdata(), doc.objsize())});
     }
 
-    LOG(2) << "recording " << records.size() << " side write keys on index '"
-           << _indexCatalogEntry->descriptor()->indexName() << "'";
+    LOGV2_DEBUG(20691,
+                2,
+                "recording {records_size} side write keys on index "
+                "'{indexCatalogEntry_descriptor_indexName}'",
+                "records_size"_attr = records.size(),
+                "indexCatalogEntry_descriptor_indexName"_attr =
+                    _indexCatalogEntry->descriptor()->indexName());
 
     // By passing a vector of null timestamps, these inserts are not timestamped individually, but
     // rather with the timestamp of the owning operation.
     std::vector<Timestamp> timestamps(records.size());
     return _sideWritesTable->rs()->insertRecords(opCtx, &records, timestamps);
+}
+
+Status IndexBuildInterceptor::retrySkippedRecords(OperationContext* opCtx,
+                                                  const CollectionPtr& collection) {
+    return _skippedRecordTracker.retrySkippedRecords(opCtx, collection);
+}
+
+void IndexBuildInterceptor::_checkDrainPhaseFailPoint(OperationContext* opCtx,
+                                                      FailPoint* fp,
+                                                      long long iteration) const {
+    fp->executeIf(
+        [=](const BSONObj& data) {
+            LOGV2(4841800,
+                  "Hanging index build during drain writes phase",
+                  "iteration"_attr = iteration,
+                  "index"_attr = _indexCatalogEntry->descriptor()->indexName());
+
+            fp->pauseWhileSet(opCtx);
+        },
+        [iteration,
+         &indexName = _indexCatalogEntry->descriptor()->indexName()](const BSONObj& data) {
+            auto indexNames = data.getObjectField("indexNames");
+            return iteration == data["iteration"].numberLong() &&
+                std::any_of(indexNames.begin(), indexNames.end(), [&indexName](const auto& elem) {
+                       return indexName == elem.String();
+                   });
+        });
 }
 
 }  // namespace mongo

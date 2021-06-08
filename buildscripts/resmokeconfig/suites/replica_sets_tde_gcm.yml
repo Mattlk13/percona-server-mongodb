@@ -18,5 +18,4 @@ executor:
           enableEncryption: ''
           encryptionKeyFile: *keyFile
           encryptionCipherMode: *cipherMode
-          setSkipShardingPartsOfPrepareTransactionFailpoint: true
       readMode: commands

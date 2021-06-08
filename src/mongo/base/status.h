@@ -168,37 +168,49 @@ public:
     /**
      * Returns the generic ErrorExtraInfo if present.
      */
-    const ErrorExtraInfo* extraInfo() const {
-        return isOK() ? nullptr : _error->extra.get();
+    const std::shared_ptr<const ErrorExtraInfo> extraInfo() const {
+        return isOK() ? nullptr : _error->extra;
     }
 
     /**
      * Returns a specific subclass of ErrorExtraInfo if the error code matches that type.
      */
     template <typename T>
-    const T* extraInfo() const {
+    std::shared_ptr<const T> extraInfo() const {
         MONGO_STATIC_ASSERT(std::is_base_of<ErrorExtraInfo, T>());
         MONGO_STATIC_ASSERT(std::is_same<error_details::ErrorExtraInfoFor<T::code>, T>());
 
         if (isOK())
-            return nullptr;
+            return {};
         if (code() != T::code)
-            return nullptr;
+            return {};
+
+        if (!_error->extra) {
+            invariant(!ErrorCodes::mustHaveExtraInfo(_error->code));
+            return {};
+        }
 
         // Can't use checked_cast due to include cycle.
-        invariant(_error->extra);
         dassert(dynamic_cast<const T*>(_error->extra.get()));
-        return static_cast<const T*>(_error->extra.get());
+        return std::static_pointer_cast<const T>(_error->extra);
     }
 
     std::string toString() const;
+
+    void serialize(BSONObjBuilder* builder) const;
+
+    /**
+     * May only be called if the status is *not OK*. Serializes the code, code name and reason in
+     * the canonical code/codeName/errmsg format used in the server command responses.
+     */
+    void serializeErrorToBSON(BSONObjBuilder* builder) const;
 
     /**
      * Returns true if this Status's code is a member of the given category.
      */
     template <ErrorCategory category>
     bool isA() const {
-        return ErrorCodes::isA<category>(code());
+        return ErrorCodes::isA<category>(*this);
     }
 
     /**
@@ -312,7 +324,7 @@ inline unsigned Status::refCount() const {
     return _error ? _error->refs.load() : 0;
 }
 
-inline Status::Status() : _error(NULL) {}
+inline Status::Status() : _error(nullptr) {}
 
 inline void Status::ref(ErrorInfo* error) {
     if (error)

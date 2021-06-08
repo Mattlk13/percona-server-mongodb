@@ -1,11 +1,13 @@
-// @tags: [requires_non_retryable_writes]
+// @tags: [
+//   requires_non_retryable_writes,
+// ]
 
 // Check query type bracketing SERVER-3222
 
 t = db.jstests_type3;
 t.drop();
 
-t.ensureIndex({a: 1});
+t.createIndex({a: 1});
 
 // Type Object
 t.save({a: {'': ''}});

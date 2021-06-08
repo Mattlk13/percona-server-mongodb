@@ -35,8 +35,9 @@
 
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/pipeline/aggregation_request.h"
+#include "mongo/db/pipeline/aggregate_command_gen.h"
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
+#include "mongo/db/read_concern_support_result.h"
 
 namespace mongo {
 
@@ -52,11 +53,13 @@ public:
      * May throw a AssertionException if there is an invalid stage specification, although full
      * validation happens later, during Pipeline construction.
      */
-    LiteParsedPipeline(const AggregationRequest& request) {
-        _stageSpecs.reserve(request.getPipeline().size());
+    LiteParsedPipeline(const AggregateCommandRequest& request)
+        : LiteParsedPipeline(request.getNamespace(), request.getPipeline()) {}
 
-        for (auto&& rawStage : request.getPipeline()) {
-            _stageSpecs.push_back(LiteParsedDocumentSource::parse(request, rawStage));
+    LiteParsedPipeline(const NamespaceString& nss, const std::vector<BSONObj>& pipelineStages) {
+        _stageSpecs.reserve(pipelineStages.size());
+        for (auto&& rawStage : pipelineStages) {
+            _stageSpecs.push_back(LiteParsedDocumentSource::parse(nss, rawStage));
         }
     }
 
@@ -76,11 +79,11 @@ public:
     /**
      * Returns a list of the priviliges required for this pipeline.
      */
-    PrivilegeVector requiredPrivileges(bool isMongos) const {
+    PrivilegeVector requiredPrivileges(bool isMongos, bool bypassDocumentValidation) const {
         PrivilegeVector requiredPrivileges;
         for (auto&& spec : _stageSpecs) {
-            Privilege::addPrivilegesToPrivilegeVector(&requiredPrivileges,
-                                                      spec->requiredPrivileges(isMongos));
+            Privilege::addPrivilegesToPrivilegeVector(
+                &requiredPrivileges, spec->requiredPrivileges(isMongos, bypassDocumentValidation));
         }
 
         return requiredPrivileges;
@@ -103,16 +106,7 @@ public:
     }
 
     /**
-     * Returns false if the pipeline has any stage which must be run locally on mongos.
-     */
-    bool allowedToForwardFromMongos() const {
-        return std::all_of(_stageSpecs.cbegin(), _stageSpecs.cend(), [](const auto& spec) {
-            return spec->allowedToForwardFromMongos();
-        });
-    }
-
-    /**
-     * Returns false if the pipeline has any Document Source which requires rewriting via serialize.
+     * Returns false if the pipeline has any stages which cannot be passed through to the shards.
      */
     bool allowedToPassthroughFromMongos() const {
         return std::all_of(_stageSpecs.cbegin(), _stageSpecs.cend(), [](const auto& spec) {
@@ -131,24 +125,49 @@ public:
     }
 
     /**
-     * Verifies that this pipeline is allowed to run with the specified read concern. This ensures
-     * that each stage is compatible, and throws a UserException if not.
+     * Verifies that this pipeline is allowed to run with the specified read concern level.
      */
-    void assertSupportsReadConcern(OperationContext* opCtx,
-                                   boost::optional<ExplainOptions::Verbosity> explain,
-                                   bool enableMajorityReadConcern) const;
+    ReadConcernSupportResult supportsReadConcern(repl::ReadConcernLevel level,
+                                                 boost::optional<ExplainOptions::Verbosity> explain,
+                                                 bool enableMajorityReadConcern) const;
+
+    /**
+     * Verifies that this pipeline is allowed to run in a multi-document transaction. This ensures
+     * that each stage is compatible, and throws a UserException if not. This should only be called
+     * if the caller has determined the current operation is part of a transaction.
+     */
+    void assertSupportsMultiDocumentTransaction(
+        boost::optional<ExplainOptions::Verbosity> explain) const;
 
     /**
      * Perform checks that verify that the LitePipe is valid. Note that this function must be called
      * before forwarding an aggregation command on an unsharded collection, in order to verify that
-     * the involved namespaces are allowed to be sharded. Returns true if any involved namespace is
-     * sharded.
+     * the involved namespaces are allowed to be sharded.
      */
-    bool verifyIsSupported(
+    void verifyIsSupported(
         OperationContext* opCtx,
         const std::function<bool(OperationContext*, const NamespaceString&)> isSharded,
         const boost::optional<ExplainOptions::Verbosity> explain,
         bool enableMajorityReadConcern) const;
+
+    /**
+     * Returns true if the first stage in the pipeline does not require an input source.
+     */
+    bool startsWithInitialSource() const {
+        return !_stageSpecs.empty() && _stageSpecs.front()->isInitialSource();
+    }
+
+    /**
+     * Increments global stage counters corresponding to the stages in this lite parsed pipeline.
+     */
+    void tickGlobalStageCounters() const;
+
+    /**
+     * Verifies that the pipeline contains valid stages. Optionally calls
+     * 'validatePipelineStagesforAPIVersion' with 'opCtx', and throws UserException if there is
+     * more than one $_internalUnpackBucket stage in the pipeline.
+     */
+    void validate(const OperationContext* opCtx, bool performApiVersionChecks = true) const;
 
 private:
     std::vector<std::unique_ptr<LiteParsedDocumentSource>> _stageSpecs;

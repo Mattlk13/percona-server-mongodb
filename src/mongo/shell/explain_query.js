@@ -4,7 +4,6 @@
 //
 
 var DBExplainQuery = (function() {
-
     //
     // Private methods.
     //
@@ -15,7 +14,7 @@ var DBExplainQuery = (function() {
      * is implemented here for backwards compatibility.
      */
     function removeVerboseFields(obj) {
-        if (typeof(obj) !== "object") {
+        if (typeof (obj) !== "object") {
             return;
         }
 
@@ -23,7 +22,7 @@ var DBExplainQuery = (function() {
         delete obj.oldPlan;
         delete obj.stats;
 
-        if (typeof(obj.length) === "number") {
+        if (typeof (obj.length) === "number") {
             for (var i = 0; i < obj.length; i++) {
                 removeVerboseFields(obj[i]);
             }
@@ -95,6 +94,7 @@ var DBExplainQuery = (function() {
 
         var delegationFuncNames = [
             "addOption",
+            "allowDiskUse",
             "batchSize",
             "collation",
             "comment",
@@ -151,6 +151,11 @@ var DBExplainQuery = (function() {
 
                 var explainCmd = {explain: innerCmd};
                 explainCmd["verbosity"] = this._verbosity;
+                // If "maxTimeMS" is set on innerCmd, it needs to be propagated to the top-level
+                // of explainCmd so that it has the intended effect.
+                if (innerCmd.hasOwnProperty("maxTimeMS")) {
+                    explainCmd.maxTimeMS = innerCmd.maxTimeMS;
+                }
 
                 var explainDb = this._query._db;
 

@@ -39,7 +39,7 @@ void InternalSchemaUniqueItemsMatchExpression::debugString(StringBuilder& debug,
     _debugAddSpace(debug, indentationLevel);
 
     BSONObjBuilder builder;
-    serialize(&builder);
+    serialize(&builder, true);
     debug << builder.obj().toString() << "\n";
 
     const auto* tag = getTag();
@@ -66,10 +66,11 @@ BSONObj InternalSchemaUniqueItemsMatchExpression::getSerializedRightHandSide() c
 }
 
 std::unique_ptr<MatchExpression> InternalSchemaUniqueItemsMatchExpression::shallowClone() const {
-    auto clone = stdx::make_unique<InternalSchemaUniqueItemsMatchExpression>(path());
+    auto clone =
+        std::make_unique<InternalSchemaUniqueItemsMatchExpression>(path(), _errorAnnotation);
     if (getTag()) {
         clone->setTag(getTag()->clone());
     }
-    return std::move(clone);
+    return clone;
 }
 }  // namespace mongo

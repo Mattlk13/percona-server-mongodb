@@ -32,8 +32,9 @@
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/operation_sharding_state.h"
+#include "mongo/db/s/shard_server_test_fixture.h"
 #include "mongo/s/catalog/type_chunk.h"
-#include "mongo/s/shard_server_test_fixture.h"
+#include "mongo/s/type_collection_timeseries_fields_gen.h"
 
 namespace mongo {
 namespace {
@@ -44,7 +45,6 @@ class CollectionMetadataFilteringTest : public ShardServerTestFixture {
 protected:
     void setUp() override {
         ShardServerTestFixture::setUp();
-        _manager = std::make_shared<MetadataManager>(getServiceContext(), kNss, executor());
     }
 
     /**
@@ -60,13 +60,24 @@ protected:
      *  time (75,25) shard0(chunk2, chunk4) shard1(chunk1, chunk3)
      *  time (25,0) - no history
      */
-    void prepareTestData() {
+    void prepareTestData(
+        boost::optional<TypeCollectionTimeseriesFields> timeseriesFields = boost::none) {
         const OID epoch = OID::gen();
         const ShardKeyPattern shardKeyPattern(BSON("_id" << 1));
 
         auto rt = RoutingTableHistory::makeNew(
-            kNss, UUID::gen(), shardKeyPattern.getKeyPattern(), nullptr, false, epoch, [&] {
-                ChunkVersion version(1, 0, epoch);
+            kNss,
+            UUID::gen(),
+            shardKeyPattern.getKeyPattern(),
+            nullptr,
+            false,
+            epoch,
+            boost::none /* timestamp */,
+            timeseriesFields,
+            boost::none,
+            true,
+            [&] {
+                ChunkVersion version(1, 0, epoch, boost::none /* timestamp */);
 
                 ChunkType chunk1(kNss,
                                  {shardKeyPattern.getKeyPattern().globalMin(), BSON("_id" << -100)},
@@ -97,22 +108,26 @@ protected:
                 return std::vector<ChunkType>{chunk1, chunk2, chunk3, chunk4};
             }());
 
-        auto cm = std::make_shared<ChunkManager>(rt, boost::none);
-        ASSERT_EQ(4, cm->numChunks());
+        ChunkManager cm(ShardId("0"),
+                        DatabaseVersion(UUID::gen()),
+                        makeStandaloneRoutingTableHistory(std::move(rt)),
+                        boost::none);
+        ASSERT_EQ(4, cm.numChunks());
 
         {
             AutoGetCollection autoColl(operationContext(), kNss, MODE_X);
-            auto* const css = CollectionShardingRuntime::get(operationContext(), kNss);
-            css->setFilteringMetadata(operationContext(), CollectionMetadata(cm, ShardId("0")));
+            CollectionShardingRuntime::get(operationContext(), kNss)
+                ->setFilteringMetadata(operationContext(), CollectionMetadata(cm, ShardId("0")));
         }
 
-        _manager->setFilteringMetadata(CollectionMetadata(cm, ShardId("0")));
+        _manager = std::make_shared<MetadataManager>(
+            getServiceContext(), kNss, executor(), CollectionMetadata(cm, ShardId("0")));
 
         auto& oss = OperationShardingState::get(operationContext());
-        const auto version = cm->getVersion(ShardId("0"));
+        const auto version = cm.getVersion(ShardId("0"));
         BSONObjBuilder builder;
         version.appendToCommand(&builder);
-        oss.initializeClientRoutingVersions(kNss, builder.obj());
+        oss.initializeClientRoutingVersionsFromCommand(kNss, builder.obj());
     }
 
     std::shared_ptr<MetadataManager> _manager;
@@ -122,101 +137,107 @@ protected:
 TEST_F(CollectionMetadataFilteringTest, FilterDocumentsInTheFuture) {
     prepareTestData();
 
-    const auto testFn = [](const ScopedCollectionMetadata& metadata) {
-        ASSERT_TRUE(metadata->keyBelongsToMe(BSON("_id" << -500)));
-        ASSERT_TRUE(metadata->keyBelongsToMe(BSON("_id" << 50)));
-        ASSERT_FALSE(metadata->keyBelongsToMe(BSON("_id" << -50)));
-        ASSERT_FALSE(metadata->keyBelongsToMe(BSON("_id" << 500)));
+    const auto testFilterFn = [](const ScopedCollectionFilter& collectionFilter) {
+        ASSERT_TRUE(collectionFilter.keyBelongsToMe(BSON("_id" << -500)));
+        ASSERT_TRUE(collectionFilter.keyBelongsToMe(BSON("_id" << 50)));
+        ASSERT_FALSE(collectionFilter.keyBelongsToMe(BSON("_id" << -50)));
+        ASSERT_FALSE(collectionFilter.keyBelongsToMe(BSON("_id" << 500)));
     };
 
-    {
-        BSONObj readConcern = BSON("readConcern" << BSON("level"
-                                                         << "snapshot"
-                                                         << "atClusterTime"
-                                                         << Timestamp(100, 0)));
+    BSONObj readConcern = BSON("readConcern" << BSON("level"
+                                                     << "snapshot"
+                                                     << "atClusterTime" << Timestamp(100, 0)));
 
-        auto&& readConcernArgs = repl::ReadConcernArgs::get(operationContext());
-        ASSERT_OK(readConcernArgs.initialize(readConcern["readConcern"]));
+    auto&& readConcernArgs = repl::ReadConcernArgs::get(operationContext());
+    ASSERT_OK(readConcernArgs.initialize(readConcern["readConcern"]));
 
-        AutoGetCollection autoColl(operationContext(), kNss, MODE_IS);
-        auto* const css = CollectionShardingState::get(operationContext(), kNss);
-        testFn(css->getOrphansFilter(operationContext()));
-    }
-
-    {
-        const auto scm = _manager->getActiveMetadata(_manager, LogicalTime(Timestamp(100, 0)));
-        testFn(*scm);
-    }
+    AutoGetCollection autoColl(operationContext(), kNss, MODE_IS);
+    auto* const css = CollectionShardingState::get(operationContext(), kNss);
+    testFilterFn(css->getOwnershipFilter(
+        operationContext(), CollectionShardingState::OrphanCleanupPolicy::kAllowOrphanCleanup));
 }
 
 // Verifies that a different set of documents is visible for a timestamp in the past
 TEST_F(CollectionMetadataFilteringTest, FilterDocumentsInThePast) {
     prepareTestData();
 
-    const auto testFn = [](const ScopedCollectionMetadata& metadata) {
-        ASSERT_FALSE(metadata->keyBelongsToMe(BSON("_id" << -500)));
-        ASSERT_FALSE(metadata->keyBelongsToMe(BSON("_id" << 50)));
-        ASSERT_TRUE(metadata->keyBelongsToMe(BSON("_id" << -50)));
-        ASSERT_TRUE(metadata->keyBelongsToMe(BSON("_id" << 500)));
+    const auto testFilterFn = [](const ScopedCollectionFilter& collectionFilter) {
+        ASSERT_FALSE(collectionFilter.keyBelongsToMe(BSON("_id" << -500)));
+        ASSERT_FALSE(collectionFilter.keyBelongsToMe(BSON("_id" << 50)));
+        ASSERT_TRUE(collectionFilter.keyBelongsToMe(BSON("_id" << -50)));
+        ASSERT_TRUE(collectionFilter.keyBelongsToMe(BSON("_id" << 500)));
     };
 
-    {
-        BSONObj readConcern = BSON("readConcern" << BSON("level"
-                                                         << "snapshot"
-                                                         << "atClusterTime"
-                                                         << Timestamp(50, 0)));
+    BSONObj readConcern = BSON("readConcern" << BSON("level"
+                                                     << "snapshot"
+                                                     << "atClusterTime" << Timestamp(50, 0)));
 
-        auto&& readConcernArgs = repl::ReadConcernArgs::get(operationContext());
-        ASSERT_OK(readConcernArgs.initialize(readConcern["readConcern"]));
+    auto&& readConcernArgs = repl::ReadConcernArgs::get(operationContext());
+    ASSERT_OK(readConcernArgs.initialize(readConcern["readConcern"]));
 
-        AutoGetCollection autoColl(operationContext(), kNss, MODE_IS);
-        auto* const css = CollectionShardingState::get(operationContext(), kNss);
-        testFn(css->getOrphansFilter(operationContext()));
-    }
-
-    {
-        const auto scm = _manager->getActiveMetadata(_manager, LogicalTime(Timestamp(50, 0)));
-        testFn(*scm);
-    }
+    AutoGetCollection autoColl(operationContext(), kNss, MODE_IS);
+    auto* const css = CollectionShardingState::get(operationContext(), kNss);
+    testFilterFn(css->getOwnershipFilter(
+        operationContext(), CollectionShardingState::OrphanCleanupPolicy::kAllowOrphanCleanup));
 }
 
 // Verifies that when accessing too far into the past we get the stale error
 TEST_F(CollectionMetadataFilteringTest, FilterDocumentsTooFarInThePastThrowsStaleChunkHistory) {
     prepareTestData();
 
-    const auto testFn = [](const ScopedCollectionMetadata& metadata) {
-        ASSERT_THROWS_CODE(metadata->keyBelongsToMe(BSON("_id" << -500)),
+    const auto testFilterFn = [](const ScopedCollectionFilter& collectionFilter) {
+        ASSERT_THROWS_CODE(collectionFilter.keyBelongsToMe(BSON("_id" << -500)),
                            AssertionException,
                            ErrorCodes::StaleChunkHistory);
-        ASSERT_THROWS_CODE(metadata->keyBelongsToMe(BSON("_id" << 50)),
+        ASSERT_THROWS_CODE(collectionFilter.keyBelongsToMe(BSON("_id" << 50)),
                            AssertionException,
                            ErrorCodes::StaleChunkHistory);
-        ASSERT_THROWS_CODE(metadata->keyBelongsToMe(BSON("_id" << -50)),
+        ASSERT_THROWS_CODE(collectionFilter.keyBelongsToMe(BSON("_id" << -50)),
                            AssertionException,
                            ErrorCodes::StaleChunkHistory);
-        ASSERT_THROWS_CODE(metadata->keyBelongsToMe(BSON("_id" << 500)),
+        ASSERT_THROWS_CODE(collectionFilter.keyBelongsToMe(BSON("_id" << 500)),
                            AssertionException,
                            ErrorCodes::StaleChunkHistory);
     };
 
-    {
-        BSONObj readConcern = BSON("readConcern" << BSON("level"
-                                                         << "snapshot"
-                                                         << "atClusterTime"
-                                                         << Timestamp(10, 0)));
+    BSONObj readConcern = BSON("readConcern" << BSON("level"
+                                                     << "snapshot"
+                                                     << "atClusterTime" << Timestamp(10, 0)));
 
-        auto&& readConcernArgs = repl::ReadConcernArgs::get(operationContext());
-        ASSERT_OK(readConcernArgs.initialize(readConcern["readConcern"]));
+    auto&& readConcernArgs = repl::ReadConcernArgs::get(operationContext());
+    ASSERT_OK(readConcernArgs.initialize(readConcern["readConcern"]));
 
-        AutoGetCollection autoColl(operationContext(), kNss, MODE_IS);
-        auto* const css = CollectionShardingState::get(operationContext(), kNss);
-        testFn(css->getOrphansFilter(operationContext()));
-    }
+    AutoGetCollection autoColl(operationContext(), kNss, MODE_IS);
+    auto* const css = CollectionShardingState::get(operationContext(), kNss);
+    testFilterFn(css->getOwnershipFilter(
+        operationContext(), CollectionShardingState::OrphanCleanupPolicy::kAllowOrphanCleanup));
+}
 
-    {
-        const auto scm = _manager->getActiveMetadata(_manager, LogicalTime(Timestamp(10, 0)));
-        testFn(*scm);
-    }
+TEST_F(CollectionMetadataFilteringTest, DisallowOpsOnShardedTimeseriesCollection) {
+    TypeCollectionTimeseriesFields timeseriesFields("fieldName");
+    prepareTestData(timeseriesFields);
+
+    BSONObj readConcern = BSON("readConcern" << BSON("level"
+                                                     << "snapshot"
+                                                     << "atClusterTime" << Timestamp(100, 0)));
+
+    auto&& readConcernArgs = repl::ReadConcernArgs::get(operationContext());
+    ASSERT_OK(readConcernArgs.initialize(readConcern["readConcern"]));
+
+    AutoGetCollection autoColl(operationContext(), kNss, MODE_IS);
+    auto* const css = CollectionShardingState::get(operationContext(), kNss);
+
+    auto check = [&](const DBException& ex) {
+        ASSERT_EQ(ex.code(), ErrorCodes::NotImplemented) << ex.toString();
+        ASSERT_STRING_CONTAINS(ex.reason(),
+                               "Operations on sharded time-series collections are not supported");
+    };
+
+    ASSERT_THROWS_WITH_CHECK(
+        css->getOwnershipFilter(operationContext(),
+                                CollectionShardingState::OrphanCleanupPolicy::kAllowOrphanCleanup),
+        AssertionException,
+        check);
 }
 
 }  // namespace

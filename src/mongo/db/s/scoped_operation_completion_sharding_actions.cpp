@@ -27,20 +27,18 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/s/scoped_operation_completion_sharding_actions.h"
 
 #include "mongo/db/curop.h"
-#include "mongo/db/s/implicit_create_collection.h"
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/shard_filtering_metadata_refresh.h"
 #include "mongo/db/s/sharding_state.h"
-#include "mongo/s/cannot_implicitly_create_collection_info.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/stale_exception.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -73,20 +71,32 @@ ScopedOperationCompletionShardingActions::~ScopedOperationCompletionShardingActi
     }
 
     if (auto staleInfo = status->extraInfo<StaleConfigInfo>()) {
+        if (staleInfo->getCriticalSectionSignal()) {
+            // Set migration critical section on operation sharding state: operation will wait for
+            // the migration to finish before returning.
+            auto& oss = OperationShardingState::get(_opCtx);
+            oss.setMigrationCriticalSectionSignal(staleInfo->getCriticalSectionSignal());
+        }
+
         auto handleMismatchStatus = onShardVersionMismatchNoExcept(
             _opCtx, staleInfo->getNss(), staleInfo->getVersionReceived());
         if (!handleMismatchStatus.isOK())
-            log() << "Failed to handle stale version exception"
-                  << causedBy(redact(handleMismatchStatus));
-    } else if (auto cannotImplicitCreateCollInfo =
-                   status->extraInfo<CannotImplicitlyCreateCollectionInfo>()) {
-        if (ShardingState::get(_opCtx)->enabled()) {
-            auto handleCannotImplicitCreateStatus =
-                onCannotImplicitlyCreateCollection(_opCtx, cannotImplicitCreateCollInfo->getNss());
-            if (!handleCannotImplicitCreateStatus.isOK())
-                log() << "Failed to handle CannotImplicitlyCreateCollection exception"
-                      << causedBy(redact(handleCannotImplicitCreateStatus));
-        }
+            LOGV2(22053,
+                  "Failed to handle stale version exception as part of the current operation: "
+                  "{error}",
+                  "Failed to handle stale version exception as part of the current operation",
+                  "error"_attr = redact(handleMismatchStatus));
+    } else if (auto staleInfo = status->extraInfo<StaleDbRoutingVersion>()) {
+        auto handleMismatchStatus = onDbVersionMismatchNoExcept(_opCtx,
+                                                                staleInfo->getDb(),
+                                                                staleInfo->getVersionReceived(),
+                                                                staleInfo->getVersionWanted());
+        if (!handleMismatchStatus.isOK())
+            LOGV2(22054,
+                  "Failed to handle database version exception as part of the current operation: "
+                  "{error}",
+                  "Failed to database version exception as part of the current operation",
+                  "error"_attr = redact(handleMismatchStatus));
     }
 }
 

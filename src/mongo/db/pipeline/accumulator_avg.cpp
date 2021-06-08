@@ -31,19 +31,22 @@
 
 #include "mongo/db/pipeline/accumulator.h"
 
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/accumulation_statement.h"
-#include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
-#include "mongo/db/pipeline/value.h"
+#include "mongo/db/pipeline/window_function/window_function_avg.h"
+#include "mongo/db/pipeline/window_function/window_function_expression.h"
 #include "mongo/platform/decimal128.h"
 
 namespace mongo {
 
 using boost::intrusive_ptr;
 
-REGISTER_ACCUMULATOR(avg, AccumulatorAvg::create);
+REGISTER_ACCUMULATOR(avg, genericParseSingleExpressionAccumulator<AccumulatorAvg>);
 REGISTER_EXPRESSION(avg, ExpressionFromAccumulator<AccumulatorAvg>::parse);
+REGISTER_REMOVABLE_WINDOW_FUNCTION(avg, AccumulatorAvg, WindowFunctionAvg);
 
 const char* AccumulatorAvg::getOpName() const {
     return "$avg";
@@ -83,6 +86,8 @@ void AccumulatorAvg::processInternal(const Value& input, bool merging) {
             _nonDecimalTotal.addLong(input.getLong());
             break;
         case NumberInt:
+            _nonDecimalTotal.addInt(input.getInt());
+            break;
         case NumberDouble:
             _nonDecimalTotal.addDouble(input.getDouble());
             break;
@@ -93,8 +98,7 @@ void AccumulatorAvg::processInternal(const Value& input, bool merging) {
     _count++;
 }
 
-intrusive_ptr<Accumulator> AccumulatorAvg::create(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+intrusive_ptr<AccumulatorState> AccumulatorAvg::create(ExpressionContext* const expCtx) {
     return new AccumulatorAvg(expCtx);
 }
 
@@ -122,9 +126,9 @@ Value AccumulatorAvg::getValue(bool toBeMerged) {
     return Value(_nonDecimalTotal.getDouble() / static_cast<double>(_count));
 }
 
-AccumulatorAvg::AccumulatorAvg(const boost::intrusive_ptr<ExpressionContext>& expCtx)
-    : Accumulator(expCtx), _isDecimal(false), _count(0) {
-    // This is a fixed size Accumulator so we never need to update this
+AccumulatorAvg::AccumulatorAvg(ExpressionContext* const expCtx)
+    : AccumulatorState(expCtx), _isDecimal(false), _count(0) {
+    // This is a fixed size AccumulatorState so we never need to update this
     _memUsageBytes = sizeof(*this);
 }
 
@@ -134,4 +138,4 @@ void AccumulatorAvg::reset() {
     _decimalTotal = {};
     _count = 0;
 }
-}
+}  // namespace mongo

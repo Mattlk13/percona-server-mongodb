@@ -29,6 +29,8 @@
 
 #include "mongo/platform/basic.h"
 
+#include <memory>
+
 #include "mongo/client/remote_command_targeter_factory_mock.h"
 #include "mongo/client/remote_command_targeter_mock.h"
 #include "mongo/db/json.h"
@@ -37,7 +39,7 @@
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/query/establish_cursors.h"
 #include "mongo/s/sharding_router_test_fixture.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/unittest/barrier.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -73,7 +75,7 @@ public:
             shards.push_back(shardType);
 
             std::unique_ptr<RemoteCommandTargeterMock> targeter(
-                stdx::make_unique<RemoteCommandTargeterMock>());
+                std::make_unique<RemoteCommandTargeterMock>());
             targeter->setConnectionStringReturnValue(ConnectionString(kTestShardHosts[i]));
             targeter->setFindHostReturnValue(kTestShardHosts[i]);
 
@@ -82,6 +84,19 @@ public:
         }
 
         setupShards(shards);
+    }
+
+    /**
+     * Mock a response for a killOperations command.
+     */
+    void expectKillOperations(size_t expected) {
+        for (size_t i = 0; i < expected; i++) {
+            onCommand([this](const RemoteCommandRequest& request) {
+                ASSERT_EQ("admin", request.dbname) << request;
+                ASSERT_TRUE(request.cmdObj.hasField("_killOperations")) << request;
+                return BSON("ok" << 1);
+            });
+        }
     }
 
 protected:
@@ -144,8 +159,50 @@ TEST_F(EstablishCursorsTest, SingleRemoteRespondsWithNonretriableError) {
     // Remote responds with non-retriable error.
     onCommand([this](const RemoteCommandRequest& request) {
         ASSERT_EQ(_nss.coll(), request.cmdObj.firstElement().valueStringData());
-        return Status(ErrorCodes::FailedToParse, "failed to parse");
+        return createErrorCursorResponse(Status(ErrorCodes::FailedToParse, "failed to parse"));
     });
+    future.default_timed_get();
+}
+
+TEST_F(EstablishCursorsTest, SingleRemoteInterruptedWhileCommandInFlight) {
+    BSONObj cmdObj = fromjson("{find: 'testcoll'}");
+    std::vector<std::pair<ShardId, BSONObj>> remotes{
+        {kTestShardIds[0], cmdObj},
+    };
+
+    auto barrier = std::make_shared<unittest::Barrier>(2);
+    auto future = launchAsync([&] {
+        ASSERT_THROWS(establishCursors(operationContext(),
+                                       executor(),
+                                       _nss,
+                                       ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+                                       remotes,
+                                       false),  // allowPartialResults
+                      ExceptionFor<ErrorCodes::CursorKilled>);
+        barrier->countDownAndWait();
+    });
+
+    onCommand([&](const RemoteCommandRequest& request) {
+        ASSERT_EQ(_nss.coll(), request.cmdObj.firstElement().valueStringData());
+
+        // Now that our "remote" has recieved the request, interrupt the opCtx which the cursor is
+        // running under.
+        {
+            stdx::lock_guard<Client> lk(*operationContext()->getClient());
+            operationContext()->getServiceContext()->killOperation(
+                lk, operationContext(), ErrorCodes::CursorKilled);
+        }
+
+        // Wait for the kill to take since there is a race between response and kill.
+        barrier->countDownAndWait();
+
+        CursorResponse cursorResponse(_nss, CursorId(123), {});
+        return cursorResponse.toBSON(CursorResponse::ResponseType::InitialResponse);
+    });
+
+    // We were interrupted so establishCursors is forced to send a killOperations out of paranoia.
+    expectKillOperations(1);
+
     future.default_timed_get();
 }
 
@@ -167,7 +224,7 @@ TEST_F(EstablishCursorsTest, SingleRemoteRespondsWithNonretriableErrorAllowParti
     // Remote responds with non-retriable error.
     onCommand([this](const RemoteCommandRequest& request) {
         ASSERT_EQ(_nss.coll(), request.cmdObj.firstElement().valueStringData());
-        return Status(ErrorCodes::FailedToParse, "failed to parse");
+        return createErrorCursorResponse(Status(ErrorCodes::FailedToParse, "failed to parse"));
     });
     future.default_timed_get();
 }
@@ -258,6 +315,10 @@ TEST_F(EstablishCursorsTest, SingleRemoteMaxesOutRetriableErrors) {
             return Status(ErrorCodes::HostUnreachable, "host unreachable");
         });
     }
+
+    // Expect a killOperations for the remote which was not reachable.
+    expectKillOperations(1);
+
     future.default_timed_get();
 }
 
@@ -274,9 +335,13 @@ TEST_F(EstablishCursorsTest, SingleRemoteMaxesOutRetriableErrorsAllowPartialResu
                                         true);  // allowPartialResults
 
         // Failure to establish a cursor due to maxing out retriable errors on one remote (in this
-        // case, the only remote) was ignored, since allowPartialResults is true, and one less
-        // cursor was established.
-        ASSERT_EQUALS(remotes.size() - 1, cursors.size());
+        // case, the only remote) was ignored, since allowPartialResults is true. The cursor entry
+        // is marked as 'partialResultReturned:true', with a CursorId of 0 and no HostAndPort.
+        ASSERT_EQ(cursors.size(), 1);
+        ASSERT(cursors.front().getHostAndPort().empty());
+        ASSERT_EQ(cursors.front().getShardId(), kTestShardIds[0]);
+        ASSERT(cursors.front().getCursorResponse().getPartialResultsReturned());
+        ASSERT_EQ(cursors.front().getCursorResponse().getCursorId(), CursorId{0});
     });
 
     // Remote repeatedly responds with retriable errors.
@@ -286,6 +351,7 @@ TEST_F(EstablishCursorsTest, SingleRemoteMaxesOutRetriableErrorsAllowPartialResu
             return Status(ErrorCodes::HostUnreachable, "host unreachable");
         });
     }
+
     future.default_timed_get();
 }
 
@@ -345,7 +411,7 @@ TEST_F(EstablishCursorsTest, MultipleRemotesOneRemoteRespondsWithNonretriableErr
     // Second remote responds with a non-retriable error.
     onCommand([this](const RemoteCommandRequest& request) {
         ASSERT_EQ(_nss.coll(), request.cmdObj.firstElement().valueStringData());
-        return Status(ErrorCodes::FailedToParse, "failed to parse");
+        return createErrorCursorResponse(Status(ErrorCodes::FailedToParse, "failed to parse"));
     });
 
     // Third remote responds with success (must give some response to mock network for each remote).
@@ -356,6 +422,9 @@ TEST_F(EstablishCursorsTest, MultipleRemotesOneRemoteRespondsWithNonretriableErr
         CursorResponse cursorResponse(_nss, CursorId(123), batch);
         return cursorResponse.toBSON(CursorResponse::ResponseType::InitialResponse);
     });
+
+    // Expect two killOperation commands, one for each remote which responded with a cursor.
+    expectKillOperations(2);
 
     future.default_timed_get();
 }
@@ -389,7 +458,7 @@ TEST_F(EstablishCursorsTest,
     // Second remote responds with a non-retriable error.
     onCommand([this](const RemoteCommandRequest& request) {
         ASSERT_EQ(_nss.coll(), request.cmdObj.firstElement().valueStringData());
-        return Status(ErrorCodes::FailedToParse, "failed to parse");
+        return createErrorCursorResponse(Status(ErrorCodes::FailedToParse, "failed to parse"));
     });
 
     // Third remote responds with success (must give some response to mock network for each remote).
@@ -400,6 +469,9 @@ TEST_F(EstablishCursorsTest,
         CursorResponse cursorResponse(_nss, CursorId(123), batch);
         return cursorResponse.toBSON(CursorResponse::ResponseType::InitialResponse);
     });
+
+    // Expect two killOperation commands, one for each remote which responded with a cursor.
+    expectKillOperations(2);
 
     future.default_timed_get();
 }
@@ -554,6 +626,9 @@ TEST_F(EstablishCursorsTest, MultipleRemotesOneRemoteMaxesOutRetriableErrors) {
         });
     }
 
+    // Expect two killOperation commands, one for each remote which responded with a cursor.
+    expectKillOperations(2);
+
     future.default_timed_get();
 }
 
@@ -570,8 +645,16 @@ TEST_F(EstablishCursorsTest, MultipleRemotesOneRemoteMaxesOutRetriableErrorsAllo
                                         remotes,
                                         true);  // allowPartialResults
         // Failure to establish a cursor due to maxing out retriable errors on one remote was
-        // ignored, since allowPartialResults is true, and one less cursor was established.
-        ASSERT_EQUALS(remotes.size() - 1, cursors.size());
+        // ignored, since allowPartialResults is true. The cursor entry for that shard is marked
+        // 'partialResultReturned:true', with a CursorId of 0 and no HostAndPort.
+        ASSERT_EQ(remotes.size(), cursors.size());
+        for (auto&& cursor : cursors) {
+            const bool isMaxedOutShard = (cursor.getShardId() == kTestShardIds[1]);
+            ASSERT_EQ(cursor.getHostAndPort().empty(), isMaxedOutShard);
+            ASSERT_EQ(cursor.getCursorResponse().getPartialResultsReturned(), isMaxedOutShard);
+            ASSERT(isMaxedOutShard ? cursor.getCursorResponse().getCursorId() == CursorId{0}
+                                   : cursor.getCursorResponse().getCursorId() > CursorId{0});
+        }
     });
 
     // First remote responds with success.
@@ -605,6 +688,73 @@ TEST_F(EstablishCursorsTest, MultipleRemotesOneRemoteMaxesOutRetriableErrorsAllo
             return Status(ErrorCodes::HostUnreachable, "host unreachable");
         });
     }
+
+    future.default_timed_get();
+}
+
+TEST_F(EstablishCursorsTest, InterruptedWithDanglingRemoteRequest) {
+    BSONObj cmdObj = fromjson("{find: 'testcoll'}");
+    std::vector<std::pair<ShardId, BSONObj>> remotes{
+        {kTestShardIds[0], cmdObj},
+        {kTestShardIds[1], cmdObj},
+    };
+
+    // Hang in ARS before it sends the request to remotes[1].
+    auto fpSend = globalFailPointRegistry().find("hangBeforeSchedulingRemoteCommand");
+    invariant(fpSend);
+    auto timesHitSend = fpSend->setMode(
+        FailPoint::alwaysOn, 0, BSON("hostAndPort" << kTestShardHosts[1].toString()));
+
+    // Also hang in ARS::next when there is exactly 1 remote that hasn't replied yet.
+    // This failpoint is important to ensure establishCursors' check for _interruptStatus.isOK()
+    // happens after this unittest does opCtx->killOperation().
+    auto fpNext = globalFailPointRegistry().find("hangBeforePollResponse");
+    invariant(fpNext);
+    auto timesHitNext = fpNext->setMode(FailPoint::alwaysOn, 0, BSON("remotesLeft" << 1));
+
+    auto future = launchAsync([&] {
+        ASSERT_THROWS(establishCursors(operationContext(),
+                                       executor(),
+                                       _nss,
+                                       ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+                                       remotes,
+                                       false),  // allowPartialResults
+                      ExceptionFor<ErrorCodes::CursorKilled>);
+    });
+
+    // First remote responds.
+    onCommand([&](const RemoteCommandRequest& request) {
+        ASSERT_EQ(_nss.coll(), request.cmdObj.firstElement().valueStringData());
+
+        CursorResponse cursorResponse(_nss, CursorId(123), {});
+        return cursorResponse.toBSON(CursorResponse::ResponseType::InitialResponse);
+    });
+
+    // Wait for ars._remotes[1] to try to send its request. We want to test the case where the
+    // opCtx is killed after this happens.
+    fpSend->waitForTimesEntered(timesHitSend + 1);
+
+    // Mark the OperationContext as killed.
+    {
+        stdx::lock_guard<Client> lk(*operationContext()->getClient());
+        operationContext()->getServiceContext()->killOperation(
+            lk, operationContext(), ErrorCodes::CursorKilled);
+    }
+
+    // Allow ars._remotes[1] to send its request.
+    fpSend->setMode(FailPoint::off);
+
+    // Wait for establishCursors to call ars.next.
+    fpNext->waitForTimesEntered(timesHitNext + 1);
+
+    // Disable the ARS::next failpoint to allow establishCursors to handle that response.
+    // Now ARS::next should check that the opCtx has been marked killed, and return a
+    // failing response to establishCursors, which should clean up by sending kill commands.
+    fpNext->setMode(FailPoint::off);
+
+    // Because we paused the ARS using hangBeforePollResponse, we know the ARS will detect the
+    // killed opCtx before sending any more requests. So we know only _killOperations will be sent.
+    expectKillOperations(2);
 
     future.default_timed_get();
 }

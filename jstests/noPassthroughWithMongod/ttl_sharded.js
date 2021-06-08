@@ -1,4 +1,5 @@
-/** Simple test of sharding TTL collections.
+/**
+ * Simple test of sharding TTL collections.
  *  - Creates a new collection with a TTL index
  *  - Shards it, and moves one chunk containing half the docs to another shard.
  *  - Checks that both shards have TTL index, and docs get deleted on both shards.
@@ -27,11 +28,11 @@ for (var i = 0; i < 24; i++) {
     var past = new Date(now - (3600 * 1000 * i));
     bulk.insert({_id: i, x: past});
 }
-assert.writeOK(bulk.execute());
+assert.commandWorked(bulk.execute());
 assert.eq(t.count(), 24, "initial docs not inserted");
 
 // create the TTL index which delete anything older than ~5.5 hours
-t.ensureIndex({x: 1}, {expireAfterSeconds: 20000});
+t.createIndex({x: 1}, {expireAfterSeconds: 20000});
 
 // split chunk in half by _id, and move one chunk to the other shard
 s.adminCommand({split: ns, middle: {_id: 12}});
@@ -42,8 +43,10 @@ assert.soon(
     function() {
         return t.count() === 6 && t.find({x: {$lt: new Date(now - 20000000)}}).count() === 0;
     },
-    "TTL index did not successfully delete expired documents, all documents: " +
-        tojson(t.find().toArray()),
+    function() {
+        return "TTL index did not successfully delete expired documents, all documents: " +
+            tojson(t.find().toArray());
+    },
     70 * 1000);
 
 // now lets check things explicily on each shard

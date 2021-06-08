@@ -31,20 +31,21 @@
 
 #include <boost/intrusive_ptr.hpp>
 #include <boost/optional.hpp>
+#include <forward_list>
 #include <type_traits>
 
 #include "mongo/base/checked_cast.h"
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
 #include "mongo/platform/atomic_word.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/type_traits.h"
 #include "mongo/stdx/utility.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/debug_util.h"
 #include "mongo/util/functional.h"
-#include "mongo/util/if_constexpr.h"
+#include "mongo/util/hierarchical_acquisition.h"
 #include "mongo/util/interruptible.h"
 #include "mongo/util/intrusive_counter.h"
 #include "mongo/util/scopeguard.h"
@@ -70,6 +71,7 @@ template <typename T>
 class SharedSemiFuture;
 
 namespace future_details {
+
 template <typename T>
 class FutureImpl;
 template <>
@@ -85,6 +87,18 @@ template <typename T>
 inline constexpr bool isFutureLike<ExecutorFuture<T>> = true;
 template <typename T>
 inline constexpr bool isFutureLike<SharedSemiFuture<T>> = true;
+
+// std::is_copy_constructible incorrectly returns true for containers of move-only types, so we use
+// our own modified version instead. Note this version is brittle at the moment, since it determines
+// whether or not the type is a container by the presense of a value_type field. After we switch to
+// C++20 we can use the Container concept for this instread.
+template <typename T, typename = void>
+struct is_really_copy_constructible : std::is_copy_constructible<T> {};
+template <typename T>
+struct is_really_copy_constructible<T, std::void_t<typename T::value_type>>
+    : is_really_copy_constructible<typename T::value_type> {};
+template <typename T>
+constexpr bool is_really_copy_constructible_v = is_really_copy_constructible<T>::value;
 
 template <typename T>
 struct UnstatusTypeImpl {
@@ -188,6 +202,45 @@ using VoidToFakeVoid = std::conditional_t<std::is_void_v<T>, FakeVoid, T>;
 template <typename T>
 using FakeVoidToVoid = std::conditional_t<std::is_same_v<T, FakeVoid>, void, T>;
 
+struct InvalidCallSentinal;  // Nothing actually returns this.
+template <typename Func, typename Arg, typename = void>
+struct FriendlyInvokeResultImpl {
+    using type = InvalidCallSentinal;
+};
+template <typename Func, typename Arg>
+struct FriendlyInvokeResultImpl<
+    Func,
+    Arg,
+    std::enable_if_t<std::is_invocable_v<Func, std::enable_if_t<!std::is_void_v<Arg>, Arg>>>> {
+    using type = std::invoke_result_t<Func, Arg>;
+};
+template <typename Func>
+struct FriendlyInvokeResultImpl<Func, void, std::enable_if_t<std::is_invocable_v<Func>>> {
+    using type = std::invoke_result_t<Func>;
+};
+template <typename Func>
+struct FriendlyInvokeResultImpl<Func, const void, std::enable_if_t<std::is_invocable_v<Func>>> {
+    using type = std::invoke_result_t<Func>;
+};
+
+template <typename Func, typename Arg>
+using FriendlyInvokeResult = typename FriendlyInvokeResultImpl<Func, Arg>::type;
+
+// Like is_invocable_v<Func, Args>, but handles Args == void correctly.
+template <typename Func, typename Arg>
+inline constexpr bool isCallable =
+    !std::is_same_v<FriendlyInvokeResult<Func, Arg>, InvalidCallSentinal>;
+
+// Like is_invocable_r_v<Func, Args>, but handles Args == void correctly and unwraps the return.
+template <typename Ret, typename Func, typename Arg>
+inline constexpr bool isCallableR =
+    (isCallable<Func, Arg> && std::is_same_v<UnwrappedType<FriendlyInvokeResult<Func, Arg>>, Ret>);
+
+// Like isCallableR, but doesn't unwrap the result type.
+template <typename Ret, typename Func, typename Arg>
+inline constexpr bool isCallableExactR = (isCallable<Func, Arg> &&
+                                          std::is_same_v<FriendlyInvokeResult<Func, Arg>, Ret>);
+
 /**
  * call() normalizes arguments to hide the FakeVoid shenanigans from users of Futures.
  * In the future it may also expand tuples to argument lists.
@@ -216,18 +269,16 @@ inline auto statusCall(Func&& func, Args&&... args) noexcept {
     using RawResult = decltype(call(func, std::forward<Args>(args)...));
     using Result = StatusWith<VoidToFakeVoid<UnstatusType<RawResult>>>;
     try {
-        IF_CONSTEXPR(std::is_void_v<RawResult>) {
+        if constexpr (std::is_void_v<RawResult>) {
             call(func, std::forward<Args>(args)...);
             return Result(FakeVoid());
-        }
-        else IF_CONSTEXPR(std::is_same_v<RawResult, Status>) {
+        } else if constexpr (std::is_same_v<RawResult, Status>) {
             auto s = call(func, std::forward<Args>(args)...);
             if (!s.isOK()) {
                 return Result(std::move(s));
             }
             return Result(FakeVoid());
-        }
-        else {
+        } else {
             return Result(call(func, std::forward<Args>(args)...));
         }
     } catch (const DBException& ex) {
@@ -245,18 +296,15 @@ inline auto statusCall(Func&& func, Args&&... args) noexcept {
 template <typename Func, typename... Args>
 inline auto throwingCall(Func&& func, Args&&... args) {
     using Result = decltype(call(func, std::forward<Args>(args)...));
-    IF_CONSTEXPR(std::is_void_v<Result>) {
+    if constexpr (std::is_void_v<Result>) {
         call(func, std::forward<Args>(args)...);
         return FakeVoid{};
-    }
-    else IF_CONSTEXPR(std::is_same_v<Result, Status>) {
+    } else if constexpr (std::is_same_v<Result, Status>) {
         uassertStatusOK(call(func, std::forward<Args>(args)...));
         return FakeVoid{};
-    }
-    else IF_CONSTEXPR(isStatusWith<Result>) {
+    } else if constexpr (isStatusWith<Result>) {
         return uassertStatusOK(call(func, std::forward<Args>(args)...));
-    }
-    else {
+    } else {
         return call(func, std::forward<Args>(args)...);
     }
 }
@@ -328,7 +376,7 @@ public:
         if (state.load(std::memory_order_acquire) == SSBState::kFinished)
             return;
 
-        stdx::unique_lock<stdx::mutex> lk(mx);
+        stdx::unique_lock lk(mx);
         if (!cv) {
             cv.emplace();
 
@@ -367,7 +415,7 @@ public:
         dassert(oldState == SSBState::kWaitingOrHaveChildren ||
                 oldState == SSBState::kHaveCallback);
 
-        DEV {
+        if (kDebugBuild) {
             // If you hit this limit one of two things has probably happened
             //
             // 1. The justForContinuation optimization isn't working.
@@ -396,7 +444,7 @@ public:
 
             Children localChildren;
 
-            stdx::unique_lock<stdx::mutex> lk(mx);
+            stdx::unique_lock lk(mx);
             localChildren.swap(children);
             if (cv) {
                 // This must be done inside the lock to correctly synchronize with wait().
@@ -449,7 +497,8 @@ public:
 
     // These are only used to signal completion to blocking waiters. Benchmarks showed that it was
     // worth deferring the construction of cv, so it can be avoided when it isn't necessary.
-    stdx::mutex mx;                                // F (not that it matters)
+
+    stdx::mutex mx;                                // NOLINT F
     boost::optional<stdx::condition_variable> cv;  // F (but guarded by mutex)
 
     // This holds the children created from a SharedSemiFuture. When this SharedState is completed,
@@ -469,7 +518,7 @@ struct SharedStateImpl final : SharedStateBase {
     // Initial methods only called from future side.
 
     boost::intrusive_ptr<SharedState<T>> addChild() {
-        static_assert(std::is_copy_constructible_v<T>);  // T has been through VoidToFakeVoid.
+        static_assert(is_really_copy_constructible_v<T>);  // T has been through VoidToFakeVoid.
         invariant(!callback);
 
         auto out = make_intrusive<SharedState<T>>();
@@ -479,23 +528,29 @@ struct SharedStateImpl final : SharedStateBase {
         }
 
         auto lk = stdx::unique_lock(mx);
+
         auto oldState = state.load(std::memory_order_acquire);
+        if (oldState == SSBState::kInit) {
+            // On the success path, our reads and writes to children are protected by the mutex
+            //
+            // On the failure path, we raced with transitionToFinished() and lost, so we need to
+            // synchronize with it via acquire before accessing the results since it wouldn't have
+            // taken the mutex.
+            state.compare_exchange_strong(oldState,
+                                          SSBState::kWaitingOrHaveChildren,
+                                          std::memory_order_relaxed,
+                                          std::memory_order_acquire);
+        }
         if (oldState == SSBState::kFinished) {
             lk.unlock();
             out->fillFromConst(*this);
             return out;
         }
-
-        if (oldState == SSBState::kInit) {
-            // memory ordering can be relaxed because that will be handled by the mutex.
-            state.compare_exchange_strong(
-                oldState, SSBState::kWaitingOrHaveChildren, std::memory_order_relaxed);
-        }
         dassert(oldState != SSBState::kHaveCallback);
 
-        // If oldState became kFinished after we checked (and therefore after we acquired the lock),
-        // the returned continuation will be completed by the promise side once it acquires the lock
-        // since we are adding ourself to the chain here.
+        // If oldState became kFinished after we checked (or successfully stored
+        // kWaitingOrHaveChildren), the returned continuation will be completed by the promise side
+        // once it acquires the lock since we are adding ourself to the chain here.
 
         children.emplace_front(out.get(), /*add ref*/ false);
         out->threadUnsafeIncRefCountTo(2);
@@ -537,21 +592,29 @@ struct SharedStateImpl final : SharedStateBase {
         transitionToFinished();
     }
 
-    void setFromStatusWith(StatusWith<T> sw) {
-        if (sw.isOK()) {
-            emplaceValue(std::move(sw.getValue()));
+    void setFrom(StatusWith<T> sosw) {
+        if (sosw.isOK()) {
+            emplaceValue(std::move(sosw.getValue()));
         } else {
-            setError(std::move(sw.getStatus()));
+            setError(std::move(sosw.getStatus()));
+        }
+    }
+
+    REQUIRES_FOR_NON_TEMPLATE(std::is_same_v<T, FakeVoid>)
+    void setFrom(Status status) {
+        if (status.isOK()) {
+            emplaceValue();
+        } else {
+            setError(std::move(status));
         }
     }
 
     void fillChildren(const Children& children) const override {
-        IF_CONSTEXPR(std::is_copy_constructible_v<T>) {  // T has been through VoidToFakeVoid.
+        if constexpr (is_really_copy_constructible_v<T>) {  // T has been through VoidToFakeVoid.
             for (auto&& child : children) {
                 checked_cast<SharedState<T>*>(child.get())->fillFromConst(*this);
             }
-        }
-        else {
+        } else {
             invariant(false, "should never call fillChildren with non-copyable T");
         }
     }
@@ -827,7 +890,7 @@ public:
     template <typename Func>
         auto then(Func&& func) && noexcept {
         using Result = NormalizedCallResult<Func, T>;
-        IF_CONSTEXPR(!isFutureLike<Result>) {
+        if constexpr (!isFutureLike<Result>) {
             return generalImpl(
                 // on ready success:
                 [&](T&& val) {
@@ -842,11 +905,10 @@ public:
                         if (!input->status.isOK())
                             return output->setError(std::move(input->status));
 
-                        output->setFromStatusWith(statusCall(func, std::move(*input->data)));
+                        output->setFrom(statusCall(func, std::move(*input->data)));
                     });
                 });
-        }
-        else {
+        } else {
             using UnwrappedResult = typename Result::value_type;
             return generalImpl(
                 // on ready success:
@@ -883,7 +945,7 @@ public:
         auto onCompletion(Func&& func) && noexcept {
         using Wrapper = StatusOrStatusWith<T>;
         using Result = NormalizedCallResult<Func, StatusOrStatusWith<T>>;
-        IF_CONSTEXPR(!isFutureLike<Result>) {
+        if constexpr (!isFutureLike<Result>) {
             return generalImpl(
                 // on ready success:
                 [&](T&& val) {
@@ -900,15 +962,13 @@ public:
                     return makeContinuation<Result>([func = std::forward<Func>(func)](
                         SharedState<T> * input, SharedState<Result> * output) mutable noexcept {
                         if (!input->status.isOK())
-                            return output->setFromStatusWith(
+                            return output->setFrom(
                                 statusCall(func, Wrapper(std::move(input->status))));
 
-                        output->setFromStatusWith(
-                            statusCall(func, Wrapper(std::move(*input->data))));
+                        output->setFrom(statusCall(func, Wrapper(std::move(*input->data))));
                     });
                 });
-        }
-        else {
+        } else {
             using UnwrappedResult = typename Result::value_type;
             return generalImpl(
                 // on ready success:
@@ -963,7 +1023,7 @@ public:
             std::is_same<VoidToFakeVoid<UnwrappedType<Result>>, T>::value,
             "func passed to Future<T>::onError must return T, StatusWith<T>, or Future<T>");
 
-        IF_CONSTEXPR(!isFutureLike<Result>) {
+        if constexpr (!isFutureLike<Result>) {
             return generalImpl(
                 // on ready success:
                 [&](T&& val) { return FutureImpl<T>::makeReady(std::move(val)); },
@@ -978,11 +1038,10 @@ public:
                         if (input->status.isOK())
                             return output->emplaceValue(std::move(*input->data));
 
-                        output->setFromStatusWith(statusCall(func, std::move(input->status)));
+                        output->setFrom(statusCall(func, std::move(input->status)));
                     });
                 });
-        }
-        else {
+        } else {
             return generalImpl(
                 // on ready success:
                 [&](T&& val) { return FutureImpl<T>::makeReady(std::move(val)); },
@@ -1023,8 +1082,7 @@ public:
 
         // TODO in C++17 with constexpr if this can be done cleaner and more efficiently by not
         // throwing.
-        return std::move(*this).onError([func =
-                                             std::forward<Func>(func)](Status && status) mutable {
+        return std::move(*this).onError([func = std::forward<Func>(func)](Status&& status) mutable {
             if (status != code)
                 uassertStatusOK(status);
             return throwingCall(func, std::move(status));
@@ -1041,9 +1099,8 @@ public:
         if (_immediate || (isReady() && _shared->status.isOK()))
             return std::move(*this);
 
-        return std::move(*this).onError([func =
-                                             std::forward<Func>(func)](Status && status) mutable {
-            if (!ErrorCodes::isA<category>(status.code()))
+        return std::move(*this).onError([func = std::forward<Func>(func)](Status&& status) mutable {
+            if (!ErrorCodes::isA<category>(status))
                 uassertStatusOK(status);
             return throwingCall(func, std::move(status));
         });
@@ -1064,9 +1121,8 @@ public:
         static_assert(std::is_void<decltype(call(func, std::declval<const Status&>()))>::value,
                       "func passed to tapError must return void");
 
-        return tapImpl(std::forward<Func>(func),
-                       [](Func && func, const T& val) noexcept {},
-                       [](Func && func, const Status& status) noexcept { call(func, status); });
+        return tapImpl(std::forward<Func>(func), [](Func && func, const T& val) noexcept {}, [
+        ](Func && func, const Status& status) noexcept { call(func, status); });
     }
 
     template <typename Func>

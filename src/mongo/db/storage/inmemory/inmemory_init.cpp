@@ -31,8 +31,6 @@ Copyright (C) 2018-present Percona and/or its affiliates. All rights reserved.
     it in the license file.
 ======= */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
-
 #include "mongo/platform/basic.h"
 
 #include "mongo/base/init.h"
@@ -41,7 +39,7 @@ Copyright (C) 2018-present Percona and/or its affiliates. All rights reserved.
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/inmemory/inmemory_global_options.h"
 #include "mongo/db/storage/storage_engine_init.h"
-#include "mongo/db/storage/kv/kv_storage_engine.h"
+#include "mongo/db/storage/storage_engine_impl.h"
 #include "mongo/db/storage/storage_engine_lock_file.h"
 #include "mongo/db/storage/storage_engine_metadata.h"
 #include "mongo/db/storage/storage_options.h"
@@ -51,7 +49,10 @@ Copyright (C) 2018-present Percona and/or its affiliates. All rights reserved.
 #include "mongo/db/storage/wiredtiger/wiredtiger_record_store.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_server_status.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
-#include "mongo/util/log.h"
+
+#if __has_feature(address_sanitizer)
+#include <sanitizer/lsan_interface.h>
+#endif
 
 namespace mongo {
 
@@ -61,33 +62,48 @@ const std::string kInMemoryEngineName = "inMemory";
 class InMemoryFactory : public StorageEngine::Factory {
 public:
     virtual ~InMemoryFactory() {}
-    virtual StorageEngine* create(const StorageGlobalParams& params,
-                                  const StorageEngineLockFile*) const {
+    virtual std::unique_ptr<StorageEngine> create(OperationContext* opCtx,
+                                                  const StorageGlobalParams& params,
+                                                  const StorageEngineLockFile*) const {
         syncInMemoryAndWiredTigerOptions();
 
         size_t cacheMB = WiredTigerUtil::getCacheSizeMB(wiredTigerGlobalOptions.cacheSizeGB);
         const bool durable = false;
         const bool ephemeral = true;
         const bool readOnly = false;
-        WiredTigerKVEngine* kv = new WiredTigerKVEngine(getCanonicalName().toString(),
-                                                        params.dbpath,
-                                                        getGlobalServiceContext()->getFastClockSource(),
-                                                        wiredTigerGlobalOptions.engineConfig,
-                                                        cacheMB,
-                                                        durable,
-                                                        ephemeral,
-                                                        params.repair,
-                                                        readOnly);
+        auto kv =
+            std::make_unique<WiredTigerKVEngine>(getCanonicalName().toString(),
+                                                 params.dbpath,
+                                                 getGlobalServiceContext()->getFastClockSource(),
+                                                 wiredTigerGlobalOptions.engineConfig,
+                                                 cacheMB,
+                                                 0,
+                                                 durable,
+                                                 ephemeral,
+                                                 params.repair,
+                                                 readOnly);
         kv->setRecordStoreExtraOptions(wiredTigerGlobalOptions.collectionConfig);
         kv->setSortedDataInterfaceExtraOptions(wiredTigerGlobalOptions.indexConfig);
-        // Intentionally leaked.
-        new WiredTigerServerStatusSection(kv);
 
-        KVStorageEngineOptions options;
+        // We must only add the server parameters to the global registry once during unit testing.
+        static int setupCountForUnitTests = 0;
+        if (setupCountForUnitTests == 0) {
+            ++setupCountForUnitTests;
+
+            // Intentionally leaked.
+            [[maybe_unused]] auto leakedSection = new WiredTigerServerStatusSection(kv.get());
+
+            // This allows unit tests to run this code without encountering memory leaks
+#if __has_feature(address_sanitizer)
+            __lsan_ignore_object(leakedSection);
+#endif
+        }
+
+        StorageEngineOptions options;
         options.directoryPerDB = params.directoryperdb;
         options.directoryForIndexes = wiredTigerGlobalOptions.directoryForIndexes;
         options.forRepair = params.repair;
-        return new KVStorageEngine(kv, options);
+        return std::make_unique<StorageEngineImpl>(opCtx, std::move(kv), options);
     }
 
     virtual StringData getCanonicalName() const {

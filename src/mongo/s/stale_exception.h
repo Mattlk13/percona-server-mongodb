@@ -31,7 +31,9 @@
 
 #include "mongo/db/namespace_string.h"
 #include "mongo/s/chunk_version.h"
-#include "mongo/s/database_version_gen.h"
+#include "mongo/s/database_version.h"
+#include "mongo/s/shard_id.h"
+#include "mongo/util/concurrency/notification.h"
 
 namespace mongo {
 
@@ -41,8 +43,14 @@ public:
 
     StaleConfigInfo(NamespaceString nss,
                     ChunkVersion received,
-                    boost::optional<ChunkVersion> wanted)
-        : _nss(std::move(nss)), _received(received), _wanted(wanted) {}
+                    boost::optional<ChunkVersion> wanted,
+                    ShardId shardId,
+                    boost::optional<SharedSemiFuture<void>> criticalSectionSignal = boost::none)
+        : _nss(std::move(nss)),
+          _received(received),
+          _wanted(wanted),
+          _shardId(shardId),
+          _criticalSectionSignal(criticalSectionSignal) {}
 
     const auto& getNss() const {
         return _nss;
@@ -56,15 +64,85 @@ public:
         return _wanted;
     }
 
-    void serialize(BSONObjBuilder* bob) const override;
-    static std::shared_ptr<const ErrorExtraInfo> parse(const BSONObj&);
-    static StaleConfigInfo parseFromCommandError(const BSONObj& commandError);
+    const auto& getShardId() const {
+        return _shardId;
+    }
 
-private:
+    auto getCriticalSectionSignal() const {
+        return _criticalSectionSignal;
+    }
+
+    void serialize(BSONObjBuilder* bob) const {
+        bob->append("ns", _nss.ns());
+        _received.appendLegacyWithField(bob, "vReceived");
+        if (_wanted) {
+            _wanted->appendLegacyWithField(bob, "vWanted");
+        }
+
+        invariant(_shardId != "");
+        bob->append("shardId", _shardId.toString());
+    }
+
+    static std::shared_ptr<const ErrorExtraInfo> parse(const BSONObj& obj) {
+        return std::make_shared<StaleConfigInfo>(parseFromCommandError(obj));
+    }
+
+    static StaleConfigInfo parseFromCommandError(const BSONObj& obj) {
+        const auto shardId = obj["shardId"].String();
+        invariant(shardId != "");
+
+        auto extractOptionalChunkVersion = [&obj](StringData field) {
+            boost::optional<ChunkVersion> ret;
+            auto swChunkVersion = ChunkVersion::parseLegacyWithField(obj, field);
+            if (swChunkVersion != ErrorCodes::NoSuchKey)
+                ret = uassertStatusOK(std::move(swChunkVersion));
+            return ret;
+        };
+
+        return StaleConfigInfo(
+            NamespaceString(obj["ns"].String()),
+            uassertStatusOK(ChunkVersion::parseLegacyWithField(obj, "vReceived")),
+            extractOptionalChunkVersion("vWanted"),
+            ShardId(shardId));
+    }
+
+protected:
     NamespaceString _nss;
     ChunkVersion _received;
     boost::optional<ChunkVersion> _wanted;
+    ShardId _shardId;
+
+    // This signal does not get serialized and therefore does not get propagated
+    // to the router.
+    boost::optional<SharedSemiFuture<void>> _criticalSectionSignal;
 };
+
+class StaleEpochInfo final : public ErrorExtraInfo {
+public:
+    static constexpr auto code = ErrorCodes::StaleEpoch;
+
+    StaleEpochInfo(NamespaceString nss) : _nss(std::move(nss)) {}
+
+    const auto& getNss() const {
+        return _nss;
+    }
+
+    void serialize(BSONObjBuilder* bob) const {
+        bob->append("ns", _nss.ns());
+    }
+
+    static std::shared_ptr<const ErrorExtraInfo> parse(const BSONObj& obj) {
+        return std::make_shared<StaleEpochInfo>(parseFromCommandError(obj));
+    }
+
+    static StaleEpochInfo parseFromCommandError(const BSONObj& obj) {
+        return StaleEpochInfo(NamespaceString(obj["ns"].String()));
+    }
+
+private:
+    NamespaceString _nss;
+};
+
 using StaleConfigException = ExceptionFor<ErrorCodes::StaleConfig>;
 
 class StaleDbRoutingVersion final : public ErrorExtraInfo {

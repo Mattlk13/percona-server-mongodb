@@ -15,11 +15,9 @@ runReadOnlyTest((function() {
             writableDB[collName].drop();
 
             assert.commandWorked(writableDB.runCommand({
-                applyOps: [{
-                    op: "c",
-                    ns: writableDB.getName() + ".$cmd",
-                    o: {create: collName, temp: true}
-                }]
+                applyOps: [
+                    {op: "c", ns: writableDB.getName() + ".$cmd", o: {create: collName, temp: true}}
+                ]
             }));
 
             var collectionInfos = writableDB.getCollectionInfos();
@@ -33,7 +31,7 @@ runReadOnlyTest((function() {
                 }
             });
             assert(collectionExists, 'Can not find collection in collectionInfos');
-            assert.writeOK(writableCollection.insert({a: 1}));
+            assert.commandWorked(writableCollection.insert({a: 1}));
         },
 
         exec: function(readableCollection) {

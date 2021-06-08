@@ -6,7 +6,6 @@ load('jstests/concurrency/fsm_libs/parse_config.js');  // for parseConfig
 load('jstests/libs/specific_secondary_reader_mongo.js');
 
 var workerThread = (function() {
-
     // workloads = list of workload filenames
     // args.tid = the thread identifier
     // args.data = map of workload -> 'this' parameter passed to the FSM state functions
@@ -60,9 +59,9 @@ var workerThread = (function() {
                 let initialOperationTime;
 
                 // JavaScript objects backed by C++ objects (e.g. BSON values from a command
-                // response) do not serialize correctly when passed through the ScopedThread
+                // response) do not serialize correctly when passed through the Thread
                 // constructor. To work around this behavior, we instead pass a stringified form
-                // of the JavaScript object through the ScopedThread constructor and use eval()
+                // of the JavaScript object through the Thread constructor and use eval()
                 // to rehydrate it.
                 if (typeof args.sessionOptions.initialClusterTime === 'string') {
                     initialClusterTime = eval('(' + args.sessionOptions.initialClusterTime + ')');
@@ -95,12 +94,6 @@ var workerThread = (function() {
                     // readPreference={mode: "secondary"} when there's only a single node in
                     // the CSRS.
                     load('jstests/libs/override_methods/set_read_preference_secondary.js');
-
-                    // Reads after an index build completes on a secondary should be causally
-                    // consistent.
-                    if (session.getOptions().isCausalConsistency()) {
-                        load('jstests/libs/override_methods/causally_consistent_index_builds.js');
-                    }
                 }
 
                 if (typeof initialClusterTime !== 'undefined') {
@@ -193,8 +186,7 @@ var workerThread = (function() {
                 // them here as non-configurable and non-writable.
                 Object.defineProperties(data, {
                     'iterations': {configurable: false, writable: false, value: data.iterations},
-                    'threadCount':
-                        {configurable: false, writable: false, value: data.threadCount}
+                    'threadCount': {configurable: false, writable: false, value: data.threadCount}
                 });
 
                 data.tid = args.tid;
@@ -207,6 +199,7 @@ var workerThread = (function() {
                     passConnectionCache: config.passConnectionCache,
                     startState: config.startState,
                     states: config.states,
+                    tid: args.tid,
                     transitions: config.transitions
                 };
             });

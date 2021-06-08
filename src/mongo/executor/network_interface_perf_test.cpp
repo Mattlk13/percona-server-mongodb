@@ -27,11 +27,12 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kASIO
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
 #include <exception>
+#include <memory>
 
 #include "mongo/base/status_with.h"
 #include "mongo/bson/bsonmisc.h"
@@ -42,11 +43,10 @@
 #include "mongo/executor/network_interface_asio.h"
 #include "mongo/executor/network_interface_asio_test_utils.h"
 #include "mongo/executor/task_executor.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/logv2/log.h"
 #include "mongo/unittest/integration_test.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/timer.h"
@@ -66,13 +66,13 @@ int timeNetworkTestMillis(std::size_t operations, NetworkInterface* net) {
     auto server = fixture.getServers()[0];
 
     std::atomic<int> remainingOps(operations);  // NOLINT
-    stdx::mutex mtx;
+    auto mtx = MONGO_MAKE_LATCH();
     stdx::condition_variable cv;
     Timer t;
 
     // This lambda function is declared here since it is mutually recursive with another callback
     // function
-    stdx::function<void()> func;
+    std::function<void()> func;
 
     const auto bsonObjPing = BSON("ping" << 1);
 
@@ -81,7 +81,7 @@ int timeNetworkTestMillis(std::size_t operations, NetworkInterface* net) {
         if (--remainingOps) {
             return func();
         }
-        stdx::unique_lock<stdx::mutex> lk(mtx);
+        stdx::unique_lock<Latch> lk(mtx);
         cv.notify_one();
     };
 
@@ -93,7 +93,7 @@ int timeNetworkTestMillis(std::size_t operations, NetworkInterface* net) {
 
     func();
 
-    stdx::unique_lock<stdx::mutex> lk(mtx);
+    stdx::unique_lock<Latch> lk(mtx);
     cv.wait(lk, [&] { return remainingOps.load() == 0; });
 
     return t.millis();
@@ -101,13 +101,16 @@ int timeNetworkTestMillis(std::size_t operations, NetworkInterface* net) {
 
 TEST(NetworkInterfaceASIO, SerialPerf) {
     NetworkInterfaceASIO::Options options{};
-    options.streamFactory = stdx::make_unique<AsyncStreamFactory>();
-    options.timerFactory = stdx::make_unique<AsyncTimerFactoryASIO>();
+    options.streamFactory = std::make_unique<AsyncStreamFactory>();
+    options.timerFactory = std::make_unique<AsyncTimerFactoryASIO>();
     NetworkInterfaceASIO netAsio{std::move(options)};
 
     int duration = timeNetworkTestMillis(numOperations, &netAsio);
     int result = numOperations * 1000 / duration;
-    log() << "THROUGHPUT asio ping ops/s: " << result;
+    LOGV2(22591,
+          "THROUGHPUT asio ping ops/s: {throughput}",
+          "THROUGHPUT asio ping ops/s",
+          "throughput"_attr = result);
 }
 
 }  // namespace

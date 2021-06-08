@@ -41,19 +41,29 @@
 
 namespace mongo {
 
-TwoDAccessMethod::TwoDAccessMethod(IndexCatalogEntry* btreeState, SortedDataInterface* btree)
-    : AbstractIndexAccessMethod(btreeState, btree) {
+TwoDAccessMethod::TwoDAccessMethod(IndexCatalogEntry* btreeState,
+                                   std::unique_ptr<SortedDataInterface> btree)
+    : AbstractIndexAccessMethod(btreeState, std::move(btree)) {
     const IndexDescriptor* descriptor = btreeState->descriptor();
 
     ExpressionParams::parseTwoDParams(descriptor->infoObj(), &_params);
 }
 
 /** Finds the key objects to put in an index */
-void TwoDAccessMethod::doGetKeys(const BSONObj& obj,
-                                 BSONObjSet* keys,
-                                 BSONObjSet* multikeyMetadataKeys,
-                                 MultikeyPaths* multikeyPaths) const {
-    ExpressionKeysPrivate::get2DKeys(obj, _params, keys);
+void TwoDAccessMethod::doGetKeys(SharedBufferFragmentBuilder& pooledBufferBuilder,
+                                 const BSONObj& obj,
+                                 GetKeysContext context,
+                                 KeyStringSet* keys,
+                                 KeyStringSet* multikeyMetadataKeys,
+                                 MultikeyPaths* multikeyPaths,
+                                 boost::optional<RecordId> id) const {
+    ExpressionKeysPrivate::get2DKeys(pooledBufferBuilder,
+                                     obj,
+                                     _params,
+                                     keys,
+                                     getSortedDataInterface()->getKeyStringVersion(),
+                                     getSortedDataInterface()->getOrdering(),
+                                     id);
 }
 
 }  // namespace mongo

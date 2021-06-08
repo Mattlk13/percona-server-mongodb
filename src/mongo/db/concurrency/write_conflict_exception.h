@@ -34,11 +34,11 @@
 #include "mongo/base/string_data.h"
 #include "mongo/db/curop.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 
 namespace mongo {
 
-MONGO_FAIL_POINT_DECLARE(skipWriteConflictRetries);
+extern FailPoint skipWriteConflictRetries;
 
 /**
  * This is thrown if during a write, two or more operations conflict with each other.
@@ -83,7 +83,12 @@ auto writeConflictRetry(OperationContext* opCtx, StringData opStr, StringData ns
     invariant(opCtx->lockState());
     invariant(opCtx->recoveryUnit());
 
-    if (opCtx->lockState()->inAWriteUnitOfWork() || MONGO_FAIL_POINT(skipWriteConflictRetries)) {
+    // This failpoint disables exception handling for write conflicts. Only allow this exception to
+    // escape user operations. Do not allow exceptions to escape internal threads, which may rely on
+    // this exception handler to avoid crashing.
+    bool userSkipWriteConflictRetry = MONGO_unlikely(skipWriteConflictRetries.shouldFail()) &&
+        opCtx->getClient()->isFromUserConnection();
+    if (opCtx->lockState()->inAWriteUnitOfWork() || userSkipWriteConflictRetry) {
         return f();
     }
 

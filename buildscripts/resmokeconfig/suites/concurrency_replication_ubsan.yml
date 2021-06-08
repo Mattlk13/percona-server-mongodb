@@ -10,17 +10,25 @@ selector:
   # These workloads use >100MB of data, which can overwhelm test hosts.
   - jstests/concurrency/fsm_workloads/agg_group_external.js
   - jstests/concurrency/fsm_workloads/agg_sort_external.js
+
   # The findAndModify_update_grow.js workload can cause OOM kills on test hosts.
   - jstests/concurrency/fsm_workloads/findAndModify_update_grow.js
+
+  # These workloads run the reIndex command, which is only allowed on a standalone node.
+  - jstests/concurrency/fsm_workloads/reindex.js
+  - jstests/concurrency/fsm_workloads/reindex_background.js
+  - jstests/concurrency/fsm_workloads/reindex_writeconflict.js
+
   exclude_with_any_tags:
   - requires_sharding
 
 executor:
   archive:
     hooks:
+      - CheckReplDBHashInBackground
+      - ValidateCollectionsInBackground
       - CheckReplDBHash
       - ValidateCollections
-      - CheckReplDBHashInBackground
     tests: true
   config:
     shell_options:
@@ -32,6 +40,7 @@ executor:
   #
   # TODO SERVER-26466: Add CheckReplOplogs hook to the concurrency suite.
   - class: CheckReplDBHashInBackground
+  - class: ValidateCollectionsInBackground
   - class: CheckReplDBHash
   - class: ValidateCollections
   - class: CleanEveryN
@@ -42,4 +51,5 @@ executor:
       oplogSize: 1024
       set_parameters:
         enableTestCommands: 1
+        roleGraphInvalidationIsFatal: 1
     num_nodes: 3

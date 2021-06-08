@@ -52,23 +52,27 @@ std::vector<SHA256Block> listSessionsUsersToDigests(const std::vector<ListSessio
  */
 class DocumentSourceListLocalSessions final : public DocumentSource {
 public:
-    static const char* kStageName;
+    static constexpr StringData kStageName = "$listLocalSessions"_sd;
 
     class LiteParsed final : public LiteParsedDocumentSource {
     public:
-        static std::unique_ptr<LiteParsed> parse(const AggregationRequest& request,
+        static std::unique_ptr<LiteParsed> parse(const NamespaceString& nss,
                                                  const BSONElement& spec) {
 
-            return stdx::make_unique<LiteParsed>(listSessionsParseSpec(kStageName, spec));
+            return std::make_unique<LiteParsed>(
+                spec.fieldName(),
+                listSessionsParseSpec(DocumentSourceListLocalSessions::kStageName, spec));
         }
 
-        explicit LiteParsed(const ListSessionsSpec& spec) : _spec(spec) {}
+        explicit LiteParsed(std::string parseTimeName, const ListSessionsSpec& spec)
+            : LiteParsedDocumentSource(std::move(parseTimeName)), _spec(spec) {}
 
         stdx::unordered_set<NamespaceString> getInvolvedNamespaces() const final {
             return stdx::unordered_set<NamespaceString>();
         }
 
-        PrivilegeVector requiredPrivileges(bool isMongos) const final {
+        PrivilegeVector requiredPrivileges(bool isMongos,
+                                           bool bypassDocumentValidation) const final {
             return listSessionsRequiredPrivileges(_spec);
         }
 
@@ -76,27 +80,24 @@ public:
             return true;
         }
 
-        bool allowedToForwardFromMongos() const final {
+        bool allowedToPassthroughFromMongos() const final {
             return false;
         }
 
-        void assertSupportsReadConcern(const repl::ReadConcernArgs& readConcern) const {
-            uassert(ErrorCodes::InvalidOptions,
-                    str::stream() << "Aggregation stage " << kStageName << " cannot run with a "
-                                  << "readConcern other than 'local', or in a multi-document "
-                                  << "transaction. Current readConcern: "
-                                  << readConcern.toString(),
-                    readConcern.getLevel() == repl::ReadConcernLevel::kLocalReadConcern);
+        ReadConcernSupportResult supportsReadConcern(repl::ReadConcernLevel level) const {
+            return onlyReadConcernLocalSupported(kStageName, level);
+        }
+
+        void assertSupportsMultiDocumentTransaction() const {
+            transactionNotSupported(DocumentSourceListLocalSessions::kStageName);
         }
 
     private:
         const ListSessionsSpec _spec;
     };
 
-    GetNextResult getNext() final;
-
     const char* getSourceName() const final {
-        return kStageName;
+        return DocumentSourceListLocalSessions::kStageName.rawData();
     }
 
     Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final {
@@ -110,7 +111,8 @@ public:
                                      DiskUseRequirement::kNoDiskUse,
                                      FacetRequirement::kNotAllowed,
                                      TransactionRequirement::kNotAllowed,
-                                     LookupRequirement::kAllowed);
+                                     LookupRequirement::kAllowed,
+                                     UnionRequirement::kNotAllowed);
 
         constraints.isIndependentOfAnyCollection = true;
         constraints.requiresInputDocSource = false;
@@ -127,6 +129,8 @@ public:
 private:
     DocumentSourceListLocalSessions(const boost::intrusive_ptr<ExpressionContext>& pExpCtx,
                                     const ListSessionsSpec& spec);
+
+    GetNextResult doGetNext() final;
 
     const ListSessionsSpec _spec;
     const LogicalSessionCache* _cache;

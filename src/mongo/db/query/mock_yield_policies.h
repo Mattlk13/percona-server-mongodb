@@ -30,27 +30,42 @@
 #pragma once
 
 #include "mongo/base/error_codes.h"
-#include "mongo/db/query/plan_yield_policy.h"
+#include "mongo/db/query/plan_executor.h"
 
 namespace mongo {
+
+/**
+ * A base class from which all mocked yield policy implementations used for testing should derive.
+ */
+class MockYieldPolicy : public PlanYieldPolicy {
+public:
+    MockYieldPolicy(ClockSource* clockSource, PlanYieldPolicy::YieldPolicy policy)
+        : PlanYieldPolicy(policy, clockSource, 0, Milliseconds{0}, nullptr, nullptr) {}
+
+private:
+    void saveState(OperationContext* opCtx) override final {
+        MONGO_UNREACHABLE;
+    }
+
+    void restoreState(OperationContext* opCtx, const Yieldable* yieldable) override final {
+        MONGO_UNREACHABLE;
+    }
+};
 
 /**
  * A custom yield policy that always reports the plan should yield, and always returns
  * ErrorCodes::ExceededTimeLimit from yield().
  */
-class AlwaysTimeOutYieldPolicy : public PlanYieldPolicy {
+class AlwaysTimeOutYieldPolicy final : public MockYieldPolicy {
 public:
-    AlwaysTimeOutYieldPolicy(PlanExecutor* exec)
-        : PlanYieldPolicy(exec, PlanExecutor::YieldPolicy::ALWAYS_TIME_OUT) {}
-
     AlwaysTimeOutYieldPolicy(ClockSource* cs)
-        : PlanYieldPolicy(PlanExecutor::YieldPolicy::ALWAYS_TIME_OUT, cs) {}
+        : MockYieldPolicy(cs, PlanYieldPolicy::YieldPolicy::ALWAYS_TIME_OUT) {}
 
-    bool shouldYieldOrInterrupt() override {
+    bool shouldYieldOrInterrupt(OperationContext*) override {
         return true;
     }
 
-    Status yieldOrInterrupt(stdx::function<void()> whileYieldingFn) override {
+    Status yieldOrInterrupt(OperationContext*, std::function<void()> whileYieldingFn) override {
         return {ErrorCodes::ExceededTimeLimit, "Using AlwaysTimeOutYieldPolicy"};
     }
 };
@@ -59,20 +74,35 @@ public:
  * A custom yield policy that always reports the plan should yield, and always returns
  * ErrorCodes::QueryPlanKilled from yield().
  */
-class AlwaysPlanKilledYieldPolicy : public PlanYieldPolicy {
+class AlwaysPlanKilledYieldPolicy final : public MockYieldPolicy {
 public:
-    AlwaysPlanKilledYieldPolicy(PlanExecutor* exec)
-        : PlanYieldPolicy(exec, PlanExecutor::YieldPolicy::ALWAYS_MARK_KILLED) {}
-
     AlwaysPlanKilledYieldPolicy(ClockSource* cs)
-        : PlanYieldPolicy(PlanExecutor::YieldPolicy::ALWAYS_MARK_KILLED, cs) {}
+        : MockYieldPolicy(cs, PlanYieldPolicy::YieldPolicy::ALWAYS_MARK_KILLED) {}
 
-    bool shouldYieldOrInterrupt() override {
+    bool shouldYieldOrInterrupt(OperationContext*) override {
         return true;
     }
 
-    Status yieldOrInterrupt(stdx::function<void()> whileYieldingFn) override {
+    Status yieldOrInterrupt(OperationContext*, std::function<void()> whileYieldingFn) override {
         return {ErrorCodes::QueryPlanKilled, "Using AlwaysPlanKilledYieldPolicy"};
+    }
+};
+
+/**
+ * A yield policy for testing which never reports that the plan should yield, as
+ * 'shouldYieldOrInterrupt()' always returns false.
+ */
+class NoopYieldPolicy final : public MockYieldPolicy {
+public:
+    NoopYieldPolicy(ClockSource* clockSource)
+        : MockYieldPolicy(clockSource, PlanYieldPolicy::YieldPolicy::NO_YIELD) {}
+
+    bool shouldYieldOrInterrupt(OperationContext*) override {
+        return false;
+    }
+
+    Status yieldOrInterrupt(OperationContext*, std::function<void()> whileYieldingFn) override {
+        MONGO_UNREACHABLE;
     }
 };
 

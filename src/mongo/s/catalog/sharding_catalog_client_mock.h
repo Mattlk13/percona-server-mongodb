@@ -38,31 +38,23 @@ namespace mongo {
  */
 class ShardingCatalogClientMock : public ShardingCatalogClient {
 public:
-    ShardingCatalogClientMock(std::unique_ptr<DistLockManager> distLockManager);
+    ShardingCatalogClientMock();
     ~ShardingCatalogClientMock();
 
-    void startup() override;
+    DatabaseType getDatabase(OperationContext* opCtx,
+                             StringData db,
+                             repl::ReadConcernLevel readConcernLevel) override;
 
-    void shutDown(OperationContext* opCtx) override;
+    std::vector<DatabaseType> getAllDBs(OperationContext* opCtx,
+                                        repl::ReadConcernLevel readConcern) override;
 
-    StatusWith<repl::OpTimeWith<DatabaseType>> getDatabase(
-        OperationContext* opCtx,
-        const std::string& dbName,
-        repl::ReadConcernLevel readConcernLevel) override;
+    CollectionType getCollection(OperationContext* opCtx,
+                                 const NamespaceString& nss,
+                                 repl::ReadConcernLevel readConcernLevel) override;
 
-    StatusWith<repl::OpTimeWith<std::vector<DatabaseType>>> getAllDBs(
-        OperationContext* opCtx, repl::ReadConcernLevel readConcern) override;
-
-    StatusWith<repl::OpTimeWith<CollectionType>> getCollection(
-        OperationContext* opCtx,
-        const NamespaceString& nss,
-        repl::ReadConcernLevel readConcernLevel) override;
-
-    StatusWith<std::vector<CollectionType>> getCollections(
-        OperationContext* opCtx,
-        const std::string* dbName,
-        repl::OpTime* optime,
-        repl::ReadConcernLevel readConcernLevel) override;
+    std::vector<CollectionType> getCollections(OperationContext* opCtx,
+                                               StringData db,
+                                               repl::ReadConcernLevel readConcernLevel) override;
 
     std::vector<NamespaceString> getAllShardedCollectionsForDb(
         OperationContext* opCtx, StringData dbName, repl::ReadConcernLevel readConcern) override;
@@ -75,7 +67,14 @@ public:
                                                  const BSONObj& sort,
                                                  boost::optional<int> limit,
                                                  repl::OpTime* opTime,
-                                                 repl::ReadConcernLevel readConcern) override;
+                                                 repl::ReadConcernLevel readConcern,
+                                                 const boost::optional<BSONObj>& hint) override;
+
+    std::pair<CollectionType, std::vector<ChunkType>> getCollectionAndChunks(
+        OperationContext* opCtx,
+        const NamespaceString& nss,
+        const ChunkVersion& sinceVersion,
+        const repl::ReadConcernArgs& readConcern) override;
 
     StatusWith<std::vector<TagsType>> getTagsForCollection(OperationContext* opCtx,
                                                            const NamespaceString& nss) override;
@@ -83,11 +82,13 @@ public:
     StatusWith<repl::OpTimeWith<std::vector<ShardType>>> getAllShards(
         OperationContext* opCtx, repl::ReadConcernLevel readConcern) override;
 
-    bool runUserManagementWriteCommand(OperationContext* opCtx,
-                                       const std::string& commandName,
-                                       const std::string& dbname,
-                                       const BSONObj& cmdObj,
-                                       BSONObjBuilder* result) override;
+    Status runUserManagementWriteCommand(OperationContext* opCtx,
+                                         StringData commandName,
+                                         StringData dbname,
+                                         const BSONObj& cmdObj,
+                                         BSONObjBuilder* result) override {
+        return Status::OK();
+    }
 
     bool runUserManagementReadCommand(OperationContext* opCtx,
                                       const std::string& dbname,
@@ -106,10 +107,6 @@ public:
 
     StatusWith<VersionType> getConfigVersion(OperationContext* opCtx,
                                              repl::ReadConcernLevel readConcern) override;
-
-    void writeConfigServerDirect(OperationContext* opCtx,
-                                 const BatchedCommandRequest& request,
-                                 BatchedCommandResponse* response) override;
 
     Status insertConfigDocument(OperationContext* opCtx,
                                 const NamespaceString& nss,
@@ -133,9 +130,7 @@ public:
                                  const BSONObj& query,
                                  const WriteConcernOptions& writeConcern) override;
 
-    Status createDatabase(OperationContext* opCtx, const std::string& dbName);
-
-    DistLockManager* getDistLockManager() override;
+    Status createDatabase(OperationContext* opCtx, StringData dbName, ShardId primaryShard);
 
     StatusWith<std::vector<KeysCollectionDocument>> getNewKeys(
         OperationContext* opCtx,
@@ -144,8 +139,6 @@ public:
         repl::ReadConcernLevel readConcernLevel) override;
 
 private:
-    std::unique_ptr<DistLockManager> _distLockManager;
-
     StatusWith<repl::OpTimeWith<std::vector<BSONObj>>> _exhaustiveFindOnConfig(
         OperationContext* opCtx,
         const ReadPreferenceSetting& readPref,
@@ -153,7 +146,8 @@ private:
         const NamespaceString& nss,
         const BSONObj& query,
         const BSONObj& sort,
-        boost::optional<long long> limit) override;
+        boost::optional<long long> limit,
+        const boost::optional<BSONObj>& hint) override;
 };
 
 }  // namespace mongo

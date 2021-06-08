@@ -27,21 +27,36 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/db/auth/authorization_checks.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/coll_mod_gen.h"
+#include "mongo/db/coll_mod_reply_validation.h"
 #include "mongo/db/commands.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/cluster_commands_helpers.h"
-#include "mongo/util/log.h"
+#include "mongo/s/grid.h"
 
 namespace mongo {
 namespace {
 
-class CollectionModCmd : public ErrmsgCommandDeprecated {
+constexpr auto kRawFieldName = "raw"_sd;
+constexpr auto kWriteConcernErrorFieldName = "writeConcernError"_sd;
+constexpr auto kTopologyVersionFieldName = "topologyVersion"_sd;
+
+class CollectionModCmd : public BasicCommandWithRequestParser<CollectionModCmd> {
 public:
-    CollectionModCmd() : ErrmsgCommandDeprecated("collMod") {}
+    using Request = CollMod;
+    using Reply = CollModReply;
+
+    CollectionModCmd() : BasicCommandWithRequestParser() {}
+
+    const std::set<std::string>& apiVersions() const {
+        return kApiVersions1;
+    }
 
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
@@ -55,31 +70,90 @@ public:
                                const std::string& dbname,
                                const BSONObj& cmdObj) const override {
         const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbname, cmdObj));
-        return AuthorizationSession::get(client)->checkAuthForCollMod(nss, cmdObj, true);
+        return auth::checkAuthForCollMod(AuthorizationSession::get(client), nss, cmdObj, true);
     }
 
     bool supportsWriteConcern(const BSONObj& cmd) const override {
         return true;
     }
 
-    bool errmsgRun(OperationContext* opCtx,
-                   const std::string& dbName,
-                   const BSONObj& cmdObj,
-                   std::string& errmsg,
-                   BSONObjBuilder& output) override {
-        const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbName, cmdObj));
-        LOG(1) << "collMod: " << nss << " cmd:" << redact(cmdObj);
+    bool runWithRequestParser(OperationContext* opCtx,
+                              const std::string& db,
+                              const BSONObj& cmdObj,
+                              const RequestParser& requestParser,
+                              BSONObjBuilder& result) final {
+        auto cmd = requestParser.request();
+        auto nss = cmd.getNamespace();
+        LOGV2_DEBUG(22748,
+                    1,
+                    "collMod: {namespace} cmd: {command}",
+                    "CMD: collMod",
+                    "namespace"_attr = nss,
+                    "command"_attr = redact(cmdObj));
 
-        auto shardResponses = scatterGatherOnlyVersionIfUnsharded(
+        auto routingInfo =
+            uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss));
+        auto shardResponses = scatterGatherVersionedTargetByRoutingTable(
             opCtx,
+            cmd.getDbName(),
             nss,
-            CommandHelpers::filterCommandRequestForPassthrough(cmdObj),
+            routingInfo,
+            applyReadWriteConcern(
+                opCtx,
+                this,
+                CommandHelpers::filterCommandRequestForPassthrough(cmd.toBSON(BSONObj()))),
             ReadPreferenceSetting::get(opCtx),
-            Shard::RetryPolicy::kNoRetry);
-        return appendRawResponses(
-            opCtx, &errmsg, &output, std::move(shardResponses), {ErrorCodes::NamespaceNotFound});
+            Shard::RetryPolicy::kNoRetry,
+            BSONObj() /* query */,
+            BSONObj() /* collation */);
+        std::string errmsg;
+        auto ok = appendRawResponses(opCtx, &errmsg, &result, std::move(shardResponses)).responseOK;
+        if (!errmsg.empty()) {
+            CommandHelpers::appendSimpleCommandStatus(result, ok, errmsg);
+        }
+
+        return ok;
     }
 
+    void validateResult(const BSONObj& resultObj) final {
+        auto ctx = IDLParserErrorContext("CollModReply");
+        if (checkIsErrorStatus(resultObj, ctx)) {
+            return;
+        }
+
+        StringDataSet ignorableFields({kWriteConcernErrorFieldName,
+                                       ErrorReply::kOkFieldName,
+                                       kTopologyVersionFieldName,
+                                       kRawFieldName});
+        auto reply = Reply::parse(ctx, resultObj.removeFields(ignorableFields));
+        coll_mod_reply_validation::validateReply(reply);
+
+        if (!resultObj.hasField(kRawFieldName)) {
+            return;
+        }
+
+        const auto& rawData = resultObj[kRawFieldName];
+        if (!ctx.checkAndAssertType(rawData, Object)) {
+            return;
+        }
+
+        auto rawCtx = IDLParserErrorContext(kRawFieldName, &ctx);
+        for (const auto& element : rawData.Obj()) {
+            if (!rawCtx.checkAndAssertType(element, Object)) {
+                return;
+            }
+
+            const auto& shardReply = element.Obj();
+            if (!checkIsErrorStatus(shardReply, ctx)) {
+                auto reply = Reply::parse(ctx, shardReply.removeFields(ignorableFields));
+                coll_mod_reply_validation::validateReply(reply);
+            }
+        }
+    }
+
+    const AuthorizationContract* getAuthorizationContract() const final {
+        return &::mongo::CollMod::kAuthorizationContract;
+    }
 } collectionModCmd;
 
 }  // namespace

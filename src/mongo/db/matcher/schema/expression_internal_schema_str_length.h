@@ -29,20 +29,22 @@
 
 #pragma once
 
+#include <functional>
+
 #include "mongo/base/string_data.h"
 #include "mongo/db/matcher/expression_leaf.h"
-#include "mongo/stdx/functional.h"
 
 namespace mongo {
 
 class InternalSchemaStrLengthMatchExpression : public LeafMatchExpression {
 public:
-    using Validator = stdx::function<bool(int)>;
+    using Validator = std::function<bool(int)>;
 
     InternalSchemaStrLengthMatchExpression(MatchType type,
                                            StringData path,
                                            long long strLen,
-                                           StringData name);
+                                           StringData name,
+                                           clonable_ptr<ErrorAnnotation> annotation = nullptr);
 
     virtual ~InternalSchemaStrLengthMatchExpression() {}
 

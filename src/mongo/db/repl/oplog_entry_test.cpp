@@ -30,6 +30,7 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/repl/idempotency_test_fixture.h"
+#include "mongo/db/repl/oplog_entry_test_helpers.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -101,6 +102,37 @@ TEST(OplogEntryTest, Create) {
                       BSON("create" << nss.coll() << "capped" << true << "size" << 15));
     ASSERT(entry.getCommandType() == OplogEntry::CommandType::kCreate);
     ASSERT_EQ(entry.getOpTime(), entryOpTime);
+}
+
+TEST(OplogEntryTest, OpTimeBaseNonStrictParsing) {
+    const BSONObj oplogEntryExtraField = BSON("ts" << Timestamp(0, 0) << "t" << 0LL << "op"
+                                                   << "c"
+                                                   << "ns" << nss.ns() << "wall" << Date_t() << "o"
+                                                   << BSON("_id" << 1) << "extraField" << 3);
+
+    // OpTimeBase should be successfully created from an OplogEntry, even though it has
+    // extraneous fields.
+    UNIT_TEST_INTERNALS_IGNORE_UNUSED_RESULT_WARNINGS(
+        OpTimeBase::parse(IDLParserErrorContext("OpTimeBase"), oplogEntryExtraField));
+
+    // OplogEntryBase should still use strict parsing and throw an error when it has extraneous
+    // fields.
+    ASSERT_THROWS_CODE(
+        OplogEntryBase::parse(IDLParserErrorContext("OplogEntryBase"), oplogEntryExtraField),
+        AssertionException,
+        40415);
+
+    const BSONObj oplogEntryMissingTimestamp =
+        BSON("t" << 0LL << "op"
+                 << "c"
+                 << "ns" << nss.ns() << "wall" << Date_t() << "o" << BSON("_id" << 1));
+
+    // When an OplogEntryBase is created with a missing required field in a chained struct, it
+    // should throw an exception.
+    ASSERT_THROWS_CODE(
+        OplogEntryBase::parse(IDLParserErrorContext("OplogEntryBase"), oplogEntryMissingTimestamp),
+        AssertionException,
+        40414);
 }
 
 

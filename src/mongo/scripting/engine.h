@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include "mongo/base/string_data.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/service_context.h"
 #include "mongo/platform/atomic_word.h"
@@ -65,8 +66,8 @@ public:
     }
 
     virtual void externalSetup() = 0;
-    virtual void setLocalDB(const std::string& localDBName) {
-        _localDBName = localDBName;
+    virtual void setLocalDB(StringData localDBName) {
+        _localDBName = localDBName.toString();
     }
 
     virtual BSONObj getObject(const char* field) = 0;
@@ -140,7 +141,7 @@ public:
         uasserted(9005, std::string("invoke failed: ") + getError());
     }
 
-    virtual void injectNative(const char* field, NativeFunction func, void* data = 0) = 0;
+    virtual void injectNative(const char* field, NativeFunction func, void* data = nullptr) = 0;
 
     virtual bool exec(StringData code,
                       const std::string& name,
@@ -209,15 +210,19 @@ class ScriptEngine : public KillOpListenerInterface {
     ScriptEngine& operator=(const ScriptEngine&) = delete;
 
 public:
-    ScriptEngine();
+    ScriptEngine(bool disableLoadStored);
     virtual ~ScriptEngine();
 
     virtual Scope* newScope() {
         return createScope();
     }
 
-    virtual Scope* newScopeForCurrentThread() {
-        return createScopeForCurrentThread();
+    virtual Scope* newScopeForCurrentThread(boost::optional<int> jsHeapLimitMB) {
+        return createScopeForCurrentThread(jsHeapLimitMB);
+    }
+
+    Scope* newScopeForCurrentThread() {
+        return newScopeForCurrentThread(boost::none);
     }
 
     virtual void runTest() = 0;
@@ -233,7 +238,12 @@ public:
     virtual int getJSHeapLimitMB() const = 0;
     virtual void setJSHeapLimitMB(int limit) = 0;
 
-    static void setup();
+    /**
+     * Calls the constructor for the Global ScriptEngine. 'disableLoadStored' causes future calls to
+     * the function Scope::loadStored(), which would otherwise load stored procedures, to be
+     * ignored.
+     */
+    static void setup(bool disableLoadStored = true);
     static void dropScopeCache();
 
     /** gets a scope from the pool or a new one if pool is empty
@@ -249,12 +259,12 @@ public:
     void setScopeInitCallback(void (*func)(Scope&)) {
         _scopeInitCallback = func;
     }
-    static void setConnectCallback(void (*func)(DBClientBase&)) {
+    static void setConnectCallback(void (*func)(DBClientBase&, StringData)) {
         _connectCallback = func;
     }
-    static void runConnectCallback(DBClientBase& c) {
+    static void runConnectCallback(DBClientBase& c, StringData uri) {
         if (_connectCallback)
-            _connectCallback(c);
+            _connectCallback(c, uri);
     }
 
     // engine implementation may either respond to interrupt events or
@@ -263,14 +273,15 @@ public:
     virtual void interruptAll() {}
 
     static std::string getInterpreterVersionString();
+    const bool _disableLoadStored;
 
 protected:
     virtual Scope* createScope() = 0;
-    virtual Scope* createScopeForCurrentThread() = 0;
+    virtual Scope* createScopeForCurrentThread(boost::optional<int> jsHeapLimitMB) = 0;
     void (*_scopeInitCallback)(Scope&);
 
 private:
-    static void (*_connectCallback)(DBClientBase&);
+    static void (*_connectCallback)(DBClientBase&, StringData);
 };
 
 void installGlobalUtils(Scope& scope);
@@ -279,4 +290,5 @@ const char* jsSkipWhiteSpace(const char* raw);
 
 ScriptEngine* getGlobalScriptEngine();
 void setGlobalScriptEngine(ScriptEngine* impl);
-}
+
+}  // namespace mongo

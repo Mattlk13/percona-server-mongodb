@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -38,6 +38,7 @@
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/write_concern_options.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/balancer_configuration.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/shard_registry.h"
@@ -45,7 +46,6 @@
 #include "mongo/s/config_server_client.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/migration_secondary_throttle_options.h"
-#include "mongo/util/log.h"
 #include "mongo/util/timer.h"
 
 namespace mongo {
@@ -99,10 +99,9 @@ public:
 
         const NamespaceString nss(parseNs(dbname, cmdObj));
 
-        auto routingInfo = uassertStatusOK(
+        const auto cm = uassertStatusOK(
             Grid::get(opCtx)->catalogCache()->getShardedCollectionRoutingInfoWithRefresh(opCtx,
                                                                                          nss));
-        const auto cm = routingInfo.cm();
 
         const auto toElt = cmdObj["to"];
         uassert(ErrorCodes::TypeMismatch,
@@ -116,15 +115,18 @@ public:
 
         const auto toStatus = Grid::get(opCtx)->shardRegistry()->getShard(opCtx, toString);
         if (!toStatus.isOK()) {
-            std::string msg(str::stream() << "Could not move chunk in '" << nss.ns()
-                                          << "' to shard '"
-                                          << toString
-                                          << "' because that shard does not exist");
-            log() << msg;
-            uasserted(ErrorCodes::ShardNotFound, msg);
+            LOGV2_OPTIONS(22755,
+                          {logv2::UserAssertAfterLog(ErrorCodes::ShardNotFound)},
+                          "Could not move chunk in {namespace} to {toShardId} because that shard"
+                          " does not exist",
+                          "moveChunk destination shard does not exist",
+                          "toShardId"_attr = toString,
+                          "namespace"_attr = nss.ns());
         }
 
         const auto to = toStatus.getValue();
+        const auto forceJumboElt = cmdObj["forceJumbo"];
+        const auto forceJumbo = forceJumboElt && forceJumboElt.Bool();
 
         // so far, chunk size serves test purposes; it may or may not become a supported parameter
         long long maxChunkSizeBytes = cmdObj["maxChunkSizeBytes"].numberLong();
@@ -147,28 +149,28 @@ public:
         if (!find.isEmpty()) {
             // find
             BSONObj shardKey =
-                uassertStatusOK(cm->getShardKeyPattern().extractShardKeyFromQuery(opCtx, find));
+                uassertStatusOK(cm.getShardKeyPattern().extractShardKeyFromQuery(opCtx, nss, find));
             if (shardKey.isEmpty()) {
                 errmsg = str::stream() << "no shard key found in chunk query " << find;
                 return false;
             }
 
-            chunk.emplace(cm->findIntersectingChunkWithSimpleCollation(shardKey));
+            chunk.emplace(cm.findIntersectingChunkWithSimpleCollation(shardKey));
         } else {
             // bounds
-            if (!cm->getShardKeyPattern().isShardKey(bounds[0].Obj()) ||
-                !cm->getShardKeyPattern().isShardKey(bounds[1].Obj())) {
-                errmsg = str::stream() << "shard key bounds "
-                                       << "[" << bounds[0].Obj() << "," << bounds[1].Obj() << ")"
-                                       << " are not valid for shard key pattern "
-                                       << cm->getShardKeyPattern().toBSON();
+            if (!cm.getShardKeyPattern().isShardKey(bounds[0].Obj()) ||
+                !cm.getShardKeyPattern().isShardKey(bounds[1].Obj())) {
+                errmsg = str::stream()
+                    << "shard key bounds "
+                    << "[" << bounds[0].Obj() << "," << bounds[1].Obj() << ")"
+                    << " are not valid for shard key pattern " << cm.getShardKeyPattern().toBSON();
                 return false;
             }
 
-            BSONObj minKey = cm->getShardKeyPattern().normalizeShardKey(bounds[0].Obj());
-            BSONObj maxKey = cm->getShardKeyPattern().normalizeShardKey(bounds[1].Obj());
+            BSONObj minKey = cm.getShardKeyPattern().normalizeShardKey(bounds[0].Obj());
+            BSONObj maxKey = cm.getShardKeyPattern().normalizeShardKey(bounds[1].Obj());
 
-            chunk.emplace(cm->findIntersectingChunkWithSimpleCollation(minKey));
+            chunk.emplace(cm.findIntersectingChunkWithSimpleCollation(minKey));
 
             if (chunk->getMin().woCompare(minKey) != 0 || chunk->getMax().woCompare(maxKey) != 0) {
                 errmsg = str::stream() << "no chunk found with the shard key bounds "
@@ -185,7 +187,7 @@ public:
         chunkType.setMin(chunk->getMin());
         chunkType.setMax(chunk->getMax());
         chunkType.setShard(chunk->getShardId());
-        chunkType.setVersion(cm->getVersion());
+        chunkType.setVersion(cm.getVersion());
 
         uassertStatusOK(configsvr_client::moveChunk(opCtx,
                                                     chunkType,
@@ -193,9 +195,17 @@ public:
                                                     maxChunkSizeBytes,
                                                     secondaryThrottle,
                                                     cmdObj["_waitForDelete"].trueValue() ||
-                                                        cmdObj["waitForDelete"].trueValue()));
+                                                        cmdObj["waitForDelete"].trueValue(),
+                                                    forceJumbo));
 
-        Grid::get(opCtx)->catalogCache()->onStaleShardVersion(std::move(routingInfo));
+        Grid::get(opCtx)
+            ->catalogCache()
+            ->invalidateShardOrEntireCollectionEntryForShardedCollection(
+                nss, boost::none, chunk->getShardId());
+        Grid::get(opCtx)
+            ->catalogCache()
+            ->invalidateShardOrEntireCollectionEntryForShardedCollection(
+                nss, boost::none, to->getId());
 
         result.append("millis", t.millis());
         return true;

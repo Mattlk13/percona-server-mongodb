@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -42,7 +42,7 @@
 #include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_size_storer.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
@@ -64,7 +64,7 @@ WiredTigerSizeStorer::WiredTigerSizeStorer(WT_CONNECTION* conn,
 }
 
 WiredTigerSizeStorer::~WiredTigerSizeStorer() {
-    stdx::lock_guard<stdx::mutex> cursorLock(_cursorMutex);
+    stdx::lock_guard<Latch> cursorLock(_cursorMutex);
     _cursor->close(_cursor);
 }
 
@@ -74,7 +74,7 @@ void WiredTigerSizeStorer::store(StringData uri, std::shared_ptr<SizeInfo> sizeI
         return;
 
     // Ordering is important: as the entry may be flushed concurrently, set the dirty flag last.
-    stdx::lock_guard<stdx::mutex> lk(_bufferMutex);
+    stdx::lock_guard<Latch> lk(_bufferMutex);
     auto& entry = _buffer[uri];
     // During rollback it is possible to get a new SizeInfo. In that case clear the dirty flag,
     // so the SizeInfo can be destructed without triggering the dirty check invariant.
@@ -82,21 +82,27 @@ void WiredTigerSizeStorer::store(StringData uri, std::shared_ptr<SizeInfo> sizeI
         entry->_dirty.store(false);
     entry = sizeInfo;
     entry->_dirty.store(true);
-    LOG(2) << "WiredTigerSizeStorer::store Marking " << uri
-           << " dirty, numRecords: " << sizeInfo->numRecords.load()
-           << ", dataSize: " << sizeInfo->dataSize.load() << ", use_count: " << entry.use_count();
+    LOGV2_DEBUG(
+        22423,
+        2,
+        "WiredTigerSizeStorer::store Marking {uri} dirty, numRecords: {sizeInfo_numRecords_load}, "
+        "dataSize: {sizeInfo_dataSize_load}, use_count: {entry_use_count}",
+        "uri"_attr = uri,
+        "sizeInfo_numRecords_load"_attr = sizeInfo->numRecords.load(),
+        "sizeInfo_dataSize_load"_attr = sizeInfo->dataSize.load(),
+        "entry_use_count"_attr = entry.use_count());
 }
 
 std::shared_ptr<WiredTigerSizeStorer::SizeInfo> WiredTigerSizeStorer::load(StringData uri) const {
     {
         // Check if we can satisfy the read from the buffer.
-        stdx::lock_guard<stdx::mutex> bufferLock(_bufferMutex);
+        stdx::lock_guard<Latch> bufferLock(_bufferMutex);
         Buffer::const_iterator it = _buffer.find(uri);
         if (it != _buffer.end())
             return it->second;
     }
 
-    stdx::lock_guard<stdx::mutex> cursorLock(_cursorMutex);
+    stdx::lock_guard<Latch> cursorLock(_cursorMutex);
     // Intentionally ignoring return value.
     ON_BLOCK_EXIT([&] { _cursor->reset(_cursor); });
 
@@ -115,17 +121,19 @@ std::shared_ptr<WiredTigerSizeStorer::SizeInfo> WiredTigerSizeStorer::load(Strin
     invariantWTOK(_cursor->get_value(_cursor, &value));
     BSONObj data(reinterpret_cast<const char*>(value.data));
 
-    LOG(2) << "WiredTigerSizeStorer::load " << uri << " -> " << redact(data);
-    auto result = std::make_shared<SizeInfo>();
-    result->numRecords.store(data["numRecords"].safeNumberLong());
-    result->dataSize.store(data["dataSize"].safeNumberLong());
-    return result;
+    LOGV2_DEBUG(22424,
+                2,
+                "WiredTigerSizeStorer::load {uri} -> {data}",
+                "uri"_attr = uri,
+                "data"_attr = redact(data));
+    return std::make_shared<SizeInfo>(data["numRecords"].safeNumberLong(),
+                                      data["dataSize"].safeNumberLong());
 }
 
 void WiredTigerSizeStorer::flush(bool syncToDisk) {
     Buffer buffer;
     {
-        stdx::lock_guard<stdx::mutex> bufferLock(_bufferMutex);
+        stdx::lock_guard<Latch> bufferLock(_bufferMutex);
         _buffer.swap(buffer);
     }
 
@@ -133,13 +141,13 @@ void WiredTigerSizeStorer::flush(bool syncToDisk) {
         return;  // Nothing to do.
 
     Timer t;
-    stdx::lock_guard<stdx::mutex> cursorLock(_cursorMutex);
+    stdx::lock_guard<Latch> cursorLock(_cursorMutex);
     {
         // On failure, place entries back into the map, unless a newer value already exists.
         ON_BLOCK_EXIT([this, &buffer]() {
             this->_cursor->reset(this->_cursor);
             if (!buffer.empty()) {
-                stdx::lock_guard<stdx::mutex> bufferLock(this->_bufferMutex);
+                stdx::lock_guard<Latch> bufferLock(this->_bufferMutex);
                 for (auto& it : buffer)
                     this->_buffer.try_emplace(it.first, it.second);
             }
@@ -159,7 +167,11 @@ void WiredTigerSizeStorer::flush(bool syncToDisk) {
                                              << sizeInfo.dataSize.load());
 
             auto& uri = it->first;
-            LOG(2) << "WiredTigerSizeStorer::flush " << uri << " -> " << redact(data);
+            LOGV2_DEBUG(22425,
+                        2,
+                        "WiredTigerSizeStorer::flush {uri} -> {data}",
+                        "uri"_attr = uri,
+                        "data"_attr = redact(data));
             WiredTigerItem key(uri.c_str(), uri.size());
             WiredTigerItem value(data.objdata(), data.objsize());
             _cursor->set_key(_cursor, key.Get());
@@ -172,6 +184,6 @@ void WiredTigerSizeStorer::flush(bool syncToDisk) {
     }
 
     auto micros = t.micros();
-    LOG(2) << "WiredTigerSizeStorer flush took " << micros << " µs";
+    LOGV2_DEBUG(22426, 2, "WiredTigerSizeStorer flush took {micros} µs", "micros"_attr = micros);
 }
 }  // namespace mongo

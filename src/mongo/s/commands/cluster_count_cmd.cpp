@@ -65,6 +65,14 @@ public:
         return false;
     }
 
+    ReadConcernSupportResult supportsReadConcern(const BSONObj& cmdObj,
+                                                 repl::ReadConcernLevel level) const override {
+        static const Status kSnapshotNotSupported{ErrorCodes::InvalidOptions,
+                                                  "read concern snapshot not supported"};
+        return {{level == repl::ReadConcernLevel::kSnapshotReadConcern, kSnapshotNotSupported},
+                Status::OK()};
+    }
+
     void addRequiredPrivileges(const std::string& dbname,
                                const BSONObj& cmdObj,
                                std::vector<Privilege>* out) const override {
@@ -84,90 +92,52 @@ public:
                 str::stream() << "Invalid namespace specified '" << nss.ns() << "'",
                 nss.isValid());
 
-        long long skip = 0;
-
-        if (cmdObj["skip"].isNumber()) {
-            skip = cmdObj["skip"].numberLong();
-            if (skip < 0) {
-                errmsg = "skip value is negative in count query";
-                return false;
-            }
-        } else if (cmdObj["skip"].ok()) {
-            errmsg = "skip value is not a valid number";
-            return false;
-        }
-
-        BSONObjBuilder countCmdBuilder;
-        countCmdBuilder.append("count", nss.coll());
-
-        BSONObj filter;
-        if (cmdObj["query"].isABSONObj()) {
-            countCmdBuilder.append("query", cmdObj["query"].Obj());
-            filter = cmdObj["query"].Obj();
-        }
-
-        BSONObj collation;
-        BSONElement collationElement;
-        auto status =
-            bsonExtractTypedField(cmdObj, "collation", BSONType::Object, &collationElement);
-        if (status.isOK()) {
-            collation = collationElement.Obj();
-        } else if (status != ErrorCodes::NoSuchKey) {
-            uassertStatusOK(status);
-        }
-
-        if (cmdObj["limit"].isNumber()) {
-            long long limit = cmdObj["limit"].numberLong();
+        std::vector<AsyncRequestsSender::Response> shardResponses;
+        try {
+            auto countRequest = CountCommandRequest::parse(IDLParserErrorContext("count"), cmdObj);
 
             // We only need to factor in the skip value when sending to the shards if we
             // have a value for limit, otherwise, we apply it only once we have collected all
             // counts.
-            if (limit != 0 && cmdObj["skip"].isNumber()) {
-                if (limit > 0)
-                    limit += skip;
-                else
-                    limit -= skip;
+            if (countRequest.getLimit() && countRequest.getSkip()) {
+                const auto limit = countRequest.getLimit().get();
+                if (limit != 0) {
+                    countRequest.setLimit(limit + countRequest.getSkip().get());
+                }
             }
-
-            countCmdBuilder.append("limit", limit);
-        }
-
-        const std::initializer_list<StringData> passthroughFields = {
-            "$queryOptions", "collation", "hint", "readConcern", QueryRequest::cmdOptionMaxTimeMS,
-        };
-        for (auto name : passthroughFields) {
-            if (auto field = cmdObj[name]) {
-                countCmdBuilder.append(field);
-            }
-        }
-
-        auto countCmdObj = countCmdBuilder.done();
-
-        std::vector<AsyncRequestsSender::Response> shardResponses;
-        try {
+            countRequest.setSkip(boost::none);
             const auto routingInfo = uassertStatusOK(
                 Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss));
-            shardResponses =
-                scatterGatherVersionedTargetByRoutingTable(opCtx,
-                                                           nss.db(),
-                                                           nss,
-                                                           routingInfo,
-                                                           countCmdObj,
-                                                           ReadPreferenceSetting::get(opCtx),
-                                                           Shard::RetryPolicy::kIdempotent,
-                                                           filter,
-                                                           collation);
+            const auto collation = countRequest.getCollation().get_value_or(BSONObj());
+            shardResponses = scatterGatherVersionedTargetByRoutingTable(
+                opCtx,
+                nss.db(),
+                nss,
+                routingInfo,
+                applyReadWriteConcern(
+                    opCtx,
+                    this,
+                    countRequest.toBSON(
+                        CommandHelpers::filterCommandRequestForPassthrough(cmdObj))),
+                ReadPreferenceSetting::get(opCtx),
+                Shard::RetryPolicy::kIdempotent,
+                countRequest.getQuery(),
+                collation);
         } catch (const ExceptionFor<ErrorCodes::CommandOnShardedViewNotSupportedOnMongod>& ex) {
             // Rewrite the count command as an aggregation.
-
-            auto countRequest = CountCommand::parse(IDLParserErrorContext("count"), cmdObj);
+            auto countRequest = CountCommandRequest::parse(IDLParserErrorContext("count"), cmdObj);
             auto aggCmdOnView =
                 uassertStatusOK(countCommandAsAggregationCommand(countRequest, nss));
-            auto aggRequestOnView =
-                uassertStatusOK(AggregationRequest::parseFromBSON(nss, aggCmdOnView));
+            auto aggCmdOnViewObj = OpMsgRequest::fromDBAndBody(nss.db(), aggCmdOnView).body;
+            auto aggRequestOnView = aggregation_request_helper::parseFromBSON(
+                nss,
+                aggCmdOnViewObj,
+                boost::none,
+                APIParameters::get(opCtx).getAPIStrict().value_or(false));
 
             auto resolvedAggRequest = ex->asExpandedViewAggregation(aggRequestOnView);
-            auto resolvedAggCmd = resolvedAggRequest.serializeToCommandObj().toBson();
+            auto resolvedAggCmd =
+                aggregation_request_helper::serializeToCommandObj(resolvedAggRequest);
 
             BSONObj aggResult = CommandHelpers::runCommandDirectly(
                 opCtx, OpMsgRequest::fromDBAndBody(dbname, std::move(resolvedAggCmd)));
@@ -259,9 +229,9 @@ public:
                                                            targetingQuery,
                                                            targetingCollation);
         } catch (const ExceptionFor<ErrorCodes::CommandOnShardedViewNotSupportedOnMongod>& ex) {
-            CountCommand countRequest(NamespaceStringOrUUID(NamespaceString{}));
+            CountCommandRequest countRequest(NamespaceStringOrUUID(NamespaceString{}));
             try {
-                countRequest = CountCommand::parse(IDLParserErrorContext("count"), cmdObj);
+                countRequest = CountCommandRequest::parse(IDLParserErrorContext("count"), cmdObj);
             } catch (...) {
                 return exceptionToStatus();
             }
@@ -271,17 +241,19 @@ public:
                 return aggCmdOnView.getStatus();
             }
 
-            auto aggRequestOnView =
-                AggregationRequest::parseFromBSON(nss, aggCmdOnView.getValue(), verbosity);
-            if (!aggRequestOnView.isOK()) {
-                return aggRequestOnView.getStatus();
-            }
+            auto aggCmdOnViewObj =
+                OpMsgRequest::fromDBAndBody(nss.db(), aggCmdOnView.getValue()).body;
+            auto aggRequestOnView = aggregation_request_helper::parseFromBSON(
+                nss,
+                aggCmdOnViewObj,
+                verbosity,
+                APIParameters::get(opCtx).getAPIStrict().value_or(false));
 
             auto bodyBuilder = result->getBodyBuilder();
             // An empty PrivilegeVector is acceptable because these privileges are only checked on
             // getMore and explain will not open a cursor.
             return ClusterAggregate::retryOnViewError(opCtx,
-                                                      aggRequestOnView.getValue(),
+                                                      aggRequestOnView,
                                                       *ex.extraInfo<ResolvedView>(),
                                                       nss,
                                                       PrivilegeVector(),
@@ -295,11 +267,7 @@ public:
 
         auto bodyBuilder = result->getBodyBuilder();
         return ClusterExplain::buildExplainResult(
-            opCtx,
-            ClusterExplain::downconvert(opCtx, shardResponses),
-            mongosStageName,
-            millisElapsed,
-            &bodyBuilder);
+            opCtx, shardResponses, mongosStageName, millisElapsed, cmdObj, &bodyBuilder);
     }
 
 private:

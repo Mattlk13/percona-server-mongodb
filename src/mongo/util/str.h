@@ -35,8 +35,8 @@
  * TODO: De-inline.
  */
 
+#include <algorithm>
 #include <boost/optional.hpp>
-#include <ctype.h>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -44,6 +44,8 @@
 
 #include "mongo/base/string_data.h"
 #include "mongo/bson/util/builder.h"
+#include "mongo/platform/bits.h"
+#include "mongo/util/ctype.h"
 
 namespace mongo::str {
 
@@ -69,6 +71,9 @@ public:
     }
     operator std::string() const {
         return ss.str();
+    }
+    operator std::string_view() const {
+        return ss.stringView();
     }
     operator mongo::StringData() const {
         return ss.stringData();
@@ -128,7 +133,7 @@ inline bool endsWith(const char* p, const char* suffix) {
 /** find char x, and return rest of the string thereafter, or an empty string if not found */
 inline const char* after(const char* s, char x) {
     const char* p = strchr(s, x);
-    return (p != 0) ? p + 1 : "";
+    return (p != nullptr) ? p + 1 : "";
 }
 inline mongo::StringData after(mongo::StringData s, char x) {
     auto pos = s.find(x);
@@ -138,7 +143,7 @@ inline mongo::StringData after(mongo::StringData s, char x) {
 /** find string x, and return rest of the string thereafter, or an empty string if not found */
 inline const char* after(const char* s, const char* x) {
     const char* p = strstr(s, x);
-    return (p != 0) ? p + strlen(x) : "";
+    return (p != nullptr) ? p + strlen(x) : "";
 }
 inline mongo::StringData after(mongo::StringData s, mongo::StringData x) {
     auto pos = s.find(x);
@@ -200,7 +205,7 @@ inline unsigned toUnsigned(const std::string& a) {
     unsigned x = 0;
     const char* p = a.c_str();
     while (1) {
-        if (!isdigit(*p))
+        if (!ctype::isDigit(*p))
             break;
         x = x * 10 + (*p - '0');
         p++;
@@ -262,6 +267,34 @@ inline mongo::StringData ltrim(mongo::StringData s) {
 
 /**
  * UTF-8 multi-byte code points consist of one leading byte of the form 11xxxxxx, and potentially
+ * many continuation bytes of the form 10xxxxxx. This method checks whether 'charByte' is a leading
+ * byte.
+ */
+inline bool isLeadingByte(char charByte) {
+    return (charByte & 0xc0) == 0xc0;
+}
+
+/**
+ * UTF-8 single-byte code points are of the form 0xxxxxxx. This method checks whether 'charByte' is
+ * a single-byte code point.
+ */
+inline bool isSingleByte(char charByte) {
+    return (charByte & 0x80) == 0x0;
+}
+
+inline size_t getCodePointLength(char charByte) {
+    if (isSingleByte(charByte)) {
+        return 1;
+    }
+
+    invariant(isLeadingByte(charByte));
+
+    // In UTF-8, the number of leading ones is the number of bytes the code point takes up.
+    return countLeadingZeros64(static_cast<unsigned char>(~charByte)) - 56;
+}
+
+/**
+ * UTF-8 multi-byte code points consist of one leading byte of the form 11xxxxxx, and potentially
  * many continuation bytes of the form 10xxxxxx. This method checks whether 'charByte' is a
  * continuation byte.
  */
@@ -282,6 +315,47 @@ inline size_t lengthInUTF8CodePoints(mongo::StringData str) {
     return strLen;
 }
 
+// Performs truncation at closest UTF-8 codepoint boundary to guarantee the end result to be valid
+// UTF-8 Input encoding has to be valid UTF-8. Random-access iterator required
+template <typename Iterator>
+Iterator UTF8SafeTruncation(Iterator begin, Iterator end, std::size_t maximum) {
+    // If we are requesting more bytes than exists in the range, then there's nothing to do
+    if (static_cast<size_t>(end - begin) <= maximum)
+        return end;
+
+    const auto rbegin = std::make_reverse_iterator(begin + maximum);
+    const auto rend = std::make_reverse_iterator(begin);
+    auto it = rbegin;
+
+    // Look back until we find the beginning of a unicode codepoint, extract its expected number of
+    // bytes
+    int codepoint_bytes = 0;
+    for (; it != rend; ++it) {
+        if ((*it & 0b1000'0000) == 0) {
+            codepoint_bytes = 1;
+            break;
+        } else if ((*it & 0b1100'0000) == 0b1100'0000) {
+            codepoint_bytes = 2;
+            uint8_t byte = static_cast<uint8_t>(*it) << 1;
+            while ((codepoint_bytes < 4) && ((byte <<= 1) & 0b1000'0000))
+                ++codepoint_bytes;
+            break;
+        }
+    }
+
+    // Check we had the expected number of continuation bytes. If not skip this codepoint.
+    int offset = codepoint_bytes - 1;
+    if (std::distance(rbegin, it) != offset)
+        offset = -1;  // This was a broken codepoint, go back one extra step to skip it
+
+    return it.base() + offset;
+}
+
+inline StringData UTF8SafeTruncation(StringData input, std::size_t maximum) {
+    auto truncatedEnd = UTF8SafeTruncation(input.begin(), input.end(), maximum);
+    return StringData(input.rawData(), truncatedEnd - input.begin());
+}
+
 inline int caseInsensitiveCompare(const char* s1, const char* s2) {
 #if defined(_WIN32)
     return _stricmp(s1, s2);
@@ -295,18 +369,10 @@ void splitStringDelim(const std::string& str, std::vector<std::string>* res, cha
 void joinStringDelim(const std::vector<std::string>& strs, std::string* res, char delim);
 
 inline std::string toLower(StringData input) {
-    std::string::size_type sz = input.size();
-
-    std::unique_ptr<char[]> line(new char[sz + 1]);
-    char* copy = line.get();
-
-    for (std::string::size_type i = 0; i < sz; i++) {
-        char c = input[i];
-        // See https://en.cppreference.com/w/cpp/string/byte/tolower
-        copy[i] = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
-    }
-    copy[sz] = 0;
-    return copy;
+    std::string r{input};
+    for (char& c : r)
+        c = ctype::toLower(c);
+    return r;
 }
 
 /** Functor for combining lexical and numeric comparisons. */
@@ -344,5 +410,11 @@ std::string escape(StringData s, bool escape_slash = false);
  * numerals, not even a +/- prefix or leading/trailing whitespace.
  */
 boost::optional<size_t> parseUnsignedBase10Integer(StringData integer);
+
+/**
+ * Converts a double to a string with specified precision. If unspecified, default to 17, which is
+ * the maximum decimal precision possible from a standard double.
+ */
+std::string convertDoubleToString(double d, int prec = 17);
 
 }  // namespace mongo::str

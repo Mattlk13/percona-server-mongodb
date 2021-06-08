@@ -40,43 +40,52 @@ namespace mongo {
 namespace {
 using std::vector;
 
+KeyStringSet makeKeyStringSet(std::initializer_list<BSONObj> objs) {
+    KeyStringSet keyStrings;
+    for (auto& obj : objs) {
+        KeyString::HeapBuilder keyString(
+            KeyString::Version::kLatestVersion, obj, Ordering::make(BSONObj()));
+        keyStrings.insert(keyString.release());
+    }
+    return keyStrings;
+}
+
 TEST(IndexAccessMethodSetDifference, EmptyInputsShouldHaveNoDifference) {
-    SimpleBSONObjComparator bsonCmp;
-    BSONObjSet left = bsonCmp.makeBSONObjSet();
-    BSONObjSet right = bsonCmp.makeBSONObjSet();
+    KeyStringSet left;
+    KeyStringSet right;
     auto diff = AbstractIndexAccessMethod::setDifference(left, right);
     ASSERT_EQ(0UL, diff.first.size());
     ASSERT_EQ(0UL, diff.second.size());
 }
 
 TEST(IndexAccessMethodSetDifference, EmptyLeftShouldHaveNoDifference) {
-    SimpleBSONObjComparator bsonCmp;
-    BSONObjSet left = bsonCmp.makeBSONObjSet();
-    BSONObjSet right = bsonCmp.makeBSONObjSet({BSON("" << 0)});
+    KeyStringSet left;
+    auto right = makeKeyStringSet({BSON("" << 0)});
+
     auto diff = AbstractIndexAccessMethod::setDifference(left, right);
     ASSERT_EQ(0UL, diff.first.size());
     ASSERT_EQ(1UL, diff.second.size());
 }
 
 TEST(IndexAccessMethodSetDifference, EmptyRightShouldReturnAllOfLeft) {
-    SimpleBSONObjComparator bsonCmp;
-    BSONObjSet left = bsonCmp.makeBSONObjSet({BSON("" << 0), BSON("" << 1)});
-    BSONObjSet right = bsonCmp.makeBSONObjSet();
+    auto left = makeKeyStringSet({BSON("" << 0), BSON("" << 1)});
+    KeyStringSet right;
+
     auto diff = AbstractIndexAccessMethod::setDifference(left, right);
     ASSERT_EQ(2UL, diff.first.size());
     ASSERT_EQ(0UL, diff.second.size());
 }
 
 TEST(IndexAccessMethodSetDifference, IdenticalSetsShouldHaveNoDifference) {
-    SimpleBSONObjComparator bsonCmp;
-    BSONObjSet left = bsonCmp.makeBSONObjSet({BSON("" << 0),
-                                              BSON(""
-                                                   << "string"),
-                                              BSON("" << BSONNULL)});
-    BSONObjSet right = bsonCmp.makeBSONObjSet({BSON("" << 0),
-                                               BSON(""
-                                                    << "string"),
-                                               BSON("" << BSONNULL)});
+    auto left = makeKeyStringSet({BSON("" << 0),
+                                  BSON(""
+                                       << "string"),
+                                  BSON("" << BSONNULL)});
+    auto right = makeKeyStringSet({BSON("" << 0),
+                                   BSON(""
+                                        << "string"),
+                                   BSON("" << BSONNULL)});
+
     auto diff = AbstractIndexAccessMethod::setDifference(left, right);
     ASSERT_EQ(0UL, diff.first.size());
     ASSERT_EQ(0UL, diff.second.size());
@@ -87,9 +96,8 @@ TEST(IndexAccessMethodSetDifference, IdenticalSetsShouldHaveNoDifference) {
 //
 
 void assertDistinct(BSONObj left, BSONObj right) {
-    SimpleBSONObjComparator bsonCmp;
-    BSONObjSet leftSet = bsonCmp.makeBSONObjSet({left});
-    BSONObjSet rightSet = bsonCmp.makeBSONObjSet({right});
+    auto leftSet = makeKeyStringSet({left});
+    auto rightSet = makeKeyStringSet({right});
     auto diff = AbstractIndexAccessMethod::setDifference(leftSet, rightSet);
     ASSERT_EQ(1UL, diff.first.size());
     ASSERT_EQ(1UL, diff.second.size());
@@ -127,52 +135,46 @@ TEST(IndexAccessMethodSetDifference, ZerosOfDifferentTypesAreNotEquivalent) {
 }
 
 TEST(IndexAccessMethodSetDifference, ShouldDetectOneDifferenceAmongManySimilarities) {
-    SimpleBSONObjComparator bsonCmp;
-    BSONObjSet left =
-        bsonCmp.makeBSONObjSet({BSON("" << 0),
-                                BSON(""
-                                     << "string"),
-                                BSON("" << BSONNULL),
-                                BSON("" << static_cast<long long>(1)),  // This is different.
-                                BSON("" << BSON("sub"
-                                                << "document")),
-                                BSON("" << BSON_ARRAY(1 << "hi" << 42))});
-    BSONObjSet right =
-        bsonCmp.makeBSONObjSet({BSON("" << 0),
-                                BSON(""
-                                     << "string"),
-                                BSON("" << BSONNULL),
-                                BSON("" << static_cast<double>(1.0)),  // This is different.
-                                BSON("" << BSON("sub"
-                                                << "document")),
-                                BSON("" << BSON_ARRAY(1 << "hi" << 42))});
+    auto left = makeKeyStringSet({BSON("" << 0),
+                                  BSON(""
+                                       << "string"),
+                                  BSON("" << BSONNULL),
+                                  BSON("" << static_cast<long long>(1)),  // This is different.
+                                  BSON("" << BSON("sub"
+                                                  << "document")),
+                                  BSON("" << BSON_ARRAY(1 << "hi" << 42))});
+    auto right = makeKeyStringSet({BSON("" << 0),
+                                   BSON(""
+                                        << "string"),
+                                   BSON("" << BSONNULL),
+                                   BSON("" << static_cast<double>(1.0)),  // This is different.
+                                   BSON("" << BSON("sub"
+                                                   << "document")),
+                                   BSON("" << BSON_ARRAY(1 << "hi" << 42))});
     auto diff = AbstractIndexAccessMethod::setDifference(left, right);
     ASSERT_EQUALS(1UL, diff.first.size());
     ASSERT_EQUALS(1UL, diff.second.size());
 }
 
 TEST(IndexAccessMethodSetDifference, SingleObjInLeftShouldFindCorrespondingObjInRight) {
-    SimpleBSONObjComparator bsonCmp;
-    BSONObjSet left = bsonCmp.makeBSONObjSet({BSON("" << 2)});
-    BSONObjSet right = bsonCmp.makeBSONObjSet({BSON("" << 1), BSON("" << 2), BSON("" << 3)});
+    auto left = makeKeyStringSet({BSON("" << 2)});
+    auto right = makeKeyStringSet({BSON("" << 1), BSON("" << 2), BSON("" << 3)});
     auto diff = AbstractIndexAccessMethod::setDifference(left, right);
     ASSERT_EQUALS(0UL, diff.first.size());
     ASSERT_EQUALS(2UL, diff.second.size());
 }
 
 TEST(IndexAccessMethodSetDifference, SingleObjInRightShouldFindCorrespondingObjInLeft) {
-    SimpleBSONObjComparator bsonCmp;
-    BSONObjSet left = bsonCmp.makeBSONObjSet({BSON("" << 1), BSON("" << 2), BSON("" << 3)});
-    BSONObjSet right = bsonCmp.makeBSONObjSet({BSON("" << 2)});
+    auto left = makeKeyStringSet({BSON("" << 1), BSON("" << 2), BSON("" << 3)});
+    auto right = makeKeyStringSet({BSON("" << 2)});
     auto diff = AbstractIndexAccessMethod::setDifference(left, right);
     ASSERT_EQUALS(2UL, diff.first.size());
     ASSERT_EQUALS(0UL, diff.second.size());
 }
 
 TEST(IndexAccessMethodSetDifference, LeftSetAllSmallerThanRightShouldBeDisjoint) {
-    SimpleBSONObjComparator bsonCmp;
-    BSONObjSet left = bsonCmp.makeBSONObjSet({BSON("" << 1), BSON("" << 2), BSON("" << 3)});
-    BSONObjSet right = bsonCmp.makeBSONObjSet({BSON("" << 4), BSON("" << 5), BSON("" << 6)});
+    auto left = makeKeyStringSet({BSON("" << 1), BSON("" << 2), BSON("" << 3)});
+    auto right = makeKeyStringSet({BSON("" << 4), BSON("" << 5), BSON("" << 6)});
     auto diff = AbstractIndexAccessMethod::setDifference(left, right);
     ASSERT_EQUALS(3UL, diff.first.size());
     ASSERT_EQUALS(3UL, diff.second.size());
@@ -185,9 +187,8 @@ TEST(IndexAccessMethodSetDifference, LeftSetAllSmallerThanRightShouldBeDisjoint)
 }
 
 TEST(IndexAccessMethodSetDifference, LeftSetAllLargerThanRightShouldBeDisjoint) {
-    SimpleBSONObjComparator bsonCmp;
-    BSONObjSet left = bsonCmp.makeBSONObjSet({BSON("" << 4), BSON("" << 5), BSON("" << 6)});
-    BSONObjSet right = bsonCmp.makeBSONObjSet({BSON("" << 1), BSON("" << 2), BSON("" << 3)});
+    auto left = makeKeyStringSet({BSON("" << 4), BSON("" << 5), BSON("" << 6)});
+    auto right = makeKeyStringSet({BSON("" << 1), BSON("" << 2), BSON("" << 3)});
     auto diff = AbstractIndexAccessMethod::setDifference(left, right);
     ASSERT_EQUALS(3UL, diff.first.size());
     ASSERT_EQUALS(3UL, diff.second.size());
@@ -200,23 +201,23 @@ TEST(IndexAccessMethodSetDifference, LeftSetAllLargerThanRightShouldBeDisjoint) 
 }
 
 TEST(IndexAccessMethodSetDifference, ShouldNotReportOverlapsFromNonDisjointSets) {
-    SimpleBSONObjComparator bsonCmp;
-    BSONObjSet left =
-        bsonCmp.makeBSONObjSet({BSON("" << 0), BSON("" << 1), BSON("" << 4), BSON("" << 6)});
-    BSONObjSet right = bsonCmp.makeBSONObjSet(
+    auto left = makeKeyStringSet({BSON("" << 0), BSON("" << 1), BSON("" << 4), BSON("" << 6)});
+    auto right = makeKeyStringSet(
         {BSON("" << -1), BSON("" << 1), BSON("" << 3), BSON("" << 4), BSON("" << 7)});
     auto diff = AbstractIndexAccessMethod::setDifference(left, right);
     ASSERT_EQUALS(2UL, diff.first.size());   // 0, 6.
     ASSERT_EQUALS(3UL, diff.second.size());  // -1, 3, 7.
-    for (auto&& obj : diff.first) {
-        ASSERT(left.find(obj) != left.end());
+    for (auto&& keyString : diff.first) {
+        ASSERT(left.find(keyString) != left.end());
         // Make sure it's not in the intersection.
+        auto obj = KeyString::toBson(keyString, Ordering::make(BSONObj()));
         ASSERT_BSONOBJ_NE(obj, BSON("" << 1));
         ASSERT_BSONOBJ_NE(obj, BSON("" << 4));
     }
-    for (auto&& obj : diff.second) {
-        ASSERT(right.find(obj) != right.end());
+    for (auto&& keyString : diff.second) {
+        ASSERT(right.find(keyString) != right.end());
         // Make sure it's not in the intersection.
+        auto obj = KeyString::toBson(keyString, Ordering::make(BSONObj()));
         ASSERT_BSONOBJ_NE(obj, BSON("" << 1));
         ASSERT_BSONOBJ_NE(obj, BSON("" << 4));
     }

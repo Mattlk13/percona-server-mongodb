@@ -12,8 +12,8 @@ executor:
     class: MongoDFixture
     mongod_options:
       set_parameters:
+        enableTestCommands: 1
         cursorTimeoutMillis: 9
-        failIndexKeyTooLong: false
         internalQueryPlannerEnableIndexIntersection: false
         ttlMonitorEnabled: false
         ttlMonitorSleepSecs: 7

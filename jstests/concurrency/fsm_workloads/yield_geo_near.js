@@ -73,8 +73,8 @@ var $config = extendWorkload($config, function($config, $super) {
                 i++;
             }
         }
-        assertAlways.writeOK(bulk.execute());
-        assertAlways.commandWorked(db[collName].ensureIndex(this.getIndexSpec()));
+        assertAlways.commandWorked(bulk.execute());
+        assertAlways.commandWorked(db[collName].createIndex(this.getIndexSpec()));
     };
 
     return $config;

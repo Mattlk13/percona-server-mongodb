@@ -1,4 +1,4 @@
-// @tags: [requires_non_retryable_writes]
+// @tags: [requires_non_retryable_writes, requires_fcv_50]
 
 //
 //  $push acquired the possibility of sorting the resulting array as part of SERVER-8008. This
@@ -54,20 +54,31 @@ assert.eq([{a: {b: 2}}, {a: {b: 3}}], t.findOne({_id: 7}).x);
 // Invalid Cases
 //
 
-// $push with $sort should not push a "$sort" field
 var doc8 = {_id: 8, x: [{a: 1}, {a: 2}]};
 t.save(doc8);
 var res = t.update({_id: 8}, {$push: {x: {$sort: {a: -1}}}});
-assert.writeErrorWithCode(res, ErrorCodes.DollarPrefixedFieldName);
-assert.docEq(t.findOne({_id: 8}), doc8);  // ensure doc was not changed
+
+var isDotsAndDollarsEnabled = db.adminCommand({getParameter: 1, featureFlagDotsAndDollars: 1})
+                                  .featureFlagDotsAndDollars.value;
+if (isDotsAndDollarsEnabled) {
+    // Test that when given a document with a $sort field that matches the form of a plain document
+    // (instead of a $sort modifier document), $push will add that field to the specified array.
+    assert.commandWorked(res);
+    assert.docEq(t.findOne({_id: 8}), {_id: 8, x: [{a: 1}, {a: 2}, {$sort: {a: -1}}]});
+} else {
+    // $push with $sort should not push a "$sort" field
+    assert.writeErrorWithCode(res, ErrorCodes.DollarPrefixedFieldName);
+    assert.docEq(t.findOne({_id: 8}), doc8);  // ensure doc was not changed
+}
 
 t.save({_id: 100, x: [{a: 1}]});
 
 // Elements of the $each vector can be integers. In here, '2' is a valid $each.
-assert.writeOK(t.update({_id: 100}, {$push: {x: {$each: [2], $slice: -2, $sort: {a: 1}}}}));
+assert.commandWorked(t.update({_id: 100}, {$push: {x: {$each: [2], $slice: -2, $sort: {a: 1}}}}));
 
 // For the same reason as above, '1' is an valid $each element.
-assert.writeOK(t.update({_id: 100}, {$push: {x: {$each: [{a: 2}, 1], $slice: -2, $sort: {a: 1}}}}));
+assert.commandWorked(
+    t.update({_id: 100}, {$push: {x: {$each: [{a: 2}, 1], $slice: -2, $sort: {a: 1}}}}));
 
 // The sort key pattern cannot be empty.
 assert.writeErrorWithCode(
@@ -75,7 +86,8 @@ assert.writeErrorWithCode(
     ErrorCodes.BadValue);
 
 // Support positive $slice's (ie, trimming from the array's front).
-assert.writeOK(t.update({_id: 100}, {$push: {x: {$each: [{a: 2}], $slice: 2, $sort: {a: 1}}}}));
+assert.commandWorked(
+    t.update({_id: 100}, {$push: {x: {$each: [{a: 2}], $slice: 2, $sort: {a: 1}}}}));
 
 // A $slice cannot be a fractional value.
 assert.writeErrorWithCode(
@@ -88,7 +100,7 @@ assert.writeErrorWithCode(
     ErrorCodes.BadValue);
 
 // Support sorting array alements that are not documents.
-assert.writeOK(t.update({_id: 100}, {$push: {x: {$each: [{a: 2}], $slice: -2, $sort: 1}}}));
+assert.commandWorked(t.update({_id: 100}, {$push: {x: {$each: [{a: 2}], $slice: -2, $sort: 1}}}));
 
 // The key pattern 'a.' is an invalid value for $sort.
 assert.writeErrorWithCode(
@@ -110,4 +122,5 @@ t.remove({});
 
 // Existing values are validated in the array do not have to be objects during a $sort with $each.
 t.save({_id: 100, x: [1, "foo"]});
-assert.writeOK(t.update({_id: 100}, {$push: {x: {$each: [{a: 2}], $slice: -2, $sort: {a: 1}}}}));
+assert.commandWorked(
+    t.update({_id: 100}, {$push: {x: {$each: [{a: 2}], $slice: -2, $sort: {a: 1}}}}));

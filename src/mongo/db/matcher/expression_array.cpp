@@ -28,9 +28,9 @@
  */
 
 #include "mongo/db/matcher/expression_array.h"
-
 #include "mongo/db/field_ref.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/query/util/make_data_structure.h"
 
 namespace mongo {
 
@@ -66,9 +66,10 @@ bool ArrayMatchingMatchExpression::equivalent(const MatchExpression* other) cons
 
 // -------
 
-ElemMatchObjectMatchExpression::ElemMatchObjectMatchExpression(StringData path,
-                                                               MatchExpression* sub)
-    : ArrayMatchingMatchExpression(ELEM_MATCH_OBJECT, path), _sub(sub) {}
+ElemMatchObjectMatchExpression::ElemMatchObjectMatchExpression(
+    StringData path, std::unique_ptr<MatchExpression> sub, clonable_ptr<ErrorAnnotation> annotation)
+    : ArrayMatchingMatchExpression(ELEM_MATCH_OBJECT, path, std::move(annotation)),
+      _sub(std::move(sub)) {}
 
 bool ElemMatchObjectMatchExpression::matchesArray(const BSONObj& anArray,
                                                   MatchDetails* details) const {
@@ -77,7 +78,7 @@ bool ElemMatchObjectMatchExpression::matchesArray(const BSONObj& anArray,
         BSONElement inner = i.next();
         if (!inner.isABSONObj())
             continue;
-        if (_sub->matchesBSON(inner.Obj(), NULL)) {
+        if (_sub->matchesBSON(inner.Obj(), nullptr)) {
             if (details && details->needRecord()) {
                 details->setElemMatchKey(inner.fieldName());
             }
@@ -92,7 +93,7 @@ void ElemMatchObjectMatchExpression::debugString(StringBuilder& debug, int inden
     debug << path() << " $elemMatch (obj)";
 
     MatchExpression::TagData* td = getTag();
-    if (NULL != td) {
+    if (nullptr != td) {
         debug << " ";
         td->debugString(&debug);
     }
@@ -102,7 +103,7 @@ void ElemMatchObjectMatchExpression::debugString(StringBuilder& debug, int inden
 
 BSONObj ElemMatchObjectMatchExpression::getSerializedRightHandSide() const {
     BSONObjBuilder subBob;
-    _sub->serialize(&subBob);
+    _sub->serialize(&subBob, true);
     return BSON("$elemMatch" << subBob.obj());
 }
 
@@ -117,23 +118,17 @@ MatchExpression::ExpressionOptimizerFunc ElemMatchObjectMatchExpression::getOpti
 
 // -------
 
-ElemMatchValueMatchExpression::ElemMatchValueMatchExpression(StringData path, MatchExpression* sub)
-    : ArrayMatchingMatchExpression(ELEM_MATCH_VALUE, path) {
-    add(sub);
-}
+ElemMatchValueMatchExpression::ElemMatchValueMatchExpression(
+    StringData path, std::unique_ptr<MatchExpression> sub, clonable_ptr<ErrorAnnotation> annotation)
+    : ArrayMatchingMatchExpression(ELEM_MATCH_VALUE, path, std::move(annotation)),
+      _subs(makeVector(std::move(sub))) {}
 
-ElemMatchValueMatchExpression::ElemMatchValueMatchExpression(StringData path)
-    : ArrayMatchingMatchExpression(ELEM_MATCH_VALUE, path) {}
+ElemMatchValueMatchExpression::ElemMatchValueMatchExpression(
+    StringData path, clonable_ptr<ErrorAnnotation> annotation)
+    : ArrayMatchingMatchExpression(ELEM_MATCH_VALUE, path, std::move(annotation)) {}
 
-ElemMatchValueMatchExpression::~ElemMatchValueMatchExpression() {
-    for (unsigned i = 0; i < _subs.size(); i++)
-        delete _subs[i];
-    _subs.clear();
-}
-
-void ElemMatchValueMatchExpression::add(MatchExpression* sub) {
-    verify(sub);
-    _subs.push_back(sub);
+void ElemMatchValueMatchExpression::add(std::unique_ptr<MatchExpression> sub) {
+    _subs.push_back(std::move(sub));
 }
 
 bool ElemMatchValueMatchExpression::matchesArray(const BSONObj& anArray,
@@ -165,7 +160,7 @@ void ElemMatchValueMatchExpression::debugString(StringBuilder& debug, int indent
     debug << path() << " $elemMatch (value)";
 
     MatchExpression::TagData* td = getTag();
-    if (NULL != td) {
+    if (nullptr != td) {
         debug << " ";
         td->debugString(&debug);
     }
@@ -178,11 +173,8 @@ void ElemMatchValueMatchExpression::debugString(StringBuilder& debug, int indent
 BSONObj ElemMatchValueMatchExpression::getSerializedRightHandSide() const {
     BSONObjBuilder emBob;
 
-    for (unsigned i = 0; i < _subs.size(); i++) {
-        BSONObjBuilder predicate;
-        _subs[i]->serialize(&predicate);
-        BSONObj predObj = predicate.obj();
-        emBob.appendElements(predObj.firstElement().embeddedObject());
+    for (auto&& child : _subs) {
+        child->serialize(&emBob, false);
     }
 
     return BSON("$elemMatch" << emBob.obj());
@@ -192,11 +184,8 @@ MatchExpression::ExpressionOptimizerFunc ElemMatchValueMatchExpression::getOptim
     return [](std::unique_ptr<MatchExpression> expression) {
         auto& subs = static_cast<ElemMatchValueMatchExpression&>(*expression)._subs;
 
-        for (MatchExpression*& subExpression : subs) {
-            auto optimizedSubExpression =
-                MatchExpression::optimize(std::unique_ptr<MatchExpression>(subExpression));
-            subExpression = optimizedSubExpression.release();
-        }
+        for (auto& subExpression : subs)
+            subExpression = MatchExpression::optimize(std::move(subExpression));
 
         return expression;
     };
@@ -204,8 +193,10 @@ MatchExpression::ExpressionOptimizerFunc ElemMatchValueMatchExpression::getOptim
 
 // ---------
 
-SizeMatchExpression::SizeMatchExpression(StringData path, int size)
-    : ArrayMatchingMatchExpression(SIZE, path), _size(size) {}
+SizeMatchExpression::SizeMatchExpression(StringData path,
+                                         int size,
+                                         clonable_ptr<ErrorAnnotation> annotation)
+    : ArrayMatchingMatchExpression(SIZE, path, std::move(annotation)), _size(size) {}
 
 bool SizeMatchExpression::matchesArray(const BSONObj& anArray, MatchDetails* details) const {
     if (_size < 0)
@@ -218,7 +209,7 @@ void SizeMatchExpression::debugString(StringBuilder& debug, int indentationLevel
     debug << path() << " $size : " << _size << "\n";
 
     MatchExpression::TagData* td = getTag();
-    if (NULL != td) {
+    if (nullptr != td) {
         debug << " ";
         td->debugString(&debug);
     }
@@ -238,4 +229,4 @@ bool SizeMatchExpression::equivalent(const MatchExpression* other) const {
 
 
 // ------------------
-}
+}  // namespace mongo

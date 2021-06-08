@@ -42,6 +42,8 @@ class BSONObjBuilder;
  */
 class LogicalTime {
 public:
+    static constexpr StringData kOperationTimeFieldName = "operationTime"_sd;
+
     LogicalTime() = default;
     explicit LogicalTime(Timestamp ts);
 
@@ -82,6 +84,12 @@ public:
      *  serialize into BSON object.
      */
     BSONObj toBSON() const;
+
+    /*
+     * These methods support IDL parsing of logical times.
+     */
+    static LogicalTime parseFromBSON(const BSONElement& elem);
+    void serializeToBSON(StringData fieldName, BSONObjBuilder* bob) const;
 
     /**
      * An uninitialized value of LogicalTime. Default constructed.

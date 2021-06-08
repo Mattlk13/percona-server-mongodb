@@ -36,14 +36,15 @@
 #include "mongo/db/exec/collection_scan_common.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/record_id.h"
+#include "mongo/db/storage/ident.h"
+#include "mongo/db/storage/key_format.h"
 #include "mongo/db/storage/record_data.h"
 
 namespace mongo {
 
 class CappedCallback;
 class Collection;
-struct CompactOptions;
-struct CompactStats;
+class CollectionPtr;
 class MAdvise;
 class OperationContext;
 
@@ -52,31 +53,6 @@ class RecordStore;
 struct ValidateResults;
 class ValidateAdaptor;
 
-struct CompactOptions {
-    // other
-    bool validateDocuments = true;
-
-    std::string toString() const;
-};
-
-struct CompactStats {};
-
-/**
- * Allows inserting a Record "in-place" without creating a copy ahead of time.
- */
-class DocWriter {
-public:
-    virtual void writeDocument(char* buf) const = 0;
-    virtual size_t documentSize() const = 0;
-    virtual bool addPadding() const {
-        return true;
-    }
-
-protected:
-    // Can't delete through base pointer.
-    ~DocWriter() = default;
-};
-
 /**
  * The data items stored in a RecordStore.
  */
@@ -84,9 +60,6 @@ struct Record {
     RecordId id;
     RecordData data;
 };
-
-enum ValidateCmdLevel : int { kValidateNormal = 0x01, kValidateFull = 0x02 };
-
 
 /**
  * Retrieves Records from a RecordStore.
@@ -136,6 +109,7 @@ public:
     /**
      * Moves forward and returns the new data or boost::none if there is no more data.
      * Continues returning boost::none once it reaches EOF unlike stl iterators.
+     * Returns records in RecordId order.
      */
     virtual boost::optional<Record> next() = 0;
 
@@ -187,13 +161,9 @@ public:
 };
 
 /**
- * Adds explicit seeking of records. This functionality is separated out from RecordCursor,
- * because some cursors, such as repair cursors, are not required to support seeking.
- *
- * Warning: MMAPv1 cannot detect if RecordIds are valid. Therefore callers should only pass
- * potentially deleted RecordIds to seek methods if they know that MMAPv1 is not the current
- * storage engine. All new storage engines must support detecting the existence of Records.
- *
+ * Adds explicit seeking of records. This functionality is separated out from RecordCursor, because
+ * some cursors are not required to support seeking. All storage engines must support detecting the
+ * existence of Records.
  */
 class SeekableRecordCursor : public RecordCursor {
 public:
@@ -204,6 +174,20 @@ public:
      * of the cursor is unspecified.
      */
     virtual boost::optional<Record> seekExact(const RecordId& id) = 0;
+
+    /**
+     * Positions this cursor near 'start' or an adjacent record if 'start' does not exist. If there
+     * is not an exact match, the cursor is positioned on the directionally previous Record. If no
+     * earlier record exists, the cursor is positioned on the directionally following record.
+     * Returns boost::none if the RecordStore is empty.
+     *
+     * For forward cursors, returns the Record with the highest RecordId less than or equal to
+     * 'start'. If no such record exists, positions on the next highest RecordId after 'start'.
+     *
+     * For reverse cursors, returns the Record with the lowest RecordId greater than or equal to
+     * 'start'. If no such record exists, positions on the next lowest RecordId before 'start'.
+     */
+    virtual boost::optional<Record> seekNear(const RecordId& start) = 0;
 
     /**
      * Prepares for state changes in underlying data without necessarily saving the current
@@ -230,16 +214,16 @@ public:
  * all RecordStore specific transaction information, as well as the LockState. Methods that take
  * an OperationContext may throw a WriteConflictException.
  *
- * This class must be thread-safe for document-level locking storage engines. In addition, for
- * storage engines implementing the KVEngine some methods must be thread safe, see KVCatalog. Only
- * for MMAPv1 is this class not thread-safe.
+ * This class must be thread-safe. In addition, for storage engines implementing the KVEngine some
+ * methods must be thread safe, see DurableCatalog.
  */
-class RecordStore {
+class RecordStore : public Ident {
     RecordStore(const RecordStore&) = delete;
     RecordStore& operator=(const RecordStore&) = delete;
 
 public:
-    RecordStore(StringData ns) : _ns(ns.toString()) {}
+    RecordStore(StringData ns, StringData identName)
+        : Ident(identName.toString()), _ns(ns.toString()) {}
 
     virtual ~RecordStore() {}
 
@@ -260,7 +244,14 @@ public:
         return ns().size() == 0;
     }
 
-    virtual const std::string& getIdent() const = 0;
+    /**
+     * The key format for this RecordStore's RecordIds.
+     *
+     * Collections with clustered indexes on _id may use the String format, however most
+     * RecordStores use Long. RecordStores with the String format require callers to provide
+     * RecordIds and will not generate them automatically.
+     */
+    virtual KeyFormat keyFormat() const = 0;
 
     /**
      * The dataSize is an approximation of the sum of the sizes (in bytes) of the
@@ -269,12 +260,18 @@ public:
     virtual long long dataSize(OperationContext* opCtx) const = 0;
 
     /**
-     * Total number of record in the RecordStore. You may need to cache it, so this call
+     * Total number of records in the RecordStore. You may need to cache it, so this call
      * takes constant time, as it is called often.
      */
     virtual long long numRecords(OperationContext* opCtx) const = 0;
 
-    virtual bool isCapped() const = 0;
+    /**
+     * Storage engines can manage oplog truncation internally as opposed to having higher layers
+     * manage it for them.
+     */
+    virtual bool selfManagedOplogTruncation() const {
+        return false;
+    }
 
     virtual void setCappedCallback(CappedCallback*) {
         MONGO_UNREACHABLE;
@@ -286,8 +283,17 @@ public:
      * @return total estimate size (in bytes) on stable storage
      */
     virtual int64_t storageSize(OperationContext* opCtx,
-                                BSONObjBuilder* extraInfo = NULL,
+                                BSONObjBuilder* extraInfo = nullptr,
                                 int infoLevel = 0) const = 0;
+
+    /**
+     * @return file bytes available for reuse
+     * A return value of zero can mean either no bytes are available, or that the real value is
+     * unknown.
+     */
+    virtual int64_t freeStorageSize(OperationContext* opCtx) const {
+        return 0;
+    }
 
     // CRUD related
 
@@ -318,10 +324,6 @@ public:
      *
      * In general prefer RecordCursor::seekExact since it can avoid copying data in more
      * storageEngines.
-     *
-     * Warning: MMAPv1 cannot detect if RecordIds are valid. Therefore callers should only pass
-     * potentially deleted RecordIds to seek methods if they know that MMAPv1 is not the current
-     * storage engine. All new storage engines must support detecting the existence of Records.
      */
     virtual bool findRecord(OperationContext* opCtx, const RecordId& loc, RecordData* out) const {
         auto cursor = getCursor(opCtx);
@@ -351,39 +353,23 @@ public:
                                       const char* data,
                                       int len,
                                       Timestamp timestamp) {
-        std::vector<Record> inOutRecords{Record{RecordId(), RecordData(data, len)}};
+        // Record stores with the Long key format accept a null RecordId, as the storage engine will
+        // generate one.
+        invariant(keyFormat() == KeyFormat::Long);
+        return insertRecord(opCtx, RecordId(), data, len, timestamp);
+    }
+
+    /**
+     * A thin wrapper around insertRecords() to simplify handling of single document inserts.
+     * If RecordId is null, the storage engine will generate one and return it.
+     */
+    StatusWith<RecordId> insertRecord(
+        OperationContext* opCtx, RecordId rid, const char* data, int len, Timestamp timestamp) {
+        std::vector<Record> inOutRecords{Record{rid, RecordData(data, len)}};
         Status status = insertRecords(opCtx, &inOutRecords, std::vector<Timestamp>{timestamp});
         if (!status.isOK())
             return status;
         return inOutRecords.front().id;
-    }
-
-    /**
-     * Inserts nDocs documents into this RecordStore using the DocWriter interface.
-     *
-     * This allows the storage engine to reserve space for a record and have it built in-place
-     * rather than building the record then copying it into its destination.
-     *
-     * On success, if idsOut is non-null the RecordIds of the inserted records will be written into
-     * it. It must have space for nDocs RecordIds.
-     */
-    virtual Status insertRecordsWithDocWriter(OperationContext* opCtx,
-                                              const DocWriter* const* docs,
-                                              const Timestamp* timestamps,
-                                              size_t nDocs,
-                                              RecordId* idsOut = nullptr) = 0;
-
-    /**
-     * A thin wrapper around insertRecordsWithDocWriter() to simplify handling of single DocWriters.
-     */
-    StatusWith<RecordId> insertRecordWithDocWriter(OperationContext* opCtx,
-                                                   const DocWriter* doc,
-                                                   Timestamp timestamp) {
-        RecordId out;
-        Status status = insertRecordsWithDocWriter(opCtx, &doc, &timestamp, 1, &out);
-        if (!status.isOK())
-            return status;
-        return out;
     }
 
     /**
@@ -430,15 +416,6 @@ public:
                                                             bool forward = true) const = 0;
 
     /**
-     * Constructs a cursor over a potentially corrupted store, which can be used to salvage
-     * damaged records. The iterator might return every record in the store if all of them
-     * are reachable and not corrupted.  Returns NULL if not supported.
-     */
-    virtual std::unique_ptr<RecordCursor> getCursorForRepair(OperationContext* opCtx) const {
-        return {};
-    }
-
-    /**
      * Constructs a cursor over a record store that returns documents in a randomized order, and
      * allows storage engines to provide a more efficient way of random sampling of a record store
      * than MongoDB's default sampling methods, which is used when this method returns {}.
@@ -479,11 +456,11 @@ public:
     }
 
     /**
-     * Does compact() leave RecordIds alone or can they change.
+     * If compact() supports online compaction.
      *
      * Only called if compactSupported() returns true.
      */
-    virtual bool compactsInPlace() const {
+    virtual bool supportsOnlineCompaction() const {
         MONGO_UNREACHABLE;
     }
 
@@ -497,24 +474,10 @@ public:
     }
 
     /**
-     * Does the RecordStore cursor retrieve its document in RecordId Order?
-     *
-     * If a subclass overrides the default value to true, the RecordStore cursor must retrieve
-     * its documents in RecordId order.
-     *
-     * This enables your storage engine to run collection validation in the
-     * background.
-     */
-    virtual bool isInRecordIdOrder() const {
-        return false;
-    }
-
-    /**
      * Performs record store specific validation to ensure consistency of underlying data
      * structures. If corruption is found, details of the errors will be in the results parameter.
      */
     virtual void validate(OperationContext* opCtx,
-                          ValidateCmdLevel level,
                           ValidateResults* results,
                           BSONObjBuilder* output) {}
 
@@ -527,35 +490,8 @@ public:
                                    double scale) const = 0;
 
     /**
-     * Load all data into cache.
-     * What cache depends on implementation.
-     *
-     * If the underlying storage engine does not support the operation,
-     * returns ErrorCodes::CommandNotSupported
-     *
-     * @param output (optional) - where to put detailed stats
-     */
-    virtual Status touch(OperationContext* opCtx, BSONObjBuilder* output) const {
-        return Status(ErrorCodes::CommandNotSupported,
-                      "this storage engine does not support touch");
-    }
-
-    /**
-     * Return the RecordId of an oplog entry as close to startingPosition as possible without
-     * being higher. If there are no entries <= startingPosition, return RecordId().
-     *
-     * If you don't implement the oplogStartHack, just use the default implementation which
-     * returns boost::none.
-     */
-    virtual boost::optional<RecordId> oplogStartHack(OperationContext* opCtx,
-                                                     const RecordId& startingPosition) const {
-        return boost::none;
-    }
-
-    /**
-     * When we write to an oplog, we call this so that if the storage engine
-     * supports doc locking, it can manage the visibility of oplog entries to ensure
-     * they are ordered.
+     * When we write to an oplog, we call this so that that the storage engine can manage the
+     * visibility of oplog entries to ensure they are ordered.
      *
      * Since this is called inside of a WriteUnitOfWork while holding a std::mutex, it is
      * illegal to acquire any LockManager locks inside of this function.
@@ -588,39 +524,66 @@ public:
                                         long long dataSize) = 0;
 
     /**
-     * used to support online change oplog size.
+     * Storage engines can choose whether to support changing the oplog size online.
      */
-    virtual Status updateCappedSize(OperationContext* opCtx, long long cappedSize) {
+    virtual Status updateOplogSize(long long newOplogSize) {
         return Status(ErrorCodes::CommandNotSupported,
-                      "this storage engine does not support updateCappedSize");
+                      "This storage engine does not support updateOplogSize");
+    }
+
+    /**
+     * Returns false if the oplog was dropped while waiting for a deletion request.
+     * This should only be called if StorageEngine::supportsOplogStones() is true.
+     * Storage engines supporting oplog stones must implement this function.
+     */
+    virtual bool yieldAndAwaitOplogDeletionRequest(OperationContext* opCtx) {
+        MONGO_UNREACHABLE;
+    }
+
+    /**
+     * This should only be called if StorageEngine::supportsOplogStones() is true.
+     * Storage engines supporting oplog stones must implement this function.
+     */
+    virtual void reclaimOplog(OperationContext* opCtx) {
+        MONGO_UNREACHABLE;
+    }
+
+    /**
+     * This should only be called if StorageEngine::supportsOplogStones() is true.
+     * Storage engines supporting oplog stones must implement this function.
+     * Populates `builder` with various statistics pertaining to oplog stones and oplog truncation.
+     */
+    virtual void getOplogTruncateStats(BSONObjBuilder& builder) const {
+        MONGO_UNREACHABLE;
+    }
+
+    /**
+     * If supported, this method returns the timestamp value for the latest storage engine committed
+     * oplog document. Note that this method will not include uncommitted writes on the input
+     * OperationContext. A new transaction may be created and destroyed to service this call.
+     *
+     * Unsupported RecordStores return the OplogOperationUnsupported error code.
+     */
+    virtual StatusWith<Timestamp> getLatestOplogTimestamp(OperationContext* opCtx) const {
+        return Status(ErrorCodes::OplogOperationUnsupported,
+                      "The current storage engine doesn't support an optimized implementation for "
+                      "getting the latest oplog timestamp.");
+    }
+
+    /**
+     * If supported, this method returns the timestamp value for the earliest storage engine
+     * committed oplog document.
+     *
+     * Unsupported RecordStores return the OplogOperationUnsupported error code.
+     */
+    virtual StatusWith<Timestamp> getEarliestOplogTimestamp(OperationContext* opCtx) {
+        return Status(ErrorCodes::OplogOperationUnsupported,
+                      "The current storage engine doesn't support an optimized implementation for "
+                      "getting the earliest oplog timestamp.");
     }
 
 protected:
     std::string _ns;
 };
 
-struct ValidateResults {
-    ValidateResults() {
-        valid = true;
-    }
-    bool valid;
-    std::vector<std::string> errors;
-    std::vector<std::string> warnings;
-    std::vector<BSONObj> extraIndexEntries;
-    std::vector<BSONObj> missingIndexEntries;
-};
-
-/**
- * This is so when a RecordStore is validating all records
- * it can call back to someone to check if a record is valid.
- * The actual data contained in a Record is totally opaque to the implementation.
- */
-class ValidateAdaptor {
-public:
-    virtual ~ValidateAdaptor() {}
-
-    virtual Status validate(const RecordId& recordId,
-                            const RecordData& recordData,
-                            size_t* dataSize) = 0;
-};
-}
+}  // namespace mongo

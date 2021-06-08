@@ -35,11 +35,10 @@
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/storage/snapshot_manager.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_begin_transaction_block.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 
 namespace mongo {
 
-using IgnorePrepared = WiredTigerBeginTxnBlock::IgnorePrepared;
 using RoundUpPreparedTimestamps = WiredTigerBeginTxnBlock::RoundUpPreparedTimestamps;
 
 class WiredTigerOplogManager;
@@ -52,9 +51,9 @@ public:
     WiredTigerSnapshotManager() = default;
 
     void setCommittedSnapshot(const Timestamp& timestamp) final;
-    void setLocalSnapshot(const Timestamp& timestamp) final;
-    boost::optional<Timestamp> getLocalSnapshot() final;
-    void dropAllSnapshots() final;
+    void setLastApplied(const Timestamp& timestamp) final;
+    boost::optional<Timestamp> getLastApplied() final;
+    void clearCommittedSnapshot() final;
 
     //
     // WT-specific methods
@@ -67,17 +66,7 @@ public:
      */
     Timestamp beginTransactionOnCommittedSnapshot(
         WT_SESSION* session,
-        IgnorePrepared ignorePrepared,
-        RoundUpPreparedTimestamps roundUpPreparedTimestamps) const;
-
-    /**
-     * Starts a transaction on the last stable local timestamp, set by setLocalSnapshot.
-     *
-     * Throws if no local snapshot has been set.
-     */
-    Timestamp beginTransactionOnLocalSnapshot(
-        WT_SESSION* session,
-        IgnorePrepared ignorePrepared,
+        PrepareConflictBehavior prepareConflictBehavior,
         RoundUpPreparedTimestamps roundUpPreparedTimestamps) const;
 
     /**
@@ -92,11 +81,13 @@ public:
 
 private:
     // Snapshot to use for reads at a commit timestamp.
-    mutable stdx::mutex _committedSnapshotMutex;  // Guards _committedSnapshot.
+    mutable Mutex _committedSnapshotMutex =  // Guards _committedSnapshot.
+        MONGO_MAKE_LATCH("WiredTigerSnapshotManager::_committedSnapshotMutex");
     boost::optional<Timestamp> _committedSnapshot;
 
-    // Snapshot to use for reads at a local stable timestamp.
-    mutable stdx::mutex _localSnapshotMutex;  // Guards _localSnapshot.
-    boost::optional<Timestamp> _localSnapshot;
+    // Timestamp to use for reads at a the lastApplied timestamp.
+    mutable Mutex _lastAppliedMutex =  // Guards _lastApplied.
+        MONGO_MAKE_LATCH("WiredTigerSnapshotManager::_lastAppliedMutex");
+    boost::optional<Timestamp> _lastApplied;
 };
-}
+}  // namespace mongo

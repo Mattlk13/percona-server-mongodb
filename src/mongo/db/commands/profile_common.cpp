@@ -26,13 +26,19 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/commands/profile_common.h"
 #include "mongo/db/commands/profile_gen.h"
+#include "mongo/db/curop.h"
+#include "mongo/db/jsobj.h"
+#include "mongo/db/profile_filter_impl.h"
 #include "mongo/idl/idl_parser.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 
@@ -66,18 +72,7 @@ bool ProfileCmdBase::run(OperationContext* opCtx,
     auto request = ProfileCmdRequest::parse(IDLParserErrorContext("profile"), cmdObj);
     const auto profilingLevel = request.getCommandParameter();
 
-    // Delegate to _applyProfilingLevel to set the profiling level appropriately whether we are on
-    // mongoD or mongoS.
-    int oldLevel = _applyProfilingLevel(opCtx, dbName, profilingLevel);
-
-    result.append("was", oldLevel);
-    result.append("slowms", serverGlobalParams.slowMS);
-    result.append("ratelimit", serverGlobalParams.rateLimit);
-    result.append("sampleRate", serverGlobalParams.sampleRate);
-
-    if (auto slowms = request.getSlowms()) {
-        serverGlobalParams.slowMS = *slowms;
-    }
+    // Validate arguments before making changes.
     int newRateLimit = serverGlobalParams.rateLimit;
     if (auto optRateLimit = request.getRatelimit()) {
         const decltype(optRateLimit)::value_type rateLimit = *optRateLimit;
@@ -85,7 +80,6 @@ bool ProfileCmdBase::run(OperationContext* opCtx,
                 str::stream() << "ratelimit must be between 0 and " << RATE_LIMIT_MAX << " inclusive",
                 0 <= rateLimit && rateLimit <= RATE_LIMIT_MAX);
         newRateLimit = std::max(rateLimit, static_cast<decltype(rateLimit)>(1));
-
     }
     double newSampleRate = serverGlobalParams.sampleRate;
     if (auto sampleRate = request.getSampleRate()) {
@@ -95,11 +89,95 @@ bool ProfileCmdBase::run(OperationContext* opCtx,
         newSampleRate = *sampleRate;
     }
     uassert(ErrorCodes::BadValue,
-            "cannot set both sampleRate and ratelimit to non-default values",
-            newSampleRate == 1.0 || newRateLimit == 1);
-    serverGlobalParams.rateLimit = newRateLimit;
-    serverGlobalParams.sampleRate = newSampleRate;
+            "cannot set both sampleRate/filter and ratelimit to non-default values",
+            (newSampleRate == 1.0 && !request.getFilter()) || newRateLimit == 1);
+
+    // Delegate to _applyProfilingLevel to set the profiling level appropriately whether we are on
+    // mongoD or mongoS.
+    auto oldSettings = _applyProfilingLevel(opCtx, dbName, request);
+    auto oldSlowMS = serverGlobalParams.slowMS;
+    auto oldRateLimit = serverGlobalParams.rateLimit;
+    auto oldSampleRate = serverGlobalParams.sampleRate;
+
+    result.append("was", oldSettings.level);
+    result.append("slowms", oldSlowMS);
+    result.append("ratelimit", oldRateLimit);
+    result.append("sampleRate", oldSampleRate);
+    if (oldSettings.filter) {
+        result.append("filter", oldSettings.filter->serialize());
+    }
+    if (oldSettings.filter || request.getFilter()) {
+        result.append("note",
+                      "When a filter expression is set, slowms and sampleRate are not used for "
+                      "profiling and slow-query log lines.");
+    }
+
+    if (auto slowms = request.getSlowms()) {
+        serverGlobalParams.slowMS = *slowms;
+    }
+    if (auto optRateLimit = request.getRatelimit()) {
+        const decltype(optRateLimit)::value_type rateLimit = *optRateLimit;
+        serverGlobalParams.rateLimit = std::max(rateLimit, static_cast<decltype(rateLimit)>(1));
+
+    }
+    if (auto sampleRate = request.getSampleRate()) {
+        serverGlobalParams.sampleRate = *sampleRate;
+    }
+
+    // Log the change made to server's profiling settings, if the request asks to change anything.
+    if (profilingLevel != -1 || request.getSlowms() || request.getSampleRate() ||
+        request.getFilter() || request.getRatelimit()) {
+        logv2::DynamicAttributes attrs;
+
+        BSONObjBuilder oldState;
+        BSONObjBuilder newState;
+
+        oldState.append("level"_sd, oldSettings.level);
+        oldState.append("slowms"_sd, oldSlowMS);
+        oldState.append("ratelimit"_sd, oldRateLimit);
+        oldState.append("sampleRate"_sd, oldSampleRate);
+        if (oldSettings.filter) {
+            oldState.append("filter"_sd, oldSettings.filter->serialize());
+        }
+        attrs.add("from", oldState.obj());
+
+        // newSettings.level may differ from profilingLevel: profilingLevel is part of the request,
+        // and if the request specifies {profile: -1, ...} then we want to show the unchanged value
+        // (0, 1, or 2).
+        auto newSettings = CollectionCatalog::get(opCtx)->getDatabaseProfileSettings(dbName);
+        newState.append("level"_sd, newSettings.level);
+        newState.append("slowms"_sd, serverGlobalParams.slowMS);
+        newState.append("ratelimit"_sd, serverGlobalParams.rateLimit);
+        newState.append("sampleRate"_sd, serverGlobalParams.sampleRate);
+        if (newSettings.filter) {
+            newState.append("filter"_sd, newSettings.filter->serialize());
+        }
+        attrs.add("to", newState.obj());
+
+        LOGV2(48742, "Profiler settings changed", attrs);
+    }
 
     return true;
 }
+
+ObjectOrUnset parseObjectOrUnset(const BSONElement& element) {
+    if (element.type() == BSONType::Object) {
+        return {{element.Obj()}};
+    } else if (element.type() == BSONType::String && element.String() == "unset"_sd) {
+        return {{}};
+    } else {
+        uasserted(ErrorCodes::BadValue, "Expected an object, or the string 'unset'.");
+    }
+}
+
+void serializeObjectOrUnset(const ObjectOrUnset& obj,
+                            StringData fieldName,
+                            BSONObjBuilder* builder) {
+    if (obj.obj) {
+        builder->append(fieldName, *obj.obj);
+    } else {
+        builder->append(fieldName, "unset"_sd);
+    }
+}
+
 }  // namespace mongo

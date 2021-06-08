@@ -27,14 +27,15 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/concurrency/d_concurrency.h"
-#include "mongo/util/log.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 
@@ -58,7 +59,8 @@ public:
                "If neither 'secs' nor 'millis' is set, command will sleep for 10 seconds. "
                "If both are set, command will sleep for the sum of 'secs' and 'millis.'\n"
                "   w:<bool> (deprecated: use 'lock' instead) if true, takes a write lock.\n"
-               "   lock: r, w, none. If r or w, db will block under a lock. Defaults to r."
+               "   lock: r, ir, w, iw, none. If r or w, db will block under a lock.\n"
+               "   If ir or iw, db will block under an intent lock. Defaults to ir."
                " 'lock' and 'w' may not both be set.\n"
                "   secs:<seconds> Amount of time to sleep, in seconds.\n"
                "   millis:<milliseconds> Amount of time to sleep, in ms.\n"
@@ -77,17 +79,38 @@ public:
         if (ns.empty()) {
             Lock::GlobalLock lk(opCtx, mode, Date_t::max(), Lock::InterruptBehavior::kThrow);
             opCtx->sleepFor(Milliseconds(millis));
-        } else if (nsIsDbOnly(ns)) {
-            uassert(50961, "lockTarget is not a valid namespace", NamespaceString::validDBName(ns));
-            Lock::DBLock lk(opCtx, ns, mode, Date_t::max());
-            opCtx->sleepFor(Milliseconds(millis));
-        } else {
-            uassert(50962,
-                    "lockTarget is not a valid namespace",
-                    NamespaceString::validCollectionComponent(ns));
-            Lock::CollectionLock lk(opCtx, NamespaceString(ns), mode, Date_t::max());
-            opCtx->sleepFor(Milliseconds(millis));
+            return;
         }
+        auto nss = NamespaceString(ns);
+        uassert(
+            50961, "lockTarget is not a valid namespace", NamespaceString::validDBName(nss.db()));
+
+        auto dbMode = mode;
+        if (!nsIsDbOnly(ns)) {
+            // Only acquire minimum dbLock mode required for collection lock acquisition.
+            dbMode = isSharedLockMode(mode) ? MODE_IS : MODE_IX;
+        }
+
+        Lock::DBLock dbLock(opCtx, nss.db(), dbMode, Date_t::max());
+
+        if (nsIsDbOnly(ns)) {
+            opCtx->sleepFor(Milliseconds(millis));
+            return;
+        }
+
+        // Need to acquire DBLock before attempting to acquire a collection lock.
+        uassert(50962,
+                "lockTarget is not a valid namespace",
+                NamespaceString::validCollectionComponent(ns));
+        Lock::CollectionLock collLock(opCtx, nss, mode, Date_t::max());
+        opCtx->sleepFor(Milliseconds(millis));
+    }
+
+    void _sleepInPBWM(mongo::OperationContext* opCtx, long long millis) {
+        Lock::ResourceLock pbwm(opCtx->lockState(), resourceIdParallelBatchWriterMode);
+        pbwm.lock(nullptr, MODE_X);
+        opCtx->sleepFor(Milliseconds(millis));
+        pbwm.unlock();
     }
 
     CmdSleep() : BasicCommand("sleep") {}
@@ -95,8 +118,8 @@ public:
              const std::string& ns,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) {
-        log() << "test only command sleep invoked";
-        long long millis = 0;
+        LOGV2(20504, "Test-only command 'sleep' invoked");
+        long long msToSleep = 0;
 
         if (cmdObj["secs"] || cmdObj["seconds"] || cmdObj["millis"]) {
             uassert(51153,
@@ -105,43 +128,74 @@ public:
 
             if (auto secsElem = cmdObj["secs"]) {
                 uassert(34344, "'secs' must be a number.", secsElem.isNumber());
-                millis += secsElem.numberLong() * 1000;
+                msToSleep += secsElem.numberLong() * 1000;
             } else if (auto secondsElem = cmdObj["seconds"]) {
                 uassert(51154, "'seconds' must be a number.", secondsElem.isNumber());
-                millis += secondsElem.numberLong() * 1000;
+                msToSleep += secondsElem.numberLong() * 1000;
             }
 
             if (auto millisElem = cmdObj["millis"]) {
                 uassert(34345, "'millis' must be a number.", millisElem.isNumber());
-                millis += millisElem.numberLong();
+                msToSleep += millisElem.numberLong();
             }
         } else {
-            millis = 10 * 1000;
+            msToSleep = 10 * 1000;
         }
 
-        StringData lockTarget;
-        if (cmdObj["lockTarget"]) {
-            lockTarget = cmdObj["lockTarget"].checkAndGetStringData();
-        }
+        auto now = opCtx->getServiceContext()->getFastClockSource()->now();
+        auto deadline = now + Milliseconds(msToSleep);
 
-        if (!cmdObj["lock"]) {
-            // Legacy implementation
-            if (cmdObj.getBoolField("w")) {
-                _sleepInLock(opCtx, millis, MODE_X, lockTarget);
-            } else {
-                _sleepInLock(opCtx, millis, MODE_S, lockTarget);
+        // Note that if the system clock moves _backwards_ (which has been known to happen), this
+        // could result in a much longer sleep than requested. Since this command is only used for
+        // testing, we're okay with this imprecision.
+        while (deadline > now) {
+            Milliseconds msRemaining = deadline - now;
+
+            // If the clock moves back by an absurd amount then uassert.
+            Milliseconds threshold(10000);
+            uassert(31173,
+                    str::stream() << "Clock must have moved backwards by at least " << threshold
+                                  << " ms during sleep command",
+                    msRemaining.count() < msToSleep + threshold.count());
+
+            ON_BLOCK_EXIT(
+                [&now, opCtx] { now = opCtx->getServiceContext()->getFastClockSource()->now(); });
+
+            StringData lockTarget;
+            if (cmdObj["lockTarget"]) {
+                lockTarget = cmdObj["lockTarget"].checkAndGetStringData();
             }
-        } else {
-            uassert(34346, "Only one of 'w' and 'lock' may be set.", !cmdObj["w"]);
 
-            std::string lock(cmdObj.getStringField("lock"));
-            if (lock == "none") {
-                opCtx->sleepFor(Milliseconds(millis));
-            } else if (lock == "w") {
-                _sleepInLock(opCtx, millis, MODE_X, lockTarget);
+            if (lockTarget == "ParallelBatchWriterMode") {
+                _sleepInPBWM(opCtx, msRemaining.count());
+                continue;
+            }
+
+            if (!cmdObj["lock"]) {
+                // The caller may specify either 'w' as true or false to take a global X lock or
+                // global S lock, respectively.
+                if (cmdObj.getBoolField("w")) {
+                    _sleepInLock(opCtx, msRemaining.count(), MODE_X, lockTarget);
+                } else {
+                    _sleepInLock(opCtx, msRemaining.count(), MODE_S, lockTarget);
+                }
             } else {
-                uassert(34347, "'lock' must be one of 'r', 'w', 'none'.", lock == "r");
-                _sleepInLock(opCtx, millis, MODE_S, lockTarget);
+                uassert(34346, "Only one of 'w' and 'lock' may be set.", !cmdObj["w"]);
+
+                std::string lock(cmdObj.getStringField("lock"));
+                if (lock == "none") {
+                    opCtx->sleepFor(Milliseconds(msRemaining));
+                } else if (lock == "w") {
+                    _sleepInLock(opCtx, msRemaining.count(), MODE_X, lockTarget);
+                } else if (lock == "iw") {
+                    _sleepInLock(opCtx, msRemaining.count(), MODE_IX, lockTarget);
+                } else if (lock == "r") {
+                    _sleepInLock(opCtx, msRemaining.count(), MODE_S, lockTarget);
+                } else {
+                    uassert(
+                        34347, "'lock' must be one of 'r', 'ir', 'w', 'iw', 'none'.", lock == "ir");
+                    _sleepInLock(opCtx, msRemaining.count(), MODE_IS, lockTarget);
+                }
             }
         }
 
@@ -153,4 +207,4 @@ public:
 };
 
 MONGO_REGISTER_TEST_COMMAND(CmdSleep);
-}  // namespace
+}  // namespace mongo

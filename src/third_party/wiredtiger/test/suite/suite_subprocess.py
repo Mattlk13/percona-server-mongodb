@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2019 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -93,7 +93,9 @@ class suite_subprocess:
             got = f.read(len(expect) + 100)
             self.assertEqual(got, expect, filename + ': does not contain expected:\n\'' + expect + '\', but contains:\n\'' + got + '\'.')
 
-    def check_file_contains_one_of(self, filename, expectlist):
+    # Check contents of the file against a provided checklist. Expected is used as a bool to either
+    # ensure checklist is included or ensure the checklist is not included in the file.
+    def check_file_contains_one_of(self, filename, checklist, expected):
         """
         Check that the file contains the expected string in the first 100K bytes
         """
@@ -101,21 +103,27 @@ class suite_subprocess:
         with open(filename, 'r') as f:
             got = f.read(maxbytes)
             found = False
-            for expect in expectlist:
+            for expect in checklist:
                 pat = self.convert_to_pattern(expect)
                 if pat == None:
                     if expect in got:
                         found = True
-                        break
+                        if expected:
+                            break
+                        else:
+                            self.fail("Did not expect: " + got)
                 else:
                     if re.search(pat, got):
                         found = True
-                        break
-            if not found:
-                if len(expectlist) == 1:
-                    expect = '\'' + expectlist[0] + '\''
+                        if expected:
+                            break
+                        else:
+                            self.fail("Did not expect: " + got)
+            if not found and expected:
+                if len(checklist) == 1:
+                    expect = '\'' + checklist[0] + '\''
                 else:
-                    expect = str(expectlist)
+                    expect = str(checklist)
                 gotstr = '\'' + \
                     (got if len(got) < 1000 else (got[0:1000] + '...')) + '\''
                 if len(got) >= maxbytes:
@@ -123,8 +131,11 @@ class suite_subprocess:
                 else:
                     self.fail(filename + ': does not contain expected ' + expect + ', got ' + gotstr)
 
-    def check_file_contains(self, filename, expect):
-        self.check_file_contains_one_of(filename, [expect])
+    def check_file_contains(self, filename, content):
+        self.check_file_contains_one_of(filename, [content], True)
+
+    def check_file_not_contains(self, filename, content):
+        self.check_file_contains_one_of(filename, [content], False)
 
     def check_empty_file(self, filename):
         """
@@ -151,7 +162,8 @@ class suite_subprocess:
         return envvar + '=' + str(os.environ.get(envvar)) + '\n'
 
     def show_outputs(self, procargs, message, filenames):
-        out = 'ERROR: wt command ' + message + ': ' + str(procargs) + '\n' + \
+        out = message + ': ' + \
+              str(procargs) + '\n' + \
               self.verbose_env('PATH') + \
               self.verbose_env('LD_LIBRARY_PATH') + \
               self.verbose_env('DYLD_LIBRARY_PATH') + \
@@ -168,6 +180,48 @@ class suite_subprocess:
                     sepline = '*' * 50 + '\n'
                     out = sepline + filename + '\n' + sepline + contents
                     WiredTigerTestCase.prout(out)
+
+    # Run a method as a subprocess using the run.py machinery.
+    # Return the process exit status and the the WiredTiger
+    # home directory used by the subprocess.
+    def run_subprocess_function(self, directory, funcname):
+        testparts = funcname.split('.')
+        if len(testparts) != 3:
+            raise ValueError('bad function name "' + funcname +
+                '", should be three part dotted name')
+        topdir = os.path.dirname(self.buildDirectory())
+        runscript = os.path.join(topdir, 'test', 'suite', 'run.py')
+        procargs = [ sys.executable, runscript, '-p', '--dir', directory,
+            funcname]
+
+        # scenario_number is only set if we are running in a scenario
+        try:
+            scennum = self.scenario_number
+            procargs.append('-s')
+            procargs.append(str(scennum))
+        except:
+            scennum = 0
+
+        returncode = -1
+        os.makedirs(directory)
+
+        # We cannot put the output/error files in the subdirectory, as
+        # that will be cleared by the run.py script.
+        with open("subprocess.err", "w") as wterr:
+            with open("subprocess.out", "w") as wtout:
+                returncode = subprocess.call(
+                    procargs, stdout=wtout, stderr=wterr)
+                if returncode != 0:
+                    # This is not necessarily an error, the primary reason to
+                    # run in a subprocess is that it may crash.
+                    self.show_outputs(procargs,
+                        "Warning: run_subprocess_function " + funcname + \
+                        " returned error code " + str(returncode),
+                        [ "subprocess.out", "subprocess.err" ])
+
+        new_home_dir = os.path.join(directory,
+            testparts[1] + '.' + str(scennum))
+        return [ returncode, new_home_dir ]
 
     # Run the wt utility.
     def runWt(self, args, infilename=None,
@@ -230,15 +284,17 @@ class suite_subprocess:
                         procargs, stdout=wtout, stderr=wterr)
         if failure:
             if returncode == 0:
-                self.show_outputs(procargs, "expected failure, got success",
-                                  [wtoutname, wterrname])
+                self.show_outputs(procargs,
+                    "ERROR: wt command expected failure, got success",
+                    [wtoutname, wterrname])
             self.assertNotEqual(returncode, 0,
                 'expected failure: "' + \
                 str(procargs) + '": exited ' + str(returncode))
         else:
             if returncode != 0:
-                self.show_outputs(procargs, "expected success, got failure",
-                                  [wtoutname, wterrname])
+                self.show_outputs(procargs,
+                    "ERROR: wt command expected success, got failure",
+                    [wtoutname, wterrname])
             self.assertEqual(returncode, 0,
                 'expected success: "' + \
                 str(procargs) + '": exited ' + str(returncode))

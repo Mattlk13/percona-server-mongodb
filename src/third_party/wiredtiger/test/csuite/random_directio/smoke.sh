@@ -4,7 +4,12 @@ set -e
 
 # Smoke-test random_directio as part of running "make check".
 
-RUN_TEST_CMD="$TEST_WRAPPER ./test_random_directio"
+# If $top_builddir/$top_srcdir aren't set, default to building in build_posix
+# and running in test/csuite.
+top_builddir=${top_builddir:-../../build_posix}
+top_srcdir=${top_srcdir:-../..}
+
+RUN_TEST_CMD="$TEST_WRAPPER $top_builddir/test/csuite/test_random_directio"
 
 # Replace for more complete testing
 #TEST_THREADS="1 5 10"
@@ -18,7 +23,7 @@ for threads in $TEST_THREADS; do
     for method in $TEST_METHODS; do
         RUN_TEST="$RUN_TEST_CMD -t 5 -m $method"
         $RUN_TEST -T $threads                              || exit 1
-        $RUN_TEST -T $threads -S create,drop,verbose       || exit 1
+        $RUN_TEST -f 20 -T $threads -S create,drop,verbose       || exit 1
 
         # Here are successively tougher schema tests that do not yet
         # reliably pass.  'verbose' can be added to any.

@@ -31,27 +31,27 @@
 
 #include "mongo/db/exec/count.h"
 
+#include <memory>
+
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set_common.h"
-#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
 using std::unique_ptr;
 using std::vector;
-using stdx::make_unique;
 
 // static
 const char* CountStage::kStageType = "COUNT";
 
-CountStage::CountStage(OperationContext* opCtx,
-                       Collection* collection,
+CountStage::CountStage(ExpressionContext* expCtx,
+                       const CollectionPtr& collection,
                        long long limit,
                        long long skip,
                        WorkingSet* ws,
                        PlanStage* child)
-    : PlanStage(kStageType, opCtx), _limit(limit), _skip(skip), _leftToSkip(_skip), _ws(ws) {
+    : PlanStage(kStageType, expCtx), _limit(limit), _skip(skip), _leftToSkip(_skip), _ws(ws) {
     invariant(_skip >= 0);
     invariant(_limit >= 0);
     invariant(child);
@@ -84,12 +84,6 @@ PlanStage::StageState CountStage::doWork(WorkingSetID* out) {
     if (PlanStage::IS_EOF == state) {
         _commonStats.isEOF = true;
         return PlanStage::IS_EOF;
-    } else if (PlanStage::FAILURE == state) {
-        // The stage which produces a failure is responsible for allocating a working set member
-        // with error details.
-        invariant(WorkingSet::INVALID_ID != id);
-        *out = id;
-        return state;
     } else if (PlanStage::ADVANCED == state) {
         // We got a result. If we're still skipping, then decrement the number left to skip.
         // Otherwise increment the count until we hit the limit.
@@ -115,8 +109,8 @@ PlanStage::StageState CountStage::doWork(WorkingSetID* out) {
 
 unique_ptr<PlanStageStats> CountStage::getStats() {
     _commonStats.isEOF = isEOF();
-    unique_ptr<PlanStageStats> ret = make_unique<PlanStageStats>(_commonStats, STAGE_COUNT);
-    ret->specific = make_unique<CountStats>(_specificStats);
+    unique_ptr<PlanStageStats> ret = std::make_unique<PlanStageStats>(_commonStats, STAGE_COUNT);
+    ret->specific = std::make_unique<CountStats>(_specificStats);
     if (!_children.empty()) {
         ret->children.emplace_back(child()->getStats());
     }

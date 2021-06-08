@@ -4,7 +4,6 @@
 //
 
 var Explainable = (function() {
-
     var parseVerbosity = function(verbosity) {
         // Truthy non-strings are interpreted as "allPlansExecution" verbosity.
         if (verbosity && (typeof verbosity !== "string")) {
@@ -16,12 +15,7 @@ var Explainable = (function() {
             return "queryPlanner";
         }
 
-        // If we're here, then the verbosity is a string. We reject invalid strings.
-        if (verbosity !== "queryPlanner" && verbosity !== "executionStats" &&
-            verbosity !== "allPlansExecution") {
-            throw Error("explain verbosity must be one of {" + "'queryPlanner'," +
-                        "'executionStats'," + "'allPlansExecution'}");
-        }
+        // All verbosity strings are passed through. Server validates if it is a known option.
 
         return verbosity;
     };
@@ -32,6 +26,16 @@ var Explainable = (function() {
         }
 
         return explainResult;
+    };
+
+    var buildExplainCmd = function(innerCmd, verbosity) {
+        var explainCmd = {"explain": innerCmd, "verbosity": verbosity};
+        // If "maxTimeMS" is set on innerCmd, it needs to be propagated to the top-level
+        // of explainCmd so that it has the intended effect.
+        if (innerCmd.hasOwnProperty("maxTimeMS")) {
+            explainCmd.maxTimeMS = innerCmd.maxTimeMS;
+        }
+        return explainCmd;
     };
 
     function constructor(collection, verbosity) {
@@ -66,6 +70,7 @@ var Explainable = (function() {
             print("\t.distinct(...) - explain a distinct operation");
             print("\t.find(...) - get an explainable query");
             print("\t.findAndModify(...) - explain a findAndModify operation");
+            print("\t.mapReduce(...) - explain a mapReduce operation");
             print("\t.remove(...) - explain a remove operation");
             print("\t.update(...) - explain an update operation");
             print("Explainable collection methods");
@@ -115,7 +120,7 @@ var Explainable = (function() {
 
                 let aggCmd = Object.extend(
                     {"aggregate": this._collection.getName(), "pipeline": pipeline}, extraOptsCopy);
-                let explainCmd = {"explain": aggCmd, "verbosity": this._verbosity};
+                let explainCmd = buildExplainCmd(aggCmd, this._verbosity);
                 let explainResult = this._collection.runReadCommand(explainCmd);
                 return throwOrReturn(explainResult);
             }
@@ -138,7 +143,7 @@ var Explainable = (function() {
 
         this.findAndModify = function(params) {
             var famCmd = Object.extend({"findAndModify": this._collection.getName()}, params);
-            var explainCmd = {"explain": famCmd, "verbosity": this._verbosity};
+            var explainCmd = buildExplainCmd(famCmd, this._verbosity);
             var explainResult = this._collection.runReadCommand(explainCmd);
             return throwOrReturn(explainResult);
         };
@@ -153,8 +158,11 @@ var Explainable = (function() {
             if (options && options.hasOwnProperty("collation")) {
                 distinctCmd.collation = options.collation;
             }
+            if (options && options.hasOwnProperty("maxTimeMS")) {
+                distinctCmd.maxTimeMS = options.maxTimeMS;
+            }
 
-            var explainCmd = {explain: distinctCmd, verbosity: this._verbosity};
+            var explainCmd = buildExplainCmd(distinctCmd, this._verbosity);
             var explainResult = this._collection.runReadCommand(explainCmd);
             return throwOrReturn(explainResult);
         };
@@ -191,9 +199,14 @@ var Explainable = (function() {
             var multi = parsed.multi;
             var collation = parsed.collation;
             var arrayFilters = parsed.arrayFilters;
+            var hint = parsed.hint;
 
             var bulk = this._collection.initializeOrderedBulkOp();
             var updateOp = bulk.find(query);
+
+            if (hint) {
+                updateOp.hint(hint);
+            }
 
             if (upsert) {
                 updateOp = updateOp.upsert();
@@ -215,6 +228,21 @@ var Explainable = (function() {
 
             var explainCmd = bulk.convertToExplainCmd(this._verbosity);
             var explainResult = this._collection.runCommand(explainCmd);
+            return throwOrReturn(explainResult);
+        };
+
+        this.mapReduce = function(map, reduce, optionsObjOrOutString) {
+            assert(optionsObjOrOutString, "Must supply the 'optionsObjOrOutString ' argument");
+
+            const mapReduceCmd = {mapreduce: this._collection.getName(), map: map, reduce: reduce};
+
+            if (typeof (optionsObjOrOutString) == "string")
+                mapReduceCmd["out"] = optionsObjOrOutString;
+            else
+                Object.extend(mapReduceCmd, optionsObjOrOutString);
+
+            const explainCmd = buildExplainCmd(mapReduceCmd, this._verbosity);
+            const explainResult = this._collection.runCommand(explainCmd);
             return throwOrReturn(explainResult);
         };
     }

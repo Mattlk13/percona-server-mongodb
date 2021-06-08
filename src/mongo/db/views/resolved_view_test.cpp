@@ -35,9 +35,9 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/json.h"
+#include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/pipeline/aggregation_request.h"
-#include "mongo/db/pipeline/document.h"
+#include "mongo/db/pipeline/aggregation_request_helper.h"
 #include "mongo/db/views/resolved_view.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/unittest/unittest.h"
@@ -48,38 +48,38 @@ namespace {
 const NamespaceString viewNss("testdb.testview");
 const NamespaceString backingNss("testdb.testcoll");
 const std::vector<BSONObj> emptyPipeline;
-const BSONObj kDefaultCursorOptionDocument =
-    BSON(AggregationRequest::kBatchSizeName << AggregationRequest::kDefaultBatchSize);
+const BSONObj kDefaultCursorOptionDocument = BSON(aggregation_request_helper::kBatchSizeField
+                                                  << aggregation_request_helper::kDefaultBatchSize);
 const BSONObj kSimpleCollation;
 
 TEST(ResolvedViewTest, ExpandingAggRequestWithEmptyPipelineOnNoOpViewYieldsEmptyPipeline) {
     const ResolvedView resolvedView{backingNss, emptyPipeline, kSimpleCollation};
-    AggregationRequest requestOnView{viewNss, emptyPipeline};
+    AggregateCommandRequest requestOnView{viewNss, emptyPipeline};
 
     auto result = resolvedView.asExpandedViewAggregation(requestOnView);
     BSONObj expected =
         BSON("aggregate" << backingNss.coll() << "pipeline" << BSONArray() << "cursor"
-                         << kDefaultCursorOptionDocument);
-    ASSERT_BSONOBJ_EQ(result.serializeToCommandObj().toBson(), expected);
+                         << kDefaultCursorOptionDocument << "collation" << BSONObj());
+    ASSERT_BSONOBJ_EQ(aggregation_request_helper::serializeToCommandObj(result), expected);
 }
 
 TEST(ResolvedViewTest, ExpandingAggRequestWithNonemptyPipelineAppendsToViewPipeline) {
     std::vector<BSONObj> viewPipeline{BSON("skip" << 7)};
     const ResolvedView resolvedView{backingNss, viewPipeline, kSimpleCollation};
-    AggregationRequest requestOnView{viewNss, std::vector<BSONObj>{BSON("limit" << 3)}};
+    AggregateCommandRequest requestOnView{viewNss, std::vector<BSONObj>{BSON("limit" << 3)}};
 
     auto result = resolvedView.asExpandedViewAggregation(requestOnView);
 
-    BSONObj expected = BSON("aggregate" << backingNss.coll() << "pipeline"
-                                        << BSON_ARRAY(BSON("skip" << 7) << BSON("limit" << 3))
-                                        << "cursor"
-                                        << kDefaultCursorOptionDocument);
-    ASSERT_BSONOBJ_EQ(result.serializeToCommandObj().toBson(), expected);
+    BSONObj expected =
+        BSON("aggregate" << backingNss.coll() << "pipeline"
+                         << BSON_ARRAY(BSON("skip" << 7) << BSON("limit" << 3)) << "cursor"
+                         << kDefaultCursorOptionDocument << "collation" << BSONObj());
+    ASSERT_BSONOBJ_EQ(aggregation_request_helper::serializeToCommandObj(result), expected);
 }
 
 TEST(ResolvedViewTest, ExpandingAggRequestPreservesExplain) {
     const ResolvedView resolvedView{backingNss, emptyPipeline, kSimpleCollation};
-    AggregationRequest aggRequest{viewNss, {}};
+    AggregateCommandRequest aggRequest{viewNss, {}};
     aggRequest.setExplain(ExplainOptions::Verbosity::kExecStats);
 
     auto result = resolvedView.asExpandedViewAggregation(aggRequest);
@@ -89,74 +89,78 @@ TEST(ResolvedViewTest, ExpandingAggRequestPreservesExplain) {
 
 TEST(ResolvedViewTest, ExpandingAggRequestWithCursorAndExplainOnlyPreservesExplain) {
     const ResolvedView resolvedView{backingNss, emptyPipeline, kSimpleCollation};
-    AggregationRequest aggRequest{viewNss, {}};
-    aggRequest.setBatchSize(10);
+    AggregateCommandRequest aggRequest{viewNss, {}};
+    SimpleCursorOptions cursor;
+    cursor.setBatchSize(10);
+    aggRequest.setCursor(cursor);
     aggRequest.setExplain(ExplainOptions::Verbosity::kExecStats);
 
     auto result = resolvedView.asExpandedViewAggregation(aggRequest);
     ASSERT(result.getExplain());
     ASSERT(*result.getExplain() == ExplainOptions::Verbosity::kExecStats);
-    ASSERT_EQ(result.getBatchSize(), AggregationRequest::kDefaultBatchSize);
+    ASSERT_EQ(
+        result.getCursor().getBatchSize().value_or(aggregation_request_helper::kDefaultBatchSize),
+        aggregation_request_helper::kDefaultBatchSize);
 }
 
 TEST(ResolvedViewTest, ExpandingAggRequestPreservesBypassDocumentValidation) {
     const ResolvedView resolvedView{backingNss, emptyPipeline, kSimpleCollation};
-    AggregationRequest aggRequest(viewNss, {});
+    AggregateCommandRequest aggRequest(viewNss, {});
     aggRequest.setBypassDocumentValidation(true);
 
     auto result = resolvedView.asExpandedViewAggregation(aggRequest);
-    ASSERT_TRUE(result.shouldBypassDocumentValidation());
+    ASSERT_TRUE(result.getBypassDocumentValidation().value_or(false));
 }
 
 TEST(ResolvedViewTest, ExpandingAggRequestPreservesAllowDiskUse) {
     const ResolvedView resolvedView{backingNss, emptyPipeline, kSimpleCollation};
-    AggregationRequest aggRequest(viewNss, {});
+    AggregateCommandRequest aggRequest(viewNss, {});
     aggRequest.setAllowDiskUse(true);
 
     auto result = resolvedView.asExpandedViewAggregation(aggRequest);
-    ASSERT_TRUE(result.shouldAllowDiskUse());
+    ASSERT_TRUE(result.getAllowDiskUse());
 }
 
 TEST(ResolvedViewTest, ExpandingAggRequestPreservesHint) {
     const ResolvedView resolvedView{backingNss, emptyPipeline, kSimpleCollation};
-    AggregationRequest aggRequest(viewNss, {});
+    AggregateCommandRequest aggRequest(viewNss, {});
     aggRequest.setHint(BSON("a" << 1));
 
     auto result = resolvedView.asExpandedViewAggregation(aggRequest);
-    ASSERT_BSONOBJ_EQ(result.getHint(), BSON("a" << 1));
+    ASSERT_BSONOBJ_EQ(result.getHint().value_or(BSONObj()), BSON("a" << 1));
 }
 
 TEST(ResolvedViewTest, ExpandingAggRequestPreservesReadPreference) {
     const ResolvedView resolvedView{backingNss, emptyPipeline, kSimpleCollation};
-    AggregationRequest aggRequest(viewNss, {});
+    AggregateCommandRequest aggRequest(viewNss, {});
     aggRequest.setUnwrappedReadPref(BSON("$readPreference"
                                          << "nearest"));
 
     auto result = resolvedView.asExpandedViewAggregation(aggRequest);
-    ASSERT_BSONOBJ_EQ(result.getUnwrappedReadPref(),
+    ASSERT_BSONOBJ_EQ(result.getUnwrappedReadPref().value_or(BSONObj()),
                       BSON("$readPreference"
                            << "nearest"));
 }
 
 TEST(ResolvedViewTest, ExpandingAggRequestPreservesReadConcern) {
     const ResolvedView resolvedView{backingNss, emptyPipeline, kSimpleCollation};
-    AggregationRequest aggRequest(viewNss, {});
+    AggregateCommandRequest aggRequest(viewNss, {});
     aggRequest.setReadConcern(BSON("level"
                                    << "linearizable"));
 
     auto result = resolvedView.asExpandedViewAggregation(aggRequest);
-    ASSERT_BSONOBJ_EQ(result.getReadConcern(),
+    ASSERT_BSONOBJ_EQ(result.getReadConcern().value_or(BSONObj()),
                       BSON("level"
                            << "linearizable"));
 }
 
 TEST(ResolvedViewTest, ExpandingAggRequestPreservesMaxTimeMS) {
     const ResolvedView resolvedView{backingNss, emptyPipeline, kSimpleCollation};
-    AggregationRequest aggRequest(viewNss, {});
+    AggregateCommandRequest aggRequest(viewNss, {});
     aggRequest.setMaxTimeMS(100u);
 
     auto result = resolvedView.asExpandedViewAggregation(aggRequest);
-    ASSERT_EQ(result.getMaxTimeMS(), 100u);
+    ASSERT_EQ(result.getMaxTimeMS().value_or(0), 100u);
 }
 
 TEST(ResolvedViewTest, ExpandingAggRequestPreservesDefaultCollationOfView) {
@@ -167,21 +171,12 @@ TEST(ResolvedViewTest, ExpandingAggRequestPreservesDefaultCollationOfView) {
     ASSERT_BSONOBJ_EQ(resolvedView.getDefaultCollation(),
                       BSON("locale"
                            << "fr_CA"));
-    AggregationRequest aggRequest(viewNss, {});
+    AggregateCommandRequest aggRequest(viewNss, {});
 
     auto result = resolvedView.asExpandedViewAggregation(aggRequest);
-    ASSERT_BSONOBJ_EQ(result.getCollation(),
+    ASSERT_BSONOBJ_EQ(result.getCollation().value_or(BSONObj()),
                       BSON("locale"
                            << "fr_CA"));
-}
-
-TEST(ResolvedViewTest, ExpandingAggRequestPreservesComment) {
-    const ResolvedView resolvedView{backingNss, emptyPipeline, kSimpleCollation};
-    AggregationRequest aggRequest(viewNss, {});
-    aggRequest.setComment("agg_comment");
-
-    auto result = resolvedView.asExpandedViewAggregation(aggRequest);
-    ASSERT_EQ(result.getComment(), "agg_comment");
 }
 
 TEST(ResolvedViewTest, FromBSONFailsIfMissingResolvedView) {
@@ -216,9 +211,8 @@ TEST(ResolvedViewTest, FromBSONFailsOnInvalidPipelineType) {
 }
 
 TEST(ResolvedViewTest, FromBSONFailsOnInvalidCollationType) {
-    BSONObj badCmdResponse =
-        BSON("resolvedView" << BSON(
-                 "ns" << backingNss.ns() << "pipeline" << BSONArray() << "collation" << 1));
+    BSONObj badCmdResponse = BSON("resolvedView" << BSON("ns" << backingNss.ns() << "pipeline"
+                                                              << BSONArray() << "collation" << 1));
     ASSERT_THROWS_CODE(ResolvedView::fromBSON(badCmdResponse), AssertionException, 40639);
 }
 
@@ -234,10 +228,10 @@ TEST(ResolvedViewTest, FromBSONSuccessfullyParsesEmptyBSONArrayIntoEmptyVector) 
 }
 
 TEST(ResolvedViewTest, FromBSONSuccessfullyParsesCollation) {
-    BSONObj cmdResponse = BSON(
-        "resolvedView" << BSON("ns" << backingNss.ns() << "pipeline" << BSONArray() << "collation"
-                                    << BSON("locale"
-                                            << "fil")));
+    BSONObj cmdResponse = BSON("resolvedView" << BSON("ns" << backingNss.ns() << "pipeline"
+                                                           << BSONArray() << "collation"
+                                                           << BSON("locale"
+                                                                   << "fil")));
     const ResolvedView result = ResolvedView::fromBSON(cmdResponse);
     ASSERT_EQ(result.getNamespace(), backingNss);
     ASSERT(std::equal(emptyPipeline.begin(),
@@ -257,8 +251,7 @@ TEST(ResolvedViewTest, FromBSONSuccessfullyParsesPopulatedBSONArrayIntoVector) {
     BSONArray pipeline = BSON_ARRAY(matchStage << sortStage << limitStage);
     BSONObj cmdResponse = BSON("resolvedView" << BSON("ns"
                                                       << "testdb.testcoll"
-                                                      << "pipeline"
-                                                      << pipeline));
+                                                      << "pipeline" << pipeline));
 
     const ResolvedView result = ResolvedView::fromBSON(cmdResponse);
     ASSERT_EQ(result.getNamespace(), backingNss);
@@ -274,8 +267,7 @@ TEST(ResolvedViewTest, IsResolvedViewErrorResponseDetectsKickbackErrorCodeSucces
     BSONObj errorResponse =
         BSON("ok" << 0 << "code" << ErrorCodes::CommandOnShardedViewNotSupportedOnMongod << "errmsg"
                   << "This view is sharded and cannot be run on mongod"
-                  << "resolvedView"
-                  << BSON("ns" << backingNss.ns() << "pipeline" << BSONArray()));
+                  << "resolvedView" << BSON("ns" << backingNss.ns() << "pipeline" << BSONArray()));
     auto status = getStatusFromCommandResult(errorResponse);
     ASSERT_EQ(status, ErrorCodes::CommandOnShardedViewNotSupportedOnMongod);
     ASSERT(status.extraInfo<ResolvedView>());

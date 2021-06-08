@@ -50,7 +50,7 @@ var BackupRestoreTest = function(options) {
             let iteration = 0;
 
             var coll = db.getSiblingDB(dbName).getCollection(collectionName);
-            coll.ensureIndex({x: 1});
+            coll.createIndex({x: 1});
 
             var largeValue = new Array(1024).join('L');
 
@@ -83,20 +83,20 @@ var BackupRestoreTest = function(options) {
                                 doc: largeValue.substring(0, match % largeValue.length),
                             });
                         }
-                        assert.writeOK(bulk.execute(writeConcern));
+                        assert.commandWorked(bulk.execute(writeConcern));
                     } else if (op < 0.4) {
                         // 20% of the operations: update docs.
                         var updateOpts = {upsert: true, multi: true, writeConcern: writeConcern};
-                        assert.writeOK(coll.update({x: {$gte: match}},
-                                                   {$inc: {x: baseNum}, $set: {n: 'hello'}},
-                                                   updateOpts));
+                        assert.commandWorked(coll.update({x: {$gte: match}},
+                                                         {$inc: {x: baseNum}, $set: {n: 'hello'}},
+                                                         updateOpts));
                     } else if (op < 0.9) {
                         // 50% of the operations: find matchings docs.
                         // itcount() consumes the cursor
                         coll.find({x: {$gte: match}}).itcount();
                     } else {
                         // 10% of the operations: remove matching docs.
-                        assert.writeOK(
+                        assert.commandWorked(
                             coll.remove({x: {$gte: match}}, {writeConcern: writeConcern}));
                     }
                 } catch (e) {
@@ -122,8 +122,8 @@ var BackupRestoreTest = function(options) {
     function _fsmClient(host) {
         // Launch FSM client
         const suite = 'concurrency_replication_for_backup_restore';
-        const resmokeCmd = 'python buildscripts/resmoke.py --shuffle --continueOnFailure' +
-            ' --repeat=99999 --mongo=' + MongoRunner.mongoShellPath +
+        const resmokeCmd = 'python buildscripts/resmoke.py run --shuffle --continueOnFailure' +
+            ' --repeat=99999 --internalParam=is_inner_level --mongo=' + MongoRunner.mongoShellPath +
             ' --shellConnString=mongodb://' + host + ' --suites=' + suite;
 
         // Returns the pid of the FSM test client so it can be terminated without waiting for its
@@ -152,8 +152,8 @@ var BackupRestoreTest = function(options) {
         assert(options.backup, "Backup option not supplied");
         assert.contains(options.backup,
                         allowedBackupKeys,
-                        'invalid option: ' + tojson(options.backup) + '; valid options are: ' +
-                            tojson(allowedBackupKeys));
+                        'invalid option: ' + tojson(options.backup) +
+                            '; valid options are: ' + tojson(allowedBackupKeys));
 
         // Number of nodes in initial replica set (default 3)
         var numNodes = options.nodes || 3;
@@ -225,9 +225,6 @@ var BackupRestoreTest = function(options) {
         }
         var copiedFiles;
 
-        // Compare dbHash of crudDb when possible on hidden secondary
-        var dbHash;
-
         // Perform the data backup to new secondary
         if (options.backup == 'fsyncLock') {
             rst.awaitSecondaryNodes();
@@ -239,7 +236,6 @@ var BackupRestoreTest = function(options) {
                 return;
             }
 
-            dbHash = secondary.getDB(crudDb).runCommand({dbhash: 1}).md5;
             copyDbpath(dbpathSecondary, hiddenDbpath);
             removeFile(hiddenDbpath + '/mongod.lock');
             print("Source directory:", tojson(ls(dbpathSecondary)));
@@ -293,45 +289,6 @@ var BackupRestoreTest = function(options) {
         // Wait up to 5 minutes until restarted node is in state secondary.
         rst.waitForState(rst.getSecondaries(), ReplSetTest.State.SECONDARY);
 
-        // Add new hidden node to replSetTest
-        jsTestLog('Starting new hidden node (but do not add to replica set) with dbpath ' +
-                  hiddenDbpath + '.');
-        var nodesBeforeAddingHiddenMember = rst.nodes.slice();
-        // ReplSetTest.add() will use default values for --oplogSize and --replSet consistent with
-        // existing nodes.
-        var hiddenCfg = {noCleanData: true, dbpath: hiddenDbpath};
-        var hiddenNode = rst.add(hiddenCfg);
-        var hiddenHost = hiddenNode.host;
-
-        // Verify if dbHash is the same on hidden secondary for crudDb
-        // Note the dbhash can only run when the DB is inactive to get a result
-        // that can be compared, which is only in the fsyncLock/fsynUnlock case
-        if (dbHash !== undefined) {
-            assert.soon(function() {
-                try {
-                    // Need to hammer this since the node can disconnect connections as it is
-                    // starting up into REMOVED replication state.
-                    return (dbHash === hiddenNode.getDB(crudDb).runCommand({dbhash: 1}).md5);
-                } catch (e) {
-                    return false;
-                }
-            });
-        }
-
-        // Add new hidden secondary to replica set
-        jsTestLog('Adding new hidden node ' + hiddenHost + ' to replica set.');
-        rst.awaitNodesAgreeOnPrimary(ReplSetTest.kDefaultTimeoutMS, nodesBeforeAddingHiddenMember);
-        primary = rst.getPrimary();
-        var rsConfig = primary.getDB("local").system.replset.findOne();
-        rsConfig.version += 1;
-        var hiddenMember = {_id: numNodes, host: hiddenHost, priority: 0, hidden: true};
-        rsConfig.members.push(hiddenMember);
-        assert.commandWorked(primary.adminCommand({replSetReconfig: rsConfig}),
-                             testName + ' failed to reconfigure replSet ' + tojson(rsConfig));
-
-        // Wait up to 5 minutes until the new hidden node is in state RECOVERING.
-        rst.waitForState(hiddenNode, [ReplSetTest.State.RECOVERING, ReplSetTest.State.SECONDARY]);
-
         jsTestLog('Stopping CRUD and FSM clients');
 
         // Stop CRUD client and FSM client.
@@ -373,6 +330,29 @@ var BackupRestoreTest = function(options) {
                 {'a': 1}, {writeConcern: {w: 'majority'}}));
         });
 
+        // Add the new hidden node to replSetTest.
+        jsTestLog('Starting new hidden node (but do not add to replica set) with dbpath ' +
+                  hiddenDbpath + '.');
+        var nodesBeforeAddingHiddenMember = rst.nodes.slice();
+        // ReplSetTest.add() will use default values for --oplogSize and --replSet consistent with
+        // existing nodes.
+        var hiddenCfg = {noCleanData: true, dbpath: hiddenDbpath};
+        var hiddenNode = rst.add(hiddenCfg);
+        var hiddenHost = hiddenNode.host;
+
+        // Add the new hidden secondary to the replica set. This triggers an election, so it must be
+        // done after stopping the background workloads to prevent the workloads from failing if a
+        // new primary is elected.
+        jsTestLog('Adding new hidden node ' + hiddenHost + ' to replica set.');
+        rst.awaitNodesAgreeOnPrimary(ReplSetTest.kDefaultTimeoutMS, nodesBeforeAddingHiddenMember);
+        primary = rst.getPrimary();
+        var rsConfig = primary.getDB("local").system.replset.findOne();
+        rsConfig.version += 1;
+        var hiddenMember = {_id: numNodes, host: hiddenHost, priority: 0, hidden: true};
+        rsConfig.members.push(hiddenMember);
+        assert.commandWorked(primary.adminCommand({replSetReconfig: rsConfig}),
+                             testName + ' failed to reconfigure replSet ' + tojson(rsConfig));
+
         // Wait up to 5 minutes until the new hidden node is in state SECONDARY.
         jsTestLog('CRUD and FSM clients stopped. Waiting for hidden node ' + hiddenHost +
                   ' to become SECONDARY');
@@ -393,7 +373,7 @@ var BackupRestoreTest = function(options) {
 
         jsTestLog('Inserting single document into primary ' + primary.host +
                   ' with writeConcern w:' + rst.nodes.length);
-        var writeResult = assert.writeOK(primary.getDB("test").foo.insert(
+        var writeResult = assert.commandWorked(primary.getDB("test").foo.insert(
             {}, {writeConcern: {w: rst.nodes.length, wtimeout: ReplSetTest.kDefaultTimeoutMS}}));
 
         // Stop set.

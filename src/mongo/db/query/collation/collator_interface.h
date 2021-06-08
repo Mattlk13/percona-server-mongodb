@@ -89,7 +89,7 @@ public:
     /**
      * Constructs a CollatorInterface capable of computing the collation described by 'spec'.
      */
-    CollatorInterface(CollationSpec spec) : _spec(std::move(spec)) {}
+    CollatorInterface(Collation spec) : _spec(std::move(spec)) {}
 
     virtual ~CollatorInterface() {}
 
@@ -115,6 +115,12 @@ public:
     virtual ComparisonKey getComparisonKey(StringData stringData) const = 0;
 
     /**
+     * Returns the comparison key string for 'stringData', according to this collation. See
+     * ComparisonKey's comments for details.
+     */
+    std::string getComparisonString(StringData stringData) const;
+
+    /**
      * Returns whether this collation has the same matching and sorting semantics as 'other'.
      */
     bool operator==(const CollatorInterface& other) const {
@@ -130,9 +136,9 @@ public:
     }
 
     /**
-     * Returns a reference to the CollationSpec.
+     * Returns a reference to the Collation.
      */
-    const CollationSpec& getSpec() const {
+    const Collation& getSpec() const {
         return _spec;
     }
 
@@ -165,7 +171,7 @@ protected:
     }
 
 private:
-    const CollationSpec _spec;
+    const Collation _spec;
 };
 
 }  // namespace mongo

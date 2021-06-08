@@ -38,18 +38,81 @@
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/query/index_bounds.h"
 #include "mongo/db/query/plan_cache.h"
+#include "mongo/db/query/plan_enumerator_explain_info.h"
 #include "mongo/db/query/stage_types.h"
+#include "mongo/util/id_generator.h"
 
 namespace mongo {
 
 class GeoNearExpression;
 
 /**
+ * Represents the granularity at which a field is available in a query solution node. Note that the
+ * order of the fields represents increasing availability.
+ */
+enum class FieldAvailability {
+    // The field is not provided.
+    kNotProvided,
+
+    // The field is provided as a hash of raw data instead of the raw data itself. For example, this
+    // can happen when the field is a hashed field in an index.
+    kHashedValueProvided,
+
+    // The field is completely provided.
+    kFullyProvided,
+};
+
+/**
+ * Represents the set of sort orders satisfied by the data returned from a particular
+ * QuerySolutionNode.
+ */
+class ProvidedSortSet {
+public:
+    ProvidedSortSet(BSONObj pattern, std::set<std::string> ignoreFields)
+        : _baseSortPattern(std::move(pattern)), _ignoredFields(std::move(ignoreFields)) {}
+    ProvidedSortSet() = default;
+
+    /**
+     * Returns true if the 'input' sort order is provided.
+     *
+     * Note: This function is sensitive to direction, i.e, if a pattern {a: 1} is provided, {a: -1}
+     * may not be provided.
+     */
+    bool contains(BSONObj input) const;
+    BSONObj getBaseSortPattern() const {
+        return _baseSortPattern;
+    }
+    const std::set<std::string>& getIgnoredFields() const {
+        return _ignoredFields;
+    }
+    std::string debugString() const {
+        str::stream ss;
+        ss << "baseSortPattern: " << _baseSortPattern << ", ignoredFields: [";
+        for (auto&& ignoreField : _ignoredFields) {
+            ss << ignoreField
+               << /* last element */ (ignoreField == *_ignoredFields.rbegin() ? "" : ", ");
+        }
+        ss << "]";
+        return ss;
+    }
+
+private:
+    // The base sort order that is used as a reference to generate all possible sort orders. It is
+    // also implied that all the prefixes of '_baseSortPattern' are provided.
+    BSONObj _baseSortPattern;
+
+    // Object to hold set of fields on which there is an equality predicate in the 'query' and
+    // doesn't contribute to the sort order. Note that this doesn't include multiKey fields or
+    // collations fields since they can contribute to the sort order.
+    std::set<std::string> _ignoredFields;
+};
+
+/**
  * This is an abstract representation of a query plan.  It can be transcribed into a tree of
  * PlanStages, which can then be handed to a PlanRunner for execution.
  */
 struct QuerySolutionNode {
-    QuerySolutionNode() {}
+    QuerySolutionNode() = default;
 
     /**
      * Constructs a QuerySolutionNode with a single child.
@@ -105,35 +168,41 @@ struct QuerySolutionNode {
     virtual bool fetched() const = 0;
 
     /**
-     * Returns true if the tree rooted at this node provides data with the field name 'field'.
-     * This data can come from any of the types of the WSM.
+     * Returns the granularity at which the tree rooted at this node provides data with the field
+     * name 'field'. This data can come from any of the types of the WSM.
      *
      * Usage: If an index-only plan has all the fields we're interested in, we don't
      * have to fetch to show results with those fields.
-     *
-     * TODO: 'field' is probably more appropriate as a FieldRef or string.
      */
-    virtual bool hasField(const std::string& field) const = 0;
+    virtual FieldAvailability getFieldAvailability(const std::string& field) const = 0;
 
     /**
-     * Returns true if the tree rooted at this node provides data that is sorted by the
-     * its location on disk.
+     * Syntatic sugar on top of getFieldAvailability(). Returns true if the 'field' is fully
+     * provided and false otherwise.
+     */
+    bool hasField(const std::string& field) const {
+        return getFieldAvailability(field) == FieldAvailability::kFullyProvided;
+    }
+
+    /**
+     * Returns true if the tree rooted at this node provides data that is sorted by its location on
+     * disk.
      *
-     * Usage: If all the children of an STAGE_AND_HASH have this property, we can compute the
-     * AND faster by replacing the STAGE_AND_HASH with STAGE_AND_SORTED.
+     * Usage: If all the children of an STAGE_AND_HASH have this property, we can compute the AND
+     * faster by replacing the STAGE_AND_HASH with STAGE_AND_SORTED.
      */
     virtual bool sortedByDiskLoc() const = 0;
 
     /**
-     * Return a BSONObjSet representing the possible sort orders of the data stream from this
-     * node.  If the data is not sorted in any particular fashion, returns an empty set.
+     * Returns a 'ProvidedSortSet' object which can be used to determine the possible sort orders of
+     * the data returned from this node.
      *
      * Usage:
      * 1. If our plan gives us a sort order, we don't have to add a sort stage.
      * 2. If all the children of an OR have the same sort order, we can maintain that
      *    sort order with a STAGE_SORT_MERGE instead of STAGE_OR.
      */
-    virtual const BSONObjSet& getSort() const = 0;
+    virtual const ProvidedSortSet& providedSorts() const = 0;
 
     /**
      * Make a deep copy.
@@ -147,7 +216,7 @@ struct QuerySolutionNode {
         for (size_t i = 0; i < this->children.size(); i++) {
             other->children.push_back(this->children[i]->clone());
         }
-        if (NULL != this->filter) {
+        if (nullptr != this->filter) {
             other->filter = this->filter->shallowClone();
         }
     }
@@ -166,6 +235,35 @@ struct QuerySolutionNode {
                        [](auto& child) { return child.release(); });
     }
 
+    bool getScanLimit() {
+        if (hitScanLimit) {
+            return hitScanLimit;
+        }
+        for (const auto& child : children) {
+            if (child->getScanLimit()) {
+                hitScanLimit = true;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * True, if this node, or any of it's children is of the given 'type'.
+     */
+    bool hasNode(StageType type) const;
+
+    /**
+     * Returns the id associated with this node. Each node in a 'QuerySolution' tree is assigned a
+     * unique identifier, which are assigned as sequential positive integers starting from 1.  An id
+     * of 0 means that no id was explicitly assigned during construction of the QuerySolution.
+     *
+     * The identifiers are unique within the tree, but not across trees.
+     */
+    PlanNodeId nodeId() const {
+        return _nodeId;
+    }
+
     // These are owned here.
     //
     // TODO SERVER-35512: Make this a vector of unique_ptr.
@@ -174,6 +272,8 @@ struct QuerySolutionNode {
     // If a stage has a non-NULL filter all values outputted from that stage must pass that
     // filter.
     std::unique_ptr<MatchExpression> filter;
+
+    bool hitScanLimit = false;
 
 protected:
     /**
@@ -188,8 +288,34 @@ protected:
     void addCommon(str::stream* ss, int indent) const;
 
 private:
+    // Allows the QuerySolution constructor to set '_nodeId'.
+    friend class QuerySolution;
+
     QuerySolutionNode(const QuerySolutionNode&) = delete;
     QuerySolutionNode& operator=(const QuerySolutionNode&) = delete;
+
+    PlanNodeId _nodeId{0u};
+};
+
+struct QuerySolutionNodeWithSortSet : public QuerySolutionNode {
+    QuerySolutionNodeWithSortSet() = default;
+
+    /**
+     * This constructor is only useful for QuerySolutionNodes with a single child.
+     */
+    explicit QuerySolutionNodeWithSortSet(std::unique_ptr<QuerySolutionNode> child)
+        : QuerySolutionNode(std::move(child)) {}
+
+    const ProvidedSortSet& providedSorts() const final {
+        return sortSet;
+    }
+
+    void cloneBaseData(QuerySolutionNodeWithSortSet* other) const {
+        QuerySolutionNode::cloneBaseData(other);
+        other->sortSet = sortSet;
+    }
+
+    ProvidedSortSet sortSet;
 };
 
 /**
@@ -198,14 +324,55 @@ private:
  * A tree of stages may be built from a QuerySolution.  The QuerySolution must outlive the tree
  * of stages.
  */
-struct QuerySolution {
-    QuerySolution() : hasBlockingStage(false), indexFilterApplied(false) {}
+class QuerySolution {
+public:
+    explicit QuerySolution(size_t plannerOptions) : plannerOptions(plannerOptions) {}
 
-    // Owned here.
-    std::unique_ptr<QuerySolutionNode> root;
+    /**
+     * Return true if this solution tree contains a node of the given 'type'.
+     */
+    bool hasNode(StageType type) const {
+        return _root && _root->hasNode(type);
+    }
 
-    // Any filters in root or below point into this object.  Must be owned.
-    BSONObj filterData;
+    /**
+     * Output a human-readable std::string representing the plan.
+     */
+    std::string toString() {
+        if (!_root) {
+            return "empty query solution";
+        }
+
+        str::stream ss;
+        _root->appendToString(&ss, 0);
+        return ss;
+    }
+
+    const QuerySolutionNode* root() const {
+        return _root.get();
+    }
+    QuerySolutionNode* root() {
+        return _root.get();
+    }
+
+    /**
+     * Assigns the QuerySolutionNode rooted at 'root' to this QuerySolution. Also assigns a unique
+     * identifying integer to each node in the tree, which can subsequently be displayed in debug
+     * output (e.g. explain).
+     */
+    void setRoot(std::unique_ptr<QuerySolutionNode> root);
+
+    /**
+     * Returns true if the execution plan which is constructed from this QuerySolution should check
+     * that the node is eligible to serve reads prior to actually performing any reads.
+     */
+    bool shouldCheckCanServeReads() const {
+        return !(plannerOptions & QueryPlannerParams::OMIT_REPL_STATE_PERMITS_READS_CHECK);
+    }
+
+    // A bit vector of flags which clients to the QueryPlanner pass to control which plans are
+    // generated and their properties.
+    const size_t plannerOptions;
 
     // There are two known scenarios in which a query solution might potentially block:
     //
@@ -216,80 +383,29 @@ struct QuerySolution {
     // Hashed AND stage:
     // The hashed AND stage buffers data from multiple index scans and could block. In that case,
     // we would want to fall back on an alternate non-blocking solution.
-    bool hasBlockingStage;
+    bool hasBlockingStage{false};
 
     // Runner executing this solution might be interested in knowing
     // if the planning process for this solution was based on filtered indices.
-    bool indexFilterApplied;
+    bool indexFilterApplied{false};
 
     // Owned here. Used by the plan cache.
     std::unique_ptr<SolutionCacheData> cacheData;
 
-    /**
-     * Output a human-readable std::string representing the plan.
-     */
-    std::string toString() {
-        if (NULL == root) {
-            return "empty query solution";
-        }
-
-        str::stream ss;
-        root->appendToString(&ss, 0);
-        return ss;
-    }
+    PlanEnumeratorExplainInfo _enumeratorExplainInfo;
 
 private:
+    using QsnIdGenerator = IdGenerator<PlanNodeId>;
+
     QuerySolution(const QuerySolution&) = delete;
     QuerySolution& operator=(const QuerySolution&) = delete;
+
+    void assignNodeIds(QsnIdGenerator& idGenerator, QuerySolutionNode& node);
+
+    std::unique_ptr<QuerySolutionNode> _root;
 };
 
-struct TextNode : public QuerySolutionNode {
-    TextNode(IndexEntry index)
-        : _sort(SimpleBSONObjComparator::kInstance.makeBSONObjSet()), index(std::move(index)) {}
-
-    virtual ~TextNode() {}
-
-    virtual StageType getType() const {
-        return STAGE_TEXT;
-    }
-
-    virtual void appendToString(str::stream* ss, int indent) const;
-
-    // Text's return is LOC_AND_OBJ so it's fetched and has all fields.
-    bool fetched() const {
-        return true;
-    }
-    bool hasField(const std::string& field) const {
-        return true;
-    }
-    bool sortedByDiskLoc() const {
-        return false;
-    }
-    const BSONObjSet& getSort() const {
-        return _sort;
-    }
-
-    QuerySolutionNode* clone() const;
-
-    BSONObjSet _sort;
-
-    IndexEntry index;
-    std::unique_ptr<fts::FTSQuery> ftsQuery;
-
-    // The number of fields in the prefix of the text index. For example, if the key pattern is
-    //
-    //   { a: 1, b: 1, _fts: "text", _ftsx: 1, c: 1 }
-    //
-    // then the number of prefix fields is 2, because of "a" and "b".
-    size_t numPrefixFields = 0u;
-
-    // "Prefix" fields of a text index can handle equality predicates.  We group them with the
-    // text node while creating the text leaf node and convert them into a BSONObj index prefix
-    // when we finish the text leaf node.
-    BSONObj indexPrefix;
-};
-
-struct CollectionScanNode : public QuerySolutionNode {
+struct CollectionScanNode : public QuerySolutionNodeWithSortSet {
     CollectionScanNode();
     virtual ~CollectionScanNode() {}
 
@@ -302,22 +418,33 @@ struct CollectionScanNode : public QuerySolutionNode {
     bool fetched() const {
         return true;
     }
-    bool hasField(const std::string& field) const {
-        return true;
+    FieldAvailability getFieldAvailability(const std::string& field) const {
+        return FieldAvailability::kFullyProvided;
     }
     bool sortedByDiskLoc() const {
         return false;
     }
-    const BSONObjSet& getSort() const {
-        return _sort;
-    }
 
     QuerySolutionNode* clone() const;
 
-    BSONObjSet _sort;
-
     // Name of the namespace.
     std::string name;
+
+    // If present, this parameter sets the start point of a forward scan or the end point of a
+    // reverse scan.
+    boost::optional<RecordId> minRecord;
+
+    // If present, this parameter sets the start point of a reverse scan or the end point of a
+    // forward scan.
+    boost::optional<RecordId> maxRecord;
+
+    // If true, the collection scan will return a token that can be used to resume the scan.
+    bool requestResumeToken = false;
+
+    // If present, the collection scan will seek to the exact RecordId, or return KeyNotFound if it
+    // does not exist. Must only be set on forward collection scans.
+    // This field cannot be used in conjunction with 'minRecord' or 'maxRecord'.
+    boost::optional<RecordId> resumeAfterRecordId;
 
     // Should we make a tailable cursor?
     bool tailable;
@@ -327,10 +454,76 @@ struct CollectionScanNode : public QuerySolutionNode {
     // across a sharded cluster.
     bool shouldTrackLatestOplogTimestamp = false;
 
-    int direction;
+    // Assert that the specified timestamp has not fallen off the oplog.
+    boost::optional<Timestamp> assertTsHasNotFallenOffOplog = boost::none;
+
+    int direction{1};
 
     // Whether or not to wait for oplog visibility on oplog collection scans.
     bool shouldWaitForOplogVisibility = false;
+
+    // Once the first matching document is found, assume that all documents after it must match.
+    bool stopApplyingFilterAfterFirstMatch = false;
+};
+
+/**
+ * A VirtualScanNode is similar to a collection or an index scan except that it doesn't depend on an
+ * underlying storage implementation. It can be used to represent a virtual
+ * collection or an index scan in memory by using a backing vector of BSONArray.
+ */
+struct VirtualScanNode : public QuerySolutionNodeWithSortSet {
+    enum class ScanType { kCollScan, kIxscan };
+
+    VirtualScanNode(std::vector<BSONArray> docs,
+                    ScanType scanType,
+                    bool hasRecordId,
+                    BSONObj indexKeyPattern = {});
+
+    virtual StageType getType() const {
+        return STAGE_VIRTUAL_SCAN;
+    }
+
+    virtual void appendToString(str::stream* ss, int indent) const;
+
+    bool fetched() const {
+        return scanType == ScanType::kCollScan;
+    }
+    FieldAvailability getFieldAvailability(const std::string& field) const {
+        if (scanType == ScanType::kCollScan) {
+            return FieldAvailability::kFullyProvided;
+        } else {
+            return indexKeyPattern.hasField(field) ? FieldAvailability::kFullyProvided
+                                                   : FieldAvailability::kNotProvided;
+        }
+    }
+    bool sortedByDiskLoc() const {
+        return false;
+    }
+
+    QuerySolutionNode* clone() const;
+
+    // A representation of a collection's documents. Here we use a BSONArray so metadata like a
+    // RecordId can be stored alongside of the main document payload. The format of the data in
+    // BSONArray is entirely up to a client of this node, but if this node is to be used for
+    // consumption downstream by stage builder implementations it must conform to the format
+    // expected by those stage builders. That expected contract depends on the hasRecordId flag. If
+    // the hasRecordId flag is 'false' the BSONArray will have a single element that is a BSONObj
+    // representation of a document being produced from this node. If 'hasRecordId' is true, then
+    // each BSONArray in docs will carry a RecordId in the zeroth position of the array and a
+    // BSONObj in the first position of the array.
+    std::vector<BSONArray> docs;
+
+    // Indicates whether the scan is mimicking a collection scan or index scan.
+    const ScanType scanType;
+
+    // A flag to indicate the format of the BSONArray document payload in the above vector, docs. If
+    // hasRecordId is set to true, then both a RecordId and a BSONObj document are stored in that
+    // order for every BSONArray in docs. Otherwise, the RecordId is omitted and the BSONArray will
+    // only carry a BSONObj document.
+    bool hasRecordId;
+
+    // Set when 'scanType' is 'kIxscan'.
+    BSONObj indexKeyPattern;
 };
 
 struct AndHashNode : public QuerySolutionNode {
@@ -344,20 +537,18 @@ struct AndHashNode : public QuerySolutionNode {
     virtual void appendToString(str::stream* ss, int indent) const;
 
     bool fetched() const;
-    bool hasField(const std::string& field) const;
+    FieldAvailability getFieldAvailability(const std::string& field) const;
     bool sortedByDiskLoc() const {
         return false;
     }
-    const BSONObjSet& getSort() const {
-        return children.back()->getSort();
+    const ProvidedSortSet& providedSorts() const {
+        return children.back()->providedSorts();
     }
 
     QuerySolutionNode* clone() const;
-
-    BSONObjSet _sort;
 };
 
-struct AndSortedNode : public QuerySolutionNode {
+struct AndSortedNode : public QuerySolutionNodeWithSortSet {
     AndSortedNode();
     virtual ~AndSortedNode();
 
@@ -368,20 +559,15 @@ struct AndSortedNode : public QuerySolutionNode {
     virtual void appendToString(str::stream* ss, int indent) const;
 
     bool fetched() const;
-    bool hasField(const std::string& field) const;
+    FieldAvailability getFieldAvailability(const std::string& field) const;
     bool sortedByDiskLoc() const {
         return true;
     }
-    const BSONObjSet& getSort() const {
-        return _sort;
-    }
 
     QuerySolutionNode* clone() const;
-
-    BSONObjSet _sort;
 };
 
-struct OrNode : public QuerySolutionNode {
+struct OrNode : public QuerySolutionNodeWithSortSet {
     OrNode();
     virtual ~OrNode();
 
@@ -392,24 +578,19 @@ struct OrNode : public QuerySolutionNode {
     virtual void appendToString(str::stream* ss, int indent) const;
 
     bool fetched() const;
-    bool hasField(const std::string& field) const;
+    FieldAvailability getFieldAvailability(const std::string& field) const;
     bool sortedByDiskLoc() const {
         // Even if our children are sorted by their diskloc or other fields, we don't maintain
         // any order on the output.
         return false;
     }
-    const BSONObjSet& getSort() const {
-        return _sort;
-    }
 
     QuerySolutionNode* clone() const;
-
-    BSONObjSet _sort;
 
     bool dedup;
 };
 
-struct MergeSortNode : public QuerySolutionNode {
+struct MergeSortNode : public QuerySolutionNodeWithSortSet {
     MergeSortNode();
     virtual ~MergeSortNode();
 
@@ -420,13 +601,9 @@ struct MergeSortNode : public QuerySolutionNode {
     virtual void appendToString(str::stream* ss, int indent) const;
 
     bool fetched() const;
-    bool hasField(const std::string& field) const;
+    FieldAvailability getFieldAvailability(const std::string& field) const;
     bool sortedByDiskLoc() const {
         return false;
-    }
-
-    const BSONObjSet& getSort() const {
-        return _sorts;
     }
 
     QuerySolutionNode* clone() const;
@@ -435,18 +612,16 @@ struct MergeSortNode : public QuerySolutionNode {
         for (size_t i = 0; i < children.size(); ++i) {
             children[i]->computeProperties();
         }
-        _sorts.clear();
-        _sorts.insert(sort);
+        sortSet = ProvidedSortSet(sort, std::set<std::string>());
     }
-
-    BSONObjSet _sorts;
 
     BSONObj sort;
     bool dedup;
 };
 
 struct FetchNode : public QuerySolutionNode {
-    FetchNode();
+    FetchNode() {}
+    FetchNode(std::unique_ptr<QuerySolutionNode> child) : QuerySolutionNode(std::move(child)) {}
     virtual ~FetchNode() {}
 
     virtual StageType getType() const {
@@ -458,22 +633,20 @@ struct FetchNode : public QuerySolutionNode {
     bool fetched() const {
         return true;
     }
-    bool hasField(const std::string& field) const {
-        return true;
+    FieldAvailability getFieldAvailability(const std::string& field) const {
+        return FieldAvailability::kFullyProvided;
     }
     bool sortedByDiskLoc() const {
         return children[0]->sortedByDiskLoc();
     }
-    const BSONObjSet& getSort() const {
-        return children[0]->getSort();
+    const ProvidedSortSet& providedSorts() const {
+        return children[0]->providedSorts();
     }
 
     QuerySolutionNode* clone() const;
-
-    BSONObjSet _sorts;
 };
 
-struct IndexScanNode : public QuerySolutionNode {
+struct IndexScanNode : public QuerySolutionNodeWithSortSet {
     IndexScanNode(IndexEntry index);
     virtual ~IndexScanNode() {}
 
@@ -488,11 +661,8 @@ struct IndexScanNode : public QuerySolutionNode {
     bool fetched() const {
         return false;
     }
-    bool hasField(const std::string& field) const;
+    FieldAvailability getFieldAvailability(const std::string& field) const;
     bool sortedByDiskLoc() const;
-    const BSONObjSet& getSort() const {
-        return _sorts;
-    }
 
     QuerySolutionNode* clone() const;
 
@@ -505,8 +675,6 @@ struct IndexScanNode : public QuerySolutionNode {
      */
     static std::set<StringData> getFieldsWithStringBounds(const IndexBounds& bounds,
                                                           const BSONObj& indexKeyPattern);
-
-    BSONObjSet _sorts;
 
     IndexEntry index;
 
@@ -528,22 +696,48 @@ struct IndexScanNode : public QuerySolutionNode {
     std::set<StringData> multikeyFields;
 };
 
+struct ReturnKeyNode : public QuerySolutionNode {
+    ReturnKeyNode(std::unique_ptr<QuerySolutionNode> child,
+                  std::vector<FieldPath> sortKeyMetaFields)
+        : QuerySolutionNode(std::move(child)), sortKeyMetaFields(std::move(sortKeyMetaFields)) {}
+
+    StageType getType() const final {
+        return STAGE_RETURN_KEY;
+    }
+
+    void appendToString(str::stream* ss, int indent) const final;
+
+    bool fetched() const final {
+        return children[0]->fetched();
+    }
+    FieldAvailability getFieldAvailability(const std::string& field) const final {
+        return FieldAvailability::kNotProvided;
+    }
+    bool sortedByDiskLoc() const final {
+        return children[0]->sortedByDiskLoc();
+    }
+    const ProvidedSortSet& providedSorts() const final {
+        return children[0]->providedSorts();
+    }
+
+    QuerySolutionNode* clone() const final;
+
+    std::vector<FieldPath> sortKeyMetaFields;
+};
+
 /**
  * We have a few implementations of the projection functionality. They are chosen by constructing
  * a type derived from this abstract struct. The most general implementation 'ProjectionNodeDefault'
  * is much slower than the fast-path implementations. We only really have all the information
  * available to choose a projection implementation at planning time.
  */
-struct ProjectionNode : QuerySolutionNode {
+struct ProjectionNode : public QuerySolutionNodeWithSortSet {
     ProjectionNode(std::unique_ptr<QuerySolutionNode> child,
                    const MatchExpression& fullExpression,
-                   BSONObj projection,
-                   ParsedProjection parsed)
-        : QuerySolutionNode(std::move(child)),
-          _sorts(SimpleBSONObjComparator::kInstance.makeBSONObjSet()),
+                   projection_ast::Projection proj)
+        : QuerySolutionNodeWithSortSet(std::move(child)),
           fullExpression(fullExpression),
-          projection(std::move(projection)),
-          parsed(parsed) {}
+          proj(std::move(proj)) {}
 
     void computeProperties() final;
 
@@ -556,13 +750,14 @@ struct ProjectionNode : QuerySolutionNode {
         return children[0]->fetched();
     }
 
-    bool hasField(const std::string& field) const {
-        // TODO: Returning false isn't always the right answer -- we may either be including
-        // certain fields, or we may be dropping fields (in which case hasField returns true).
-        //
-        // Given that projection sits on top of everything else in .find() it doesn't matter
-        // what we do here.
-        return false;
+    FieldAvailability getFieldAvailability(const std::string& field) const {
+        // If we were to construct a plan where the input to the project stage was a hashed value,
+        // and that field was retained exactly, then we would mistakenly return 'kFullyProvided'.
+        // The important point here is that we are careful to construct plans where we fetch before
+        // projecting if there is hashed data, collation keys, etc. So this situation does not
+        // arise.
+        return proj.isFieldRetainedExactly(StringData{field}) ? FieldAvailability::kFullyProvided
+                                                              : FieldAvailability::kNotProvided;
     }
 
     bool sortedByDiskLoc() const {
@@ -574,10 +769,6 @@ struct ProjectionNode : QuerySolutionNode {
         return children[0]->sortedByDiskLoc();
     }
 
-    const BSONObjSet& getSort() const {
-        return _sorts;
-    }
-
 protected:
     void cloneProjectionData(ProjectionNode* copy) const;
 
@@ -587,17 +778,11 @@ public:
      */
     virtual StringData projectionImplementationTypeToString() const = 0;
 
-    BSONObjSet _sorts;
-
     // The full query tree.  Needed when we have positional operators.
     // Owned in the CanonicalQuery, not here.
     const MatchExpression& fullExpression;
 
-    // Given that we don't yet have a MatchExpression analogue for the expression language, we
-    // use a BSONObj.
-    BSONObj projection;
-
-    ParsedProjection parsed;
+    projection_ast::Projection proj;
 };
 
 /**
@@ -623,10 +808,9 @@ struct ProjectionNodeDefault final : ProjectionNode {
 struct ProjectionNodeCovered final : ProjectionNode {
     ProjectionNodeCovered(std::unique_ptr<QuerySolutionNode> child,
                           const MatchExpression& fullExpression,
-                          BSONObj projection,
-                          ParsedProjection parsed,
+                          projection_ast::Projection proj,
                           BSONObj coveredKeyObj)
-        : ProjectionNode(std::move(child), fullExpression, projection, parsed),
+        : ProjectionNode(std::move(child), fullExpression, std::move(proj)),
           coveredKeyObj(std::move(coveredKeyObj)) {}
 
     StageType getType() const final {
@@ -670,16 +854,16 @@ struct SortKeyGeneratorNode : public QuerySolutionNode {
         return children[0]->fetched();
     }
 
-    bool hasField(const std::string& field) const final {
-        return children[0]->hasField(field);
+    FieldAvailability getFieldAvailability(const std::string& field) const final {
+        return children[0]->getFieldAvailability(field);
     }
 
     bool sortedByDiskLoc() const final {
         return children[0]->sortedByDiskLoc();
     }
 
-    const BSONObjSet& getSort() const final {
-        return children[0]->getSort();
+    const ProvidedSortSet& providedSorts() const final {
+        return children[0]->providedSorts();
     }
 
     QuerySolutionNode* clone() const final;
@@ -690,47 +874,80 @@ struct SortKeyGeneratorNode : public QuerySolutionNode {
     BSONObj sortSpec;
 };
 
-struct SortNode : public QuerySolutionNode {
-    SortNode() : _sorts(SimpleBSONObjComparator::kInstance.makeBSONObjSet()), limit(0) {}
+struct SortNode : public QuerySolutionNodeWithSortSet {
+    SortNode() : limit(0) {}
 
     virtual ~SortNode() {}
-
-    virtual StageType getType() const {
-        return STAGE_SORT;
-    }
 
     virtual void appendToString(str::stream* ss, int indent) const;
 
     bool fetched() const {
         return children[0]->fetched();
     }
-    bool hasField(const std::string& field) const {
-        return children[0]->hasField(field);
+    FieldAvailability getFieldAvailability(const std::string& field) const {
+        return children[0]->getFieldAvailability(field);
     }
     bool sortedByDiskLoc() const {
         return false;
     }
 
-    const BSONObjSet& getSort() const {
-        return _sorts;
-    }
-
-    QuerySolutionNode* clone() const;
-
     virtual void computeProperties() {
         for (size_t i = 0; i < children.size(); ++i) {
             children[i]->computeProperties();
         }
-        _sorts.clear();
-        _sorts.insert(pattern);
+        sortSet = ProvidedSortSet(pattern, std::set<std::string>());
     }
-
-    BSONObjSet _sorts;
 
     BSONObj pattern;
 
     // Sum of both limit and skip count in the parsed query.
     size_t limit;
+
+    bool addSortKeyMetadata = false;
+
+    // The maximum number of bytes of memory we're willing to use during execution of the sort. If
+    // this limit is exceeded and we're not allowed to spill to disk, the query will fail at
+    // execution time. Otherwise, the data will be spilled to disk.
+    uint64_t maxMemoryUsageBytes = internalQueryMaxBlockingSortMemoryUsageBytes.load();
+
+protected:
+    void cloneSortData(SortNode* copy) const;
+
+private:
+    virtual StringData sortImplementationTypeToString() const = 0;
+};
+
+/**
+ * Represents sort algorithm that can handle any kind of input data.
+ */
+struct SortNodeDefault final : public SortNode {
+    virtual StageType getType() const override {
+        return STAGE_SORT_DEFAULT;
+    }
+
+    QuerySolutionNode* clone() const override;
+
+    StringData sortImplementationTypeToString() const override {
+        return "DEFAULT"_sd;
+    }
+};
+
+/**
+ * Represents a special, optimized sort algorithm that is only correct if:
+ *  - The input data is fetched.
+ *  - The input data has no metadata attached.
+ *  - The record id can be discarded.
+ */
+struct SortNodeSimple final : public SortNode {
+    virtual StageType getType() const {
+        return STAGE_SORT_SIMPLE;
+    }
+
+    QuerySolutionNode* clone() const override;
+
+    StringData sortImplementationTypeToString() const override {
+        return "SIMPLE"_sd;
+    }
 };
 
 struct LimitNode : public QuerySolutionNode {
@@ -746,14 +963,14 @@ struct LimitNode : public QuerySolutionNode {
     bool fetched() const {
         return children[0]->fetched();
     }
-    bool hasField(const std::string& field) const {
-        return children[0]->hasField(field);
+    FieldAvailability getFieldAvailability(const std::string& field) const {
+        return children[0]->getFieldAvailability(field);
     }
     bool sortedByDiskLoc() const {
         return children[0]->sortedByDiskLoc();
     }
-    const BSONObjSet& getSort() const {
-        return children[0]->getSort();
+    const ProvidedSortSet& providedSorts() const {
+        return children[0]->providedSorts();
     }
 
     QuerySolutionNode* clone() const;
@@ -773,14 +990,14 @@ struct SkipNode : public QuerySolutionNode {
     bool fetched() const {
         return children[0]->fetched();
     }
-    bool hasField(const std::string& field) const {
-        return children[0]->hasField(field);
+    FieldAvailability getFieldAvailability(const std::string& field) const {
+        return children[0]->getFieldAvailability(field);
     }
     bool sortedByDiskLoc() const {
         return children[0]->sortedByDiskLoc();
     }
-    const BSONObjSet& getSort() const {
-        return children[0]->getSort();
+    const ProvidedSortSet& providedSorts() const {
+        return children[0]->providedSorts();
     }
 
     QuerySolutionNode* clone() const;
@@ -788,13 +1005,9 @@ struct SkipNode : public QuerySolutionNode {
     long long skip;
 };
 
-// This is a standalone stage.
-struct GeoNear2DNode : public QuerySolutionNode {
+struct GeoNear2DNode : public QuerySolutionNodeWithSortSet {
     GeoNear2DNode(IndexEntry index)
-        : _sorts(SimpleBSONObjComparator::kInstance.makeBSONObjSet()),
-          index(std::move(index)),
-          addPointMeta(false),
-          addDistMeta(false) {}
+        : index(std::move(index)), addPointMeta(false), addDistMeta(false) {}
 
     virtual ~GeoNear2DNode() {}
 
@@ -806,19 +1019,14 @@ struct GeoNear2DNode : public QuerySolutionNode {
     bool fetched() const {
         return true;
     }
-    bool hasField(const std::string& field) const {
-        return true;
+    FieldAvailability getFieldAvailability(const std::string& field) const {
+        return FieldAvailability::kFullyProvided;
     }
     bool sortedByDiskLoc() const {
         return false;
     }
-    const BSONObjSet& getSort() const {
-        return _sorts;
-    }
 
     QuerySolutionNode* clone() const;
-
-    BSONObjSet _sorts;
 
     // Not owned here
     const GeoNearExpression* nq;
@@ -829,13 +1037,9 @@ struct GeoNear2DNode : public QuerySolutionNode {
     bool addDistMeta;
 };
 
-// This is actually its own standalone stage.
-struct GeoNear2DSphereNode : public QuerySolutionNode {
+struct GeoNear2DSphereNode : public QuerySolutionNodeWithSortSet {
     GeoNear2DSphereNode(IndexEntry index)
-        : _sorts(SimpleBSONObjComparator::kInstance.makeBSONObjSet()),
-          index(std::move(index)),
-          addPointMeta(false),
-          addDistMeta(false) {}
+        : index(std::move(index)), addPointMeta(false), addDistMeta(false) {}
 
     virtual ~GeoNear2DSphereNode() {}
 
@@ -847,19 +1051,14 @@ struct GeoNear2DSphereNode : public QuerySolutionNode {
     bool fetched() const {
         return true;
     }
-    bool hasField(const std::string& field) const {
-        return true;
+    FieldAvailability getFieldAvailability(const std::string& field) const {
+        return FieldAvailability::kFullyProvided;
     }
     bool sortedByDiskLoc() const {
         return false;
     }
-    const BSONObjSet& getSort() const {
-        return _sorts;
-    }
 
     QuerySolutionNode* clone() const;
-
-    BSONObjSet _sorts;
 
     // Not owned here
     const GeoNearExpression* nq;
@@ -892,14 +1091,14 @@ struct ShardingFilterNode : public QuerySolutionNode {
     bool fetched() const {
         return children[0]->fetched();
     }
-    bool hasField(const std::string& field) const {
-        return children[0]->hasField(field);
+    FieldAvailability getFieldAvailability(const std::string& field) const {
+        return children[0]->getFieldAvailability(field);
     }
     bool sortedByDiskLoc() const {
         return children[0]->sortedByDiskLoc();
     }
-    const BSONObjSet& getSort() const {
-        return children[0]->getSort();
+    const ProvidedSortSet& providedSorts() const {
+        return children[0]->providedSorts();
     }
 
     QuerySolutionNode* clone() const;
@@ -909,9 +1108,8 @@ struct ShardingFilterNode : public QuerySolutionNode {
  * Distinct queries only want one value for a given field.  We run an index scan but
  * *always* skip over the current key to the next key.
  */
-struct DistinctNode : public QuerySolutionNode {
-    DistinctNode(IndexEntry index)
-        : sorts(SimpleBSONObjComparator::kInstance.makeBSONObjSet()), index(std::move(index)) {}
+struct DistinctNode : public QuerySolutionNodeWithSortSet {
+    DistinctNode(IndexEntry index) : index(std::move(index)) {}
 
     virtual ~DistinctNode() {}
 
@@ -925,21 +1123,21 @@ struct DistinctNode : public QuerySolutionNode {
     bool fetched() const {
         return false;
     }
-    bool hasField(const std::string& field) const {
-        return !index.keyPattern[field].eoo();
+    FieldAvailability getFieldAvailability(const std::string& field) const {
+        // The distinct scan can return collation keys, but we can still consider the field fully
+        // provided. This is because the logic around when the index bounds might incorporate
+        // collation keys does not rely on 'getFieldAvailability()'. As a future improvement, we
+        // could look into using 'getFieldAvailabilty()' for collation covering analysis.
+        return index.keyPattern[field].eoo() ? FieldAvailability::kNotProvided
+                                             : FieldAvailability::kFullyProvided;
     }
     bool sortedByDiskLoc() const {
         return false;
-    }
-    const BSONObjSet& getSort() const {
-        return sorts;
     }
 
     QuerySolutionNode* clone() const;
 
     virtual void computeProperties();
-
-    BSONObjSet sorts;
 
     IndexEntry index;
     IndexBounds bounds;
@@ -955,9 +1153,8 @@ struct DistinctNode : public QuerySolutionNode {
  * Some count queries reduce to counting how many keys are between two entries in a
  * Btree.
  */
-struct CountScanNode : public QuerySolutionNode {
-    CountScanNode(IndexEntry index)
-        : sorts(SimpleBSONObjComparator::kInstance.makeBSONObjSet()), index(std::move(index)) {}
+struct CountScanNode : public QuerySolutionNodeWithSortSet {
+    CountScanNode(IndexEntry index) : index(std::move(index)) {}
 
     virtual ~CountScanNode() {}
 
@@ -969,19 +1166,14 @@ struct CountScanNode : public QuerySolutionNode {
     bool fetched() const {
         return false;
     }
-    bool hasField(const std::string& field) const {
-        return true;
+    FieldAvailability getFieldAvailability(const std::string& field) const {
+        return FieldAvailability::kFullyProvided;
     }
     bool sortedByDiskLoc() const {
         return false;
     }
-    const BSONObjSet& getSort() const {
-        return sorts;
-    }
 
     QuerySolutionNode* clone() const;
-
-    BSONObjSet sorts;
 
     IndexEntry index;
 
@@ -1008,20 +1200,97 @@ struct EnsureSortedNode : public QuerySolutionNode {
     bool fetched() const {
         return children[0]->fetched();
     }
-    bool hasField(const std::string& field) const {
-        return children[0]->hasField(field);
+    FieldAvailability getFieldAvailability(const std::string& field) const {
+        return children[0]->getFieldAvailability(field);
     }
     bool sortedByDiskLoc() const {
         return children[0]->sortedByDiskLoc();
     }
-    const BSONObjSet& getSort() const {
-        return children[0]->getSort();
+    const ProvidedSortSet& providedSorts() const {
+        return children[0]->providedSorts();
     }
 
     QuerySolutionNode* clone() const;
 
     // The pattern that the results should be sorted by.
     BSONObj pattern;
+};
+
+struct EofNode : public QuerySolutionNodeWithSortSet {
+    EofNode() {}
+
+    virtual StageType getType() const {
+        return STAGE_EOF;
+    }
+
+    virtual void appendToString(str::stream* ss, int indent) const;
+
+    bool fetched() const {
+        return false;
+    }
+
+    FieldAvailability getFieldAvailability(const std::string& field) const {
+        return FieldAvailability::kNotProvided;
+    }
+
+    bool sortedByDiskLoc() const {
+        return false;
+    }
+
+    QuerySolutionNode* clone() const;
+};
+
+struct TextOrNode : public OrNode {
+    TextOrNode() {}
+
+    StageType getType() const override {
+        return STAGE_TEXT_OR;
+    }
+
+    void appendToString(str::stream* ss, int indent) const override;
+    QuerySolutionNode* clone() const override;
+};
+
+struct TextMatchNode : public QuerySolutionNodeWithSortSet {
+    TextMatchNode(IndexEntry index, std::unique_ptr<fts::FTSQuery> ftsQuery, bool wantTextScore)
+        : index(std::move(index)), ftsQuery(std::move(ftsQuery)), wantTextScore(wantTextScore) {}
+
+    StageType getType() const override {
+        return STAGE_TEXT_MATCH;
+    }
+
+    void appendToString(str::stream* ss, int indent) const override;
+
+    // Text's return is LOC_AND_OBJ so it's fetched and has all fields.
+    bool fetched() const {
+        return true;
+    }
+    FieldAvailability getFieldAvailability(const std::string& field) const {
+        return FieldAvailability::kFullyProvided;
+    }
+    bool sortedByDiskLoc() const override {
+        return false;
+    }
+
+    QuerySolutionNode* clone() const override;
+
+    IndexEntry index;
+    std::unique_ptr<fts::FTSQuery> ftsQuery;
+
+    // The number of fields in the prefix of the text index. For example, if the key pattern is
+    //
+    //   { a: 1, b: 1, _fts: "text", _ftsx: 1, c: 1 }
+    //
+    // then the number of prefix fields is 2, because of "a" and "b".
+    size_t numPrefixFields = 0u;
+
+    // "Prefix" fields of a text index can handle equality predicates.  We group them with the
+    // text node while creating the text leaf node and convert them into a BSONObj index prefix
+    // when we finish the text leaf node.
+    BSONObj indexPrefix;
+
+    // True, if we need to compute text scores.
+    bool wantTextScore;
 };
 
 }  // namespace mongo

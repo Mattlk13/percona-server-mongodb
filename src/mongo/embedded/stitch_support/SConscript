@@ -1,23 +1,14 @@
 # -*- mode: python; -*-
 
-import libdeps
-
 Import("env")
 Import("get_option")
 
-env = env.Clone()
+if get_option('build-tools') == 'next':
+    import libdeps_next as libdeps
+else:
+    import libdeps
 
-if get_option('install-mode') == 'hygienic':
-    env.AutoInstall(
-        '.',
-        source=[
-            '#/LICENSE-Community.txt',
-            '#/distsrc/THIRD-PARTY-NOTICES',
-        ],
-        INSTALL_ALIAS=[
-            'stitch-support',
-        ],
-    )
+env = env.Clone()
 
 stitchSupportEnv = env.Clone()
 stitchSupportEnv.AppendUnique(
@@ -57,24 +48,21 @@ stitchSupportTargets = stitchSupportEnv.Library(
         '$BUILD_DIR/mongo/db/ops/parsed_update',
         '$BUILD_DIR/mongo/db/query/collation/collator_factory_icu',
         '$BUILD_DIR/mongo/db/query/collation/collator_factory_interface',
+        '$BUILD_DIR/mongo/db/vector_clock_trivial',
     ],
-    INSTALL_ALIAS=[
-        'stitch-support',
-    ],
+    AIB_COMPONENT='stitch-support',
 )
 
-if get_option('install-mode') == 'hygienic':
-    env.AutoInstall(
-        'include/stitch_support/v1/stitch_support',
-        source=['stitch_support.h'],
-        INSTALL_ALIAS=[
-            'stitch-support',
-        ],
-    )
+env.AutoInstall(
+    '$PREFIX_INCLUDEDIR/stitch_support/v1/stitch_support',
+    source=['stitch_support.h'],
+    AIB_COMPONENT='stitch-support',
+    AIB_ROLE='dev',
+)
 
 if get_option('link-model') != 'dynamic-sdk':
     stitchSupportTestEnv = env.Clone()
-    unitTest = stitchSupportTestEnv.Program(
+    unitTest = stitchSupportTestEnv.CppUnitTest(
         target="stitch_support_test",
         source=[
             "stitch_support_test.cpp",
@@ -83,9 +71,6 @@ if get_option('link-model') != 'dynamic-sdk':
             '$BUILD_DIR/mongo/unittest/unittest',
             'stitch_support',
         ],
-        INSTALL_ALIAS=[
-            'stitch-support-test',
-        ],
+        UNITTEST_HAS_CUSTOM_MAINLINE=True,
+        AIB_COMPONENT='stitch-support-test',
     )
-
-    env.RegisterUnitTest(unitTest[0]);

@@ -29,11 +29,12 @@
 
 #include "mongo/db/exec/count_scan.h"
 
+#include <memory>
+
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/index/index_access_method.h"
-#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
@@ -61,11 +62,10 @@ BSONObj replaceBSONFieldNames(const BSONObj& replace, const BSONObj& fieldNames)
 
     return bob.obj();
 }
-}
+}  // namespace
 
 using std::unique_ptr;
 using std::vector;
-using stdx::make_unique;
 
 // static
 const char* CountScan::kStageType = "COUNT_SCAN";
@@ -73,8 +73,11 @@ const char* CountScan::kStageType = "COUNT_SCAN";
 // When building the CountScan stage we take the keyPattern, index name, and multikey details from
 // the CountScanParams rather than resolving them via the IndexDescriptor, since these may differ
 // from the descriptor's contents.
-CountScan::CountScan(OperationContext* opCtx, CountScanParams params, WorkingSet* workingSet)
-    : RequiresIndexStage(kStageType, opCtx, params.indexDescriptor),
+CountScan::CountScan(ExpressionContext* expCtx,
+                     const CollectionPtr& collection,
+                     CountScanParams params,
+                     WorkingSet* workingSet)
+    : RequiresIndexStage(kStageType, expCtx, collection, params.indexDescriptor, workingSet),
       _workingSet(workingSet),
       _keyPattern(std::move(params.keyPattern)),
       _shouldDedup(params.isMultiKey),
@@ -112,10 +115,16 @@ PlanStage::StageState CountScan::doWork(WorkingSetID* out) {
 
         if (needInit) {
             // First call to work().  Perform cursor init.
-            _cursor = indexAccessMethod()->newCursor(getOpCtx());
+            _cursor = indexAccessMethod()->newCursor(opCtx());
             _cursor->setEndPosition(_endKey, _endKeyInclusive);
 
-            entry = _cursor->seek(_startKey, _startKeyInclusive, kWantLoc);
+            auto keyStringForSeek = IndexEntryComparison::makeKeyStringFromBSONKeyForSeek(
+                _startKey,
+                indexAccessMethod()->getSortedDataInterface()->getKeyStringVersion(),
+                indexAccessMethod()->getSortedDataInterface()->getOrdering(),
+                true, /* forward */
+                _startKeyInclusive);
+            entry = _cursor->seek(keyStringForSeek);
         } else {
             entry = _cursor->next(kWantLoc);
         }
@@ -142,6 +151,8 @@ PlanStage::StageState CountScan::doWork(WorkingSetID* out) {
     }
 
     WorkingSetID id = _workingSet->allocate();
+    WorkingSetMember* member = _workingSet->get(id);
+    member->recordId = entry->loc;
     _workingSet->transitionToRecordIdAndObj(id);
     *out = id;
     return PlanStage::ADVANCED;
@@ -168,13 +179,14 @@ void CountScan::doDetachFromOperationContext() {
 
 void CountScan::doReattachToOperationContext() {
     if (_cursor)
-        _cursor->reattachToOperationContext(getOpCtx());
+        _cursor->reattachToOperationContext(opCtx());
 }
 
 unique_ptr<PlanStageStats> CountScan::getStats() {
-    unique_ptr<PlanStageStats> ret = make_unique<PlanStageStats>(_commonStats, STAGE_COUNT_SCAN);
+    unique_ptr<PlanStageStats> ret =
+        std::make_unique<PlanStageStats>(_commonStats, STAGE_COUNT_SCAN);
 
-    unique_ptr<CountScanStats> countStats = make_unique<CountScanStats>(_specificStats);
+    unique_ptr<CountScanStats> countStats = std::make_unique<CountScanStats>(_specificStats);
     countStats->keyPattern = _specificStats.keyPattern.getOwned();
 
     countStats->startKey = replaceBSONFieldNames(_startKey, countStats->keyPattern);

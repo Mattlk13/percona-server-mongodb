@@ -1,55 +1,105 @@
 /**
- * Tests that a prepared transactions are correctly rolled-back.
+ * Tests that prepared transactions are correctly rolled-back.
  *
- * @tags: [uses_transactions, uses_prepare_transaction]
+ * @tags: [
+ *   uses_prepare_transaction,
+ *   uses_transactions,
+ * ]
  */
 (function() {
-    "use strict";
+"use strict";
 
-    load("jstests/core/txns/libs/prepare_helpers.js");
-    load("jstests/replsets/libs/rollback_test.js");
+load("jstests/core/txns/libs/prepare_helpers.js");
+load("jstests/replsets/libs/rollback_test.js");
+load("jstests/replsets/libs/rollback_files.js");
+load("jstests/libs/uuid_util.js");
 
-    const rollbackTest = new RollbackTest();
-    const rollbackNode = rollbackTest.getPrimary();
+const rollbackTest = new RollbackTest();
+const rollbackNode = rollbackTest.getPrimary();
 
-    const testDB = rollbackNode.getDB("test");
-    const collName = "rollback_prepare_transaction";
-    const testColl = testDB.getCollection(collName);
-    const txnDoc = {_id: 42};
+const testDB = rollbackNode.getDB("test");
+const collName = "rollback_prepare_transaction";
+const testColl = testDB.getCollection(collName);
 
-    // We perform some operations on the collection aside from starting and preparing a transaction
-    // in order to cause the count diff computed by replication to be non-zero.
-    assert.commandWorked(testColl.insert({_id: 1}));
+// We perform some operations on the collection aside from starting and preparing a transaction
+// in order to cause the count diff computed by replication to be non-zero.
+assert.commandWorked(testColl.insert({_id: "a"}));
 
-    rollbackTest.transitionToRollbackOperations();
+// Start two separate sessions for running transactions. On 'session1', we will run a prepared
+// transaction whose commit operation gets rolled back, and on 'session2', we will run a
+// prepared transaction whose prepare operation gets rolled back.
+const session1 = rollbackNode.startSession();
+const session1DB = session1.getDatabase(testDB.getName());
+const session1Coll = session1DB.getCollection(collName);
 
-    // The following operations will be rolled-back.
-    assert.commandWorked(testColl.insert({_id: 2}));
+const session2 = rollbackNode.startSession();
+const session2DB = session2.getDatabase(testDB.getName());
+const session2Coll = session2DB.getCollection(collName);
 
-    const session = rollbackNode.startSession();
-    const sessionDB = session.getDatabase(testDB.getName());
-    const sessionColl = sessionDB.getCollection(collName);
+// Prepare a transaction whose commit operation will be rolled back.
+session1.startTransaction();
+assert.commandWorked(session1Coll.insert({_id: "t2_a"}));
+assert.commandWorked(session1Coll.insert({_id: "t2_b"}));
+assert.commandWorked(session1Coll.insert({_id: "t2_c"}));
+let prepareTs = PrepareHelpers.prepareTransaction(session1);
 
-    session.startTransaction();
-    assert.commandWorked(sessionColl.insert(txnDoc));
+rollbackTest.transitionToRollbackOperations();
 
-    // Use w: 1 to simulate a prepare that will not become majority-committed.
-    PrepareHelpers.prepareTransaction(session, {w: 1});
+// The following operations will be rolled-back.
+assert.commandWorked(testColl.insert({_id: "b"}));
 
-    // This is not exactly correct, but characterizes the current behavior of fastcount, which
-    // includes the prepared but uncommitted transaction in the collection count.
-    assert.eq(3, testColl.count());
+session2.startTransaction();
+assert.commandWorked(session2Coll.insert({_id: "t1"}));
 
-    // Only two documents are visible.
-    arrayEq([{_id: 1}, {_id: 2}], testColl.find().toArray());
+// Use w: 1 to simulate a prepare that will not become majority-committed.
+PrepareHelpers.prepareTransaction(session2, {w: 1});
 
-    rollbackTest.transitionToSyncSourceOperationsBeforeRollback();
-    rollbackTest.transitionToSyncSourceOperationsDuringRollback();
-    rollbackTest.transitionToSteadyStateOperations();
+// Commit the transaction that was prepared before the common point.
+PrepareHelpers.commitTransaction(session1, prepareTs);
 
-    // Both the regular insert and prepared insert should be rolled-back.
-    assert.eq(1, testColl.count());
-    assert.eq({_id: 1}, testColl.findOne());
+// This is not exactly correct, but characterizes the current behavior of fastcount, which
+// includes the prepared but uncommitted transaction in the collection count.
+assert.eq(6, testColl.count());
 
-    rollbackTest.stop();
+// Check the visible documents.
+assert.sameMembers([{_id: "a"}, {_id: "b"}, {_id: "t2_a"}, {_id: "t2_b"}, {_id: "t2_c"}],
+                   testColl.find().toArray());
+
+rollbackTest.transitionToSyncSourceOperationsBeforeRollback();
+rollbackTest.transitionToSyncSourceOperationsDuringRollback();
+// Skip consistency checks so they don't conflict with the prepared transaction.
+rollbackTest.transitionToSteadyStateOperations({skipDataConsistencyChecks: true});
+
+// Both the regular insert and prepared insert should be rolled-back.
+assert.sameMembers([{_id: "a"}], testColl.find().toArray());
+
+// Confirm that the rollback wrote deleted documents to a file.
+const replTest = rollbackTest.getTestFixture();
+const expectedDocs = [{_id: "b"}, {_id: "t2_a"}, {_id: "t2_b"}, {_id: "t2_c"}];
+
+const uuid = getUUIDFromListCollections(testDB, collName);
+checkRollbackFiles(replTest.getDbPath(rollbackNode), testColl.getFullName(), uuid, expectedDocs);
+
+let adminDB = rollbackTest.getPrimary().getDB("admin");
+
+// Since we rolled back the prepared transaction on session2, retrying the prepareTransaction
+// command on this session should fail with a NoSuchTransaction error.
+assert.commandFailedWithCode(adminDB.adminCommand({
+    prepareTransaction: 1,
+    lsid: session2.getSessionId(),
+    txnNumber: session2.getTxnNumber_forTesting(),
+    autocommit: false
+}),
+                             ErrorCodes.NoSuchTransaction);
+
+// Allow the test to complete by aborting the left over prepared transaction.
+jsTestLog("Aborting the prepared transaction on session " + tojson(session1.getSessionId()));
+assert.commandWorked(adminDB.adminCommand({
+    abortTransaction: 1,
+    lsid: session1.getSessionId(),
+    txnNumber: session1.getTxnNumber_forTesting(),
+    autocommit: false
+}));
+
+rollbackTest.stop();
 })();

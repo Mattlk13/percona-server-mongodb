@@ -43,13 +43,13 @@ ConnectionString RemoteCommandTargeterStandalone::connectionString() {
     return ConnectionString(_hostAndPort);
 }
 
-SemiFuture<HostAndPort> RemoteCommandTargeterStandalone::findHostWithMaxWait(
-    const ReadPreferenceSetting& readPref, Milliseconds maxWait) {
+SemiFuture<HostAndPort> RemoteCommandTargeterStandalone::findHost(
+    const ReadPreferenceSetting& readPref, const CancellationToken& cancelToken) {
     return {_hostAndPort};
 }
 
-SemiFuture<std::vector<HostAndPort>> RemoteCommandTargeterStandalone::findHostsWithMaxWait(
-    const ReadPreferenceSetting& readPref, Milliseconds maxWait) {
+SemiFuture<std::vector<HostAndPort>> RemoteCommandTargeterStandalone::findHosts(
+    const ReadPreferenceSetting& readPref, const CancellationToken& cancelToken) {
     return {{_hostAndPort}};
 }
 
@@ -58,13 +58,18 @@ StatusWith<HostAndPort> RemoteCommandTargeterStandalone::findHost(
     return _hostAndPort;
 }
 
-void RemoteCommandTargeterStandalone::markHostNotMaster(const HostAndPort& host,
-                                                        const Status& status) {
+void RemoteCommandTargeterStandalone::markHostNotPrimary(const HostAndPort& host,
+                                                         const Status& status) {
     dassert(host == _hostAndPort);
 }
 
 void RemoteCommandTargeterStandalone::markHostUnreachable(const HostAndPort& host,
                                                           const Status& status) {
+    dassert(host == _hostAndPort);
+}
+
+void RemoteCommandTargeterStandalone::markHostShuttingDown(const HostAndPort& host,
+                                                           const Status& status) {
     dassert(host == _hostAndPort);
 }
 

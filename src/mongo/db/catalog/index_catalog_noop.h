@@ -43,10 +43,6 @@ public:
         return Status::OK();
     }
 
-    bool ok() const override {
-        return true;
-    }
-
     bool haveAnyIndexes() const override {
         return false;
     }
@@ -85,10 +81,10 @@ public:
         return nullptr;
     }
 
-    IndexDescriptor* findIndexByKeyPatternAndCollationSpec(
+    IndexDescriptor* findIndexByKeyPatternAndOptions(
         OperationContext* const opCtx,
         const BSONObj& key,
-        const BSONObj& collationSpec,
+        const BSONObj& indexSpec,
         const bool includeUnfinishedIndexes = false) const override {
         return nullptr;
     }
@@ -128,13 +124,15 @@ public:
         return {};
     }
 
-    Status checkUnfinished() const override {
-        return Status::OK();
-    }
-
     std::unique_ptr<IndexIterator> getIndexIterator(
         OperationContext* const opCtx, const bool includeUnfinishedIndexes) const override {
         return {};
+    }
+
+    IndexCatalogEntry* createIndexEntry(OperationContext* opCtx,
+                                        std::unique_ptr<IndexDescriptor> descriptor,
+                                        CreateIndexEntryFlags flags) override {
+        return nullptr;
     }
 
     StatusWith<BSONObj> createIndexOnEmptyCollection(OperationContext* const opCtx,
@@ -142,8 +140,10 @@ public:
         return spec;
     }
 
-    StatusWith<BSONObj> prepareSpecForCreate(OperationContext* const opCtx,
-                                             const BSONObj& original) const override {
+    StatusWith<BSONObj> prepareSpecForCreate(
+        OperationContext* const opCtx,
+        const BSONObj& original,
+        const boost::optional<ResumeIndexInfo>& resumeInfo) const override {
         return original;
     }
 
@@ -161,7 +161,7 @@ public:
 
     void dropAllIndexes(OperationContext* opCtx,
                         bool includingIdIndex,
-                        stdx::function<void(const IndexDescriptor*)> onDropFn) override {}
+                        std::function<void(const IndexDescriptor*)> onDropFn) override {}
 
     void dropAllIndexes(OperationContext* opCtx, bool includingIdIndex) override {}
 
@@ -169,11 +169,22 @@ public:
         return Status::OK();
     }
 
+    Status dropUnfinishedIndex(OperationContext* const opCtx,
+                               const IndexDescriptor* const desc) override {
+        return Status::OK();
+    }
+
+    Status dropIndexEntry(OperationContext* opCtx, IndexCatalogEntry* entry) override {
+        return Status::OK();
+    }
+
+    void deleteIndexFromDisk(OperationContext* opCtx, const std::string& indexName) override {}
+
     std::vector<BSONObj> getAndClearUnfinishedIndexes(OperationContext* const opCtx) {
         return {};
     }
 
-    bool isMultikey(OperationContext* const opCtx, const IndexDescriptor* const idx) {
+    bool isMultikey(const IndexDescriptor* const idx) {
         return false;
     }
 
@@ -183,16 +194,19 @@ public:
     }
 
     void setMultikeyPaths(OperationContext* const opCtx,
+                          const CollectionPtr& coll,
                           const IndexDescriptor* const desc,
-                          const MultikeyPaths& multikeyPaths) override {}
+                          const MultikeyPaths& multikeyPaths) const override {}
 
     Status indexRecords(OperationContext* const opCtx,
+                        const CollectionPtr& coll,
                         const std::vector<BsonRecord>& bsonRecords,
                         int64_t* const keysInsertedOut) override {
         return Status::OK();
     }
 
     Status updateRecord(OperationContext* const opCtx,
+                        const CollectionPtr& coll,
                         const BSONObj& oldDoc,
                         const BSONObj& newDoc,
                         const RecordId& recordId,
@@ -215,11 +229,6 @@ public:
         return "";
     }
 
-    std::unique_ptr<IndexBuildBlockInterface> createIndexBuildBlock(
-        OperationContext* opCtx, const BSONObj& spec, IndexBuildMethod method) override {
-        return {};
-    }
-
     std::string::size_type getLongestIndexNameLength(OperationContext* opCtx) const override {
         return 0U;
     }
@@ -229,12 +238,13 @@ public:
     }
 
     void prepareInsertDeleteOptions(OperationContext* opCtx,
+                                    const NamespaceString& ns,
                                     const IndexDescriptor* desc,
                                     InsertDeleteOptions* options) const override {}
 
-    void setNs(NamespaceString ns) override {}
-
-    void indexBuildSuccess(OperationContext* opCtx, IndexCatalogEntry* index) override {}
+    void indexBuildSuccess(OperationContext* opCtx,
+                           const CollectionPtr& coll,
+                           IndexCatalogEntry* index) override {}
 };
 
 }  // namespace mongo

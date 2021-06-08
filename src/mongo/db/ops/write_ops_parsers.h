@@ -32,46 +32,94 @@
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/db/pipeline/value.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/update/document_diff_serialization.h"
+#include "mongo/stdx/variant.h"
+#include "mongo/util/visit_helper.h"
 
 namespace mongo {
 namespace write_ops {
-
 // Conservative per array element overhead. This value was calculated as 1 byte (element type) + 5
 // bytes (max string encoding of the array index encoded as string and the maximum key is 99999) + 1
 // byte (zero terminator) = 7 bytes
 constexpr int kWriteCommandBSONArrayPerElementOverheadBytes = 7;
 
+constexpr int kRetryableAndTxnBatchWriteBSONSizeOverhead =
+    kWriteCommandBSONArrayPerElementOverheadBytes * 2;
+
 /**
  * Parses the 'limit' property of a delete entry, which has inverted meaning from the 'multi'
  * property of an update.
+ *
+ * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+ * break because of it.
  */
 bool readMultiDeleteProperty(const BSONElement& limitElement);
 
 /**
  * Writes the 'isMulti' value as a limit property.
+ *
+ * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+ * break because of it.
  */
 void writeMultiDeleteProperty(bool isMulti, StringData fieldName, BSONObjBuilder* builder);
 
+/**
+ * Serializes the opTime fields to specified BSON builder. A 'term' field will be included only
+ * when it is intialized.
+ */
+void opTimeSerializerWithTermCheck(repl::OpTime opTime, StringData fieldName, BSONObjBuilder* bob);
+
+/**
+ * Method to deserialize the specified BSON element to opTime. This method is used by the IDL
+ * parser to generate the deserializer code.
+ */
+repl::OpTime opTimeParser(BSONElement elem);
+
 class UpdateModification {
 public:
-    enum class Type { kClassic, kPipeline };
+    enum class Type { kClassic, kPipeline, kDelta };
 
-    static StringData typeToString(Type type) {
-        return (type == Type::kClassic ? "Classic"_sd : "Pipeline"_sd);
+    /**
+     * Used to indicate that a certain type of update is being passed to the constructor.
+     */
+    struct DiffOptions {
+        bool mustCheckExistenceForInsertOperations = true;
+    };
+    struct ClassicTag {};
+
+    // Given the 'o' field of an update oplog entry, will return an UpdateModification that can be
+    // applied. The `options` parameter will be applied only in the case a Delta update is parsed.
+    static UpdateModification parseFromOplogEntry(const BSONObj& oField,
+                                                  const DiffOptions& options);
+    static UpdateModification parseFromClassicUpdate(const BSONObj& modifiers) {
+        return UpdateModification(modifiers, ClassicTag{});
+    }
+    static UpdateModification parseFromV2Delta(const doc_diff::Diff& diff,
+                                               DiffOptions const& options) {
+        return UpdateModification(diff, options);
     }
 
     UpdateModification() = default;
     UpdateModification(BSONElement update);
     UpdateModification(std::vector<BSONObj> pipeline);
+    UpdateModification(doc_diff::Diff, DiffOptions);
     // This constructor exists only to provide a fast-path for constructing classic-style updates.
-    UpdateModification(const BSONObj& update);
-
+    UpdateModification(const BSONObj& update, ClassicTag);
 
     /**
      * These methods support IDL parsing of the "u" field from the update command and OP_UPDATE.
+     *
+     * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+     * break because of it.
      */
     static UpdateModification parseFromBSON(BSONElement elem);
+
+    /**
+     * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+     * break because of it.
+     */
     void serializeToBSON(StringData fieldName, BSONObjBuilder* bob) const;
 
     // When parsing from legacy OP_UPDATE messages, we receive the "u" field as an object. When an
@@ -83,50 +131,61 @@ public:
     // representing an aggregation stage, due to the leading '$'' character.
     static UpdateModification parseLegacyOpUpdateFromBSON(const BSONObj& obj);
 
-    int objsize() const {
-        if (_type == Type::kClassic) {
-            return _classicUpdate->objsize();
-        }
+    int objsize() const;
 
-        int size = 0;
-        std::for_each(_pipeline->begin(), _pipeline->end(), [&size](const BSONObj& obj) {
-            size += obj.objsize() + kWriteCommandBSONArrayPerElementOverheadBytes;
-        });
-
-        return size + kWriteCommandBSONArrayPerElementOverheadBytes;
-    }
-
-    Type type() const {
-        return _type;
-    }
+    Type type() const;
 
     BSONObj getUpdateClassic() const {
-        invariant(_type == Type::kClassic);
-        return *_classicUpdate;
+        invariant(type() == Type::kClassic);
+        return stdx::get<ClassicUpdate>(_update).bson;
     }
 
     const std::vector<BSONObj>& getUpdatePipeline() const {
-        invariant(_type == Type::kPipeline);
-        return *_pipeline;
+        invariant(type() == Type::kPipeline);
+        return stdx::get<PipelineUpdate>(_update);
+    }
+
+    doc_diff::Diff getDiff() const {
+        invariant(type() == Type::kDelta);
+        return stdx::get<DeltaUpdate>(_update).diff;
+    }
+
+    bool mustCheckExistenceForInsertOperations() const {
+        invariant(type() == Type::kDelta);
+        return stdx::get<DeltaUpdate>(_update).options.mustCheckExistenceForInsertOperations;
     }
 
     std::string toString() const {
         StringBuilder sb;
-        sb << "{type: " << typeToString(_type) << ", update: ";
 
-        if (_type == Type::kClassic) {
-            sb << *_classicUpdate << "}";
-        } else {
-            sb << Value(*_pipeline).toString();
-        }
+        stdx::visit(visit_helper::Overloaded{[&sb](const ClassicUpdate& classic) {
+                                                 sb << "{type: Classic, update: " << classic.bson
+                                                    << "}";
+                                             },
+                                             [&sb](const PipelineUpdate& pipeline) {
+                                                 sb << "{type: Pipeline, update: "
+                                                    << Value(pipeline).toString() << "}";
+                                             },
+                                             [&sb](const DeltaUpdate& delta) {
+                                                 sb << "{type: Delta, update: " << delta.diff
+                                                    << "}";
+                                             }},
+                    _update);
 
         return sb.str();
     }
 
 private:
-    Type _type = Type::kClassic;
-    boost::optional<BSONObj> _classicUpdate;
-    boost::optional<std::vector<BSONObj>> _pipeline;
+    // Wrapper class used to avoid having a variant where multiple alternatives have the same type.
+    struct ClassicUpdate {
+        BSONObj bson;
+    };
+    using PipelineUpdate = std::vector<BSONObj>;
+    struct DeltaUpdate {
+        doc_diff::Diff diff;
+        DiffOptions options;
+    };
+    stdx::variant<ClassicUpdate, PipelineUpdate, DeltaUpdate> _update;
 };
 
 }  // namespace write_ops

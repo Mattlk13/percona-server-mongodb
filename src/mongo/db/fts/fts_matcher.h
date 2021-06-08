@@ -75,6 +75,14 @@ public:
      */
     bool negativePhrasesMatch(const BSONObj& obj) const;
 
+    const FTSQueryImpl& query() const {
+        return _query;
+    }
+
+    const FTSSpec& spec() const {
+        return _spec;
+    }
+
 private:
     /**
      * For matching, can we skip the positive term check?  This is done as optimization when
@@ -112,5 +120,5 @@ private:
     const FTSQueryImpl _query;
     const FTSSpec _spec;
 };
-}
-}
+}  // namespace fts
+}  // namespace mongo

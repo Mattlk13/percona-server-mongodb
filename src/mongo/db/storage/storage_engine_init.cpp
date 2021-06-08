@@ -27,27 +27,27 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/storage/storage_engine_init.h"
 
 #include <map>
+#include <memory>
 
 #include "mongo/base/init.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/concurrency/lock_state.h"
 #include "mongo/db/encryption/encryption_options.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/storage/control/storage_control.h"
 #include "mongo/db/storage/storage_engine_lock_file.h"
 #include "mongo/db/storage/storage_engine_metadata.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/storage/storage_repair_observer.h"
-#include "mongo/db/unclean_shutdown.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -60,9 +60,10 @@ namespace {
 void createLockFile(ServiceContext* service);
 }  // namespace
 
-extern bool _supportsDocLocking;
+StorageEngine::LastShutdownState initializeStorageEngine(OperationContext* opCtx,
+                                                         const StorageEngineInitFlags initFlags) {
+    ServiceContext* service = opCtx->getServiceContext();
 
-void initializeStorageEngine(ServiceContext* service, const StorageEngineInitFlags initFlags) {
     // This should be set once.
     invariant(!service->getStorageEngine());
 
@@ -79,27 +80,15 @@ void initializeStorageEngine(ServiceContext* service, const StorageEngineInitFla
         if (storageGlobalParams.repair) {
             repairObserver->onRepairStarted();
         } else if (repairObserver->isIncomplete()) {
-            severe()
-                << "An incomplete repair has been detected! This is likely because a repair "
-                   "operation unexpectedly failed before completing. MongoDB will not start up "
-                   "again without --repair.";
-            fassertFailedNoTrace(50922);
+            LOGV2_FATAL_NOTRACE(
+                50922,
+                "An incomplete repair has been detected! This is likely because a repair "
+                "operation unexpectedly failed before completing. MongoDB will not start up "
+                "again without --repair.");
         }
     }
 
     if (auto existingStorageEngine = StorageEngineMetadata::getStorageEngineForPath(dbpath)) {
-        if (*existingStorageEngine == "mmapv1" ||
-            (storageGlobalParams.engineSetByUser && storageGlobalParams.engine == "mmapv1")) {
-            log() << startupWarningsLog;
-            log() << "** WARNING: Support for MMAPV1 storage engine has been deprecated and will be"
-                  << startupWarningsLog;
-            log() << "**          removed in version 4.2. Please plan to migrate to the wiredTiger"
-                  << startupWarningsLog;
-            log() << "**          storage engine." << startupWarningsLog;
-            log() << "**          See http://dochub.mongodb.org/core/deprecated-mmapv1";
-            log() << startupWarningsLog;
-        }
-
         if (storageGlobalParams.engineSetByUser) {
             // Verify that the name of the user-supplied storage engine matches the contents of
             // the metadata file.
@@ -107,42 +96,22 @@ void initializeStorageEngine(ServiceContext* service, const StorageEngineInitFla
                 getFactoryForStorageEngine(service, storageGlobalParams.engine);
             if (factory) {
                 uassert(28662,
-                        str::stream() << "Cannot start server. Detected data files in " << dbpath
-                                      << " created by"
-                                      << " the '"
-                                      << *existingStorageEngine
-                                      << "' storage engine, but the"
-                                      << " specified storage engine was '"
-                                      << factory->getCanonicalName()
-                                      << "'.",
+                        str::stream()
+                            << "Cannot start server. Detected data files in " << dbpath
+                            << " created by"
+                            << " the '" << *existingStorageEngine << "' storage engine, but the"
+                            << " specified storage engine was '" << factory->getCanonicalName()
+                            << "'.",
                         factory->getCanonicalName() == *existingStorageEngine);
             }
         } else {
             // Otherwise set the active storage engine as the contents of the metadata file.
-            log() << "Detected data files in " << dbpath << " created by the '"
-                  << *existingStorageEngine << "' storage engine, so setting the active"
-                  << " storage engine to '" << *existingStorageEngine << "'.";
+            LOGV2(22270,
+                  "Storage engine to use detected by data files",
+                  "dbpath"_attr = boost::filesystem::path(dbpath).generic_string(),
+                  "storageEngine"_attr = *existingStorageEngine);
             storageGlobalParams.engine = *existingStorageEngine;
         }
-    } else if (!storageGlobalParams.engineSetByUser) {
-        // Ensure the default storage engine is available with this build of mongod.
-        uassert(28663,
-                str::stream()
-                    << "Cannot start server. The default storage engine '"
-                    << storageGlobalParams.engine
-                    << "' is not available with this build of mongod. Please specify a different"
-                    << " storage engine explicitly, e.g. --storageEngine=mmapv1.",
-                isRegisteredStorageEngine(service, storageGlobalParams.engine));
-    } else if (storageGlobalParams.engineSetByUser && storageGlobalParams.engine == "mmapv1") {
-        log() << startupWarningsLog;
-        log() << "** WARNING: You have explicitly specified 'MMAPV1' storage engine in your"
-              << startupWarningsLog;
-        log() << "**          config file or as a command line option.  Support for the MMAPV1"
-              << startupWarningsLog;
-        log() << "**          storage engine has been deprecated and will be removed in"
-              << startupWarningsLog;
-        log() << "**          version 4.2. See http://dochub.mongodb.org/core/deprecated-mmapv1";
-        log() << startupWarningsLog;
     }
 
     const StorageEngine::Factory* factory =
@@ -162,12 +131,14 @@ void initializeStorageEngine(ServiceContext* service, const StorageEngineInitFla
         uassert(34368,
                 str::stream()
                     << "Server was started in read-only mode, but the configured storage engine, "
-                    << storageGlobalParams.engine
-                    << ", does not support read-only operation",
+                    << storageGlobalParams.engine << ", does not support read-only operation",
                 factory->supportsReadOnly());
     }
 
-    std::unique_ptr<StorageEngineMetadata> metadata = StorageEngineMetadata::forPath(dbpath);
+    std::unique_ptr<StorageEngineMetadata> metadata;
+    if ((initFlags & StorageEngineInitFlags::kSkipMetadataFile) == 0) {
+        metadata = StorageEngineMetadata::forPath(dbpath);
+    }
 
     if (storageGlobalParams.readOnly) {
         uassert(34415,
@@ -190,7 +161,7 @@ void initializeStorageEngine(ServiceContext* service, const StorageEngineInitFla
 
     auto& lockFile = StorageEngineLockFile::get(service);
     service->setStorageEngine(std::unique_ptr<StorageEngine>(
-        factory->create(storageGlobalParams, lockFile ? &*lockFile : nullptr)));
+        factory->create(opCtx, storageGlobalParams, lockFile ? &*lockFile : nullptr)));
     service->getStorageEngine()->finishInit();
 
     if (lockFile) {
@@ -198,7 +169,7 @@ void initializeStorageEngine(ServiceContext* service, const StorageEngineInitFla
     }
 
     // Write a new metadata file if it is not present.
-    if (!metadata.get()) {
+    if (!metadata.get() && (initFlags & StorageEngineInitFlags::kSkipMetadataFile) == 0) {
         invariant(!storageGlobalParams.readOnly);
         metadata.reset(new StorageEngineMetadata(storageGlobalParams.dbpath));
         metadata->setStorageEngine(factory->getCanonicalName().toString());
@@ -208,12 +179,21 @@ void initializeStorageEngine(ServiceContext* service, const StorageEngineInitFla
 
     guard.dismiss();
 
-    _supportsDocLocking = service->getStorageEngine()->supportsDocLocking();
+    if (lockFile && lockFile->createdByUncleanShutdown()) {
+        return StorageEngine::LastShutdownState::kUnclean;
+    } else {
+        return StorageEngine::LastShutdownState::kClean;
+    }
 }
 
 void shutdownGlobalStorageEngineCleanly(ServiceContext* service) {
-    invariant(service->getStorageEngine());
-    service->getStorageEngine()->cleanShutdown();
+    auto storageEngine = service->getStorageEngine();
+    invariant(storageEngine);
+    StorageControl::stopStorageControls(
+        service,
+        {ErrorCodes::ShutdownInProgress, "The storage catalog is being closed."},
+        /*forRestart=*/false);
+    storageEngine->cleanShutdown();
     auto& lockFile = StorageEngineLockFile::get(service);
     if (lockFile) {
         lockFile->clearPidAndUnlock();
@@ -229,9 +209,7 @@ void createLockFile(ServiceContext* service) {
     } catch (const std::exception& ex) {
         uassert(28596,
                 str::stream() << "Unable to determine status of lock file in the data directory "
-                              << storageGlobalParams.dbpath
-                              << ": "
-                              << ex.what(),
+                              << storageGlobalParams.dbpath << ": " << ex.what(),
                 false);
     }
     const bool wasUnclean = lockFile->createdByUncleanShutdown();
@@ -244,12 +222,13 @@ void createLockFile(ServiceContext* service) {
 
     if (wasUnclean) {
         if (storageGlobalParams.readOnly) {
-            severe() << "Attempted to open dbpath in readOnly mode, but the server was "
-                        "previously not shut down cleanly.";
-            fassertFailedNoTrace(34416);
+            LOGV2_FATAL_NOTRACE(34416,
+                                "Attempted to open dbpath in readOnly mode, but the server was "
+                                "previously not shut down cleanly.");
         }
-        warning() << "Detected unclean shutdown - " << lockFile->getFilespec() << " is not empty.";
-        startingAfterUncleanShutdown(service) = true;
+        LOGV2_WARNING(22271,
+                      "Detected unclean shutdown - Lock file is not empty",
+                      "lockFile"_attr = lockFile->getFilespec());
     }
 }
 
@@ -289,7 +268,7 @@ StorageEngine::Factory* getFactoryForStorageEngine(ServiceContext* service, Stri
 Status validateStorageOptions(
     ServiceContext* service,
     const BSONObj& storageEngineOptions,
-    stdx::function<Status(const StorageEngine::Factory* const, const BSONObj&)> validateFunc) {
+    std::function<Status(const StorageEngine::Factory* const, const BSONObj&)> validateFunc) {
 
     BSONObjIterator storageIt(storageEngineOptions);
     while (storageIt.more()) {
@@ -341,19 +320,22 @@ public:
     void onCreateClient(Client* client) override{};
     void onDestroyClient(Client* client) override{};
     void onCreateOperationContext(OperationContext* opCtx) {
+        // Use a fully fledged lock manager even when the storage engine is not set.
+        opCtx->setLockState(std::make_unique<LockerImpl>());
+
+        // There are a few cases where we don't have a storage engine available yet when creating an
+        // operation context.
+        // 1. During startup, we create an operation context to allow the storage engine
+        //    initialization code to make use of the lock manager.
+        // 2. There are unit tests that create an operation context before initializing the storage
+        //    engine.
+        // 3. Unit tests that use an operation context but don't require a storage engine for their
+        //    testing purpose.
         auto service = opCtx->getServiceContext();
         auto storageEngine = service->getStorageEngine();
-        // NOTE(schwerin): The following uassert would be more desirable than the early return when
-        // no storage engine is set, but to achieve that we would have to ensure that this file was
-        // never linked into a test binary that didn't actually need/use the storage engine.
-        //
-        // uassert(<some code>,
-        //         "Must instantiate storage engine before creating OperationContext",
-        //         storageEngine);
         if (!storageEngine) {
             return;
         }
-        opCtx->setLockState(stdx::make_unique<LockerImpl>());
         opCtx->setRecoveryUnit(std::unique_ptr<RecoveryUnit>(storageEngine->newRecoveryUnit()),
                                WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
     }

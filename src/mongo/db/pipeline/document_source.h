@@ -33,6 +33,7 @@
 
 #include <boost/intrusive_ptr.hpp>
 #include <boost/optional.hpp>
+#include <functional>
 #include <list>
 #include <memory>
 #include <string>
@@ -42,35 +43,38 @@
 #include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/db/collection_index_usage_tracker.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/generic_cursor.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/dependencies.h"
-#include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/field_path.h"
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/pipeline/stage_constraints.h"
-#include "mongo/db/pipeline/value.h"
 #include "mongo/db/query/explain_options.h"
-#include "mongo/stdx/functional.h"
 #include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 
-class AggregationRequest;
 class Document;
 
 /**
  * Registers a DocumentSource to have the name 'key'.
  *
- * 'liteParser' takes an AggregationRequest and a BSONElement and returns a
+ * 'liteParser' takes an AggregateCommandRequest and a BSONElement and returns a
  * LiteParsedDocumentSource. This is used for checks that need to happen before a full parse,
  * such as checks about which namespaces are referenced by this aggregation.
  *
- * 'fullParser' takes a BSONElement and an ExpressionContext and returns a fully-executable
- * DocumentSource. This will be used for optimization and execution.
+ * 'fullParser' is either a DocumentSource::SimpleParser or a DocumentSource::Parser.
+ * In both cases, it takes a BSONElement and an ExpressionContext and returns fully-executable
+ * DocumentSource(s), for optimization and execution. In the common case it's a SimpleParser,
+ * which returns a single DocumentSource; in the general case it's a Parser, which returns a whole
+ * std::list to support "multi-stage aliases" like $bucket.
  *
  * Stages that do not require any special pre-parse checks can use
  * LiteParsedDocumentSourceDefault::parse as their 'liteParser'.
@@ -81,55 +85,88 @@ class Document;
  * REGISTER_DOCUMENT_SOURCE(foo,
  *                          LiteParsedDocumentSourceDefault::parse,
  *                          DocumentSourceFoo::createFromBson);
- *
- * If your stage is actually an alias which needs to return more than one stage (such as
- * $sortByCount), you should use the REGISTER_MULTI_STAGE_ALIAS macro instead.
  */
-#define REGISTER_DOCUMENT_SOURCE_CONDITIONALLY(key, liteParser, fullParser, ...)             \
-    MONGO_INITIALIZER(addToDocSourceParserMap_##key)(InitializerContext*) {                  \
-        if (!__VA_ARGS__) {                                                                  \
-            return Status::OK();                                                             \
-        }                                                                                    \
-        auto fullParserWrapper = [](BSONElement stageSpec,                                   \
-                                    const boost::intrusive_ptr<ExpressionContext>& expCtx) { \
-            return std::list<boost::intrusive_ptr<DocumentSource>>{                          \
-                (fullParser)(stageSpec, expCtx)};                                            \
-        };                                                                                   \
-        LiteParsedDocumentSource::registerParser("$" #key, liteParser);                      \
-        DocumentSource::registerParser("$" #key, fullParserWrapper);                         \
-        return Status::OK();                                                                 \
-    }
-
-#define REGISTER_DOCUMENT_SOURCE(key, liteParser, fullParser) \
-    REGISTER_DOCUMENT_SOURCE_CONDITIONALLY(key, liteParser, fullParser, true)
-
-#define REGISTER_TEST_DOCUMENT_SOURCE(key, liteParser, fullParser) \
-    REGISTER_DOCUMENT_SOURCE_CONDITIONALLY(                        \
-        key, liteParser, fullParser, ::mongo::getTestCommandsEnabled())
+#define REGISTER_DOCUMENT_SOURCE(key, liteParser, fullParser, allowedWithApiStrict)               \
+    REGISTER_DOCUMENT_SOURCE_CONDITIONALLY(key,                                                   \
+                                           liteParser,                                            \
+                                           fullParser,                                            \
+                                           allowedWithApiStrict,                                  \
+                                           LiteParsedDocumentSource::AllowedWithClientType::kAny, \
+                                           boost::none,                                           \
+                                           true)
 
 /**
- * Registers a multi-stage alias (such as $sortByCount) to have the single name 'key'. When a stage
- * with name '$key' is found, 'liteParser' will be used to produce a LiteParsedDocumentSource,
- * while 'fullParser' will be called to construct a vector of DocumentSources. See the comments on
- * REGISTER_DOCUMENT_SOURCE for more information.
- *
- * As an example, if your stage alias looks like {$foo: <args>} and does *not* require any special
- * pre-parse checks, you should implement a static parser like DocumentSourceFoo::createFromBson(),
- * and register it like so:
- * REGISTER_MULTI_STAGE_ALIAS(foo,
- *                            LiteParsedDocumentSourceDefault::parse,
- *                            DocumentSourceFoo::createFromBson);
+ * Like REGISTER_DOCUMENT_SOURCE, except the parser will only be enabled when FCV >= minVersion.
+ * We store minVersion in the parserMap, so that changing FCV at runtime correctly enables/disables
+ * the parser.
  */
-#define REGISTER_MULTI_STAGE_ALIAS(key, liteParser, fullParser)                  \
-    MONGO_INITIALIZER(addAliasToDocSourceParserMap_##key)(InitializerContext*) { \
-        LiteParsedDocumentSource::registerParser("$" #key, (liteParser));        \
-        DocumentSource::registerParser("$" #key, (fullParser));                  \
-        return Status::OK();                                                     \
+#define REGISTER_DOCUMENT_SOURCE_WITH_MIN_VERSION(                                                \
+    key, liteParser, fullParser, allowedWithApiStrict, minVersion)                                \
+    REGISTER_DOCUMENT_SOURCE_CONDITIONALLY(key,                                                   \
+                                           liteParser,                                            \
+                                           fullParser,                                            \
+                                           allowedWithApiStrict,                                  \
+                                           LiteParsedDocumentSource::AllowedWithClientType::kAny, \
+                                           minVersion,                                            \
+                                           true)
+
+/**
+ * Registers a DocumentSource which cannot be exposed to the users.
+ */
+#define REGISTER_INTERNAL_DOCUMENT_SOURCE(key, liteParser, fullParser, condition) \
+    REGISTER_DOCUMENT_SOURCE_CONDITIONALLY(                                       \
+        key,                                                                      \
+        liteParser,                                                               \
+        fullParser,                                                               \
+        LiteParsedDocumentSource::AllowedWithApiStrict::kInternal,                \
+        LiteParsedDocumentSource::AllowedWithClientType::kInternal,               \
+        boost::none,                                                              \
+        condition)
+
+/**
+ * Like REGISTER_DOCUMENT_SOURCE_WITH_MIN_VERSION, except you can also specify a condition,
+ * evaluated during startup, that decides whether to register the parser.
+ *
+ * For example, you could check a feature flag, and register the parser only when it's enabled.
+ *
+ * Note that the condition is evaluated only once, during a MONGO_INITIALIZER. Don't specify
+ * a condition that can change at runtime, such as FCV. (Feature flags are ok, because they
+ * cannot be toggled at runtime.)
+ *
+ * This is the most general REGISTER_DOCUMENT_SOURCE* macro, which all others should delegate to.
+ */
+#define REGISTER_DOCUMENT_SOURCE_CONDITIONALLY(                                     \
+    key, liteParser, fullParser, allowedWithApiStrict, clientType, minVersion, ...) \
+    MONGO_INITIALIZER(addToDocSourceParserMap_##key)(InitializerContext*) {         \
+        if (!__VA_ARGS__) {                                                         \
+            return;                                                                 \
+        }                                                                           \
+        LiteParsedDocumentSource::registerParser(                                   \
+            "$" #key, liteParser, allowedWithApiStrict, clientType);                \
+        DocumentSource::registerParser("$" #key, fullParser, minVersion);           \
     }
+
+/**
+ * Like REGISTER_DOCUMENT_SOURCE, except the parser is only enabled when test-commands are enabled.
+ */
+#define REGISTER_TEST_DOCUMENT_SOURCE(key, liteParser, fullParser)        \
+    REGISTER_DOCUMENT_SOURCE_CONDITIONALLY(                               \
+        key,                                                              \
+        liteParser,                                                       \
+        fullParser,                                                       \
+        LiteParsedDocumentSource::AllowedWithApiStrict::kNeverInVersion1, \
+        LiteParsedDocumentSource::AllowedWithClientType::kAny,            \
+        boost::none,                                                      \
+        ::mongo::getTestCommandsEnabled())
 
 class DocumentSource : public RefCountable {
 public:
-    using Parser = stdx::function<std::list<boost::intrusive_ptr<DocumentSource>>(
+    // In general a parser returns a list of DocumentSources, to accomodate "multi-stage aliases"
+    // like $bucket.
+    using Parser = std::function<std::list<boost::intrusive_ptr<DocumentSource>>(
+        BSONElement, const boost::intrusive_ptr<ExpressionContext>&)>;
+    // But in the common case a parser returns only one DocumentSource.
+    using SimpleParser = std::function<boost::intrusive_ptr<DocumentSource>(
         BSONElement, const boost::intrusive_ptr<ExpressionContext>&)>;
 
     using ChangeStreamRequirement = StageConstraints::ChangeStreamRequirement;
@@ -140,6 +177,7 @@ public:
     using StreamType = StageConstraints::StreamType;
     using TransactionRequirement = StageConstraints::TransactionRequirement;
     using LookupRequirement = StageConstraints::LookupRequirement;
+    using UnionRequirement = StageConstraints::UnionRequirement;
 
     /**
      * This is what is returned from the main DocumentSource API: getNext(). It is essentially a
@@ -241,14 +279,33 @@ public:
      * The main execution API of a DocumentSource. Returns an intermediate query result generated by
      * this DocumentSource.
      *
-     * All implementers must call pExpCtx->checkForInterrupt().
-     *
      * For performance reasons, a streaming stage must not keep references to documents across calls
      * to getNext(). Such stages must retrieve a result from their child and then release it (or
      * return it) before asking for another result. Failing to do so can result in extra work, since
      * the Document/Value library must copy data on write when that data has a refcount above one.
      */
-    virtual GetNextResult getNext() = 0;
+    GetNextResult getNext() {
+        pExpCtx->checkForInterrupt();
+
+        if (MONGO_likely(!pExpCtx->shouldCollectDocumentSourceExecStats())) {
+            return doGetNext();
+        }
+
+        auto serviceCtx = pExpCtx->opCtx->getServiceContext();
+        invariant(serviceCtx);
+        auto fcs = serviceCtx->getFastClockSource();
+        invariant(fcs);
+
+        invariant(_commonStats.executionTimeMillis);
+        ScopedTimer timer(fcs, _commonStats.executionTimeMillis.get_ptr());
+        ++_commonStats.works;
+
+        GetNextResult next = doGetNext();
+        if (next.isAdvanced()) {
+            ++_commonStats.advanced;
+        }
+        return next;
+    }
 
     /**
      * Returns a struct containing information about any special constraints imposed on using this
@@ -270,6 +327,21 @@ public:
         if (pSource) {
             pSource->dispose();
         }
+    }
+
+    /**
+     * Get the CommonStats for this DocumentSource.
+     */
+    const CommonStats& getCommonStats() const {
+        return _commonStats;
+    }
+
+    /**
+     * Get the stats specific to the DocumentSource. It is legal for the DocumentSource to return
+     * nullptr to indicate that no specific stats are available.
+     */
+    virtual const SpecificStats* getSpecificStats() const {
+        return nullptr;
     }
 
     /**
@@ -305,7 +377,6 @@ public:
     virtual void addInvolvedCollections(
         stdx::unordered_set<NamespaceString>* collectionNames) const {}
 
-
     virtual void detachFromOperationContext() {}
 
     virtual void reattachToOperationContext(OperationContext* opCtx) {}
@@ -327,7 +398,31 @@ public:
      * DO NOT call this method directly. Instead, use the REGISTER_DOCUMENT_SOURCE macro defined in
      * this file.
      */
-    static void registerParser(std::string name, Parser parser);
+    static void registerParser(
+        std::string name,
+        Parser parser,
+        boost::optional<ServerGlobalParams::FeatureCompatibility::Version> requiredMinVersion);
+    /**
+     * Convenience wrapper for the common case, when DocumentSource::Parser returns a list of one
+     * DocumentSource.
+     *
+     * DO NOT call this method directly. Instead, use the REGISTER_DOCUMENT_SOURCE macro defined in
+     * this file.
+     */
+    static void registerParser(
+        std::string name,
+        SimpleParser simpleParser,
+        boost::optional<ServerGlobalParams::FeatureCompatibility::Version> requiredMinVersion);
+
+    /**
+     * Returns true if the DocumentSource has a query.
+     */
+    virtual bool hasQuery() const;
+
+    /**
+     * Returns the DocumentSource query if it exists.
+     */
+    virtual BSONObj getQuery() const;
 
 private:
     /**
@@ -403,6 +498,17 @@ public:
                           StringMap<std::string>&& renames)
             : type(type), paths(std::move(paths)), renames(std::move(renames)) {}
 
+        std::set<std::string> getNewNames() {
+            std::set<std::string> newNames;
+            for (auto&& name : paths) {
+                newNames.insert(name);
+            }
+            for (auto&& rename : renames) {
+                newNames.insert(rename.first);
+            }
+            return newNames;
+        }
+
         Type type;
         std::set<std::string> paths;
 
@@ -433,17 +539,9 @@ public:
     /**
      * Returns the expression context from the stage's context.
      */
-    const ExpressionContext& getContext() const {
-        return *pExpCtx;
+    const boost::intrusive_ptr<ExpressionContext>& getContext() const {
+        return pExpCtx;
     }
-
-    /**
-     * Given 'currentNames' which describes a set of paths which the caller is interested in,
-     * returns boost::none if any of those paths are modified by this stage, or a mapping from
-     * their old name to their new name if they are preserved but possibly renamed by this stage.
-     */
-    boost::optional<StringMap<std::string>> renamedPaths(
-        const std::set<std::string>& currentNames) const;
 
     /**
      * Get the dependencies this operation needs to do its job. If overridden, subclasses must add
@@ -478,15 +576,21 @@ public:
     }
 
 protected:
-    explicit DocumentSource(const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
+    DocumentSource(const StringData stageName,
+                   const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
+
+    /**
+     * The main execution API of a DocumentSource. Returns an intermediate query result generated by
+     * this DocumentSource. See comment at getNext().
+     */
+    virtual GetNextResult doGetNext() = 0;
 
     /**
      * Attempt to perform an optimization with the following source in the pipeline. 'container'
-     * refers to the entire pipeline, and 'itr' points to this stage within the pipeline. The caller
-     * must guarantee that std::next(itr) != container->end().
+     * refers to the entire pipeline, and 'itr' points to this stage within the pipeline.
      *
      * The return value is an iterator over the same container which points to the first location
-     * in the container at which an optimization may be possible.
+     * in the container at which an optimization may be possible, or the end of the container().
      *
      * For example, if a swap takes place, the returned iterator should just be the position
      * directly preceding 'itr', if such a position exists, since the stage at that position may be
@@ -516,6 +620,8 @@ protected:
     boost::intrusive_ptr<ExpressionContext> pExpCtx;
 
 private:
+    CommonStats _commonStats;
+
     /**
      * Create a Value that represents the document source.
      *

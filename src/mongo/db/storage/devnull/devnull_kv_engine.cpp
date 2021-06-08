@@ -31,11 +31,11 @@
 
 #include "mongo/db/storage/devnull/devnull_kv_engine.h"
 
-#include "mongo/db/snapshot_window_options.h"
-#include "mongo/db/storage/ephemeral_for_test/ephemeral_for_test_record_store.h"
+#include <memory>
+
+#include "mongo/db/storage/devnull/ephemeral_catalog_record_store.h"
 #include "mongo/db/storage/record_store.h"
 #include "mongo/db/storage/sorted_data_interface.h"
-#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
@@ -45,6 +45,9 @@ public:
         return {};
     }
     boost::optional<Record> seekExact(const RecordId& id) final {
+        return {};
+    }
+    boost::optional<Record> seekNear(const RecordId& id) final {
         return {};
     }
     void save() final {}
@@ -57,18 +60,14 @@ public:
 
 class DevNullRecordStore : public RecordStore {
 public:
-    DevNullRecordStore(StringData ns, const CollectionOptions& options)
-        : RecordStore(ns), _options(options) {
+    DevNullRecordStore(StringData ns, StringData identName, const CollectionOptions& options)
+        : RecordStore(ns, identName), _options(options) {
         _numInserts = 0;
         _dummy = BSON("_id" << 1);
     }
 
     virtual const char* name() const {
         return "devnull";
-    }
-
-    const std::string& getIdent() const override {
-        return _ident;
     }
 
     virtual void setCappedCallback(CappedCallback*) {}
@@ -85,8 +84,12 @@ public:
         return _options.capped;
     }
 
+    virtual KeyFormat keyFormat() const {
+        return KeyFormat::Long;
+    }
+
     virtual int64_t storageSize(OperationContext* opCtx,
-                                BSONObjBuilder* extraInfo = NULL,
+                                BSONObjBuilder* extraInfo = nullptr,
                                 int infoLevel = 0) const {
         return 0;
     }
@@ -103,20 +106,6 @@ public:
         _numInserts += inOutRecords->size();
         for (auto& record : *inOutRecords) {
             record.id = RecordId(6, 4);
-        }
-        return Status::OK();
-    }
-
-    virtual Status insertRecordsWithDocWriter(OperationContext* opCtx,
-                                              const DocWriter* const* docs,
-                                              const Timestamp*,
-                                              size_t nDocs,
-                                              RecordId* idsOut) {
-        _numInserts += nDocs;
-        if (idsOut) {
-            for (size_t i = 0; i < nDocs; i++) {
-                idsOut[i] = RecordId(6, 4);
-            }
         }
         return Status::OK();
     }
@@ -143,7 +132,7 @@ public:
 
     std::unique_ptr<SeekableRecordCursor> getCursor(OperationContext* opCtx,
                                                     bool forward) const final {
-        return stdx::make_unique<EmptyRecordCursor>();
+        return std::make_unique<EmptyRecordCursor>();
     }
 
     virtual Status truncate(OperationContext* opCtx) {
@@ -158,10 +147,6 @@ public:
         result->appendNumber("numInserts", _numInserts);
     }
 
-    virtual Status touch(OperationContext* opCtx, BSONObjBuilder* output) const {
-        return Status::OK();
-    }
-
     void waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx) const override {}
 
     virtual void updateStatsAfterRepair(OperationContext* opCtx,
@@ -172,7 +157,6 @@ private:
     CollectionOptions _options;
     long long _numInserts;
     BSONObj _dummy;
-    std::string _ident;
 };
 
 class DevNullSortedDataBuilderInterface : public SortedDataBuilderInterface {
@@ -182,38 +166,43 @@ class DevNullSortedDataBuilderInterface : public SortedDataBuilderInterface {
 public:
     DevNullSortedDataBuilderInterface() {}
 
-    virtual StatusWith<SpecialFormatInserted> addKey(const BSONObj& key, const RecordId& loc) {
-        return StatusWith<SpecialFormatInserted>(SpecialFormatInserted::NoSpecialFormatInserted);
+    virtual Status addKey(const KeyString::Value& keyString) {
+        return Status::OK();
     }
 };
 
 class DevNullSortedDataInterface : public SortedDataInterface {
 public:
+    DevNullSortedDataInterface(StringData identName)
+        : SortedDataInterface(identName,
+                              KeyString::Version::kLatestVersion,
+                              Ordering::make(BSONObj()),
+                              KeyFormat::Long) {}
+
     virtual ~DevNullSortedDataInterface() {}
 
-    virtual SortedDataBuilderInterface* getBulkBuilder(OperationContext* opCtx, bool dupsAllowed) {
-        return new DevNullSortedDataBuilderInterface();
+    virtual std::unique_ptr<SortedDataBuilderInterface> makeBulkBuilder(OperationContext* opCtx,
+                                                                        bool dupsAllowed) {
+        return {};
     }
 
-    virtual StatusWith<SpecialFormatInserted> insert(OperationContext* opCtx,
-                                                     const BSONObj& key,
-                                                     const RecordId& loc,
-                                                     bool dupsAllowed) {
-        return StatusWith<SpecialFormatInserted>(SpecialFormatInserted::NoSpecialFormatInserted);
+    virtual Status insert(OperationContext* opCtx,
+                          const KeyString::Value& keyString,
+                          bool dupsAllowed) {
+        return Status::OK();
     }
 
     virtual void unindex(OperationContext* opCtx,
-                         const BSONObj& key,
-                         const RecordId& loc,
+                         const KeyString::Value& keyString,
                          bool dupsAllowed) {}
 
-    virtual Status dupKeyCheck(OperationContext* opCtx, const BSONObj& key) {
+    virtual Status dupKeyCheck(OperationContext* opCtx, const KeyString::Value& keyString) {
         return Status::OK();
     }
 
     virtual void fullValidate(OperationContext* opCtx,
                               long long* numKeysOut,
-                              ValidateResults* fullResults) const {}
+                              IndexValidateResults* fullResults) const {}
 
     virtual bool appendCustomStats(OperationContext* opCtx,
                                    BSONObjBuilder* output,
@@ -222,6 +211,10 @@ public:
     }
 
     virtual long long getSpaceUsedBytes(OperationContext* opCtx) const {
+        return 0;
+    }
+
+    virtual long long getFreeStorageBytes(OperationContext* opCtx) const {
         return 0;
     }
 
@@ -245,35 +238,60 @@ std::unique_ptr<RecordStore> DevNullKVEngine::getRecordStore(OperationContext* o
                                                              StringData ident,
                                                              const CollectionOptions& options) {
     if (ident == "_mdb_catalog") {
-        return stdx::make_unique<EphemeralForTestRecordStore>(ns, &_catalogInfo);
+        return std::make_unique<EphemeralForTestRecordStore>(ns, ident, &_catalogInfo);
     }
-    return stdx::make_unique<DevNullRecordStore>(ns, options);
+    return std::make_unique<DevNullRecordStore>(ns, ident, options);
 }
 
 std::unique_ptr<RecordStore> DevNullKVEngine::makeTemporaryRecordStore(OperationContext* opCtx,
                                                                        StringData ident) {
-    return stdx::make_unique<DevNullRecordStore>("", CollectionOptions());
+    return std::make_unique<DevNullRecordStore>("" /* ns */, ident, CollectionOptions());
 }
 
-SortedDataInterface* DevNullKVEngine::getSortedDataInterface(OperationContext* opCtx,
-                                                             StringData ident,
-                                                             const IndexDescriptor* desc) {
-    return new DevNullSortedDataInterface();
+std::unique_ptr<SortedDataInterface> DevNullKVEngine::getSortedDataInterface(
+    OperationContext* opCtx,
+    const CollectionOptions& collOptions,
+    StringData ident,
+    const IndexDescriptor* desc) {
+    return std::make_unique<DevNullSortedDataInterface>(ident);
 }
 
-int64_t DevNullKVEngine::getCacheOverflowTableInsertCount(OperationContext* opCtx) const {
-    return _overflowTableInsertCountForTest;
-}
+namespace {
 
-void DevNullKVEngine::setCacheOverflowTableInsertCountForTest(int insertsCount) {
-    invariant(insertsCount >= 0);
-    _overflowTableInsertCountForTest = insertsCount;
-}
+class StreamingCursorImpl : public StorageEngine::StreamingCursor {
+public:
+    StreamingCursorImpl() = delete;
+    StreamingCursorImpl(StorageEngine::BackupOptions options)
+        : StorageEngine::StreamingCursor(options) {
+        _backupBlocks = {{"filename.wt"}};
+        _exhaustCursor = false;
+    };
 
-StatusWith<std::vector<std::string>> DevNullKVEngine::beginNonBlockingBackup(
-    OperationContext* opCtx) {
-    std::vector<std::string> filesToCopy = {"filename.wt"};
-    return filesToCopy;
+    ~StreamingCursorImpl() = default;
+
+    BSONObj getMetadataObject(UUID backupId) {
+        return BSONObj();
+    }
+
+    StatusWith<std::vector<StorageEngine::BackupBlock>> getNextBatch(const std::size_t batchSize) {
+        if (_exhaustCursor) {
+            std::vector<StorageEngine::BackupBlock> emptyVector;
+            return emptyVector;
+        }
+        _exhaustCursor = true;
+        return _backupBlocks;
+    }
+
+private:
+    std::vector<StorageEngine::BackupBlock> _backupBlocks;
+    bool _exhaustCursor;
+};
+
+}  // namespace
+
+StatusWith<std::unique_ptr<StorageEngine::StreamingCursor>> DevNullKVEngine::beginNonBlockingBackup(
+    OperationContext* opCtx, const StorageEngine::BackupOptions& options) {
+    return std::make_unique<StreamingCursorImpl>(options);
 }
 
 StatusWith<std::vector<std::string>> DevNullKVEngine::extendBackupCursor(OperationContext* opCtx) {

@@ -7,11 +7,6 @@ selector:
   # Transactions do not support retryability of individual operations.
   # TODO: Remove this once it is supported (SERVER-33952).
   - jstests/core/txns/**/*.js
-  # These tests are not expected to pass with replica-sets:
-  - jstests/core/capped_update.js
-  - jstests/core/dbadmin.js
-  - jstests/core/opcounters_write_cmd.js
-  - jstests/core/read_after_optime.js
 
   # No-op retries are not ignored by top, the profiler, or opcount.
   - jstests/core/operation_latency_histogram.js
@@ -21,19 +16,14 @@ selector:
   - jstests/core/top.js
   - jstests/core/views/views_stats.js
 
-  # Uses plan cache commands.
-  - jstests/core/restart_catalog.js
-
-  # TODO SERVER-31249: getLastError should not be affected by no-op retries.
   - jstests/core/bulk_legacy_enforce_gle.js
 
   # TODO SERVER-31242: findAndModify no-op retry should respect the fields option.
   - jstests/core/crud_api.js
+  - jstests/core/find_and_modify.js
   - jstests/core/find_and_modify2.js
   - jstests/core/find_and_modify_server6865.js
-
-  # TODO SERVER-31245: Inserts to "system.indexes" bypass the check for retryability.
-  - jstests/core/batch_write_command_insert.js
+  - jstests/core/fts_find_and_modify.js
 
   # Stepdown commands during fsync lock will fail.
   - jstests/core/currentop.js
@@ -41,8 +31,6 @@ selector:
   - jstests/core/killop_drop_collection.js
 
   # Expect drops/creates to fail or have a certain response:
-  - jstests/core/drop.js
-  - jstests/core/dropdb.js
   - jstests/core/explain_upsert.js
   - jstests/core/indexes_multiple_commands.js
 
@@ -54,12 +42,6 @@ selector:
   # Expect results to return in a certain order, secondaries may apply ops out of order.
   - jstests/core/coveredIndex1.js
   - jstests/core/sortc.js
-
-  # Assert on the ismaster field of an isMaster response. If a primary steps down after accepting
-  # an isMaster command and returns before its connection is closed, the response can contain
-  # ismaster: false.
-  - jstests/core/dbadmin.js
-  - jstests/core/ismaster.js
 
   # Spawns new mongo shells, which don't retry connecting on stepdown errors.
   - jstests/core/shell_connection_strings.js
@@ -74,6 +56,7 @@ selector:
   - jstests/core/validate_cmd_ns.js # Calls _exec() directly, not retryable.
 
   exclude_with_any_tags:
+  - assumes_standalone_mongod
   ##
   # The next four tags correspond to the special errors thrown by the auto_retry_on_network_error.js
   # override when it refuses to run a certain command. Above each tag are the message(s) that cause
@@ -110,6 +93,11 @@ selector:
   ## The next tag corresponds to long running-operations, as they may exhaust their number
   # of retries and result in a network error being thrown.
   - operations_longer_than_stepdown_interval
+  # Operations in the main test shell aren't guaranteed to be causally consistent with operations
+  # performed earlier in a parallel shell if multiple nodes are electable because the latest
+  # operation and cluster times aren't shared between shells.
+  # "Cowardly refusing to run test with network retries enabled when it uses startParallelShell()"
+  - uses_parallel_shell
 
 executor:
   archive:

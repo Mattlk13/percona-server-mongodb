@@ -36,11 +36,12 @@
 #include "mongo/util/str.h"
 
 //#set $codes_with_extra = [ec for ec in $codes if ec.extra]
+//#set $codes_with_non_optional_extra = [ec for ec in $codes if ec.extra and not ec.extraIsOptional]
 
 namespace mongo {
 
 namespace {
-// You can thing of this namespace as a compile-time map<ErrorCodes::Error, ErrorExtraInfoParser*>.
+// You can think of this namespace as a compile-time map<ErrorCodes::Error, ErrorExtraInfoParser*>.
 namespace parsers {
 //#for $ec in $codes_with_extra
 ErrorExtraInfo::Parser* $ec.name = nullptr;
@@ -75,7 +76,8 @@ std::ostream& operator<<(std::ostream& stream, ErrorCodes::Error code) {
 }
 
 //#for $cat in $categories
-bool ErrorCodes::is${cat.name}(Error err) {
+template <>
+bool ErrorCodes::isA<ErrorCategory::$cat.name>(Error err) {
     switch (err) {
         //#for $code in $cat.codes
         case $code:
@@ -85,11 +87,22 @@ bool ErrorCodes::is${cat.name}(Error err) {
             return false;
     }
 }
-//#end for
 
-bool ErrorCodes::shouldHaveExtraInfo(Error code) {
+//#end for
+bool ErrorCodes::canHaveExtraInfo(Error code) {
     switch (code) {
         //#for $ec in $codes_with_extra
+        case ErrorCodes::$ec.name:
+            return true;
+        //#end for
+        default:
+            return false;
+    }
+}
+
+bool ErrorCodes::mustHaveExtraInfo(Error code) {
+    switch (code) {
+        //#for $ec in $codes_with_non_optional_extra
         case ErrorCodes::$ec.name:
             return true;
         //#end for

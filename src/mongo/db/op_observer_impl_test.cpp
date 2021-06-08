@@ -29,25 +29,28 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/db/catalog/import_collection_oplog_entry_gen.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/locker_noop.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/keys_collection_client_sharded.h"
 #include "mongo/db/keys_collection_manager.h"
-#include "mongo/db/logical_clock.h"
 #include "mongo/db/logical_time_validator.h"
 #include "mongo/db/op_observer_impl.h"
+#include "mongo/db/read_write_concern_defaults.h"
+#include "mongo/db/read_write_concern_defaults_cache_lookup_mock.h"
 #include "mongo/db/repl/oplog.h"
+#include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/repl/oplog_interface_local.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
-#include "mongo/db/repl/storage_interface_mock.h"
+#include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/service_context_d_test_fixture.h"
 #include "mongo/db/session_catalog_mongod.h"
-#include "mongo/db/storage/ephemeral_for_test/ephemeral_for_test_recovery_unit.h"
 #include "mongo/db/transaction_participant.h"
 #include "mongo/db/transaction_participant_gen.h"
+#include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/util/clock_source_mock.h"
 
@@ -65,18 +68,20 @@ public:
 
         auto service = getServiceContext();
         auto opCtx = cc().makeOperationContext();
-        repl::StorageInterface::set(service, stdx::make_unique<repl::StorageInterfaceMock>());
+        // onStepUp() relies on the storage interface to create the config.transactions table.
+        repl::StorageInterface::set(service, std::make_unique<repl::StorageInterfaceImpl>());
 
         // Set up ReplicationCoordinator and create oplog.
         repl::ReplicationCoordinator::set(
             service,
-            stdx::make_unique<repl::ReplicationCoordinatorMock>(service, createReplSettings()));
-        repl::setOplogCollectionName(service);
+            std::make_unique<repl::ReplicationCoordinatorMock>(service, createReplSettings()));
         repl::createOplog(opCtx.get());
 
         // Ensure that we are primary.
         auto replCoord = repl::ReplicationCoordinator::get(opCtx.get());
         ASSERT_OK(replCoord->setFollowerMode(repl::MemberState::RS_PRIMARY));
+
+        ReadWriteConcernDefaults::create(getServiceContext(), _lookupMock.getFetchDefaultsFn());
     }
 
 protected:
@@ -91,6 +96,13 @@ protected:
             result[i] = opEntry.first;
         }
         ASSERT_EQUALS(ErrorCodes::CollectionIsEmpty, oplogIter->next().getStatus());
+        // Some unittests reuse the same OperationContext to read the oplog and end up acquiring the
+        // RSTL lock after using the OplogInterfaceLocal. This is a hack to make sure we do not hold
+        // RSTL lock for prepared transactions.
+        if (opCtx->inMultiDocumentTransaction() &&
+            TransactionParticipant::get(opCtx).transactionIsPrepared()) {
+            opCtx->lockState()->unlockRSTLforPrepare();
+        }
         return result;
     }
 
@@ -98,6 +110,8 @@ protected:
     BSONObj getSingleOplogEntry(OperationContext* opCtx) {
         return getNOplogEntries(opCtx, 1).back();
     }
+
+    ReadWriteConcernDefaultsLookupMock _lookupMock;
 
 private:
     // Creates a reasonable set of ReplSettings for most tests.  We need to be able to
@@ -119,12 +133,10 @@ TEST_F(OpObserverTest, StartIndexBuildExpectedOplogEntry) {
 
     BSONObj specX = BSON("key" << BSON("x" << 1) << "name"
                                << "x_1"
-                               << "v"
-                               << 2);
+                               << "v" << 2);
     BSONObj specA = BSON("key" << BSON("a" << 1) << "name"
                                << "a_1"
-                               << "v"
-                               << 2);
+                               << "v" << 2);
     std::vector<BSONObj> specs = {specX, specA};
 
     // Write to the oplog.
@@ -161,12 +173,10 @@ TEST_F(OpObserverTest, CommitIndexBuildExpectedOplogEntry) {
 
     BSONObj specX = BSON("key" << BSON("x" << 1) << "name"
                                << "x_1"
-                               << "v"
-                               << 2);
+                               << "v" << 2);
     BSONObj specA = BSON("key" << BSON("a" << 1) << "name"
                                << "a_1"
-                               << "v"
-                               << 2);
+                               << "v" << 2);
     std::vector<BSONObj> specs = {specX, specA};
 
     // Write to the oplog.
@@ -203,20 +213,20 @@ TEST_F(OpObserverTest, AbortIndexBuildExpectedOplogEntry) {
 
     BSONObj specX = BSON("key" << BSON("x" << 1) << "name"
                                << "x_1"
-                               << "v"
-                               << 2);
+                               << "v" << 2);
     BSONObj specA = BSON("key" << BSON("a" << 1) << "name"
                                << "a_1"
-                               << "v"
-                               << 2);
+                               << "v" << 2);
     std::vector<BSONObj> specs = {specX, specA};
 
     // Write to the oplog.
+    Status cause(ErrorCodes::OperationFailed, "index build failed");
     {
         AutoGetDb autoDb(opCtx.get(), nss.db(), MODE_X);
         WriteUnitOfWork wunit(opCtx.get());
+        auto fromMigrate = false;
         opObserver.onAbortIndexBuild(
-            opCtx.get(), nss, uuid, indexBuildUUID, specs, false /*fromMigrate*/);
+            opCtx.get(), nss, uuid, indexBuildUUID, specs, cause, fromMigrate);
         wunit.commit();
     }
 
@@ -228,12 +238,19 @@ TEST_F(OpObserverTest, AbortIndexBuildExpectedOplogEntry) {
     indexesArr.append(specX);
     indexesArr.append(specA);
     indexesArr.done();
+    BSONObjBuilder causeBuilder(abortIndexBuildBuilder.subobjStart("cause"));
+    causeBuilder.appendBool("ok", 0);
+    cause.serializeErrorToBSON(&causeBuilder);
+    causeBuilder.done();
     BSONObj abortIndexBuildCmd = abortIndexBuildBuilder.done();
 
     // Ensure the abortIndexBuild fields were correctly set.
     auto oplogEntry = getSingleOplogEntry(opCtx.get());
     auto o = oplogEntry.getObjectField("o");
     ASSERT_BSONOBJ_EQ(abortIndexBuildCmd, o);
+
+    // Should be able to extract a Status from the 'cause' field.
+    ASSERT_EQUALS(cause, getStatusFromCommandResult(o.getObjectField("cause")));
 }
 
 TEST_F(OpObserverTest, CollModWithCollectionOptionsAndTTLInfo) {
@@ -252,19 +269,19 @@ TEST_F(OpObserverTest, CollModWithCollectionOptionsAndTTLInfo) {
                                         << "indexData");
 
     CollectionOptions oldCollOpts;
-    oldCollOpts.validationLevel = "strict";
-    oldCollOpts.validationAction = "error";
+    oldCollOpts.validationLevel = ValidationLevelEnum::strict;
+    oldCollOpts.validationAction = ValidationActionEnum::error;
 
-    TTLCollModInfo ttlInfo;
-    ttlInfo.expireAfterSeconds = Seconds(10);
-    ttlInfo.oldExpireAfterSeconds = Seconds(5);
-    ttlInfo.indexName = "name_of_index";
+    IndexCollModInfo indexInfo;
+    indexInfo.expireAfterSeconds = Seconds(10);
+    indexInfo.oldExpireAfterSeconds = Seconds(5);
+    indexInfo.indexName = "name_of_index";
 
     // Write to the oplog.
     {
-        AutoGetDb autoDb(opCtx.get(), nss.db(), MODE_X);
+        AutoGetCollection autoColl(opCtx.get(), nss, MODE_X);
         WriteUnitOfWork wunit(opCtx.get());
-        opObserver.onCollMod(opCtx.get(), nss, uuid, collModCmd, oldCollOpts, ttlInfo);
+        opObserver.onCollMod(opCtx.get(), nss, uuid, collModCmd, oldCollOpts, indexInfo);
         wunit.commit();
     }
 
@@ -272,24 +289,25 @@ TEST_F(OpObserverTest, CollModWithCollectionOptionsAndTTLInfo) {
 
     // Ensure that collMod fields were properly added to the oplog entry.
     auto o = oplogEntry.getObjectField("o");
-    auto oExpected =
-        BSON("collMod" << nss.coll() << "validationLevel"
-                       << "off"
-                       << "validationAction"
-                       << "warn"
-                       << "index"
-                       << BSON("name" << ttlInfo.indexName << "expireAfterSeconds"
-                                      << durationCount<Seconds>(ttlInfo.expireAfterSeconds)));
+    auto oExpected = BSON(
+        "collMod" << nss.coll() << "validationLevel"
+                  << "off"
+                  << "validationAction"
+                  << "warn"
+                  << "index"
+                  << BSON("name" << indexInfo.indexName << "expireAfterSeconds"
+                                 << durationCount<Seconds>(indexInfo.expireAfterSeconds.get())));
     ASSERT_BSONOBJ_EQ(oExpected, o);
 
     // Ensure that the old collection metadata was saved.
     auto o2 = oplogEntry.getObjectField("o2");
-    auto o2Expected =
-        BSON("collectionOptions_old"
-             << BSON("validationLevel" << oldCollOpts.validationLevel << "validationAction"
-                                       << oldCollOpts.validationAction)
-             << "expireAfterSeconds_old"
-             << durationCount<Seconds>(ttlInfo.oldExpireAfterSeconds));
+    auto o2Expected = BSON("collectionOptions_old"
+                           << BSON("validationLevel"
+                                   << ValidationLevel_serializer(*oldCollOpts.validationLevel)
+                                   << "validationAction"
+                                   << ValidationAction_serializer(*oldCollOpts.validationAction))
+                           << "expireAfterSeconds_old"
+                           << durationCount<Seconds>(indexInfo.oldExpireAfterSeconds.get()));
 
     ASSERT_BSONOBJ_EQ(o2Expected, o2);
 }
@@ -307,12 +325,12 @@ TEST_F(OpObserverTest, CollModWithOnlyCollectionOptions) {
                                         << "warn");
 
     CollectionOptions oldCollOpts;
-    oldCollOpts.validationLevel = "strict";
-    oldCollOpts.validationAction = "error";
+    oldCollOpts.validationLevel = ValidationLevelEnum::strict;
+    oldCollOpts.validationAction = ValidationActionEnum::error;
 
     // Write to the oplog.
     {
-        AutoGetDb autoDb(opCtx.get(), nss.db(), MODE_X);
+        AutoGetCollection autoColl(opCtx.get(), nss, MODE_X);
         WriteUnitOfWork wunit(opCtx.get());
         opObserver.onCollMod(opCtx.get(), nss, uuid, collModCmd, oldCollOpts, boost::none);
         wunit.commit();
@@ -327,10 +345,12 @@ TEST_F(OpObserverTest, CollModWithOnlyCollectionOptions) {
 
     // Ensure that the old collection metadata was saved and that TTL info is not present.
     auto o2 = oplogEntry.getObjectField("o2");
-    auto o2Expected =
-        BSON("collectionOptions_old"
-             << BSON("validationLevel" << oldCollOpts.validationLevel << "validationAction"
-                                       << oldCollOpts.validationAction));
+    auto o2Expected = BSON("collectionOptions_old"
+                           << BSON("validationLevel"
+                                   << ValidationLevel_serializer(*oldCollOpts.validationLevel)
+                                   << "validationAction"
+                                   << ValidationAction_serializer(*oldCollOpts.validationAction)));
+
     ASSERT_BSONOBJ_EQ(o2Expected, o2);
 }
 
@@ -391,10 +411,9 @@ TEST_F(OpObserverTest, OnRenameCollectionReturnsRenameOpTime) {
     // Ensure that renameCollection fields were properly added to oplog entry.
     ASSERT_EQUALS(uuid, unittest::assertGet(UUID::parse(oplogEntry["ui"])));
     auto o = oplogEntry.getObjectField("o");
-    auto oExpected = BSON(
-        "renameCollection" << sourceNss.ns() << "to" << targetNss.ns() << "stayTemp" << stayTemp
-                           << "dropTarget"
-                           << dropTargetUuid);
+    auto oExpected =
+        BSON("renameCollection" << sourceNss.ns() << "to" << targetNss.ns() << "stayTemp"
+                                << stayTemp << "dropTarget" << dropTargetUuid);
     ASSERT_BSONOBJ_EQ(oExpected, o);
 
     // Ensure that the rename optime returned is the same as the last optime in the ReplClientInfo.
@@ -423,9 +442,64 @@ TEST_F(OpObserverTest, OnRenameCollectionOmitsDropTargetFieldIfDropTargetUuidIsN
     // Ensure that renameCollection fields were properly added to oplog entry.
     ASSERT_EQUALS(uuid, unittest::assertGet(UUID::parse(oplogEntry["ui"])));
     auto o = oplogEntry.getObjectField("o");
-    auto oExpected = BSON(
-        "renameCollection" << sourceNss.ns() << "to" << targetNss.ns() << "stayTemp" << stayTemp);
+    auto oExpected = BSON("renameCollection" << sourceNss.ns() << "to" << targetNss.ns()
+                                             << "stayTemp" << stayTemp);
     ASSERT_BSONOBJ_EQ(oExpected, o);
+}
+
+TEST_F(OpObserverTest, MustBePrimaryToWriteOplogEntries) {
+    OpObserverImpl opObserver;
+    auto opCtx = cc().makeOperationContext();
+
+    ASSERT_OK(repl::ReplicationCoordinator::get(opCtx.get())
+                  ->setFollowerMode(repl::MemberState::RS_SECONDARY));
+
+    Lock::GlobalWrite globalWrite(opCtx.get());
+    WriteUnitOfWork wunit(opCtx.get());
+
+    // No-op writes should be prohibited.
+    ASSERT_THROWS_CODE(
+        opObserver.onOpMessage(opCtx.get(), {}), DBException, ErrorCodes::NotWritablePrimary);
+}
+
+TEST_F(OpObserverTest, ImportCollectionOplogEntry) {
+    OpObserverImpl opObserver;
+    auto opCtx = cc().makeOperationContext();
+
+    auto importUUID = UUID::gen();
+    NamespaceString nss("test.coll");
+    long long numRecords = 1;
+    long long dataSize = 2;
+    // A dummy invalid catalog entry. We do not need a valid catalog entry for this test.
+    auto catalogEntry = BSON("ns" << nss.ns() << "ident"
+                                  << "collection-7-1792004489479993697");
+    auto storageMetadata = BSON("storage"
+                                << "metadata");
+    bool isDryRun = false;
+
+    // Write to the oplog.
+    {
+        AutoGetDb autoDb(opCtx.get(), nss.db(), MODE_X);
+        WriteUnitOfWork wunit(opCtx.get());
+        opObserver.onImportCollection(opCtx.get(),
+                                      importUUID,
+                                      nss,
+                                      numRecords,
+                                      dataSize,
+                                      catalogEntry,
+                                      storageMetadata,
+                                      isDryRun);
+        wunit.commit();
+    }
+
+    auto oplogEntryObj = getSingleOplogEntry(opCtx.get());
+    OplogEntry oplogEntry = assertGet(OplogEntry::parse(oplogEntryObj));
+    ASSERT_TRUE(repl::OpTypeEnum::kCommand == oplogEntry.getOpType());
+    ASSERT_TRUE(OplogEntry::CommandType::kImportCollection == oplogEntry.getCommandType());
+
+    ImportCollectionOplogEntry importCollection(
+        nss, importUUID, numRecords, dataSize, catalogEntry, storageMetadata, isDryRun);
+    ASSERT_BSONOBJ_EQ(importCollection.toBSON(), oplogEntry.getObject());
 }
 
 /**
@@ -455,8 +529,12 @@ public:
             AutoGetCollection autoColl(opCtx, nss, MODE_IX);
             WriteUnitOfWork wuow(opCtx);
             auto opTime = repl::OpTime(Timestamp(10, 1), 1);  // Dummy timestamp.
-            txnParticipant.onWriteOpCompletedOnPrimary(
-                opCtx, txnNum, {stmtId}, opTime, Date_t::now(), boost::none, boost::none);
+            SessionTxnRecord sessionTxnRecord;
+            sessionTxnRecord.setSessionId(*opCtx->getLogicalSessionId());
+            sessionTxnRecord.setTxnNum(txnNum);
+            sessionTxnRecord.setLastWriteOpTime(opTime);
+            sessionTxnRecord.setLastWriteDate(Date_t::now());
+            txnParticipant.onWriteOpCompletedOnPrimary(opCtx, {stmtId}, sessionTxnRecord);
             wuow.commit();
         }
     }
@@ -512,32 +590,32 @@ TEST_F(OpObserverTest, MultipleAboutToDeleteAndOnDelete) {
     AutoGetDb autoDb(opCtx.get(), nss.db(), MODE_X);
     WriteUnitOfWork wunit(opCtx.get());
     opObserver.aboutToDelete(opCtx.get(), nss, BSON("_id" << 1));
-    opObserver.onDelete(opCtx.get(), nss, uuid, {}, false, {});
+    opObserver.onDelete(opCtx.get(), nss, uuid, kUninitializedStmtId, {});
     opObserver.aboutToDelete(opCtx.get(), nss, BSON("_id" << 1));
-    opObserver.onDelete(opCtx.get(), nss, uuid, {}, false, {});
+    opObserver.onDelete(opCtx.get(), nss, uuid, kUninitializedStmtId, {});
 }
 
 DEATH_TEST_F(OpObserverTest, AboutToDeleteMustPreceedOnDelete, "invariant") {
     OpObserverImpl opObserver;
     auto opCtx = cc().makeOperationContext();
-    opCtx->swapLockState(stdx::make_unique<LockerNoop>());
+    cc().swapLockState(std::make_unique<LockerNoop>());
     NamespaceString nss = {"test", "coll"};
-    opObserver.onDelete(opCtx.get(), nss, {}, {}, false, {});
+    opObserver.onDelete(opCtx.get(), nss, {}, kUninitializedStmtId, {});
 }
 
 DEATH_TEST_F(OpObserverTest, EachOnDeleteRequiresAboutToDelete, "invariant") {
     OpObserverImpl opObserver;
     auto opCtx = cc().makeOperationContext();
-    opCtx->swapLockState(stdx::make_unique<LockerNoop>());
+    cc().swapLockState(std::make_unique<LockerNoop>());
     NamespaceString nss = {"test", "coll"};
     opObserver.aboutToDelete(opCtx.get(), nss, {});
-    opObserver.onDelete(opCtx.get(), nss, {}, {}, false, {});
-    opObserver.onDelete(opCtx.get(), nss, {}, {}, false, {});
+    opObserver.onDelete(opCtx.get(), nss, {}, kUninitializedStmtId, {});
+    opObserver.onDelete(opCtx.get(), nss, {}, kUninitializedStmtId, {});
 }
 
-DEATH_TEST_F(OpObserverTest,
-             NodeCrashesIfShardIdentityDocumentRolledBack,
-             "Fatal Assertion 50712") {
+DEATH_TEST_REGEX_F(OpObserverTest,
+                   NodeCrashesIfShardIdentityDocumentRolledBack,
+                   "Fatal assertion.*50712") {
     OpObserverImpl opObserver;
     auto opCtx = cc().makeOperationContext();
 
@@ -563,6 +641,7 @@ public:
 
         opCtx()->setLogicalSessionId(makeLogicalSessionIdForTest());
         opCtx()->setTxnNumber(txnNum());
+        opCtx()->setInMultiDocumentTransaction();
         _sessionCheckout = std::make_unique<MongoDOperationContextSession>(opCtx());
 
         auto txnParticipant = TransactionParticipant::get(opCtx());
@@ -676,48 +755,6 @@ private:
     TxnNumber _txnNum = 0;
 };
 
-/**
- * Test fixture with sessions and an extra-large oplog for testing large transactions.
- */
-class OpObserverLargeTransactionTest : public OpObserverTransactionTest {
-private:
-    repl::ReplSettings createReplSettings() override {
-        repl::ReplSettings settings;
-        // We need an oplog comfortably large enough to hold an oplog entry that exceeds the BSON
-        // size limit.  Otherwise we will get the wrong error code when trying to write one.
-        settings.setOplogSizeBytes(BSONObjMaxInternalSize + 2 * 1024 * 1024);
-        settings.setReplSetString("mySet/node1:12345");
-        return settings;
-    }
-};
-
-// Tests that a transaction aborts if it becomes too large only during the commit.
-TEST_F(OpObserverLargeTransactionTest, TransactionTooLargeWhileCommitting) {
-    const NamespaceString nss("testDB", "testColl");
-    auto uuid = CollectionUUID::gen();
-
-    auto txnParticipant = TransactionParticipant::get(opCtx());
-    txnParticipant.unstashTransactionResources(opCtx(), "insert");
-
-    // This size is crafted such that two operations of this size are not too big to fit in a single
-    // oplog entry, but two operations plus oplog overhead are too big to fit in a single oplog
-    // entry.
-    constexpr size_t kHalfTransactionSize = BSONObjMaxInternalSize / 2 - 175;
-    std::unique_ptr<uint8_t[]> halfTransactionData(new uint8_t[kHalfTransactionSize]());
-    auto operation = repl::OplogEntry::makeInsertOperation(
-        nss,
-        uuid,
-        BSON(
-            "_id" << 0 << "data"
-                  << BSONBinData(halfTransactionData.get(), kHalfTransactionSize, BinDataGeneral)));
-    txnParticipant.addTransactionOperation(opCtx(), operation);
-    txnParticipant.addTransactionOperation(opCtx(), operation);
-    ASSERT_THROWS_CODE(opObserver().onUnpreparedTransactionCommit(
-                           opCtx(), txnParticipant.retrieveCompletedTransactionOperations(opCtx())),
-                       AssertionException,
-                       ErrorCodes::TransactionTooLarge);
-}
-
 TEST_F(OpObserverTransactionTest, TransactionalPrepareTest) {
     const NamespaceString nss1("testDB", "testColl");
     const NamespaceString nss2("testDB2", "testColl2");
@@ -740,7 +777,7 @@ TEST_F(OpObserverTransactionTest, TransactionalPrepareTest) {
     opObserver().onInserts(opCtx(), nss1, uuid1, inserts1.begin(), inserts1.end(), false);
 
     CollectionUpdateArgs updateArgs2;
-    updateArgs2.stmtId = 1;
+    updateArgs2.stmtIds = {1};
     updateArgs2.updatedDoc = BSON("_id" << 0 << "data"
                                         << "y");
     updateArgs2.update = BSON("$set" << BSON("data"
@@ -753,61 +790,46 @@ TEST_F(OpObserverTransactionTest, TransactionalPrepareTest) {
                                nss1,
                                BSON("_id" << 0 << "data"
                                           << "x"));
-    opObserver().onDelete(opCtx(), nss1, uuid1, 0, false, boost::none);
+    opObserver().onDelete(opCtx(), nss1, uuid1, 0, {});
 
     {
         Lock::GlobalLock lk(opCtx(), MODE_IX);
         WriteUnitOfWork wuow(opCtx());
-        OplogSlot slot = repl::getNextOpTime(opCtx());
-        txnParticipant.transitionToPreparedforTest(opCtx(), slot);
-        opCtx()->recoveryUnit()->setPrepareTimestamp(slot.getTimestamp());
-        opObserver().onTransactionPrepare(
-            opCtx(), {slot}, txnParticipant.retrieveCompletedTransactionOperations(opCtx()));
+        // One reserved slot for each statement, plus the prepare.
+        auto reservedSlots = repl::getNextOpTimes(opCtx(), 5);
+        auto prepareOpTime = reservedSlots.back();
+        txnParticipant.transitionToPreparedforTest(opCtx(), prepareOpTime);
+        opCtx()->recoveryUnit()->setPrepareTimestamp(prepareOpTime.getTimestamp());
+        auto txnOps = txnParticipant.retrieveCompletedTransactionOperations(opCtx());
+        opObserver().onTransactionPrepare(opCtx(), reservedSlots, &txnOps, 0);
     }
 
     auto oplogEntryObj = getSingleOplogEntry(opCtx());
     checkCommonFields(oplogEntryObj);
     OplogEntry oplogEntry = assertGet(OplogEntry::parse(oplogEntryObj));
     auto o = oplogEntry.getObject();
-    auto oExpected = BSON("applyOps" << BSON_ARRAY(BSON("op"
-                                                        << "i"
-                                                        << "ns"
-                                                        << nss1.toString()
-                                                        << "ui"
-                                                        << uuid1
-                                                        << "o"
-                                                        << BSON("_id" << 0 << "data"
-                                                                      << "x"))
-                                                   << BSON("op"
-                                                           << "i"
-                                                           << "ns"
-                                                           << nss1.toString()
-                                                           << "ui"
-                                                           << uuid1
-                                                           << "o"
-                                                           << BSON("_id" << 1 << "data"
-                                                                         << "y"))
-                                                   << BSON("op"
-                                                           << "u"
-                                                           << "ns"
-                                                           << nss2.toString()
-                                                           << "ui"
-                                                           << uuid2
-                                                           << "o"
-                                                           << BSON("$set" << BSON("data"
-                                                                                  << "y"))
-                                                           << "o2"
-                                                           << BSON("_id" << 0))
-                                                   << BSON("op"
-                                                           << "d"
-                                                           << "ns"
-                                                           << nss1.toString()
-                                                           << "ui"
-                                                           << uuid1
-                                                           << "o"
-                                                           << BSON("_id" << 0)))
-                                     << "prepare"
-                                     << true);
+    auto oExpected =
+        BSON("applyOps" << BSON_ARRAY(BSON("op"
+                                           << "i"
+                                           << "ns" << nss1.toString() << "ui" << uuid1 << "o"
+                                           << BSON("_id" << 0 << "data"
+                                                         << "x"))
+                                      << BSON("op"
+                                              << "i"
+                                              << "ns" << nss1.toString() << "ui" << uuid1 << "o"
+                                              << BSON("_id" << 1 << "data"
+                                                            << "y"))
+                                      << BSON("op"
+                                              << "u"
+                                              << "ns" << nss2.toString() << "ui" << uuid2 << "o"
+                                              << BSON("$set" << BSON("data"
+                                                                     << "y"))
+                                              << "o2" << BSON("_id" << 0))
+                                      << BSON("op"
+                                              << "d"
+                                              << "ns" << nss1.toString() << "ui" << uuid1 << "o"
+                                              << BSON("_id" << 0)))
+                        << "prepare" << true);
     ASSERT_BSONOBJ_EQ(oExpected, o);
     ASSERT(oplogEntry.shouldPrepare());
     ASSERT_EQ(oplogEntry.getTimestamp(), opCtx()->recoveryUnit()->getPrepareTimestamp());
@@ -835,8 +857,8 @@ TEST_F(OpObserverTransactionTest, TransactionalPreparedCommitTest) {
         const auto prepareSlot = repl::getNextOpTime(opCtx());
         txnParticipant.transitionToPreparedforTest(opCtx(), prepareSlot);
         prepareTimestamp = prepareSlot.getTimestamp();
-        opObserver().onTransactionPrepare(
-            opCtx(), {prepareSlot}, txnParticipant.retrieveCompletedTransactionOperations(opCtx()));
+        auto txnOps = txnParticipant.retrieveCompletedTransactionOperations(opCtx());
+        opObserver().onTransactionPrepare(opCtx(), {prepareSlot}, &txnOps, 0);
 
         commitSlot = repl::getNextOpTime(opCtx());
     }
@@ -844,8 +866,6 @@ TEST_F(OpObserverTransactionTest, TransactionalPreparedCommitTest) {
     // Mimic committing the transaction.
     opCtx()->setWriteUnitOfWork(nullptr);
     opCtx()->lockState()->unsetMaxLockTimeout();
-
-    txnParticipant.transitionToCommittingWithPrepareforTest(opCtx());
 
     {
         Lock::GlobalLock lk(opCtx(), MODE_IX);
@@ -872,16 +892,11 @@ TEST_F(OpObserverTransactionTest, TransactionalPreparedCommitTest) {
         checkCommonFields(oplogEntryObj);
         OplogEntry oplogEntry = assertGet(OplogEntry::parse(oplogEntryObj));
         auto o = oplogEntry.getObject();
-        auto oExpected = BSON("applyOps" << BSON_ARRAY(BSON("op"
-                                                            << "i"
-                                                            << "ns"
-                                                            << nss.toString()
-                                                            << "ui"
-                                                            << uuid
-                                                            << "o"
-                                                            << doc))
-                                         << "prepare"
-                                         << true);
+        auto oExpected = BSON(
+            "applyOps" << BSON_ARRAY(BSON("op"
+                                          << "i"
+                                          << "ns" << nss.toString() << "ui" << uuid << "o" << doc))
+                       << "prepare" << true);
         ASSERT_BSONOBJ_EQ(oExpected, o);
         ASSERT(oplogEntry.shouldPrepare());
     }
@@ -909,8 +924,8 @@ TEST_F(OpObserverTransactionTest, TransactionalPreparedAbortTest) {
 
         const auto prepareSlot = repl::getNextOpTime(opCtx());
         txnParticipant.transitionToPreparedforTest(opCtx(), prepareSlot);
-        opObserver().onTransactionPrepare(
-            opCtx(), {prepareSlot}, txnParticipant.retrieveCompletedTransactionOperations(opCtx()));
+        auto txnOps = txnParticipant.retrieveCompletedTransactionOperations(opCtx());
+        opObserver().onTransactionPrepare(opCtx(), {prepareSlot}, &txnOps, 0);
         abortSlot = repl::getNextOpTime(opCtx());
     }
 
@@ -940,16 +955,11 @@ TEST_F(OpObserverTransactionTest, TransactionalPreparedAbortTest) {
         checkCommonFields(oplogEntryObj);
         OplogEntry oplogEntry = assertGet(OplogEntry::parse(oplogEntryObj));
         auto o = oplogEntry.getObject();
-        auto oExpected = BSON("applyOps" << BSON_ARRAY(BSON("op"
-                                                            << "i"
-                                                            << "ns"
-                                                            << nss.toString()
-                                                            << "ui"
-                                                            << uuid
-                                                            << "o"
-                                                            << doc))
-                                         << "prepare"
-                                         << true);
+        auto oExpected = BSON(
+            "applyOps" << BSON_ARRAY(BSON("op"
+                                          << "i"
+                                          << "ns" << nss.toString() << "ui" << uuid << "o" << doc))
+                       << "prepare" << true);
         ASSERT_BSONOBJ_EQ(oExpected, o);
         ASSERT(oplogEntry.shouldPrepare());
     }
@@ -983,18 +993,19 @@ TEST_F(OpObserverTransactionTest, TransactionalUnpreparedAbortTest) {
     ASSERT_EQUALS(ErrorCodes::CollectionIsEmpty, oplogIter->next().getStatus());
 }
 
-TEST_F(OpObserverTransactionTest, PreparingEmptyTransactionLogsEmptyApplyOps) {
+TEST_F(OpObserverTransactionTest,
+       PreparingEmptyTransactionLogsEmptyApplyOpsAndWritesToTransactionTable) {
     auto txnParticipant = TransactionParticipant::get(opCtx());
     txnParticipant.unstashTransactionResources(opCtx(), "prepareTransaction");
-
+    repl::OpTime prepareOpTime;
     {
         Lock::GlobalLock lk(opCtx(), MODE_IX);
         WriteUnitOfWork wuow(opCtx());
-        OplogSlot slot = repl::getNextOpTime(opCtx());
-        txnParticipant.transitionToPreparedforTest(opCtx(), slot);
-        opCtx()->recoveryUnit()->setPrepareTimestamp(slot.getTimestamp());
-        opObserver().onTransactionPrepare(
-            opCtx(), {slot}, txnParticipant.retrieveCompletedTransactionOperations(opCtx()));
+        prepareOpTime = repl::getNextOpTime(opCtx());
+        txnParticipant.transitionToPreparedforTest(opCtx(), prepareOpTime);
+        opCtx()->recoveryUnit()->setPrepareTimestamp(prepareOpTime.getTimestamp());
+        auto txnOps = txnParticipant.retrieveCompletedTransactionOperations(opCtx());
+        opObserver().onTransactionPrepare(opCtx(), {prepareOpTime}, &txnOps, 0);
     }
 
     auto oplogEntryObj = getSingleOplogEntry(opCtx());
@@ -1004,7 +1015,14 @@ TEST_F(OpObserverTransactionTest, PreparingEmptyTransactionLogsEmptyApplyOps) {
     auto oExpected = BSON("applyOps" << BSONArray() << "prepare" << true);
     ASSERT_BSONOBJ_EQ(oExpected, o);
     ASSERT(oplogEntry.shouldPrepare());
-    ASSERT_EQ(oplogEntry.getTimestamp(), opCtx()->recoveryUnit()->getPrepareTimestamp());
+    const auto startOpTime = oplogEntry.getOpTime();
+    ASSERT_EQ(startOpTime.getTimestamp(), opCtx()->recoveryUnit()->getPrepareTimestamp());
+    ASSERT_EQ(prepareOpTime, txnParticipant.getLastWriteOpTime());
+
+    txnParticipant.stashTransactionResources(opCtx());
+    assertTxnRecord(txnNum(), prepareOpTime, DurableTxnStateEnum::kPrepared);
+    assertTxnRecordStartOpTime(startOpTime);
+    txnParticipant.unstashTransactionResources(opCtx(), "prepareTransaction");
 }
 
 TEST_F(OpObserverTransactionTest, PreparingTransactionWritesToTransactionTable) {
@@ -1018,8 +1036,8 @@ TEST_F(OpObserverTransactionTest, PreparingTransactionWritesToTransactionTable) 
         OplogSlot slot = repl::getNextOpTime(opCtx());
         txnParticipant.transitionToPreparedforTest(opCtx(), slot);
         prepareOpTime = slot;
-        opObserver().onTransactionPrepare(
-            opCtx(), {slot}, txnParticipant.retrieveCompletedTransactionOperations(opCtx()));
+        auto txnOps = txnParticipant.retrieveCompletedTransactionOperations(opCtx());
+        opObserver().onTransactionPrepare(opCtx(), {slot}, &txnOps, 0);
         opCtx()->recoveryUnit()->setPrepareTimestamp(slot.getTimestamp());
     }
 
@@ -1052,8 +1070,8 @@ TEST_F(OpObserverTransactionTest, AbortingPreparedTransactionWritesToTransaction
         WriteUnitOfWork wuow(opCtx());
         OplogSlot slot = repl::getNextOpTime(opCtx());
         opCtx()->recoveryUnit()->setPrepareTimestamp(slot.getTimestamp());
-        opObserver().onTransactionPrepare(
-            opCtx(), {slot}, txnParticipant.retrieveCompletedTransactionOperations(opCtx()));
+        auto txnOps = txnParticipant.retrieveCompletedTransactionOperations(opCtx());
+        opObserver().onTransactionPrepare(opCtx(), {slot}, &txnOps, 0);
         txnParticipant.transitionToPreparedforTest(opCtx(), slot);
         abortSlot = repl::getNextOpTime(opCtx());
     }
@@ -1090,22 +1108,24 @@ TEST_F(OpObserverTransactionTest, CommittingUnpreparedNonEmptyTransactionWritesT
         opObserver().onInserts(opCtx(), nss, uuid, insert.begin(), insert.end(), false);
     }
 
-    opObserver().onUnpreparedTransactionCommit(
-        opCtx(), txnParticipant.retrieveCompletedTransactionOperations(opCtx()));
+    auto txnOps = txnParticipant.retrieveCompletedTransactionOperations(opCtx());
+    opObserver().onUnpreparedTransactionCommit(opCtx(), &txnOps, 0);
     opCtx()->getWriteUnitOfWork()->commit();
 
     assertTxnRecord(txnNum(), {}, DurableTxnStateEnum::kCommitted);
 }
 
 TEST_F(OpObserverTransactionTest,
-       CommittingUnpreparedEmptyTransactionDoesNotWriteToTransactionTable) {
+       CommittingUnpreparedEmptyTransactionDoesNotWriteToTransactionTableOrOplog) {
     auto txnParticipant = TransactionParticipant::get(opCtx());
     txnParticipant.unstashTransactionResources(opCtx(), "prepareTransaction");
 
-    opObserver().onUnpreparedTransactionCommit(
-        opCtx(), txnParticipant.retrieveCompletedTransactionOperations(opCtx()));
+    auto txnOps = txnParticipant.retrieveCompletedTransactionOperations(opCtx());
+    opObserver().onUnpreparedTransactionCommit(opCtx(), &txnOps, 0);
 
     txnParticipant.stashTransactionResources(opCtx());
+
+    getNOplogEntries(opCtx(), 0);
 
     // Abort the storage-transaction without calling the OpObserver.
     txnParticipant.shutdown(opCtx());
@@ -1124,8 +1144,8 @@ TEST_F(OpObserverTransactionTest, CommittingPreparedTransactionWritesToTransacti
         OplogSlot slot = repl::getNextOpTime(opCtx());
         prepareOpTime = slot;
         opCtx()->recoveryUnit()->setPrepareTimestamp(slot.getTimestamp());
-        opObserver().onTransactionPrepare(
-            opCtx(), {slot}, txnParticipant.retrieveCompletedTransactionOperations(opCtx()));
+        auto txnOps = txnParticipant.retrieveCompletedTransactionOperations(opCtx());
+        opObserver().onTransactionPrepare(opCtx(), {slot}, &txnOps, 0);
         txnParticipant.transitionToPreparedforTest(opCtx(), slot);
     }
 
@@ -1137,7 +1157,6 @@ TEST_F(OpObserverTransactionTest, CommittingPreparedTransactionWritesToTransacti
     opCtx()->setWriteUnitOfWork(nullptr);
     opCtx()->lockState()->unsetMaxLockTimeout();
 
-    txnParticipant.transitionToCommittingWithPrepareforTest(opCtx());
     {
         Lock::GlobalLock lk(opCtx(), MODE_IX);
         opObserver().onPreparedTransactionCommit(
@@ -1176,48 +1195,33 @@ TEST_F(OpObserverTransactionTest, TransactionalInsertTest) {
     AutoGetCollection autoColl2(opCtx(), nss2, MODE_IX);
     opObserver().onInserts(opCtx(), nss1, uuid1, inserts1.begin(), inserts1.end(), false);
     opObserver().onInserts(opCtx(), nss2, uuid2, inserts2.begin(), inserts2.end(), false);
-    opObserver().onUnpreparedTransactionCommit(
-        opCtx(), txnParticipant.retrieveCompletedTransactionOperations(opCtx()));
+    auto txnOps = txnParticipant.retrieveCompletedTransactionOperations(opCtx());
+    opObserver().onUnpreparedTransactionCommit(opCtx(), &txnOps, 0);
     auto oplogEntryObj = getSingleOplogEntry(opCtx());
     checkCommonFields(oplogEntryObj);
     OplogEntry oplogEntry = assertGet(OplogEntry::parse(oplogEntryObj));
     auto o = oplogEntry.getObject();
-    auto oExpected = BSON("applyOps" << BSON_ARRAY(BSON("op"
-                                                        << "i"
-                                                        << "ns"
-                                                        << nss1.toString()
-                                                        << "ui"
-                                                        << uuid1
-                                                        << "o"
-                                                        << BSON("_id" << 0 << "data"
-                                                                      << "x"))
-                                                   << BSON("op"
-                                                           << "i"
-                                                           << "ns"
-                                                           << nss1.toString()
-                                                           << "ui"
-                                                           << uuid1
-                                                           << "o"
-                                                           << BSON("_id" << 1 << "data"
-                                                                         << "y"))
-                                                   << BSON("op"
-                                                           << "i"
-                                                           << "ns"
-                                                           << nss2.toString()
-                                                           << "ui"
-                                                           << uuid2
-                                                           << "o"
-                                                           << BSON("_id" << 2 << "data"
-                                                                         << "z"))
-                                                   << BSON("op"
-                                                           << "i"
-                                                           << "ns"
-                                                           << nss2.toString()
-                                                           << "ui"
-                                                           << uuid2
-                                                           << "o"
-                                                           << BSON("_id" << 3 << "data"
-                                                                         << "w"))));
+    auto oExpected =
+        BSON("applyOps" << BSON_ARRAY(BSON("op"
+                                           << "i"
+                                           << "ns" << nss1.toString() << "ui" << uuid1 << "o"
+                                           << BSON("_id" << 0 << "data"
+                                                         << "x"))
+                                      << BSON("op"
+                                              << "i"
+                                              << "ns" << nss1.toString() << "ui" << uuid1 << "o"
+                                              << BSON("_id" << 1 << "data"
+                                                            << "y"))
+                                      << BSON("op"
+                                              << "i"
+                                              << "ns" << nss2.toString() << "ui" << uuid2 << "o"
+                                              << BSON("_id" << 2 << "data"
+                                                            << "z"))
+                                      << BSON("op"
+                                              << "i"
+                                              << "ns" << nss2.toString() << "ui" << uuid2 << "o"
+                                              << BSON("_id" << 3 << "data"
+                                                            << "w"))));
     ASSERT_BSONOBJ_EQ(oExpected, o);
     ASSERT(!oplogEntry.shouldPrepare());
     ASSERT_FALSE(oplogEntryObj.hasField("prepare"));
@@ -1232,7 +1236,7 @@ TEST_F(OpObserverTransactionTest, TransactionalUpdateTest) {
     txnParticipant.unstashTransactionResources(opCtx(), "update");
 
     CollectionUpdateArgs updateArgs1;
-    updateArgs1.stmtId = 0;
+    updateArgs1.stmtIds = {0};
     updateArgs1.updatedDoc = BSON("_id" << 0 << "data"
                                         << "x");
     updateArgs1.update = BSON("$set" << BSON("data"
@@ -1241,7 +1245,7 @@ TEST_F(OpObserverTransactionTest, TransactionalUpdateTest) {
     OplogUpdateEntryArgs update1(std::move(updateArgs1), nss1, uuid1);
 
     CollectionUpdateArgs updateArgs2;
-    updateArgs2.stmtId = 1;
+    updateArgs2.stmtIds = {1};
     updateArgs2.updatedDoc = BSON("_id" << 1 << "data"
                                         << "y");
     updateArgs2.update = BSON("$set" << BSON("data"
@@ -1254,33 +1258,24 @@ TEST_F(OpObserverTransactionTest, TransactionalUpdateTest) {
     AutoGetCollection autoColl2(opCtx(), nss2, MODE_IX);
     opObserver().onUpdate(opCtx(), update1);
     opObserver().onUpdate(opCtx(), update2);
-    opObserver().onUnpreparedTransactionCommit(
-        opCtx(), txnParticipant.retrieveCompletedTransactionOperations(opCtx()));
+    auto txnOps = txnParticipant.retrieveCompletedTransactionOperations(opCtx());
+    opObserver().onUnpreparedTransactionCommit(opCtx(), &txnOps, 0);
     auto oplogEntry = getSingleOplogEntry(opCtx());
     checkCommonFields(oplogEntry);
     auto o = oplogEntry.getObjectField("o");
-    auto oExpected = BSON("applyOps" << BSON_ARRAY(BSON("op"
-                                                        << "u"
-                                                        << "ns"
-                                                        << nss1.toString()
-                                                        << "ui"
-                                                        << uuid1
-                                                        << "o"
-                                                        << BSON("$set" << BSON("data"
-                                                                               << "x"))
-                                                        << "o2"
-                                                        << BSON("_id" << 0))
-                                                   << BSON("op"
-                                                           << "u"
-                                                           << "ns"
-                                                           << nss2.toString()
-                                                           << "ui"
-                                                           << uuid2
-                                                           << "o"
-                                                           << BSON("$set" << BSON("data"
-                                                                                  << "y"))
-                                                           << "o2"
-                                                           << BSON("_id" << 1))));
+    auto oExpected =
+        BSON("applyOps" << BSON_ARRAY(BSON("op"
+                                           << "u"
+                                           << "ns" << nss1.toString() << "ui" << uuid1 << "o"
+                                           << BSON("$set" << BSON("data"
+                                                                  << "x"))
+                                           << "o2" << BSON("_id" << 0))
+                                      << BSON("op"
+                                              << "u"
+                                              << "ns" << nss2.toString() << "ui" << uuid2 << "o"
+                                              << BSON("$set" << BSON("data"
+                                                                     << "y"))
+                                              << "o2" << BSON("_id" << 1))));
     ASSERT_BSONOBJ_EQ(oExpected, o);
     ASSERT_FALSE(oplogEntry.hasField("prepare"));
     ASSERT_FALSE(oplogEntry.getBoolField("prepare"));
@@ -1302,33 +1297,25 @@ TEST_F(OpObserverTransactionTest, TransactionalDeleteTest) {
                                nss1,
                                BSON("_id" << 0 << "data"
                                           << "x"));
-    opObserver().onDelete(opCtx(), nss1, uuid1, 0, false, boost::none);
+    opObserver().onDelete(opCtx(), nss1, uuid1, 0, {});
     opObserver().aboutToDelete(opCtx(),
                                nss2,
                                BSON("_id" << 1 << "data"
                                           << "y"));
-    opObserver().onDelete(opCtx(), nss2, uuid2, 0, false, boost::none);
-    opObserver().onUnpreparedTransactionCommit(
-        opCtx(), txnParticipant.retrieveCompletedTransactionOperations(opCtx()));
+    opObserver().onDelete(opCtx(), nss2, uuid2, 0, {});
+    auto txnOps = txnParticipant.retrieveCompletedTransactionOperations(opCtx());
+    opObserver().onUnpreparedTransactionCommit(opCtx(), &txnOps, 0);
     auto oplogEntry = getSingleOplogEntry(opCtx());
     checkCommonFields(oplogEntry);
     auto o = oplogEntry.getObjectField("o");
     auto oExpected = BSON("applyOps" << BSON_ARRAY(BSON("op"
                                                         << "d"
-                                                        << "ns"
-                                                        << nss1.toString()
-                                                        << "ui"
-                                                        << uuid1
-                                                        << "o"
-                                                        << BSON("_id" << 0))
+                                                        << "ns" << nss1.toString() << "ui" << uuid1
+                                                        << "o" << BSON("_id" << 0))
                                                    << BSON("op"
                                                            << "d"
-                                                           << "ns"
-                                                           << nss2.toString()
-                                                           << "ui"
-                                                           << uuid2
-                                                           << "o"
-                                                           << BSON("_id" << 1))));
+                                                           << "ns" << nss2.toString() << "ui"
+                                                           << uuid2 << "o" << BSON("_id" << 1))));
     ASSERT_BSONOBJ_EQ(oExpected, o);
     ASSERT_FALSE(oplogEntry.hasField("prepare"));
     ASSERT_FALSE(oplogEntry.getBoolField("prepare"));
@@ -1336,7 +1323,6 @@ TEST_F(OpObserverTransactionTest, TransactionalDeleteTest) {
 
 class OpObserverMultiEntryTransactionTest : public OpObserverTransactionTest {
     void setUp() override {
-        gUseMultipleOplogEntryFormatForTransactions = true;
         _prevPackingLimit = gMaxNumberOfTransactionOperationsInSingleOplogEntry;
         gMaxNumberOfTransactionOperationsInSingleOplogEntry = 1;
         OpObserverTransactionTest::setUp();
@@ -1344,31 +1330,12 @@ class OpObserverMultiEntryTransactionTest : public OpObserverTransactionTest {
 
     void tearDown() override {
         OpObserverTransactionTest::tearDown();
-        gUseMultipleOplogEntryFormatForTransactions = false;
         gMaxNumberOfTransactionOperationsInSingleOplogEntry = _prevPackingLimit;
     }
 
 private:
     int _prevPackingLimit;
 };
-
-TEST_F(OpObserverMultiEntryTransactionTest,
-       CommittingUnpreparedEmptyTransactionDoesNotWriteToTransactionTableOrOplog) {
-    auto txnParticipant = TransactionParticipant::get(opCtx());
-    txnParticipant.unstashTransactionResources(opCtx(), "prepareTransaction");
-
-    opObserver().onUnpreparedTransactionCommit(
-        opCtx(), txnParticipant.retrieveCompletedTransactionOperations(opCtx()));
-
-    txnParticipant.stashTransactionResources(opCtx());
-
-    getNOplogEntries(opCtx(), 0);
-
-    // Abort the storage-transaction without calling the OpObserver.
-    txnParticipant.shutdown(opCtx());
-
-    assertNoTxnRecord();
-}
 
 TEST_F(OpObserverMultiEntryTransactionTest, TransactionSingleStatementTest) {
     const NamespaceString nss("testDB", "testColl");
@@ -1381,8 +1348,8 @@ TEST_F(OpObserverMultiEntryTransactionTest, TransactionSingleStatementTest) {
     WriteUnitOfWork wuow(opCtx());
     AutoGetCollection autoColl1(opCtx(), nss, MODE_IX);
     opObserver().onInserts(opCtx(), nss, uuid, inserts.begin(), inserts.end(), false);
-    opObserver().onUnpreparedTransactionCommit(
-        opCtx(), txnParticipant.retrieveCompletedTransactionOperations(opCtx()));
+    auto txnOps = txnParticipant.retrieveCompletedTransactionOperations(opCtx());
+    opObserver().onUnpreparedTransactionCommit(opCtx(), &txnOps, 0);
     auto oplogEntryObj = getNOplogEntries(opCtx(), 1)[0];
     checkSessionAndTransactionFields(oplogEntryObj);
     auto oplogEntry = assertGet(OplogEntry::parse(oplogEntryObj));
@@ -1393,12 +1360,8 @@ TEST_F(OpObserverMultiEntryTransactionTest, TransactionSingleStatementTest) {
     // The implicit commit oplog entry.
     auto oExpected = BSON("applyOps" << BSON_ARRAY(BSON("op"
                                                         << "i"
-                                                        << "ns"
-                                                        << nss.toString()
-                                                        << "ui"
-                                                        << uuid
-                                                        << "o"
-                                                        << BSON("_id" << 0))));
+                                                        << "ns" << nss.toString() << "ui" << uuid
+                                                        << "o" << BSON("_id" << 0))));
     ASSERT_BSONOBJ_EQ(oExpected, oplogEntry.getObject());
 }
 
@@ -1420,8 +1383,8 @@ TEST_F(OpObserverMultiEntryTransactionTest, TransactionalInsertTest) {
     AutoGetCollection autoColl2(opCtx(), nss2, MODE_IX);
     opObserver().onInserts(opCtx(), nss1, uuid1, inserts1.begin(), inserts1.end(), false);
     opObserver().onInserts(opCtx(), nss2, uuid2, inserts2.begin(), inserts2.end(), false);
-    opObserver().onUnpreparedTransactionCommit(
-        opCtx(), txnParticipant.retrieveCompletedTransactionOperations(opCtx()));
+    auto txnOps = txnParticipant.retrieveCompletedTransactionOperations(opCtx());
+    opObserver().onUnpreparedTransactionCommit(opCtx(), &txnOps, 0);
     auto oplogEntryObjs = getNOplogEntries(opCtx(), 4);
     std::vector<OplogEntry> oplogEntries;
     mongo::repl::OpTime expectedPrevWriteOpTime;
@@ -1437,52 +1400,32 @@ TEST_F(OpObserverMultiEntryTransactionTest, TransactionalInsertTest) {
     }
     auto oExpected = BSON("applyOps" << BSON_ARRAY(BSON("op"
                                                         << "i"
-                                                        << "ns"
-                                                        << nss1.toString()
-                                                        << "ui"
-                                                        << uuid1
-                                                        << "o"
-                                                        << BSON("_id" << 0)))
-                                     << "partialTxn"
-                                     << true);
+                                                        << "ns" << nss1.toString() << "ui" << uuid1
+                                                        << "o" << BSON("_id" << 0)))
+                                     << "partialTxn" << true);
     ASSERT_BSONOBJ_EQ(oExpected, oplogEntries[0].getObject());
 
     oExpected = BSON("applyOps" << BSON_ARRAY(BSON("op"
                                                    << "i"
-                                                   << "ns"
-                                                   << nss1.toString()
-                                                   << "ui"
-                                                   << uuid1
-                                                   << "o"
-                                                   << BSON("_id" << 1)))
-                                << "partialTxn"
-                                << true);
+                                                   << "ns" << nss1.toString() << "ui" << uuid1
+                                                   << "o" << BSON("_id" << 1)))
+                                << "partialTxn" << true);
     ASSERT_BSONOBJ_EQ(oExpected, oplogEntries[1].getObject());
 
     oExpected = BSON("applyOps" << BSON_ARRAY(BSON("op"
                                                    << "i"
-                                                   << "ns"
-                                                   << nss2.toString()
-                                                   << "ui"
-                                                   << uuid2
-                                                   << "o"
-                                                   << BSON("_id" << 2)))
-                                << "partialTxn"
-                                << true);
+                                                   << "ns" << nss2.toString() << "ui" << uuid2
+                                                   << "o" << BSON("_id" << 2)))
+                                << "partialTxn" << true);
     ASSERT_BSONOBJ_EQ(oExpected, oplogEntries[2].getObject());
 
     // This should be the implicit commit oplog entry, indicated by the absence of the 'partialTxn'
     // field.
     oExpected = BSON("applyOps" << BSON_ARRAY(BSON("op"
                                                    << "i"
-                                                   << "ns"
-                                                   << nss2.toString()
-                                                   << "ui"
-                                                   << uuid2
-                                                   << "o"
-                                                   << BSON("_id" << 3)))
-                                << "count"
-                                << 4);
+                                                   << "ns" << nss2.toString() << "ui" << uuid2
+                                                   << "o" << BSON("_id" << 3)))
+                                << "count" << 4);
     ASSERT_BSONOBJ_EQ(oExpected, oplogEntries[3].getObject());
 }
 
@@ -1495,7 +1438,7 @@ TEST_F(OpObserverMultiEntryTransactionTest, TransactionalUpdateTest) {
     txnParticipant.unstashTransactionResources(opCtx(), "update");
 
     CollectionUpdateArgs updateArgs1;
-    updateArgs1.stmtId = 0;
+    updateArgs1.stmtIds = {0};
     updateArgs1.updatedDoc = BSON("_id" << 0 << "data"
                                         << "x");
     updateArgs1.update = BSON("$set" << BSON("data"
@@ -1504,7 +1447,7 @@ TEST_F(OpObserverMultiEntryTransactionTest, TransactionalUpdateTest) {
     OplogUpdateEntryArgs update1(std::move(updateArgs1), nss1, uuid1);
 
     CollectionUpdateArgs updateArgs2;
-    updateArgs2.stmtId = 1;
+    updateArgs2.stmtIds = {1};
     updateArgs2.updatedDoc = BSON("_id" << 1 << "data"
                                         << "y");
     updateArgs2.update = BSON("$set" << BSON("data"
@@ -1517,8 +1460,8 @@ TEST_F(OpObserverMultiEntryTransactionTest, TransactionalUpdateTest) {
     AutoGetCollection autoColl2(opCtx(), nss2, MODE_IX);
     opObserver().onUpdate(opCtx(), update1);
     opObserver().onUpdate(opCtx(), update2);
-    opObserver().onUnpreparedTransactionCommit(
-        opCtx(), txnParticipant.retrieveCompletedTransactionOperations(opCtx()));
+    auto txnOps = txnParticipant.retrieveCompletedTransactionOperations(opCtx());
+    opObserver().onUnpreparedTransactionCommit(opCtx(), &txnOps, 0);
     auto oplogEntryObjs = getNOplogEntries(opCtx(), 2);
     std::vector<OplogEntry> oplogEntries;
     mongo::repl::OpTime expectedPrevWriteOpTime;
@@ -1533,37 +1476,186 @@ TEST_F(OpObserverMultiEntryTransactionTest, TransactionalUpdateTest) {
         expectedPrevWriteOpTime = repl::OpTime{oplogEntry.getTimestamp(), *oplogEntry.getTerm()};
     }
 
-    auto oExpected = BSON("applyOps" << BSON_ARRAY(BSON("op"
-                                                        << "u"
-                                                        << "ns"
-                                                        << nss1.toString()
-                                                        << "ui"
-                                                        << uuid1
-                                                        << "o"
-                                                        << BSON("$set" << BSON("data"
-                                                                               << "x"))
-                                                        << "o2"
-                                                        << BSON("_id" << 0)))
-                                     << "partialTxn"
-                                     << true);
+    auto oExpected =
+        BSON("applyOps" << BSON_ARRAY(BSON("op"
+                                           << "u"
+                                           << "ns" << nss1.toString() << "ui" << uuid1 << "o"
+                                           << BSON("$set" << BSON("data"
+                                                                  << "x"))
+                                           << "o2" << BSON("_id" << 0)))
+                        << "partialTxn" << true);
     ASSERT_BSONOBJ_EQ(oExpected, oplogEntries[0].getObject());
 
     // This should be the implicit commit oplog entry, indicated by the absence of the 'partialTxn'
     // field.
-    oExpected = BSON("applyOps" << BSON_ARRAY(BSON("op"
-                                                   << "u"
-                                                   << "ns"
-                                                   << nss2.toString()
-                                                   << "ui"
-                                                   << uuid2
-                                                   << "o"
-                                                   << BSON("$set" << BSON("data"
-                                                                          << "y"))
-                                                   << "o2"
-                                                   << BSON("_id" << 1)))
-                                << "count"
-                                << 2);
+    oExpected =
+        BSON("applyOps" << BSON_ARRAY(BSON("op"
+                                           << "u"
+                                           << "ns" << nss2.toString() << "ui" << uuid2 << "o"
+                                           << BSON("$set" << BSON("data"
+                                                                  << "y"))
+                                           << "o2" << BSON("_id" << 1)))
+                        << "count" << 2);
     ASSERT_BSONOBJ_EQ(oExpected, oplogEntries[1].getObject());
+}
+
+TEST_F(OpObserverMultiEntryTransactionTest, TransactionPreImageTest) {
+    const NamespaceString nss1("testDB", "testColl");
+    auto uuid1 = CollectionUUID::gen();
+    auto txnParticipant = TransactionParticipant::get(opCtx());
+    txnParticipant.unstashTransactionResources(opCtx(), "txntest");
+
+    CollectionUpdateArgs updateArgs1;
+    const auto updateSpec = BSON("$set" << BSON("data"
+                                                << "x"));
+    const auto updatePreImage = BSON("_id" << 0 << "data"
+                                           << "y");
+    const auto updatePostImage = BSON("_id" << 0 << "data"
+                                            << "x");
+    const auto updateFilter = BSON("_id" << 0);
+
+    updateArgs1.stmtIds = {0};
+    updateArgs1.updatedDoc = updatePostImage;
+    updateArgs1.update = updateSpec;
+    updateArgs1.preImageDoc = updatePreImage;
+    updateArgs1.preImageRecordingEnabledForCollection = true;
+    updateArgs1.criteria = updateFilter;
+    OplogUpdateEntryArgs update1(std::move(updateArgs1), nss1, uuid1);
+
+    WriteUnitOfWork wuow(opCtx());
+    AutoGetCollection autoColl1(opCtx(), nss1, MODE_IX);
+    opObserver().onUpdate(opCtx(), update1);
+
+    const auto deletedDoc = BSON("_id" << 1 << "data"
+                                       << "z");
+    OpObserver::OplogDeleteEntryArgs args;
+    args.deletedDoc = &deletedDoc;
+    opObserver().aboutToDelete(opCtx(), nss1, deletedDoc);
+    opObserver().onDelete(opCtx(), nss1, uuid1, 0, args);
+
+    auto txnOps = txnParticipant.retrieveCompletedTransactionOperations(opCtx());
+    opObserver().onUnpreparedTransactionCommit(opCtx(), &txnOps, 2);
+
+    auto oplogEntryObjs = getNOplogEntries(opCtx(), 4);
+    std::vector<OplogEntry> oplogEntries;
+    mongo::repl::OpTime expectedPrevWriteOpTime;
+    for (const auto& oplogEntryObj : oplogEntryObjs) {
+        oplogEntries.push_back(assertGet(OplogEntry::parse(oplogEntryObj)));
+        const auto& oplogEntry = oplogEntries.back();
+        if (oplogEntry.getOpType() == repl::OpTypeEnum::kNoop) {
+            continue;
+        }
+        checkSessionAndTransactionFields(oplogEntryObj);
+        ASSERT(!oplogEntry.shouldPrepare());
+        ASSERT_TRUE(oplogEntry.getPrevWriteOpTimeInTransaction());
+        ASSERT_EQ(expectedPrevWriteOpTime, *oplogEntry.getPrevWriteOpTimeInTransaction());
+        ASSERT_LT(expectedPrevWriteOpTime.getTimestamp(), oplogEntry.getTimestamp());
+        expectedPrevWriteOpTime = repl::OpTime{oplogEntry.getTimestamp(), *oplogEntry.getTerm()};
+    }
+
+    ASSERT(oplogEntries[0].getOpType() == repl::OpTypeEnum::kNoop);
+    ASSERT_BSONOBJ_EQ(updatePreImage, oplogEntries[0].getObject());
+    ASSERT(oplogEntries[1].getOpType() == repl::OpTypeEnum::kNoop);
+    ASSERT_BSONOBJ_EQ(deletedDoc, oplogEntries[1].getObject());
+    ASSERT_BSONOBJ_EQ(BSON("applyOps"
+                           << BSON_ARRAY(BSON("op"
+                                              << "u"
+                                              << "ns" << nss1.toString() << "ui" << uuid1 << "o"
+                                              << updateSpec << "o2" << BSON("_id" << 0)
+                                              << "preImageOpTime" << oplogEntries[0].getOpTime()))
+                           << "partialTxn" << true),
+                      oplogEntries[2].getObject());
+    ASSERT_BSONOBJ_EQ(BSON("applyOps"
+                           << BSON_ARRAY(BSON("op"
+                                              << "d"
+                                              << "ns" << nss1.toString() << "ui" << uuid1 << "o"
+                                              << BSON("_id" << 1) << "preImageOpTime"
+                                              << oplogEntries[1].getOpTime()))
+                           << "count" << 2),
+                      oplogEntries[3].getObject());
+}
+
+TEST_F(OpObserverMultiEntryTransactionTest, PreparedTransactionPreImageTest) {
+    const NamespaceString nss1("testDB", "testColl");
+    auto uuid1 = CollectionUUID::gen();
+    auto txnParticipant = TransactionParticipant::get(opCtx());
+    txnParticipant.unstashTransactionResources(opCtx(), "txntest");
+
+    CollectionUpdateArgs updateArgs1;
+    const auto updateSpec = BSON("$set" << BSON("data"
+                                                << "x"));
+    const auto updatePreImage = BSON("_id" << 0 << "data"
+                                           << "y");
+    const auto updatePostImage = BSON("_id" << 0 << "data"
+                                            << "x");
+    const auto updateFilter = BSON("_id" << 0);
+
+    updateArgs1.stmtIds = {0};
+    updateArgs1.updatedDoc = updatePostImage;
+    updateArgs1.update = updateSpec;
+    updateArgs1.preImageDoc = updatePreImage;
+    updateArgs1.preImageRecordingEnabledForCollection = true;
+    updateArgs1.criteria = updateFilter;
+    OplogUpdateEntryArgs update1(std::move(updateArgs1), nss1, uuid1);
+
+    WriteUnitOfWork wuow(opCtx());
+    AutoGetCollection autoColl1(opCtx(), nss1, MODE_IX);
+    opObserver().onUpdate(opCtx(), update1);
+
+    const auto deletedDoc = BSON("_id" << 1 << "data"
+                                       << "z");
+    OpObserver::OplogDeleteEntryArgs args;
+    args.deletedDoc = &deletedDoc;
+    opObserver().aboutToDelete(opCtx(), nss1, deletedDoc);
+    opObserver().onDelete(opCtx(), nss1, uuid1, 0, args);
+
+    repl::OpTime prepareOpTime;
+    {
+        Lock::GlobalLock lk(opCtx(), MODE_IX);
+        auto reservedSlots = repl::getNextOpTimes(opCtx(), 4);
+        prepareOpTime = reservedSlots.back();
+        txnParticipant.transitionToPreparedforTest(opCtx(), prepareOpTime);
+        opCtx()->recoveryUnit()->setPrepareTimestamp(prepareOpTime.getTimestamp());
+        auto txnOps = txnParticipant.retrieveCompletedTransactionOperations(opCtx());
+        opObserver().onTransactionPrepare(opCtx(), reservedSlots, &txnOps, 2);
+    }
+
+    auto oplogEntryObjs = getNOplogEntries(opCtx(), 4);
+    std::vector<OplogEntry> oplogEntries;
+    mongo::repl::OpTime expectedPrevWriteOpTime;
+    for (const auto& oplogEntryObj : oplogEntryObjs) {
+        oplogEntries.push_back(assertGet(OplogEntry::parse(oplogEntryObj)));
+        const auto& oplogEntry = oplogEntries.back();
+        if (oplogEntry.getOpType() == repl::OpTypeEnum::kNoop) {
+            continue;
+        }
+        checkSessionAndTransactionFields(oplogEntryObj);
+        ASSERT_TRUE(oplogEntry.getPrevWriteOpTimeInTransaction());
+        ASSERT_EQ(expectedPrevWriteOpTime, *oplogEntry.getPrevWriteOpTimeInTransaction());
+        ASSERT_LT(expectedPrevWriteOpTime.getTimestamp(), oplogEntry.getTimestamp());
+        expectedPrevWriteOpTime = repl::OpTime{oplogEntry.getTimestamp(), *oplogEntry.getTerm()};
+    }
+
+    ASSERT(oplogEntries[0].getOpType() == repl::OpTypeEnum::kNoop);
+    ASSERT_BSONOBJ_EQ(updatePreImage, oplogEntries[0].getObject());
+    ASSERT(oplogEntries[1].getOpType() == repl::OpTypeEnum::kNoop);
+    ASSERT_BSONOBJ_EQ(deletedDoc, oplogEntries[1].getObject());
+    ASSERT_BSONOBJ_EQ(BSON("applyOps"
+                           << BSON_ARRAY(BSON("op"
+                                              << "u"
+                                              << "ns" << nss1.toString() << "ui" << uuid1 << "o"
+                                              << updateSpec << "o2" << BSON("_id" << 0)
+                                              << "preImageOpTime" << oplogEntries[0].getOpTime()))
+                           << "partialTxn" << true),
+                      oplogEntries[2].getObject());
+    ASSERT_BSONOBJ_EQ(BSON("applyOps"
+                           << BSON_ARRAY(BSON("op"
+                                              << "d"
+                                              << "ns" << nss1.toString() << "ui" << uuid1 << "o"
+                                              << BSON("_id" << 1) << "preImageOpTime"
+                                              << oplogEntries[1].getOpTime()))
+                           << "prepare" << true << "count" << 2),
+                      oplogEntries[3].getObject());
 }
 
 TEST_F(OpObserverMultiEntryTransactionTest, TransactionalDeleteTest) {
@@ -1582,14 +1674,14 @@ TEST_F(OpObserverMultiEntryTransactionTest, TransactionalDeleteTest) {
                                nss1,
                                BSON("_id" << 0 << "data"
                                           << "x"));
-    opObserver().onDelete(opCtx(), nss1, uuid1, 0, false, boost::none);
+    opObserver().onDelete(opCtx(), nss1, uuid1, 0, {});
     opObserver().aboutToDelete(opCtx(),
                                nss2,
                                BSON("_id" << 1 << "data"
                                           << "y"));
-    opObserver().onDelete(opCtx(), nss2, uuid2, 0, false, boost::none);
-    opObserver().onUnpreparedTransactionCommit(
-        opCtx(), txnParticipant.retrieveCompletedTransactionOperations(opCtx()));
+    opObserver().onDelete(opCtx(), nss2, uuid2, 0, {});
+    auto txnOps = txnParticipant.retrieveCompletedTransactionOperations(opCtx());
+    opObserver().onUnpreparedTransactionCommit(opCtx(), &txnOps, 0);
     auto oplogEntryObjs = getNOplogEntries(opCtx(), 2);
     std::vector<OplogEntry> oplogEntries;
     mongo::repl::OpTime expectedPrevWriteOpTime;
@@ -1606,58 +1698,19 @@ TEST_F(OpObserverMultiEntryTransactionTest, TransactionalDeleteTest) {
 
     auto oExpected = BSON("applyOps" << BSON_ARRAY(BSON("op"
                                                         << "d"
-                                                        << "ns"
-                                                        << nss1.toString()
-                                                        << "ui"
-                                                        << uuid1
-                                                        << "o"
-                                                        << BSON("_id" << 0)))
-                                     << "partialTxn"
-                                     << true);
+                                                        << "ns" << nss1.toString() << "ui" << uuid1
+                                                        << "o" << BSON("_id" << 0)))
+                                     << "partialTxn" << true);
     ASSERT_BSONOBJ_EQ(oExpected, oplogEntries[0].getObject());
 
     // This should be the implicit commit oplog entry, indicated by the absence of the 'partialTxn'
     // field.
     oExpected = oExpected = BSON("applyOps" << BSON_ARRAY(BSON("op"
                                                                << "d"
-                                                               << "ns"
-                                                               << nss2.toString()
-                                                               << "ui"
-                                                               << uuid2
-                                                               << "o"
-                                                               << BSON("_id" << 1)))
-                                            << "count"
-                                            << 2);
+                                                               << "ns" << nss2.toString() << "ui"
+                                                               << uuid2 << "o" << BSON("_id" << 1)))
+                                            << "count" << 2);
     ASSERT_BSONOBJ_EQ(oExpected, oplogEntries[1].getObject());
-}
-
-TEST_F(OpObserverMultiEntryTransactionTest,
-       PreparingEmptyTransactionOnlyWritesPrepareOplogEntryAndToTransactionTable) {
-    auto txnParticipant = TransactionParticipant::get(opCtx());
-    txnParticipant.unstashTransactionResources(opCtx(), "prepareTransaction");
-    repl::OpTime prepareOpTime;
-    auto reservedSlots = repl::getNextOpTimes(opCtx(), 1);
-    prepareOpTime = reservedSlots.back();
-    opCtx()->recoveryUnit()->setPrepareTimestamp(prepareOpTime.getTimestamp());
-    opObserver().onTransactionPrepare(
-        opCtx(), reservedSlots, txnParticipant.retrieveCompletedTransactionOperations(opCtx()));
-
-    auto oplogEntryObjs = getNOplogEntries(opCtx(), 1);
-    auto prepareEntryObj = oplogEntryObjs.back();
-    const auto prepareOplogEntry = assertGet(OplogEntry::parse(prepareEntryObj));
-    checkSessionAndTransactionFields(prepareEntryObj);
-    // The startOpTime should refer to the prepare oplog entry for an empty transaction.
-    const auto startOpTime = prepareOplogEntry.getOpTime();
-
-    ASSERT_EQ(prepareOpTime.getTimestamp(), opCtx()->recoveryUnit()->getPrepareTimestamp());
-    ASSERT_BSONOBJ_EQ(BSON("applyOps" << BSONArray() << "prepare" << true),
-                      prepareOplogEntry.getObject());
-    txnParticipant.stashTransactionResources(opCtx());
-    assertTxnRecord(txnNum(), prepareOpTime, DurableTxnStateEnum::kPrepared);
-    assertTxnRecordStartOpTime(startOpTime);
-    txnParticipant.unstashTransactionResources(opCtx(), "abortTransaction");
-
-    ASSERT_EQ(prepareOpTime, txnParticipant.getLastWriteOpTime());
 }
 
 TEST_F(OpObserverMultiEntryTransactionTest, TransactionalInsertPrepareTest) {
@@ -1688,8 +1741,8 @@ TEST_F(OpObserverMultiEntryTransactionTest, TransactionalInsertPrepareTest) {
         prepareOpTime = reservedSlots.back();
         txnParticipant.transitionToPreparedforTest(opCtx(), prepareOpTime);
         opCtx()->recoveryUnit()->setPrepareTimestamp(prepareOpTime.getTimestamp());
-        opObserver().onTransactionPrepare(
-            opCtx(), reservedSlots, txnParticipant.retrieveCompletedTransactionOperations(opCtx()));
+        auto txnOps = txnParticipant.retrieveCompletedTransactionOperations(opCtx());
+        opObserver().onTransactionPrepare(opCtx(), reservedSlots, &txnOps, 0);
     }
     auto oplogEntryObjs = getNOplogEntries(opCtx(), 4);
     std::vector<OplogEntry> oplogEntries;
@@ -1706,52 +1759,30 @@ TEST_F(OpObserverMultiEntryTransactionTest, TransactionalInsertPrepareTest) {
 
     auto oExpected = BSON("applyOps" << BSON_ARRAY(BSON("op"
                                                         << "i"
-                                                        << "ns"
-                                                        << nss1.toString()
-                                                        << "ui"
-                                                        << uuid1
-                                                        << "o"
-                                                        << BSON("_id" << 0)))
-                                     << "partialTxn"
-                                     << true);
+                                                        << "ns" << nss1.toString() << "ui" << uuid1
+                                                        << "o" << BSON("_id" << 0)))
+                                     << "partialTxn" << true);
     ASSERT_BSONOBJ_EQ(oExpected, oplogEntries[0].getObject());
 
     oExpected = BSON("applyOps" << BSON_ARRAY(BSON("op"
                                                    << "i"
-                                                   << "ns"
-                                                   << nss1.toString()
-                                                   << "ui"
-                                                   << uuid1
-                                                   << "o"
-                                                   << BSON("_id" << 1)))
-                                << "partialTxn"
-                                << true);
+                                                   << "ns" << nss1.toString() << "ui" << uuid1
+                                                   << "o" << BSON("_id" << 1)))
+                                << "partialTxn" << true);
     ASSERT_BSONOBJ_EQ(oExpected, oplogEntries[1].getObject());
 
     oExpected = BSON("applyOps" << BSON_ARRAY(BSON("op"
                                                    << "i"
-                                                   << "ns"
-                                                   << nss2.toString()
-                                                   << "ui"
-                                                   << uuid2
-                                                   << "o"
-                                                   << BSON("_id" << 2)))
-                                << "partialTxn"
-                                << true);
+                                                   << "ns" << nss2.toString() << "ui" << uuid2
+                                                   << "o" << BSON("_id" << 2)))
+                                << "partialTxn" << true);
     ASSERT_BSONOBJ_EQ(oExpected, oplogEntries[2].getObject());
 
     oExpected = BSON("applyOps" << BSON_ARRAY(BSON("op"
                                                    << "i"
-                                                   << "ns"
-                                                   << nss2.toString()
-                                                   << "ui"
-                                                   << uuid2
-                                                   << "o"
-                                                   << BSON("_id" << 3)))
-                                << "prepare"
-                                << true
-                                << "count"
-                                << 4);
+                                                   << "ns" << nss2.toString() << "ui" << uuid2
+                                                   << "o" << BSON("_id" << 3)))
+                                << "prepare" << true << "count" << 4);
     ASSERT_BSONOBJ_EQ(oExpected, oplogEntries[3].getObject());
 
     ASSERT_EQ(prepareOpTime.getTimestamp(), opCtx()->recoveryUnit()->getPrepareTimestamp());
@@ -1771,7 +1802,7 @@ TEST_F(OpObserverMultiEntryTransactionTest, TransactionalUpdatePrepareTest) {
     txnParticipant.unstashTransactionResources(opCtx(), "update");
 
     CollectionUpdateArgs updateArgs1;
-    updateArgs1.stmtId = 0;
+    updateArgs1.stmtIds = {0};
     updateArgs1.updatedDoc = BSON("_id" << 0 << "data"
                                         << "x");
     updateArgs1.update = BSON("$set" << BSON("data"
@@ -1780,7 +1811,7 @@ TEST_F(OpObserverMultiEntryTransactionTest, TransactionalUpdatePrepareTest) {
     OplogUpdateEntryArgs update1(std::move(updateArgs1), nss1, uuid1);
 
     CollectionUpdateArgs updateArgs2;
-    updateArgs2.stmtId = 1;
+    updateArgs2.stmtIds = {1};
     updateArgs2.updatedDoc = BSON("_id" << 1 << "data"
                                         << "y");
     updateArgs2.update = BSON("$set" << BSON("data"
@@ -1798,8 +1829,8 @@ TEST_F(OpObserverMultiEntryTransactionTest, TransactionalUpdatePrepareTest) {
     prepareOpTime = reservedSlots.back();
     txnParticipant.transitionToPreparedforTest(opCtx(), prepareOpTime);
     opCtx()->recoveryUnit()->setPrepareTimestamp(prepareOpTime.getTimestamp());
-    opObserver().onTransactionPrepare(
-        opCtx(), reservedSlots, txnParticipant.retrieveCompletedTransactionOperations(opCtx()));
+    auto txnOps = txnParticipant.retrieveCompletedTransactionOperations(opCtx());
+    opObserver().onTransactionPrepare(opCtx(), reservedSlots, &txnOps, 0);
 
     auto oplogEntryObjs = getNOplogEntries(opCtx(), 2);
     std::vector<OplogEntry> oplogEntries;
@@ -1814,36 +1845,24 @@ TEST_F(OpObserverMultiEntryTransactionTest, TransactionalUpdatePrepareTest) {
         expectedPrevWriteOpTime = repl::OpTime{oplogEntry.getTimestamp(), *oplogEntry.getTerm()};
     }
 
-    auto oExpected = BSON("applyOps" << BSON_ARRAY(BSON("op"
-                                                        << "u"
-                                                        << "ns"
-                                                        << nss1.toString()
-                                                        << "ui"
-                                                        << uuid1
-                                                        << "o"
-                                                        << BSON("$set" << BSON("data"
-                                                                               << "x"))
-                                                        << "o2"
-                                                        << BSON("_id" << 0)))
-                                     << "partialTxn"
-                                     << true);
+    auto oExpected =
+        BSON("applyOps" << BSON_ARRAY(BSON("op"
+                                           << "u"
+                                           << "ns" << nss1.toString() << "ui" << uuid1 << "o"
+                                           << BSON("$set" << BSON("data"
+                                                                  << "x"))
+                                           << "o2" << BSON("_id" << 0)))
+                        << "partialTxn" << true);
     ASSERT_BSONOBJ_EQ(oExpected, oplogEntries[0].getObject());
 
-    oExpected = BSON("applyOps" << BSON_ARRAY(BSON("op"
-                                                   << "u"
-                                                   << "ns"
-                                                   << nss2.toString()
-                                                   << "ui"
-                                                   << uuid2
-                                                   << "o"
-                                                   << BSON("$set" << BSON("data"
-                                                                          << "y"))
-                                                   << "o2"
-                                                   << BSON("_id" << 1)))
-                                << "prepare"
-                                << true
-                                << "count"
-                                << 2);
+    oExpected =
+        BSON("applyOps" << BSON_ARRAY(BSON("op"
+                                           << "u"
+                                           << "ns" << nss2.toString() << "ui" << uuid2 << "o"
+                                           << BSON("$set" << BSON("data"
+                                                                  << "y"))
+                                           << "o2" << BSON("_id" << 1)))
+                        << "prepare" << true << "count" << 2);
     ASSERT_BSONOBJ_EQ(oExpected, oplogEntries[1].getObject());
 
     ASSERT_EQ(prepareOpTime.getTimestamp(), opCtx()->recoveryUnit()->getPrepareTimestamp());
@@ -1869,12 +1888,12 @@ TEST_F(OpObserverMultiEntryTransactionTest, TransactionalDeletePrepareTest) {
                                nss1,
                                BSON("_id" << 0 << "data"
                                           << "x"));
-    opObserver().onDelete(opCtx(), nss1, uuid1, 0, false, boost::none);
+    opObserver().onDelete(opCtx(), nss1, uuid1, 0, {});
     opObserver().aboutToDelete(opCtx(),
                                nss2,
                                BSON("_id" << 1 << "data"
                                           << "y"));
-    opObserver().onDelete(opCtx(), nss2, uuid2, 0, false, boost::none);
+    opObserver().onDelete(opCtx(), nss2, uuid2, 0, {});
 
     repl::OpTime prepareOpTime;
     {
@@ -1884,8 +1903,8 @@ TEST_F(OpObserverMultiEntryTransactionTest, TransactionalDeletePrepareTest) {
         txnParticipant.transitionToPreparedforTest(opCtx(), prepareOpTime);
         prepareOpTime = reservedSlots.back();
         opCtx()->recoveryUnit()->setPrepareTimestamp(prepareOpTime.getTimestamp());
-        opObserver().onTransactionPrepare(
-            opCtx(), reservedSlots, txnParticipant.retrieveCompletedTransactionOperations(opCtx()));
+        auto txnOps = txnParticipant.retrieveCompletedTransactionOperations(opCtx());
+        opObserver().onTransactionPrepare(opCtx(), reservedSlots, &txnOps, 0);
     }
 
     auto oplogEntryObjs = getNOplogEntries(opCtx(), 2);
@@ -1903,28 +1922,16 @@ TEST_F(OpObserverMultiEntryTransactionTest, TransactionalDeletePrepareTest) {
 
     auto oExpected = BSON("applyOps" << BSON_ARRAY(BSON("op"
                                                         << "d"
-                                                        << "ns"
-                                                        << nss1.toString()
-                                                        << "ui"
-                                                        << uuid1
-                                                        << "o"
-                                                        << BSON("_id" << 0)))
-                                     << "partialTxn"
-                                     << true);
+                                                        << "ns" << nss1.toString() << "ui" << uuid1
+                                                        << "o" << BSON("_id" << 0)))
+                                     << "partialTxn" << true);
     ASSERT_BSONOBJ_EQ(oExpected, oplogEntries[0].getObject());
 
     oExpected = BSON("applyOps" << BSON_ARRAY(BSON("op"
                                                    << "d"
-                                                   << "ns"
-                                                   << nss2.toString()
-                                                   << "ui"
-                                                   << uuid2
-                                                   << "o"
-                                                   << BSON("_id" << 1)))
-                                << "prepare"
-                                << true
-                                << "count"
-                                << 2);
+                                                   << "ns" << nss2.toString() << "ui" << uuid2
+                                                   << "o" << BSON("_id" << 1)))
+                                << "prepare" << true << "count" << 2);
     ASSERT_BSONOBJ_EQ(oExpected, oplogEntries[1].getObject());
 
     ASSERT_EQ(prepareOpTime.getTimestamp(), opCtx()->recoveryUnit()->getPrepareTimestamp());
@@ -1960,8 +1967,8 @@ TEST_F(OpObserverMultiEntryTransactionTest, CommitPreparedTest) {
         txnParticipant.transitionToPreparedforTest(opCtx(), prepareOpTime);
 
         opCtx()->recoveryUnit()->setPrepareTimestamp(prepareOpTime.getTimestamp());
-        opObserver().onTransactionPrepare(
-            opCtx(), reservedSlots, txnParticipant.retrieveCompletedTransactionOperations(opCtx()));
+        auto txnOps = txnParticipant.retrieveCompletedTransactionOperations(opCtx());
+        opObserver().onTransactionPrepare(opCtx(), reservedSlots, &txnOps, 0);
     }
 
     auto oplogEntryObjs = getNOplogEntries(opCtx(), 2);
@@ -1997,7 +2004,6 @@ TEST_F(OpObserverMultiEntryTransactionTest, CommitPreparedTest) {
     // commitTimestamp must be greater than the prepareTimestamp.
     auto commitTimestamp = Timestamp(prepareTimestamp.getSecs(), prepareTimestamp.getInc() + 1);
 
-    txnParticipant.transitionToCommittingWithPrepareforTest(opCtx());
     {
         Lock::GlobalLock lk(opCtx(), MODE_IX);
         opObserver().onPreparedTransactionCommit(
@@ -2044,8 +2050,8 @@ TEST_F(OpObserverMultiEntryTransactionTest, AbortPreparedTest) {
         txnParticipant.transitionToPreparedforTest(opCtx(), prepareOpTime);
 
         opCtx()->recoveryUnit()->setPrepareTimestamp(prepareOpTime.getTimestamp());
-        opObserver().onTransactionPrepare(
-            opCtx(), reservedSlots, txnParticipant.retrieveCompletedTransactionOperations(opCtx()));
+        auto txnOps = txnParticipant.retrieveCompletedTransactionOperations(opCtx());
+        opObserver().onTransactionPrepare(opCtx(), reservedSlots, &txnOps, 0);
     }
 
     auto oplogEntryObjs = getNOplogEntries(opCtx(), 1);
@@ -2115,8 +2121,8 @@ TEST_F(OpObserverMultiEntryTransactionTest, UnpreparedTransactionPackingTest) {
     AutoGetCollection autoColl2(opCtx(), nss2, MODE_IX);
     opObserver().onInserts(opCtx(), nss1, uuid1, inserts1.begin(), inserts1.end(), false);
     opObserver().onInserts(opCtx(), nss2, uuid2, inserts2.begin(), inserts2.end(), false);
-    opObserver().onUnpreparedTransactionCommit(
-        opCtx(), txnParticipant.retrieveCompletedTransactionOperations(opCtx()));
+    auto txnOps = txnParticipant.retrieveCompletedTransactionOperations(opCtx());
+    opObserver().onUnpreparedTransactionCommit(opCtx(), &txnOps, 0);
     auto oplogEntryObjs = getNOplogEntries(opCtx(), 1);
     std::vector<OplogEntry> oplogEntries;
     mongo::repl::OpTime expectedPrevWriteOpTime;
@@ -2132,36 +2138,20 @@ TEST_F(OpObserverMultiEntryTransactionTest, UnpreparedTransactionPackingTest) {
     }
     auto oExpected = BSON("applyOps" << BSON_ARRAY(BSON("op"
                                                         << "i"
-                                                        << "ns"
-                                                        << nss1.toString()
-                                                        << "ui"
-                                                        << uuid1
-                                                        << "o"
-                                                        << BSON("_id" << 0))
+                                                        << "ns" << nss1.toString() << "ui" << uuid1
+                                                        << "o" << BSON("_id" << 0))
                                                    << BSON("op"
                                                            << "i"
-                                                           << "ns"
-                                                           << nss1.toString()
-                                                           << "ui"
-                                                           << uuid1
-                                                           << "o"
-                                                           << BSON("_id" << 1))
+                                                           << "ns" << nss1.toString() << "ui"
+                                                           << uuid1 << "o" << BSON("_id" << 1))
                                                    << BSON("op"
                                                            << "i"
-                                                           << "ns"
-                                                           << nss2.toString()
-                                                           << "ui"
-                                                           << uuid2
-                                                           << "o"
-                                                           << BSON("_id" << 2))
+                                                           << "ns" << nss2.toString() << "ui"
+                                                           << uuid2 << "o" << BSON("_id" << 2))
                                                    << BSON("op"
                                                            << "i"
-                                                           << "ns"
-                                                           << nss2.toString()
-                                                           << "ui"
-                                                           << uuid2
-                                                           << "o"
-                                                           << BSON("_id" << 3))));
+                                                           << "ns" << nss2.toString() << "ui"
+                                                           << uuid2 << "o" << BSON("_id" << 3))));
     ASSERT_BSONOBJ_EQ(oExpected, oplogEntries[0].getObject());
 }
 
@@ -2191,8 +2181,8 @@ TEST_F(OpObserverMultiEntryTransactionTest, PreparedTransactionPackingTest) {
     prepareOpTime = reservedSlots.back();
     txnParticipant.transitionToPreparedforTest(opCtx(), prepareOpTime);
     opCtx()->recoveryUnit()->setPrepareTimestamp(prepareOpTime.getTimestamp());
-    opObserver().onTransactionPrepare(
-        opCtx(), reservedSlots, txnParticipant.retrieveCompletedTransactionOperations(opCtx()));
+    auto txnOps = txnParticipant.retrieveCompletedTransactionOperations(opCtx());
+    opObserver().onTransactionPrepare(opCtx(), reservedSlots, &txnOps, 0);
     auto oplogEntryObj = getSingleOplogEntry(opCtx());
     std::vector<OplogEntry> oplogEntries;
     mongo::repl::OpTime expectedPrevWriteOpTime;
@@ -2205,38 +2195,21 @@ TEST_F(OpObserverMultiEntryTransactionTest, PreparedTransactionPackingTest) {
     expectedPrevWriteOpTime = repl::OpTime{oplogEntry.getTimestamp(), *oplogEntry.getTerm()};
     auto oExpected = BSON("applyOps" << BSON_ARRAY(BSON("op"
                                                         << "i"
-                                                        << "ns"
-                                                        << nss1.toString()
-                                                        << "ui"
-                                                        << uuid1
-                                                        << "o"
-                                                        << BSON("_id" << 0))
+                                                        << "ns" << nss1.toString() << "ui" << uuid1
+                                                        << "o" << BSON("_id" << 0))
                                                    << BSON("op"
                                                            << "i"
-                                                           << "ns"
-                                                           << nss1.toString()
-                                                           << "ui"
-                                                           << uuid1
-                                                           << "o"
-                                                           << BSON("_id" << 1))
+                                                           << "ns" << nss1.toString() << "ui"
+                                                           << uuid1 << "o" << BSON("_id" << 1))
                                                    << BSON("op"
                                                            << "i"
-                                                           << "ns"
-                                                           << nss2.toString()
-                                                           << "ui"
-                                                           << uuid2
-                                                           << "o"
-                                                           << BSON("_id" << 2))
+                                                           << "ns" << nss2.toString() << "ui"
+                                                           << uuid2 << "o" << BSON("_id" << 2))
                                                    << BSON("op"
                                                            << "i"
-                                                           << "ns"
-                                                           << nss2.toString()
-                                                           << "ui"
-                                                           << uuid2
-                                                           << "o"
-                                                           << BSON("_id" << 3)))
-                                     << "prepare"
-                                     << true);
+                                                           << "ns" << nss2.toString() << "ui"
+                                                           << uuid2 << "o" << BSON("_id" << 3)))
+                                     << "prepare" << true);
     ASSERT_BSONOBJ_EQ(oExpected, oplogEntries[0].getObject());
 }
 
@@ -2265,8 +2238,8 @@ TEST_F(OpObserverMultiEntryTransactionTest, CommitPreparedPackingTest) {
     txnParticipant.transitionToPreparedforTest(opCtx(), prepareOpTime);
 
     opCtx()->recoveryUnit()->setPrepareTimestamp(prepareOpTime.getTimestamp());
-    opObserver().onTransactionPrepare(
-        opCtx(), reservedSlots, txnParticipant.retrieveCompletedTransactionOperations(opCtx()));
+    auto txnOps = txnParticipant.retrieveCompletedTransactionOperations(opCtx());
+    opObserver().onTransactionPrepare(opCtx(), reservedSlots, &txnOps, 0);
 
     auto oplogEntryObjs = getNOplogEntries(opCtx(), 1);
 
@@ -2300,7 +2273,6 @@ TEST_F(OpObserverMultiEntryTransactionTest, CommitPreparedPackingTest) {
     // commitTimestamp must be greater than the prepareTimestamp.
     auto commitTimestamp = Timestamp(prepareTimestamp.getSecs(), prepareTimestamp.getInc() + 1);
 
-    txnParticipant.transitionToCommittingWithPrepareforTest(opCtx());
     opObserver().onPreparedTransactionCommit(
         opCtx(),
         commitSlot,
@@ -2322,22 +2294,25 @@ TEST_F(OpObserverMultiEntryTransactionTest, CommitPreparedPackingTest) {
     assertTxnRecordStartOpTime(boost::none);
 }
 
-class OpObserverLargeMultiEntryTransactionTest : public OpObserverLargeTransactionTest {
-    void setUp() override {
-        gUseMultipleOplogEntryFormatForTransactions = true;
-        OpObserverTransactionTest::setUp();
-    }
-
-    void tearDown() override {
-        OpObserverTransactionTest::tearDown();
-        gUseMultipleOplogEntryFormatForTransactions = false;
+/**
+ * Test fixture with sessions and an extra-large oplog for testing large transactions.
+ */
+class OpObserverLargeTransactionTest : public OpObserverTransactionTest {
+private:
+    repl::ReplSettings createReplSettings() override {
+        repl::ReplSettings settings;
+        // We need an oplog comfortably large enough to hold an oplog entry that exceeds the BSON
+        // size limit.  Otherwise we will get the wrong error code when trying to write one.
+        settings.setOplogSizeBytes(BSONObjMaxInternalSize + 2 * 1024 * 1024);
+        settings.setReplSetString("mySet/node1:12345");
+        return settings;
     }
 };
 
 // Tests that a large transaction may be committed.  This test creates a transaction with two
 // operations that together are just big enough to exceed the size limit, which should result in a
 // two oplog entry transaction.
-TEST_F(OpObserverLargeMultiEntryTransactionTest, LargeTransactionCreatesMultipleOplogEntries) {
+TEST_F(OpObserverLargeTransactionTest, LargeTransactionCreatesMultipleOplogEntries) {
     const NamespaceString nss("testDB", "testColl");
     auto uuid = CollectionUUID::gen();
 
@@ -2349,13 +2324,13 @@ TEST_F(OpObserverLargeMultiEntryTransactionTest, LargeTransactionCreatesMultiple
     // entry.
     constexpr size_t kHalfTransactionSize = BSONObjMaxInternalSize / 2 - 175;
     std::unique_ptr<uint8_t[]> halfTransactionData(new uint8_t[kHalfTransactionSize]());
-    auto operation1 = repl::OplogEntry::makeInsertOperation(
+    auto operation1 = repl::DurableOplogEntry::makeInsertOperation(
         nss,
         uuid,
         BSON(
             "_id" << 0 << "data"
                   << BSONBinData(halfTransactionData.get(), kHalfTransactionSize, BinDataGeneral)));
-    auto operation2 = repl::OplogEntry::makeInsertOperation(
+    auto operation2 = repl::DurableOplogEntry::makeInsertOperation(
         nss,
         uuid,
         BSON(
@@ -2363,8 +2338,8 @@ TEST_F(OpObserverLargeMultiEntryTransactionTest, LargeTransactionCreatesMultiple
                   << BSONBinData(halfTransactionData.get(), kHalfTransactionSize, BinDataGeneral)));
     txnParticipant.addTransactionOperation(opCtx(), operation1);
     txnParticipant.addTransactionOperation(opCtx(), operation2);
-    opObserver().onUnpreparedTransactionCommit(
-        opCtx(), txnParticipant.retrieveCompletedTransactionOperations(opCtx()));
+    auto txnOps = txnParticipant.retrieveCompletedTransactionOperations(opCtx());
+    opObserver().onUnpreparedTransactionCommit(opCtx(), &txnOps, 0);
     auto oplogEntryObjs = getNOplogEntries(opCtx(), 2);
     std::vector<OplogEntry> oplogEntries;
     mongo::repl::OpTime expectedPrevWriteOpTime;
@@ -2384,6 +2359,46 @@ TEST_F(OpObserverLargeMultiEntryTransactionTest, LargeTransactionCreatesMultiple
 
     oExpected = BSON("applyOps" << BSON_ARRAY(operation2.toBSON()) << "count" << 2);
     ASSERT_BSONOBJ_EQ(oExpected, oplogEntries[1].getObject());
+}
+
+TEST_F(OpObserverTest, OnRollbackInvalidatesDefaultRWConcernCache) {
+    auto& rwcDefaults = ReadWriteConcernDefaults::get(getServiceContext());
+    auto opCtx = getClient()->makeOperationContext();
+
+    // Put initial defaults in the cache.
+    {
+        RWConcernDefault origDefaults;
+        origDefaults.setUpdateOpTime(Timestamp(10, 20));
+        origDefaults.setUpdateWallClockTime(Date_t::fromMillisSinceEpoch(1234));
+        _lookupMock.setLookupCallReturnValue(std::move(origDefaults));
+    }
+    auto origCachedDefaults = rwcDefaults.getDefault(opCtx.get());
+    ASSERT_EQ(Timestamp(10, 20), *origCachedDefaults.getUpdateOpTime());
+    ASSERT_EQ(Date_t::fromMillisSinceEpoch(1234), *origCachedDefaults.getUpdateWallClockTime());
+
+    // Change the mock's defaults, but don't invalidate the cache yet. The cache should still return
+    // the original defaults.
+    {
+        RWConcernDefault newDefaults;
+        newDefaults.setUpdateOpTime(Timestamp(50, 20));
+        newDefaults.setUpdateWallClockTime(Date_t::fromMillisSinceEpoch(5678));
+        _lookupMock.setLookupCallReturnValue(std::move(newDefaults));
+
+        auto cachedDefaults = rwcDefaults.getDefault(opCtx.get());
+        ASSERT_EQ(Timestamp(10, 20), *cachedDefaults.getUpdateOpTime());
+        ASSERT_EQ(Date_t::fromMillisSinceEpoch(1234), *cachedDefaults.getUpdateWallClockTime());
+    }
+
+    // Rollback to a timestamp should invalidate the cache and getting the defaults should now
+    // return the latest value.
+    {
+        OpObserverImpl opObserver;
+        OpObserver::RollbackObserverInfo rbInfo;
+        opObserver.onReplicationRollback(opCtx.get(), rbInfo);
+    }
+    auto newCachedDefaults = rwcDefaults.getDefault(opCtx.get());
+    ASSERT_EQ(Timestamp(50, 20), *newCachedDefaults.getUpdateOpTime());
+    ASSERT_EQ(Date_t::fromMillisSinceEpoch(5678), *newCachedDefaults.getUpdateWallClockTime());
 }
 
 }  // namespace

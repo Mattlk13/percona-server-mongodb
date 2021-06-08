@@ -80,6 +80,14 @@ public:
         }
     }
 
+    virtual void onStartIndexBuildSinglePhase(OperationContext* opCtx,
+                                              const NamespaceString& nss) override {
+        ReservedTimes times{opCtx};
+        for (auto& o : _observers) {
+            o->onStartIndexBuildSinglePhase(opCtx, nss);
+        }
+    }
+
     virtual void onCommitIndexBuild(OperationContext* opCtx,
                                     const NamespaceString& nss,
                                     CollectionUUID collUUID,
@@ -97,10 +105,11 @@ public:
                                    CollectionUUID collUUID,
                                    const UUID& indexBuildUUID,
                                    const std::vector<BSONObj>& indexes,
+                                   const Status& cause,
                                    bool fromMigrate) override {
         ReservedTimes times{opCtx};
         for (auto& o : _observers) {
-            o->onAbortIndexBuild(opCtx, nss, collUUID, indexBuildUUID, indexes, fromMigrate);
+            o->onAbortIndexBuild(opCtx, nss, collUUID, indexBuildUUID, indexes, cause, fromMigrate);
         }
     }
 
@@ -133,25 +142,36 @@ public:
                   const NamespaceString& nss,
                   OptionalCollectionUUID uuid,
                   StmtId stmtId,
-                  bool fromMigrate,
-                  const boost::optional<BSONObj>& deletedDoc) override {
+                  const OplogDeleteEntryArgs& args) override {
         ReservedTimes times{opCtx};
         for (auto& o : _observers)
-            o->onDelete(opCtx, nss, uuid, stmtId, fromMigrate, deletedDoc);
+            o->onDelete(opCtx, nss, uuid, stmtId, args);
     }
 
     void onInternalOpMessage(OperationContext* const opCtx,
                              const NamespaceString& nss,
                              const boost::optional<UUID> uuid,
                              const BSONObj& msgObj,
-                             const boost::optional<BSONObj> o2MsgObj) override {
+                             const boost::optional<BSONObj> o2MsgObj,
+                             const boost::optional<repl::OpTime> preImageOpTime,
+                             const boost::optional<repl::OpTime> postImageOpTime,
+                             const boost::optional<repl::OpTime> prevWriteOpTimeInTransaction,
+                             const boost::optional<OplogSlot> slot) override {
         ReservedTimes times{opCtx};
         for (auto& o : _observers)
-            o->onInternalOpMessage(opCtx, nss, uuid, msgObj, o2MsgObj);
+            o->onInternalOpMessage(opCtx,
+                                   nss,
+                                   uuid,
+                                   msgObj,
+                                   o2MsgObj,
+                                   preImageOpTime,
+                                   postImageOpTime,
+                                   prevWriteOpTimeInTransaction,
+                                   slot);
     }
 
     void onCreateCollection(OperationContext* const opCtx,
-                            Collection* coll,
+                            const CollectionPtr& coll,
                             const NamespaceString& collectionName,
                             const CollectionOptions& options,
                             const BSONObj& idIndex,
@@ -163,13 +183,13 @@ public:
 
     void onCollMod(OperationContext* const opCtx,
                    const NamespaceString& nss,
-                   OptionalCollectionUUID uuid,
+                   const UUID& uuid,
                    const BSONObj& collModCmd,
                    const CollectionOptions& oldCollOptions,
-                   boost::optional<TTLCollModInfo> ttlInfo) override {
+                   boost::optional<IndexCollModInfo> indexInfo) override {
         ReservedTimes times{opCtx};
         for (auto& o : _observers)
-            o->onCollMod(opCtx, nss, uuid, collModCmd, oldCollOptions, ttlInfo);
+            o->onCollMod(opCtx, nss, uuid, collModCmd, oldCollOptions, indexInfo);
     }
 
     void onDropDatabase(OperationContext* const opCtx, const std::string& dbName) override {
@@ -183,10 +203,20 @@ public:
                                   const OptionalCollectionUUID uuid,
                                   std::uint64_t numRecords,
                                   const CollectionDropType dropType) override {
+        return onDropCollection(
+            opCtx, collectionName, uuid, numRecords, dropType, false /* markFromMigrate*/);
+    }
+
+    repl::OpTime onDropCollection(OperationContext* const opCtx,
+                                  const NamespaceString& collectionName,
+                                  const OptionalCollectionUUID uuid,
+                                  std::uint64_t numRecords,
+                                  const CollectionDropType dropType,
+                                  bool markFromMigrate) override {
         ReservedTimes times{opCtx};
         for (auto& observer : this->_observers) {
-            auto time =
-                observer->onDropCollection(opCtx, collectionName, uuid, numRecords, dropType);
+            auto time = observer->onDropCollection(
+                opCtx, collectionName, uuid, numRecords, dropType, markFromMigrate);
             invariant(time.isNull());
         }
         return _getOpTimeToReturn(times.get().reservedOpTimes);
@@ -202,7 +232,6 @@ public:
             o->onDropIndex(opCtx, nss, uuid, indexName, idxDescriptor);
     }
 
-
     void onRenameCollection(OperationContext* const opCtx,
                             const NamespaceString& fromCollection,
                             const NamespaceString& toCollection,
@@ -210,10 +239,54 @@ public:
                             OptionalCollectionUUID dropTargetUUID,
                             std::uint64_t numRecords,
                             bool stayTemp) override {
+        onRenameCollection(opCtx,
+                           fromCollection,
+                           toCollection,
+                           uuid,
+                           dropTargetUUID,
+                           numRecords,
+                           stayTemp,
+                           false /* markFromMigrate */);
+    }
+
+    void onRenameCollection(OperationContext* const opCtx,
+                            const NamespaceString& fromCollection,
+                            const NamespaceString& toCollection,
+                            OptionalCollectionUUID uuid,
+                            OptionalCollectionUUID dropTargetUUID,
+                            std::uint64_t numRecords,
+                            bool stayTemp,
+                            bool markFromMigrate) override {
         ReservedTimes times{opCtx};
         for (auto& o : _observers)
-            o->onRenameCollection(
-                opCtx, fromCollection, toCollection, uuid, dropTargetUUID, numRecords, stayTemp);
+            o->onRenameCollection(opCtx,
+                                  fromCollection,
+                                  toCollection,
+                                  uuid,
+                                  dropTargetUUID,
+                                  numRecords,
+                                  stayTemp,
+                                  markFromMigrate);
+    }
+
+    void onImportCollection(OperationContext* opCtx,
+                            const UUID& importUUID,
+                            const NamespaceString& nss,
+                            long long numRecords,
+                            long long dataSize,
+                            const BSONObj& catalogEntry,
+                            const BSONObj& storageMetadata,
+                            bool isDryRun) override {
+        ReservedTimes times{opCtx};
+        for (auto& o : _observers)
+            o->onImportCollection(opCtx,
+                                  importUUID,
+                                  nss,
+                                  numRecords,
+                                  dataSize,
+                                  catalogEntry,
+                                  storageMetadata,
+                                  isDryRun);
     }
 
     repl::OpTime preRenameCollection(OperationContext* const opCtx,
@@ -223,10 +296,34 @@ public:
                                      OptionalCollectionUUID dropTargetUUID,
                                      std::uint64_t numRecords,
                                      bool stayTemp) override {
+        return preRenameCollection(opCtx,
+                                   fromCollection,
+                                   toCollection,
+                                   uuid,
+                                   dropTargetUUID,
+                                   numRecords,
+                                   stayTemp,
+                                   false /* markFromMigrate */);
+    }
+
+    repl::OpTime preRenameCollection(OperationContext* const opCtx,
+                                     const NamespaceString& fromCollection,
+                                     const NamespaceString& toCollection,
+                                     OptionalCollectionUUID uuid,
+                                     OptionalCollectionUUID dropTargetUUID,
+                                     std::uint64_t numRecords,
+                                     bool stayTemp,
+                                     bool markFromMigrate) override {
         ReservedTimes times{opCtx};
         for (auto& observer : this->_observers) {
-            const auto time = observer->preRenameCollection(
-                opCtx, fromCollection, toCollection, uuid, dropTargetUUID, numRecords, stayTemp);
+            const auto time = observer->preRenameCollection(opCtx,
+                                                            fromCollection,
+                                                            toCollection,
+                                                            uuid,
+                                                            dropTargetUUID,
+                                                            numRecords,
+                                                            stayTemp,
+                                                            markFromMigrate);
             invariant(time.isNull());
         }
         return _getOpTimeToReturn(times.get().reservedOpTimes);
@@ -259,11 +356,12 @@ public:
             o->onEmptyCapped(opCtx, collectionName, uuid);
     }
 
-    void onUnpreparedTransactionCommit(
-        OperationContext* opCtx, const std::vector<repl::ReplOperation>& statements) override {
+    void onUnpreparedTransactionCommit(OperationContext* opCtx,
+                                       std::vector<repl::ReplOperation>* statements,
+                                       size_t numberOfPreImagesToWrite) override {
         ReservedTimes times{opCtx};
         for (auto& o : _observers)
-            o->onUnpreparedTransactionCommit(opCtx, statements);
+            o->onUnpreparedTransactionCommit(opCtx, statements, numberOfPreImagesToWrite);
     }
 
     void onPreparedTransactionCommit(
@@ -279,10 +377,12 @@ public:
 
     void onTransactionPrepare(OperationContext* opCtx,
                               const std::vector<OplogSlot>& reservedSlots,
-                              std::vector<repl::ReplOperation>& statements) override {
+                              std::vector<repl::ReplOperation>* statements,
+                              size_t numberOfPreImagesToWrite) override {
         ReservedTimes times{opCtx};
         for (auto& observer : _observers) {
-            observer->onTransactionPrepare(opCtx, reservedSlots, statements);
+            observer->onTransactionPrepare(
+                opCtx, reservedSlots, statements, numberOfPreImagesToWrite);
         }
     }
 
@@ -297,6 +397,12 @@ public:
                                const RollbackObserverInfo& rbInfo) override {
         for (auto& o : _observers)
             o->onReplicationRollback(opCtx, rbInfo);
+    }
+
+    void onMajorityCommitPointUpdate(ServiceContext* service,
+                                     const repl::OpTime& newCommitPoint) override {
+        for (auto& o : _observers)
+            o->onMajorityCommitPointUpdate(service, newCommitPoint);
     }
 
 private:

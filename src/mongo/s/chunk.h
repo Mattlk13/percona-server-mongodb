@@ -45,6 +45,14 @@ class ChunkInfo {
 public:
     explicit ChunkInfo(const ChunkType& from);
 
+    ChunkInfo(ChunkRange range,
+              std::string maxKeyString,
+              ShardId shardId,
+              ChunkVersion version,
+              std::vector<ChunkHistory> history,
+              bool jumbo,
+              std::shared_ptr<ChunkWritesTracker> writesTracker);
+
     const auto& getRange() const {
         return _range;
     }
@@ -55,6 +63,14 @@ public:
 
     const BSONObj& getMax() const {
         return _range.getMax();
+    }
+
+    const std::string& getMaxKeyString() const {
+        return _maxKeyString;
+    }
+
+    const ShardId& getShardId() const {
+        return _shardId;
     }
 
     const ShardId& getShardIdAt(const boost::optional<Timestamp>& ts) const;
@@ -104,6 +120,7 @@ public:
 
 private:
     const ChunkRange _range;
+    const std::string _maxKeyString;
 
     const ShardId _shardId;
 
@@ -136,6 +153,10 @@ public:
 
     const ShardId& getShardId() const {
         return _chunkInfo.getShardIdAt(_atClusterTime);
+    }
+
+    const auto& getRange() const {
+        return _chunkInfo.getRange();
     }
 
     /**

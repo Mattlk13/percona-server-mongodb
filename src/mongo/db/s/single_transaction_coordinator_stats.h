@@ -29,6 +29,8 @@
 
 #pragma once
 
+#include "mongo/db/client.h"
+#include "mongo/rpc/metadata/client_metadata.h"
 #include "mongo/util/tick_source.h"
 #include "mongo/util/time_support.h"
 
@@ -43,6 +45,24 @@ class SingleTransactionCoordinatorStats {
 public:
     SingleTransactionCoordinatorStats() = default;
 
+    struct LastClientInfo {
+        std::string clientHostAndPort;
+        long long connectionId;
+        BSONObj clientMetadata;
+        std::string appName;
+
+        void update(Client* client) {
+            if (client->hasRemote()) {
+                clientHostAndPort = client->getRemote().toString();
+            }
+            connectionId = client->getConnectionId();
+            if (auto metadata = ClientMetadata::get(client)) {
+                clientMetadata = metadata->getDocument();
+                appName = metadata->getApplicationName().toString();
+            }
+        }
+    };
+
     //
     // Setters
     //
@@ -52,12 +72,12 @@ public:
      *
      * Can only be called once.
      */
-    void setStartTime(TickSource::Tick curTick, Date_t curWallClockTime);
+    void setCreateTime(TickSource::Tick curTick, Date_t curWallClockTime);
 
     /**
      * Sets the time the transaction coordinator was destroyed.
      *
-     * Can only be called once, and must be called after setStartTime.
+     * Can only be called once, and must be called after setCreateTime.
      */
     void setEndTime(TickSource::Tick curTick, Date_t curWallClockTime);
 
@@ -65,7 +85,7 @@ public:
      * Sets the time the transaction coordinator wrote the participant list and started waiting for
      * the participant list to become majority-committed.
      *
-     * Can only be called once, and must be called after setStartTime.
+     * Can only be called once, and must be called after setCreateTime.
      */
     void setWritingParticipantListStartTime(TickSource::Tick curTick, Date_t curWallClockTime);
 
@@ -93,17 +113,99 @@ public:
      */
     void setWaitingForDecisionAcksStartTime(TickSource::Tick curTick, Date_t curWallClockTime);
 
+    /**
+     * Sets the time the transaction coordinator deleted its durable state.
+     *
+     * Can only be called once, and must be called after setWaitingForDecisionAcksStartTime.
+     */
+    void setDeletingCoordinatorDocStartTime(TickSource::Tick curTick, Date_t curWallClockTime);
+
     //
     // Getters
     //
 
     /**
-     * If the end time has been set, returns the duration between the start time and end time, else
-     * returns the duration between the start time and curTick.
+     * Returns the time the coordinator was created.
      *
-     * Must be called after setStartTime, but can be called any number of times.
+     * Must be called after setCreateTime.
      */
-    Microseconds getDuration(TickSource* tickSource, TickSource::Tick curTick) const;
+    Date_t getCreateTime() const {
+        return _createWallClockTime;
+    }
+
+    /**
+     * Returns the time the coordinator was destroyed.
+     *
+     * Must be called after setCreateTime.
+     */
+    Date_t getEndTime() const {
+        return _endWallClockTime;
+    }
+
+    /**
+     * Returns the time the coordinator started writing the participant list. Note, this is also the
+     * two-phase commit start time.
+     *
+     * Must be called after setWritingParticipantListStartTime.
+     */
+    Date_t getWritingParticipantListStartTime() const {
+        return _writingParticipantListStartWallClockTime;
+    }
+
+    /**
+     * Returns the time the coordinator started sending 'prepare' and collecting votes.
+     *
+     * Must be called after setWaitingForVotesStartTime.
+     */
+    Date_t getWaitingForVotesStartTime() const {
+        return _waitingForVotesStartWallClockTime;
+    }
+
+    /**
+     * Returns the time the coordinator started making the decision durable.
+     *
+     * Must be called after setWritingDecisionStartTime.
+     */
+    Date_t getWritingDecisionStartTime() const {
+        return _writingDecisionStartWallClockTime;
+    }
+
+    /**
+     * Returns the time the coordinator started sending the decision and waiting for
+     * acknowledgments.
+     *
+     * Must be called after setWaitingForDecisionAcksStartTime.
+     */
+    Date_t getWaitingForDecisionAcksStartTime() const {
+        return _waitingForDecisionAcksStartWallClockTime;
+    }
+
+    /**
+     * Returns the time the coordinator started deleting its durable state.
+     *
+     * Must be called after setDeletingCoordinatorDocStartTime.
+     */
+    Date_t getDeletingCoordinatorDocStartTime() const {
+        return _deletingCoordinatorDocStartWallClockTime;
+    }
+
+    /**
+     * If the end time has been set, returns the duration between the create time and end time, else
+     * returns the duration between the create time and curTick.
+     *
+     * Must be called after setCreateTime, but can be called any number of times.
+     */
+    Microseconds getDurationSinceCreation(TickSource* tickSource, TickSource::Tick curTick) const;
+
+    /**
+     * If the end time has been set, returns the duration between the writing participant list start
+     * time and end time, else returns the duration between the writing participant list start time
+     * and curTick.
+     *
+     * Must be called after setWritingParticipantListStartTime, but can be called any number of
+     * times.
+     */
+    Microseconds getTwoPhaseCommitDuration(TickSource* tickSource, TickSource::Tick curTick) const;
 
     /**
      * If the waiting for votes start time has been set, returns the duration between the writing
@@ -135,9 +237,9 @@ public:
     Microseconds getWritingDecisionDuration(TickSource* tickSource, TickSource::Tick curTick) const;
 
     /**
-     * If the end time has been set, returns the duration between the waiting for decision acks
-     * start time and the end time, else returns the duration between the waiting for decision acks
-     * start time and curTick.
+     * If the deleting coordinator doc start time has been set, returns the duration between the
+     * waiting for decision acks start time and the deleting coordinator doc start time, else
+     * returns the duration between the waiting for decision acks start time and curTick.
      *
      * Must be called after setWaitingForDecisionAcksStartTime, but can be called any number of
      * times.
@@ -145,10 +247,50 @@ public:
     Microseconds getWaitingForDecisionAcksDuration(TickSource* tickSource,
                                                    TickSource::Tick curTick) const;
 
-private:
-    Date_t _startWallClockTime;
-    TickSource::Tick _startTime{0};
+    /**
+     * If the end time has been set, returns the duration between the deleting coordinator doc start
+     * and the end time, else returns the duration between the deleting coordinator doc start time
+     * and curTick.
+     *
+     * Must be called after setDeletingCoordinatorDocStartTime, but can be called any number of
+     * times.
+     */
+    Microseconds getDeletingCoordinatorDocDuration(TickSource* tickSource,
+                                                   TickSource::Tick curTick) const;
 
+    /**
+     * Reports the time duration for each step in the two-phase commit and stores them as a
+     * sub-document of the provided parent BSONObjBuilder. The metrics are stored under key
+     * "stepDurations" in the parent document.
+     */
+    void reportMetrics(BSONObjBuilder& parent,
+                       TickSource* tickSource,
+                       TickSource::Tick curTick) const;
+
+    /**
+     * Reports information about the last client to interact with this transaction.
+     */
+    void reportLastClient(BSONObjBuilder& parent) const;
+
+    /**
+     * Updates the LastClientInfo object stored in this SingleTransactionStats instance with the
+     * given Client's information.
+     */
+    void updateLastClientInfo(Client* client) {
+        invariant(client);
+        _lastClientInfo.update(client);
+    }
+    /*
+     * Marks this transaction coordinator has having recovered from failure.
+     */
+    void setRecoveredFromFailover();
+
+private:
+    Date_t _createWallClockTime;
+    TickSource::Tick _createTime{0};
+
+    // The writing participant list start time doubles as the two-phase commit start time, since
+    // writing the participant list is the first step of the two-phase commit.
     Date_t _writingParticipantListStartWallClockTime;
     TickSource::Tick _writingParticipantListStartTime{0};
 
@@ -161,8 +303,14 @@ private:
     Date_t _waitingForDecisionAcksStartWallClockTime;
     TickSource::Tick _waitingForDecisionAcksStartTime{0};
 
+    Date_t _deletingCoordinatorDocStartWallClockTime;
+    TickSource::Tick _deletingCoordinatorDocStartTime{0};
+
     Date_t _endWallClockTime;
     TickSource::Tick _endTime{0};
+
+    LastClientInfo _lastClientInfo;
+    bool _hasRecoveredFromFailover = false;
 };
 
 }  // namespace mongo

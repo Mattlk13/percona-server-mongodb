@@ -33,6 +33,9 @@
 #include <iosfwd>
 #include <limits>
 #include <ratio>
+#include <type_traits>
+
+#include <fmt/format.h>
 
 #include "mongo/base/static_assert.h"
 #include "mongo/platform/overflow_arithmetic.h"
@@ -42,6 +45,8 @@
 #include "mongo/util/str.h"
 
 namespace mongo {
+
+class BSONObj;
 
 template <typename Allocator>
 class StringBuilderImpl;
@@ -55,6 +60,14 @@ using Milliseconds = Duration<std::milli>;
 using Seconds = Duration<std::ratio<1>>;
 using Minutes = Duration<std::ratio<60>>;
 using Hours = Duration<std::ratio<3600>>;
+using Days = Duration<std::ratio<86400>>;
+
+namespace duration_detail {
+template <typename>
+inline constexpr bool isMongoDuration = false;
+template <typename... Ts>
+inline constexpr bool isMongoDuration<Duration<Ts...>> = true;
+}  // namespace duration_detail
 
 //
 // Streaming output operators for common duration types. Writes the numerical value followed by
@@ -63,32 +76,6 @@ using Hours = Duration<std::ratio<3600>>;
 // E.g., std::cout << Minutes{5} << std::endl; should produce the following:
 // 5min
 //
-
-std::ostream& operator<<(std::ostream& os, Nanoseconds ns);
-std::ostream& operator<<(std::ostream& os, Microseconds us);
-std::ostream& operator<<(std::ostream& os, Milliseconds ms);
-std::ostream& operator<<(std::ostream& os, Seconds s);
-std::ostream& operator<<(std::ostream& os, Minutes m);
-std::ostream& operator<<(std::ostream& os, Hours h);
-
-template <typename Allocator>
-StringBuilderImpl<Allocator>& operator<<(StringBuilderImpl<Allocator>& os, Nanoseconds ns);
-
-template <typename Allocator>
-StringBuilderImpl<Allocator>& operator<<(StringBuilderImpl<Allocator>& os, Microseconds us);
-
-template <typename Allocator>
-StringBuilderImpl<Allocator>& operator<<(StringBuilderImpl<Allocator>& os, Milliseconds ms);
-
-template <typename Allocator>
-StringBuilderImpl<Allocator>& operator<<(StringBuilderImpl<Allocator>& os, Seconds s);
-
-template <typename Allocator>
-StringBuilderImpl<Allocator>& operator<<(StringBuilderImpl<Allocator>& os, Minutes m);
-
-template <typename Allocator>
-StringBuilderImpl<Allocator>& operator<<(StringBuilderImpl<Allocator>& os, Hours h);
-
 
 template <typename Duration1, typename Duration2>
 using HigherPrecisionDuration =
@@ -103,20 +90,25 @@ using HigherPrecisionDuration =
  * the ToDuration. For example, Seconds::max() cannot be represented as a Milliseconds, and so
  * attempting to cast that value to Milliseconds will throw an exception.
  */
-template <typename ToDuration, typename FromPeriod>
+template <typename ToDuration,
+          typename FromPeriod,
+          std::enable_if_t<duration_detail::isMongoDuration<ToDuration>, int> = 0>
 constexpr ToDuration duration_cast(const Duration<FromPeriod>& from) {
     using FromOverTo = std::ratio_divide<FromPeriod, typename ToDuration::period>;
     if (ToDuration::template isHigherPrecisionThan<Duration<FromPeriod>>()) {
         typename ToDuration::rep toCount = 0;
         uassert(ErrorCodes::DurationOverflow,
                 "Overflow casting from a lower-precision duration to a higher-precision duration",
-                !mongoSignedMultiplyOverflow64(from.count(), FromOverTo::num, &toCount));
+                !overflow::mul(from.count(), FromOverTo::num, &toCount));
         return ToDuration{toCount};
     }
     return ToDuration{from.count() / FromOverTo::den};
 }
 
-template <typename ToDuration, typename FromRep, typename FromPeriod>
+template <typename ToDuration,
+          typename FromRep,
+          typename FromPeriod,
+          std::enable_if_t<duration_detail::isMongoDuration<ToDuration>, int> = 0>
 constexpr ToDuration duration_cast(const stdx::chrono::duration<FromRep, FromPeriod>& d) {
     return duration_cast<ToDuration>(Duration<FromPeriod>{d.count()});
 }
@@ -150,6 +142,42 @@ inline long long durationCount(const stdx::chrono::duration<RepIn, PeriodIn>& d)
 template <typename Period>
 class Duration {
 public:
+    static constexpr StringData unit_short() {
+        if constexpr (std::is_same_v<Duration, Nanoseconds>) {
+            return "ns"_sd;
+        } else if constexpr (std::is_same_v<Duration, Microseconds>) {
+            return "\xce\xbcs"_sd;
+        } else if constexpr (std::is_same_v<Duration, Milliseconds>) {
+            return "ms"_sd;
+        } else if constexpr (std::is_same_v<Duration, Seconds>) {
+            return "s"_sd;
+        } else if constexpr (std::is_same_v<Duration, Minutes>) {
+            return "min"_sd;
+        } else if constexpr (std::is_same_v<Duration, Hours>) {
+            return "hr"_sd;
+        } else if constexpr (std::is_same_v<Duration, Days>) {
+            return "d"_sd;
+        }
+        return StringData{};
+    }
+    static constexpr StringData mongoUnitSuffix() {
+        if constexpr (std::is_same_v<Duration, Nanoseconds>) {
+            return "Nanos"_sd;
+        } else if constexpr (std::is_same_v<Duration, Microseconds>) {
+            return "Micros"_sd;
+        } else if constexpr (std::is_same_v<Duration, Milliseconds>) {
+            return "Millis"_sd;
+        } else if constexpr (std::is_same_v<Duration, Seconds>) {
+            return "Seconds"_sd;
+        } else if constexpr (std::is_same_v<Duration, Minutes>) {
+            return "Minutes"_sd;
+        } else if constexpr (std::is_same_v<Duration, Hours>) {
+            return "Hours"_sd;
+        } else if constexpr (std::is_same_v<Duration, Days>) {
+            return "Days"_sd;
+        }
+        return StringData{};
+    }
     MONGO_STATIC_ASSERT_MSG(Period::num > 0, "Duration::period's numerator must be positive");
     MONGO_STATIC_ASSERT_MSG(Period::den > 0, "Duration::period's denominator must be positive");
 
@@ -281,7 +309,7 @@ public:
         }
         using OtherOverThis = std::ratio_divide<OtherPeriod, period>;
         rep otherCount;
-        if (mongoSignedMultiplyOverflow64(other.count(), OtherOverThis::num, &otherCount)) {
+        if (overflow::mul(other.count(), OtherOverThis::num, &otherCount)) {
             return other.count() < 0 ? 1 : -1;
         }
         if (count() < otherCount) {
@@ -329,14 +357,14 @@ public:
     Duration& operator+=(const Duration& other) {
         uassert(ErrorCodes::DurationOverflow,
                 str::stream() << "Overflow while adding " << other << " to " << *this,
-                !mongoSignedAddOverflow64(count(), other.count(), &_count));
+                !overflow::add(count(), other.count(), &_count));
         return *this;
     }
 
     Duration& operator-=(const Duration& other) {
         uassert(ErrorCodes::DurationOverflow,
                 str::stream() << "Overflow while subtracting " << other << " from " << *this,
-                !mongoSignedSubtractOverflow64(count(), other.count(), &_count));
+                !overflow::sub(count(), other.count(), &_count));
         return *this;
     }
 
@@ -347,7 +375,7 @@ public:
             "Durations may only be multiplied by values of signed integral type");
         uassert(ErrorCodes::DurationOverflow,
                 str::stream() << "Overflow while multiplying " << *this << " by " << scale,
-                !mongoSignedMultiplyOverflow64(count(), scale, &_count));
+                !overflow::mul(count(), scale, &_count));
         return *this;
     }
 
@@ -361,6 +389,13 @@ public:
         _count /= scale;
         return *this;
     }
+
+    BSONObj toBSON() const;
+
+    std::string toString() const {
+        return fmt::format("{} {}", count(), unit_short());
+    }
+
 
 private:
     rep _count = {};
@@ -444,6 +479,57 @@ template <typename Period, typename Rep2>
 Duration<Period> operator/(Duration<Period> d, const Rep2& scale) {
     d /= scale;
     return d;
+}
+
+template <typename Stream, typename Period>
+Stream& streamPut(Stream& os, const Duration<Period>& dp) {
+    MONGO_STATIC_ASSERT_MSG(!Duration<Period>::unit_short().empty(),
+                            "Only standard Durations can logged");
+    return os << dp.count() << dp.unit_short();
+}
+
+template <typename Period>
+std::ostream& operator<<(std::ostream& os, Duration<Period> dp) {
+    MONGO_STATIC_ASSERT_MSG(!Duration<Period>::unit_short().empty(),
+                            "Only standard Durations can logged");
+    return streamPut(os, dp);
+}
+
+template <typename Allocator, typename Period>
+StringBuilderImpl<Allocator>& operator<<(StringBuilderImpl<Allocator>& os, Duration<Period> dp) {
+    MONGO_STATIC_ASSERT_MSG(!Duration<Period>::unit_short().empty(),
+                            "Only standard Durations can logged");
+    return streamPut(os, dp);
+}
+
+/**
+ * Make a std::chrono::duration from an arithmetic expression and a period ratio.
+ * This does not do any math or precision changes. It's just a type-deduced wrapper
+ * that attaches a period to a number for typesafety. The output std::chrono::duration
+ * will retain the Rep type and value of the input argument.
+ *
+ * E.g:
+ *      int waited = 123;  // unitless, type-unsafe millisecond count.
+ *      auto dur = deduceChronoDuration<std::milli>(waited);
+ *      static_assert(std::is_same_v<decltype(dur),
+ *                                   std::chrono::duration<int, std::milli>>);
+ *      invariant(dur.count() == 123);
+ *
+ * Note that std::chrono::duration<int, std::milli> is not std::milliseconds,
+ * which has a different (unspecified) Rep type.
+ *
+ * Then mongo::duration_cast can convert the deduced std::chrono::duration to
+ * mongo::Duration, or `std::chrono::duration_cast` be used to adjust the rep
+ * to create a more canonical std::chrono::duration:
+ *
+ *      auto durMongo = duration_cast<Milliseconds>(dur);
+ *      auto durChrono = duration_cast<std::milliseconds>(dur);
+ *
+ * Order the cast operations carefully to avoid losing range or precision.
+ */
+template <typename Per = std::ratio<1>, typename Rep>
+constexpr auto deduceChronoDuration(const Rep& count) {
+    return stdx::chrono::duration<Rep, Per>{count};
 }
 
 }  // namespace mongo

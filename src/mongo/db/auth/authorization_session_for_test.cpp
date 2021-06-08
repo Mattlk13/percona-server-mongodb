@@ -38,7 +38,6 @@
 #include "mongo/db/auth/user.h"
 #include "mongo/db/auth/user_name.h"
 #include "mongo/db/auth/user_set.h"
-#include "mongo/stdx/memory.h"
 
 namespace mongo {
 constexpr StringData AuthorizationSessionForTest::kTestDBName;
@@ -53,11 +52,11 @@ void AuthorizationSessionForTest::assumePrivilegesForDB(Privilege privilege, Str
 
 void AuthorizationSessionForTest::assumePrivilegesForDB(PrivilegeVector privileges,
                                                         StringData dbName) {
-    auto user = std::make_shared<User>(UserName("authorizationSessionForTestUser", dbName));
-    user->addPrivileges(privileges);
+    UserHandle userHandle(User(UserName("authorizationSessionForTestUser", dbName)));
+    userHandle->addPrivileges(privileges);
 
-    _authenticatedUsers.add(user);
-    _testUsers.emplace_back(std::move(user));
+    _authenticatedUsers.add(userHandle);
+    _testUsers.emplace_back(std::move(userHandle));
     _buildAuthenticatedRolesVector();
 }
 

@@ -2,7 +2,6 @@
 'use strict';
 
 function CollectionValidator() {
-    load('jstests/libs/feature_compatibility_version.js');
     load('jstests/libs/parallelTester.js');
 
     if (!(this instanceof CollectionValidator)) {
@@ -25,8 +24,6 @@ function CollectionValidator() {
         assert.eq(typeof obj, 'object', 'The `obj` argument must be an object');
         assert(obj.hasOwnProperty('full'), 'Please specify whether to use full validation');
 
-        const full = obj.full;
-
         // Failed collection validation results are saved in failed_res.
         let full_res = {ok: 1, failed_res: []};
 
@@ -46,9 +43,11 @@ function CollectionValidator() {
             jsTest.options().skipValidationNamespaces.length > 0) {
             let skippedCollections = [];
             for (let ns of jsTest.options().skipValidationNamespaces) {
-                // Strip off the database name from 'ns' to extract the collName.
+                // Attempt to strip the name of the database we are about to validate off of the
+                // namespace we wish to skip. If the replace() function does find a match with the
+                // database, then we know that the collection we want to skip is in the database we
+                // are about to validate. We will then put it in the 'filter' for later use.
                 const collName = ns.replace(new RegExp('^' + db.getName() + '\.'), '');
-                // Skip the collection 'collName' if the db name was removed from 'ns'.
                 if (collName !== ns) {
                     skippedCollections.push({name: {$ne: collName}});
                 }
@@ -59,11 +58,11 @@ function CollectionValidator() {
         let collInfo = db.getCollectionInfos(filter);
         for (let collDocument of collInfo) {
             const coll = db.getCollection(collDocument['name']);
-            const res = coll.validate(full);
+            const res = coll.validate(obj);
 
             if (!res.ok || !res.valid) {
                 if (jsTest.options().skipValidationOnNamespaceNotFound &&
-                    res.errmsg === 'ns not found') {
+                    res.codeName === "NamespaceNotFound") {
                     // During a 'stopStart' backup/restore on the secondary node, the actual list of
                     // collections can be out of date if ops are still being applied from the oplog.
                     // In this case we skip the collection if the ns was not found at time of
@@ -73,8 +72,8 @@ function CollectionValidator() {
                     continue;
                 }
                 const host = db.getMongo().host;
-                print('Collection validation failed on host ' + host + ' with response: ' +
-                      tojson(res));
+                print('Collection validation failed on host ' + host +
+                      ' with response: ' + tojson(res));
                 dumpCollection(coll, 100);
                 full_res.failed_res.push(res);
                 full_res.ok = 0;
@@ -87,15 +86,21 @@ function CollectionValidator() {
     // Run a separate thread to validate collections on each server in parallel.
     const validateCollectionsThread = function(validatorFunc, host) {
         try {
-            load('jstests/libs/feature_compatibility_version.js');
-
             print('Running validate() on ' + host);
             const conn = new Mongo(host);
-            conn.setSlaveOk();
+            conn.setSecondaryOk();
             jsTest.authenticate(conn);
 
-            const requiredFCV = jsTest.options().forceValidationWithFeatureCompatibilityVersion;
+            // Skip validating collections for arbiters.
+            if (conn.getDB('admin').isMaster('admin').arbiterOnly === true) {
+                print('Skipping collection validation on arbiter ' + host);
+                return {ok: 1};
+            }
+
+            let requiredFCV = jsTest.options().forceValidationWithFeatureCompatibilityVersion;
             if (requiredFCV) {
+                requiredFCV = new Function(`return typeof ${requiredFCV} === "string" ? ${
+                    requiredFCV} : "${requiredFCV}"`)();
                 // Make sure this node has the desired FCV as it may take time for the updates to
                 // replicate to the nodes that weren't part of the w=majority.
                 assert.soonNoExcept(() => {
@@ -119,38 +124,15 @@ function CollectionValidator() {
         }
     };
 
-    this.validateNodes = function(hostList, setFCVHost) {
+    this.validateNodes = function(hostList) {
         // We run the scoped threads in a try/finally block in case any thread throws an exception,
         // in which case we want to still join all the threads.
         let threads = [];
-        let adminDB;
-        let originalFCV;
-
-        const requiredFCV = jsTest.options().forceValidationWithFeatureCompatibilityVersion;
-        if (requiredFCV) {
-            let conn = new Mongo(setFCVHost);
-            adminDB = conn.getDB('admin');
-            originalFCV = adminDB.system.version.findOne({_id: 'featureCompatibilityVersion'});
-
-            if (originalFCV.targetVersion) {
-                // If a previous FCV upgrade or downgrade was interrupted, then we run the
-                // setFeatureCompatibilityVersion command to complete it before attempting to set
-                // the feature compatibility version to 'requiredFCV'.
-                assert.commandWorked(adminDB.runCommand(
-                    {setFeatureCompatibilityVersion: originalFCV.targetVersion}));
-                checkFCV(adminDB, originalFCV.targetVersion);
-            }
-
-            if (originalFCV.version !== requiredFCV && originalFCV.targetVersion !== requiredFCV) {
-                assert.commandWorked(
-                    adminDB.runCommand({setFeatureCompatibilityVersion: requiredFCV}));
-            }
-        }
 
         try {
             hostList.forEach(host => {
                 const thread =
-                    new ScopedThread(validateCollectionsThread, this.validateCollections, host);
+                    new Thread(validateCollectionsThread, this.validateCollections, host);
                 threads.push(thread);
                 thread.start();
             });
@@ -164,11 +146,6 @@ function CollectionValidator() {
             returnData.forEach(res => {
                 assert.commandWorked(res, 'Collection validation failed');
             });
-        }
-
-        if (originalFCV && originalFCV.version !== requiredFCV) {
-            assert.commandWorked(
-                adminDB.runCommand({setFeatureCompatibilityVersion: originalFCV.version}));
         }
     };
 }

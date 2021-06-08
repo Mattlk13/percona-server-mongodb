@@ -27,31 +27,31 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
 #include <boost/version.hpp>
+#include <functional>
 #include <iostream>
 
 #include "mongo/config.h"
 #include "mongo/db/client.h"
 #include "mongo/dbtests/dbtests.h"
+#include "mongo/logv2/log.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/bits.h"
-#include "mongo/stdx/functional.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/concurrency/ticketholder.h"
-#include "mongo/util/log.h"
 #include "mongo/util/timer.h"
 
 namespace ThreadedTests {
 
-using std::unique_ptr;
 using std::cout;
 using std::endl;
 using std::string;
+using std::unique_ptr;
 
 template <int nthreads_param = 10>
 class ThreadedTest {
@@ -239,7 +239,7 @@ private:
         Hotel(int nRooms) : _nRooms(nRooms), _checkedIn(0), _maxRooms(0) {}
 
         void checkIn() {
-            stdx::lock_guard<stdx::mutex> lk(_frontDesk);
+            stdx::lock_guard<Latch> lk(_frontDesk);
             _checkedIn++;
             verify(_checkedIn <= _nRooms);
             if (_checkedIn > _maxRooms)
@@ -247,12 +247,12 @@ private:
         }
 
         void checkOut() {
-            stdx::lock_guard<stdx::mutex> lk(_frontDesk);
+            stdx::lock_guard<Latch> lk(_frontDesk);
             _checkedIn--;
             verify(_checkedIn >= 0);
         }
 
-        stdx::mutex _frontDesk;
+        Mutex _frontDesk = MONGO_MAKE_LATCH("Hotel::_frontDesk");
         int _nRooms;
         int _checkedIn;
         int _maxRooms;
@@ -278,7 +278,7 @@ private:
             _hotel.checkOut();
 
             if ((i % (checkIns / 10)) == 0)
-                mongo::unittest::log() << "checked in " << i << " times..." << endl;
+                LOGV2(22517, "checked in {i} times...", "i"_attr = i);
         }
     }
 
@@ -289,9 +289,9 @@ private:
     }
 };
 
-class All : public Suite {
+class All : public OldStyleSuiteSpecification {
 public:
-    All() : Suite("threading") {}
+    All() : OldStyleSuiteSpecification("threading") {}
 
     void setupTests() {
         // Slack is a test to see how long it takes for another thread to pick up
@@ -307,5 +307,5 @@ public:
     }
 };
 
-SuiteInstance<All> myall;
+OldStyleSuiteInitializer<All> myall;
 }  // namespace ThreadedTests

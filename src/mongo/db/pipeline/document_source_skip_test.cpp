@@ -29,11 +29,11 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/document_value_test_util.h"
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
-#include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/document_source_mock.h"
 #include "mongo/db/pipeline/document_source_skip.h"
-#include "mongo/db/pipeline/document_value_test_util.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -50,7 +50,8 @@ TEST_F(DocumentSourceSkipTest, ShouldPropagatePauses) {
                                            Document(),
                                            Document(),
                                            DocumentSource::GetNextResult::makePauseExecution(),
-                                           DocumentSource::GetNextResult::makePauseExecution()});
+                                           DocumentSource::GetNextResult::makePauseExecution()},
+                                          getExpCtx());
     skip->setSource(mock.get());
 
     // Skip the first document.

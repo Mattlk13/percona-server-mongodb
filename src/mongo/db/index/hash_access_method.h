@@ -46,7 +46,7 @@ class CollatorInterface;
  */
 class HashAccessMethod : public AbstractIndexAccessMethod {
 public:
-    HashAccessMethod(IndexCatalogEntry* btreeState, SortedDataInterface* btree);
+    HashAccessMethod(IndexCatalogEntry* btreeState, std::unique_ptr<SortedDataInterface> btree);
 
 private:
     /**
@@ -55,21 +55,21 @@ private:
      * This function ignores the 'multikeyPaths' and 'multikeyMetadataKeys' pointers because hashed
      * indexes don't support tracking path-level multikey information.
      */
-    void doGetKeys(const BSONObj& obj,
-                   BSONObjSet* keys,
-                   BSONObjSet* multikeyMetadataKeys,
-                   MultikeyPaths* multikeyPaths) const final;
+    void doGetKeys(SharedBufferFragmentBuilder& pooledBufferBuilder,
+                   const BSONObj& obj,
+                   GetKeysContext context,
+                   KeyStringSet* keys,
+                   KeyStringSet* multikeyMetadataKeys,
+                   MultikeyPaths* multikeyPaths,
+                   boost::optional<RecordId> id) const final;
 
-    // Only one of our fields is hashed.  This is the field name for it.
-    std::string _hashedField;
+    BSONObj _keyPattern;
 
     // _seed defaults to zero.
     HashSeed _seed;
 
     // _hashVersion defaults to zero.
     int _hashVersion;
-
-    BSONObj _missingKey;
 
     // Null if this index orders strings according to the simple binary compare. If non-null,
     // represents the collator used to generate index keys for indexed strings.

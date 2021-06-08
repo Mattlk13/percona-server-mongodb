@@ -41,6 +41,7 @@
 
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/service_context.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/platform/random.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/transport/session.h"
@@ -48,10 +49,11 @@
 #include "mongo/util/decorable.h"
 #include "mongo/util/invariant.h"
 #include "mongo/util/net/hostandport.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 
-class Collection;
+class Locker;
 class OperationContext;
 class ThreadClient;
 
@@ -139,12 +141,15 @@ public:
     void reportState(BSONObjBuilder& builder);
 
     // Ensures stability of the client's OperationContext. When the client is locked,
-    // the OperationContext will not disappear.
+    // the OperationContext and the Locker within it will not disappear.
     void lock() {
         _lock.lock();
     }
     void unlock() {
         _lock.unlock();
+    }
+    bool try_lock() {
+        return _lock.try_lock();
     }
 
     /**
@@ -154,22 +159,6 @@ public:
      * If provided, the LogicalSessionId links this operation to a logical session.
      */
     ServiceContext::UniqueOperationContext makeOperationContext();
-
-    /**
-     * Sets the active operation context on this client to "opCtx", which must be non-NULL.
-     *
-     * It is an error to call this method if there is already an operation context on Client.
-     * It is an error to call this on an unlocked client.
-     */
-    void setOperationContext(OperationContext* opCtx);
-
-    /**
-     * Clears the active operation context on this client.
-     *
-     * There must already be such a context set on this client.
-     * It is an error to call this on an unlocked client.
-     */
-    void resetOperationContext();
 
     /**
      * Gets the operation context active on this client, or nullptr if there is no such context.
@@ -199,11 +188,16 @@ public:
         return _connectionId == 0;
     }
 
+    const auto& getUUID() const {
+        return _uuid;
+    }
+
     /**
-     * Used to set system operations as killable. This should only be called once per Client and
-     * only from system connections. The Client should be locked by the caller.
+     * Used to mark system operations that are allowed to be killed by the stepdown process. This
+     * should only be called once per Client and only from system connections. The Client should be
+     * locked by the caller.
      */
-    void setSystemOperationKillable(WithLock) {
+    void setSystemOperationKillableByStepdown(WithLock) {
         // This can only be changed once for system operations.
         invariant(isFromSystemConnection());
         invariant(!_systemOperationKillable);
@@ -211,10 +205,10 @@ public:
     }
 
     /**
-     * Used to determine whether a system operation is killable that was started by a system
-     * connection. The Client should be locked by the caller.
+     * Used to determine whether a system operation is allowed to be killed by the stepdown process.
+     * The Client should be locked by the caller.
      */
-    bool shouldKillSystemOperation(WithLock) const {
+    bool canKillSystemOperationInStepdown(WithLock) const {
         // Should only be called on system operations.
         invariant(isFromSystemConnection());
         return _systemOperationKillable;
@@ -224,12 +218,61 @@ public:
         return _prng;
     }
 
+    /**
+     * Safely swaps the locker in the OperationContext, releasing the old locker to the caller.
+     * Locks this Client to do this safely.
+     */
+    std::unique_ptr<Locker> swapLockState(std::unique_ptr<Locker> locker);
+
+    /**
+     * Checks if there is an active currentOp associated with this client.
+     * The definition of active varies between User and System connections.
+     * Note that the caller must hold the client lock.
+     */
+    bool hasAnyActiveCurrentOp() const;
+
+    /**
+     * Signal the client's OperationContext that it has been killed.
+     * Any future OperationContext on this client will also receive a kill signal.
+     */
+    void setKilled() noexcept;
+
+    /**
+     * Get the state for killing the client's OperationContext.
+     */
+    bool getKilled() const noexcept {
+        return _killed.loadRelaxed();
+    }
+
+    /**
+     * Whether this client supports the hello command, which indicates that the server
+     * can return "not primary" error messages.
+     */
+    bool supportsHello() const {
+        return _supportsHello;
+    }
+
+    /**
+     * Will be set to true if the client sent { helloOk: true } when opening a
+     * connection to the server. Defaults to false.
+     */
+    void setSupportsHello(bool newVal) {
+        _supportsHello = newVal;
+    }
+
 private:
     friend class ServiceContext;
     friend class ThreadClient;
     explicit Client(std::string desc,
                     ServiceContext* serviceContext,
                     transport::SessionHandle session);
+
+    /**
+     * Sets the active operation context on this client to "opCtx".
+     */
+    void _setOperationContext(OperationContext* opCtx) {
+        _opCtx = opCtx;
+    }
 
     ServiceContext* const _serviceContext;
     const transport::SessionHandle _session;
@@ -253,6 +296,14 @@ private:
     bool _systemOperationKillable = false;
 
     PseudoRandom _prng;
+
+    AtomicWord<bool> _killed{false};
+
+    // Whether this client used { helloOk: true } when opening its connection, indicating that
+    // it supports the hello command.
+    bool _supportsHello = false;
+
+    UUID _uuid;
 };
 
 /**

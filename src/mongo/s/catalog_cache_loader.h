@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include <memory>
 #include <vector>
 
 #include "mongo/base/status_with.h"
@@ -37,17 +38,10 @@
 #include "mongo/s/catalog/type_collection.h"
 #include "mongo/s/catalog/type_database.h"
 #include "mongo/s/chunk_version.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/concurrency/notification.h"
 #include "mongo/util/uuid.h"
 
-#define LOG_CATALOG_REFRESH(level) \
-    MONGO_LOG_COMPONENT(level, ::mongo::logger::LogComponent::kShardingCatalogRefresh)
-
 namespace mongo {
-
-class NamespaceString;
-class OperationContext;
 
 /**
  * Interface through which the sharding catalog cache requests the set of changed chunks to be
@@ -71,19 +65,35 @@ public:
      */
     struct CollectionAndChangedChunks {
         CollectionAndChangedChunks();
-        CollectionAndChangedChunks(boost::optional<UUID> uuid,
-                                   const OID& collEpoch,
-                                   const BSONObj& collShardKeyPattern,
-                                   const BSONObj& collDefaultCollation,
-                                   bool collShardKeyIsUnique,
-                                   std::vector<ChunkType> chunks);
+        CollectionAndChangedChunks(
+            OID collEpoch,
+            boost::optional<Timestamp> collCreationTime,
+            UUID uuid,
+            const BSONObj& collShardKeyPattern,
+            const BSONObj& collDefaultCollation,
+            bool collShardKeyIsUnique,
+            boost::optional<TypeCollectionTimeseriesFields> collTimeseriesFields,
+            boost::optional<TypeCollectionReshardingFields> collReshardingFields,
+            bool allowMigrations,
+            std::vector<ChunkType> chunks);
 
         // Information about the entire collection
-        boost::optional<UUID> uuid;
         OID epoch;
+        boost::optional<Timestamp> creationTime;
+        boost::optional<UUID> uuid;  // This value can never be boost::none,
+                                     // except under the default constructor
         BSONObj shardKeyPattern;
         BSONObj defaultCollation;
-        bool shardKeyIsUnique{false};
+        bool shardKeyIsUnique;
+
+        // This information will be valid if the collection is a time-series buckets collection.
+        boost::optional<TypeCollectionTimeseriesFields> timeseriesFields;
+
+        // If the collection is currently undergoing a resharding operation, the optional will be
+        // populated.
+        boost::optional<TypeCollectionReshardingFields> reshardingFields;
+
+        bool allowMigrations;
 
         // The chunks which have changed sorted by their chunkVersion. This list might potentially
         // contain all the chunks in the collection.
@@ -91,7 +101,7 @@ public:
     };
 
     using GetChunksSinceCallbackFn =
-        stdx::function<void(OperationContext*, StatusWith<CollectionAndChangedChunks>)>;
+        std::function<void(OperationContext*, StatusWith<CollectionAndChangedChunks>)>;
 
     /**
      * Initializes internal state. Must be called only once when sharding state is initialized.
@@ -109,39 +119,34 @@ public:
     virtual void onStepUp() = 0;
 
     /**
+     * Transitions into shut down and cleans up state. Once this transitions to shut down, should
+     * not be able to transition back to normal. Should be safe to be called more than once.
+     */
+    virtual void shutDown() = 0;
+
+    /**
      * Notifies the loader that the persisted collection version for 'nss' has been updated.
      */
     virtual void notifyOfCollectionVersionUpdate(const NamespaceString& nss) = 0;
 
     /**
-     * Non-blocking call, which requests the chunks changed since the specified version to be
-     * fetched from the persistent metadata store and invokes the callback function with the result.
-     * The callback function must never throw - it is a fatal error to do so.
+     * Non-blocking call, which returns the chunks changed since the specified version to be
+     * fetched from the persistent metadata store.
      *
      * If for some reason the asynchronous fetch operation cannot be dispatched (for example on
-     * shutdown), throws a DBException. Otherwise it is guaranteed that the callback function will
-     * be invoked even on error and the returned notification will be signalled.
-     *
-     * The callbackFn object must not be destroyed until it has been called. The returned
-     * Notification object can be waited on in order to ensure that.
+     * shutdown), throws a DBException.
      */
-    virtual std::shared_ptr<Notification<void>> getChunksSince(
-        const NamespaceString& nss, ChunkVersion version, GetChunksSinceCallbackFn callbackFn) = 0;
+    virtual SemiFuture<CollectionAndChangedChunks> getChunksSince(const NamespaceString& nss,
+                                                                  ChunkVersion version) = 0;
 
     /**
-     * Non-blocking call, which requests the most recent db version for the given dbName from the
-     * the persistent metadata store and invokes the callback function with the result.
-     * The callback function must never throw - it is a fatal error to do so.
+     * Non-blocking call, which returns the most recent db version for the given dbName from the
+     * the persistent metadata store.
      *
      * If for some reason the asynchronous fetch operation cannot be dispatched (for example on
-     * shutdown), throws a DBException. Otherwise it is guaranteed that the callback function will
-     * be invoked even on error.
-     *
-     * The callbackFn object must not be destroyed until it has been called.
+     * shutdown), throws a DBException.
      */
-    virtual void getDatabase(
-        StringData dbName,
-        stdx::function<void(OperationContext*, StatusWith<DatabaseType>)> callbackFn) = 0;
+    virtual SemiFuture<DatabaseType> getDatabase(StringData dbName) = 0;
 
     /**
      * Waits for any pending changes for the specified collection to be persisted locally (not

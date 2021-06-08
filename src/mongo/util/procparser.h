@@ -60,12 +60,12 @@ Status parseProcStat(const std::vector<StringData>& keys,
                      BSONObjBuilder* builder);
 
 /**
-* Read from file, and write the specified list of keys into builder.
-*
-* See parseProcStat.
-*
-* Returns Status errors on file reading issues.
-*/
+ * Read from file, and write the specified list of keys into builder.
+ *
+ * See parseProcStat.
+ *
+ * Returns Status errors on file reading issues.
+ */
 Status parseProcStatFile(StringData filename,
                          const std::vector<StringData>& keys,
                          BSONObjBuilder* builder);
@@ -134,6 +134,25 @@ Status parseProcDiskStatsFile(StringData filename,
  * If the directory does not exist, or otherwise permission is denied, returns an empty vector.
  */
 std::vector<std::string> findPhysicalDisks(StringData directory);
+
+/**
+ * Read a string matching /proc/vmstat format, and write the specified list of keys in builder.
+ *
+ * keys - list of keys to output in BSON. If keys is empty, all keys are outputed.
+ * data - string to parsee
+ * builder - BSON output
+ */
+Status parseProcVMStat(const std::vector<StringData>& keys,
+                       StringData data,
+                       BSONObjBuilder* builder);
+
+/**
+ * Read from file, and write the specified list of keys in builder.
+ */
+Status parseProcVMStatFile(StringData filename,
+                           const std::vector<StringData>& keys,
+                           BSONObjBuilder* builder);
+
 
 }  // namespace procparser
 }  // namespace mongo

@@ -30,7 +30,8 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/jsobj.h"
-#include "mongo/db/keys_collection_document.h"
+#include "mongo/db/keys_collection_document_gen.h"
+#include "mongo/db/time_proof_service.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -49,14 +50,11 @@ TEST(KeysCollectionDocument, Roundtrip) {
 
     const auto expiresAt = LogicalTime(Timestamp(100, 200));
 
-    KeysCollectionDocument keysCollectionDoc(
-        keyId, std::move(purpose), std::move(key), std::move(expiresAt));
+    KeysCollectionDocument keysCollectionDoc(keyId);
+    keysCollectionDoc.setKeysCollectionDocumentBase({purpose, key, expiresAt});
 
     auto serializedObj = keysCollectionDoc.toBSON();
-
-    auto parseStatus = KeysCollectionDocument::fromBSON(serializedObj);
-    ASSERT_OK(parseStatus.getStatus());
-    const auto& parsedKey = parseStatus.getValue();
+    auto parsedKey = KeysCollectionDocument::parse(IDLParserErrorContext("keyDoc"), serializedObj);
 
     ASSERT_EQ(keyId, parsedKey.getKeyId());
     ASSERT_EQ(purpose, parsedKey.getPurpose());
@@ -79,8 +77,10 @@ TEST(KeysCollectionDocument, MissingKeyIdShouldFailToParse) {
     expiresAt.asTimestamp().append(builder.bb(), "expiresAt");
 
     auto serializedObj = builder.done();
-    auto status = KeysCollectionDocument::fromBSON(serializedObj).getStatus();
-    ASSERT_EQ(ErrorCodes::NoSuchKey, status);
+    ASSERT_THROWS_CODE(
+        KeysCollectionDocument::parse(IDLParserErrorContext("keyDoc"), serializedObj),
+        AssertionException,
+        40414);
 }
 
 TEST(KeysCollectionDocument, MissingPurposeShouldFailToParse) {
@@ -93,13 +93,15 @@ TEST(KeysCollectionDocument, MissingPurposeShouldFailToParse) {
     const auto expiresAt = LogicalTime(Timestamp(100, 200));
 
     BSONObjBuilder builder;
-    builder.append("keyId", keyId);
+    builder.append("_id", keyId);
     builder.append("key", BSONBinData(key.data(), key.size(), BinDataGeneral));
     expiresAt.asTimestamp().append(builder.bb(), "expiresAt");
 
     auto serializedObj = builder.done();
-    auto status = KeysCollectionDocument::fromBSON(serializedObj).getStatus();
-    ASSERT_EQ(ErrorCodes::NoSuchKey, status);
+    ASSERT_THROWS_CODE(
+        KeysCollectionDocument::parse(IDLParserErrorContext("keyDoc"), serializedObj),
+        AssertionException,
+        40414);
 }
 
 TEST(KeysCollectionDocument, MissingKeyShouldFailToParse) {
@@ -110,13 +112,15 @@ TEST(KeysCollectionDocument, MissingKeyShouldFailToParse) {
     const auto expiresAt = LogicalTime(Timestamp(100, 200));
 
     BSONObjBuilder builder;
-    builder.append("keyId", keyId);
+    builder.append("_id", keyId);
     builder.append("purpose", purpose);
     expiresAt.asTimestamp().append(builder.bb(), "expiresAt");
 
     auto serializedObj = builder.done();
-    auto status = KeysCollectionDocument::fromBSON(serializedObj).getStatus();
-    ASSERT_EQ(ErrorCodes::NoSuchKey, status);
+    ASSERT_THROWS_CODE(
+        KeysCollectionDocument::parse(IDLParserErrorContext("keyDoc"), serializedObj),
+        AssertionException,
+        40414);
 }
 
 TEST(KeysCollectionDocument, MissingExpiresAtShouldFailToParse) {
@@ -129,13 +133,15 @@ TEST(KeysCollectionDocument, MissingExpiresAtShouldFailToParse) {
     TimeProofService::Key key(keyHash);
 
     BSONObjBuilder builder;
-    builder.append("keyId", keyId);
+    builder.append("_id", keyId);
     builder.append("purpose", purpose);
     builder.append("key", BSONBinData(key.data(), key.size(), BinDataGeneral));
 
     auto serializedObj = builder.done();
-    auto status = KeysCollectionDocument::fromBSON(serializedObj).getStatus();
-    ASSERT_EQ(ErrorCodes::NoSuchKey, status);
+    ASSERT_THROWS_CODE(
+        KeysCollectionDocument::parse(IDLParserErrorContext("keyDoc"), serializedObj),
+        AssertionException,
+        40414);
 }
 
 }  // namespace

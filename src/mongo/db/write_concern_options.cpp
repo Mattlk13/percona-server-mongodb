@@ -29,12 +29,16 @@
 
 #include "mongo/platform/basic.h"
 
+#include <type_traits>
+
 #include "mongo/db/write_concern_options.h"
 
 #include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/field_parser.h"
+#include "mongo/db/repl/repl_set_config.h"
+#include "mongo/idl/basic_types_gen.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -71,6 +75,12 @@ const BSONObj WriteConcernOptions::Default = BSONObj();
 const BSONObj WriteConcernOptions::Acknowledged(BSON("w" << W_NORMAL));
 const BSONObj WriteConcernOptions::Unacknowledged(BSON("w" << W_NONE));
 const BSONObj WriteConcernOptions::Majority(BSON("w" << WriteConcernOptions::kMajority));
+
+// The "kInternalWriteDefault" write concern, used by internal operations, is deliberately empty (no
+// 'w' or 'wtimeout' specified). This allows internal operations to specify a write concern, while
+// still allowing it to be either w:1 or automatically upconverted to w:majority on configsvrs.
+const BSONObj WriteConcernOptions::kInternalWriteDefault;
+
 constexpr Seconds WriteConcernOptions::kWriteConcernTimeoutSystem;
 constexpr Seconds WriteConcernOptions::kWriteConcernTimeoutMigration;
 constexpr Seconds WriteConcernOptions::kWriteConcernTimeoutSharding;
@@ -91,8 +101,7 @@ WriteConcernOptions::WriteConcernOptions(const std::string& mode,
                                          Milliseconds timeout)
     : syncMode(sync), wNumNodes(0), wMode(mode), wTimeout(durationCount<Milliseconds>(timeout)) {}
 
-Status WriteConcernOptions::parse(const BSONObj& obj) {
-    reset();
+StatusWith<WriteConcernOptions> WriteConcernOptions::parse(const BSONObj& obj) {
     if (obj.isEmpty()) {
         return Status(ErrorCodes::FailedToParse, "write concern object cannot be empty");
     }
@@ -100,6 +109,9 @@ Status WriteConcernOptions::parse(const BSONObj& obj) {
     BSONElement jEl;
     BSONElement fsyncEl;
     BSONElement wEl;
+    int wTimeout = 0;
+
+    WriteConcernOptions writeConcern;
 
     for (auto e : obj) {
         const auto fieldName = e.fieldNameStringData();
@@ -108,22 +120,33 @@ Status WriteConcernOptions::parse(const BSONObj& obj) {
             if (!jEl.isNumber() && jEl.type() != Bool) {
                 return Status(ErrorCodes::FailedToParse, "j must be numeric or a boolean value");
             }
+            writeConcern.usedDefault = false;
         } else if (fieldName == kFSyncFieldName) {
             fsyncEl = e;
             if (!fsyncEl.isNumber() && fsyncEl.type() != Bool) {
                 return Status(ErrorCodes::FailedToParse,
                               "fsync must be numeric or a boolean value");
             }
+            writeConcern.usedDefault = false;
         } else if (fieldName == kWFieldName) {
             wEl = e;
+            writeConcern.usedDefault = false;
         } else if (fieldName == kWTimeoutFieldName) {
-            wTimeout = e.numberInt();
+            wTimeout = e.safeNumberLong();
+            writeConcern.usedDefault = false;
         } else if (fieldName == kWElectionIdFieldName) {
             // Ignore.
         } else if (fieldName == kWOpTimeFieldName) {
             // Ignore.
         } else if (fieldName.equalCaseInsensitive(kGetLastErrorFieldName)) {
             // Ignore GLE field.
+        } else if (fieldName == ReadWriteConcernProvenance::kSourceFieldName) {
+            try {
+                writeConcern._provenance = ReadWriteConcernProvenance::parse(
+                    IDLParserErrorContext("WriteConcernOptions::parse"), obj);
+            } catch (const DBException&) {
+                return exceptionToStatus();
+            }
         } else {
             return Status(ErrorCodes::FailedToParse,
                           str::stream() << "unrecognized write concern field: " << fieldName);
@@ -132,53 +155,56 @@ Status WriteConcernOptions::parse(const BSONObj& obj) {
 
     const bool j = jEl.trueValue();
     const bool fsync = fsyncEl.trueValue();
-
-    if (j && fsync)
+    if (j && fsync) {
         return Status(ErrorCodes::FailedToParse, "fsync and j options cannot be used together");
+    }
 
     if (j) {
-        syncMode = SyncMode::JOURNAL;
+        writeConcern.syncMode = SyncMode::JOURNAL;
     } else if (fsync) {
-        syncMode = SyncMode::FSYNC;
+        writeConcern.syncMode = SyncMode::FSYNC;
     } else if (!jEl.eoo()) {
-        syncMode = SyncMode::NONE;
+        writeConcern.syncMode = SyncMode::NONE;
     }
 
     if (wEl.isNumber()) {
-        wNumNodes = wEl.numberInt();
-        usedDefaultW = false;
+        auto wNumNodes = wEl.safeNumberLong();
+        if (wNumNodes < 0 ||
+            wNumNodes > static_cast<decltype(wNumNodes)>(repl::ReplSetConfig::kMaxMembers)) {
+            return Status(ErrorCodes::FailedToParse,
+                          str::stream() << "w has to be a non-negative number and not greater than "
+                                        << repl::ReplSetConfig::kMaxMembers);
+        }
+        writeConcern.wNumNodes = static_cast<decltype(writeConcern.wNumNodes)>(wNumNodes);
+        writeConcern.usedDefaultW = false;
     } else if (wEl.type() == String) {
-        wMode = wEl.valuestrsafe();
-        usedDefaultW = false;
+        writeConcern.wNumNodes = 0;
+        writeConcern.wMode = wEl.valuestrsafe();
+        writeConcern.usedDefaultW = false;
     } else if (wEl.eoo() || wEl.type() == jstNULL || wEl.type() == Undefined) {
-        wNumNodes = 1;
+        writeConcern.wNumNodes = 1;
     } else {
         return Status(ErrorCodes::FailedToParse, "w has to be a number or a string");
     }
 
-    return Status::OK();
+    writeConcern.wTimeout = wTimeout;
+
+    return writeConcern;
 }
 
 WriteConcernOptions WriteConcernOptions::deserializerForIDL(const BSONObj& obj) {
-    WriteConcernOptions writeConcernOptions;
-    uassertStatusOK(writeConcernOptions.parse(obj));
-    return writeConcernOptions;
+    if (!obj.isEmpty()) {
+        return uassertStatusOK(parse(obj));
+    }
+    return WriteConcernOptions();
 }
 
-StatusWith<WriteConcernOptions> WriteConcernOptions::extractWCFromCommand(
-    const BSONObj& cmdObj, const WriteConcernOptions& defaultWC) {
-    WriteConcernOptions writeConcern = defaultWC;
-    writeConcern.usedDefault = true;
-    writeConcern.usedDefaultW = true;
-    if (writeConcern.wNumNodes == 0 && writeConcern.wMode.empty()) {
-        writeConcern.wNumNodes = 1;
-    }
-
+StatusWith<WriteConcernOptions> WriteConcernOptions::extractWCFromCommand(const BSONObj& cmdObj) {
     // Return the default write concern if no write concern is provided. We check for the existence
     // of the write concern field up front in order to avoid the expense of constructing an error
     // status in bsonExtractTypedField() below.
     if (!cmdObj.hasField(kWriteConcernField)) {
-        return writeConcern;
+        return WriteConcernOptions();
     }
 
     BSONElement writeConcernElement;
@@ -191,15 +217,70 @@ StatusWith<WriteConcernOptions> WriteConcernOptions::extractWCFromCommand(
     BSONObj writeConcernObj = writeConcernElement.Obj();
     // Empty write concern is interpreted to default.
     if (writeConcernObj.isEmpty()) {
-        return writeConcern;
+        return WriteConcernOptions();
     }
 
-    wcStatus = writeConcern.parse(writeConcernObj);
-    writeConcern.usedDefault = false;
-    if (!wcStatus.isOK()) {
-        return wcStatus;
+    // Ensure that the write concern document complies with the strict IDL definition, found in
+    // idl/basic_types.idl.
+    try {
+        auto writeConcernIdl =
+            WriteConcernIdl::parse(IDLParserErrorContext("writeConcern"), writeConcernObj);
+        // Convert the IDL parsed WriteConcern into a WriteConcernOptions object.
+        auto sw = convertFromIdl(writeConcernIdl);
+        if (!sw.isOK()) {
+            return sw.getStatus();
+        }
+        auto writeConcernOptions = sw.getValue();
+        writeConcernOptions.usedDefault = false;
+        return writeConcernOptions;
+    } catch (const DBException& ex) {
+        return ex.toStatus();
+    }
+}
+
+StatusWith<WriteConcernOptions> WriteConcernOptions::convertFromIdl(
+    const WriteConcernIdl& writeConcernIdl) {
+    WriteConcernOptions writeConcern;
+    auto parsedW = writeConcernIdl.getWriteConcernW();
+    if (!parsedW.usedDefault()) {
+        writeConcern.usedDefaultW = false;
+        auto wVal = parsedW.getValue();
+        if (auto wNum = stdx::get_if<std::int64_t>(&wVal)) {
+            if (*wNum < 0 ||
+                *wNum >
+                    static_cast<std::decay_t<decltype(*wNum)>>(repl::ReplSetConfig::kMaxMembers)) {
+                uasserted(ErrorCodes::FailedToParse,
+                          str::stream() << "w has to be a non-negative number and not greater than "
+                                        << repl::ReplSetConfig::kMaxMembers);
+            }
+            writeConcern.wNumNodes = static_cast<decltype(writeConcern.wNumNodes)>(*wNum);
+        } else {
+            auto wMode = stdx::get_if<std::string>(&wVal);
+            invariant(wMode);
+            writeConcern.wNumNodes = 0;  // Have to reset from default 1.
+            writeConcern.wMode = std::move(*wMode);
+        }
     }
 
+    auto j = writeConcernIdl.getJ();
+    auto fsync = writeConcernIdl.getFsync();
+    if (j && fsync && *j && *fsync) {
+        // If j and fsync are both set to true
+        return Status{ErrorCodes::FailedToParse, "fsync and j options cannot be used together"};
+    }
+    if (j && *j) {
+        writeConcern.syncMode = SyncMode::JOURNAL;
+    } else if (fsync && *fsync) {
+        writeConcern.syncMode = SyncMode::FSYNC;
+    } else if (j) {
+        // j has been set to false
+        writeConcern.syncMode = SyncMode::NONE;
+    }
+
+    writeConcern.wTimeout = writeConcernIdl.getWtimeout();
+    if (auto source = writeConcernIdl.getSource()) {
+        writeConcern._provenance = ReadWriteConcernProvenance(*source);
+    }
     return writeConcern;
 }
 
@@ -222,11 +303,19 @@ BSONObj WriteConcernOptions::toBSON() const {
 
     builder.append("wtimeout", wTimeout);
 
+    _provenance.serialize(&builder);
+
     return builder.obj();
 }
 
-bool WriteConcernOptions::shouldWaitForOtherNodes() const {
+bool WriteConcernOptions::needToWaitForOtherNodes() const {
     return !wMode.empty() || wNumNodes > 1;
+}
+
+bool WriteConcernOptions::operator==(const WriteConcernOptions& other) const {
+    return syncMode == other.syncMode && wMode == other.wMode && wNumNodes == other.wNumNodes &&
+        wDeadline == other.wDeadline && wTimeout == other.wTimeout &&
+        _provenance == other._provenance;
 }
 
 }  // namespace mongo

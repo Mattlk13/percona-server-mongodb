@@ -29,16 +29,27 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/db/api_parameters.h"
+#include "mongo/db/auth/authorization_checks.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/query/cursor_response.h"
-#include "mongo/db/query/getmore_request.h"
+#include "mongo/db/query/getmore_command_gen.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/s/query/cluster_cursor_manager.h"
 #include "mongo/s/query/cluster_find.h"
 
 namespace mongo {
 namespace {
+
+// getMore can run with any readConcern, because cursor-creating commands like find can run with any
+// readConcern.  However, since getMore automatically uses the readConcern of the command that
+// created the cursor, it is not appropriate to apply the default readConcern (just as
+// client-specified readConcern isn't appropriate).
+static const ReadConcernSupportResult kSupportsReadConcernResult{
+    Status::OK(),
+    {{ErrorCodes::InvalidOptions,
+      "default read concern not permitted (getMore uses the cursor's read concern)"}}};
 
 /**
  * Implements the getMore command on mongos. Retrieves more from an existing mongos cursor
@@ -49,6 +60,10 @@ class ClusterGetMoreCmd final : public Command {
 public:
     ClusterGetMoreCmd() : Command("getMore") {}
 
+    const std::set<std::string>& apiVersions() const {
+        return kApiVersions1;
+    }
+
     std::unique_ptr<CommandInvocation> parse(OperationContext* opCtx,
                                              const OpMsgRequest& opMsgRequest) override {
         return std::make_unique<Invocation>(this, opMsgRequest);
@@ -58,34 +73,45 @@ public:
     public:
         Invocation(Command* cmd, const OpMsgRequest& request)
             : CommandInvocation(cmd),
-              _request(uassertStatusOK(
-                  GetMoreRequest::parseFromBSON(request.getDatabase().toString(), request.body))) {}
+              _cmd(GetMoreCommandRequest::parse({"getMore"}, request.body)) {}
 
     private:
         NamespaceString ns() const override {
-            return _request.nss;
+            return NamespaceString(_cmd.getDbName(), _cmd.getCollection());
         }
 
         bool supportsWriteConcern() const override {
             return false;
         }
 
+        ReadConcernSupportResult supportsReadConcern(repl::ReadConcernLevel level) const override {
+            return kSupportsReadConcernResult;
+        }
+
         void doCheckAuthorization(OperationContext* opCtx) const override {
-            uassertStatusOK(AuthorizationSession::get(opCtx->getClient())
-                                ->checkAuthForGetMore(_request.nss,
-                                                      _request.cursorid,
-                                                      _request.term.is_initialized()));
+            uassertStatusOK(auth::checkAuthForGetMore(AuthorizationSession::get(opCtx->getClient()),
+                                                      ns(),
+                                                      _cmd.getCommandParameter(),
+                                                      _cmd.getTerm().is_initialized()));
         }
 
         void run(OperationContext* opCtx, rpc::ReplyBuilderInterface* reply) override {
             // Counted as a getMore, not as a command.
             globalOpCounters.gotGetMore();
             auto bob = reply->getBodyBuilder();
-            auto response = uassertStatusOK(ClusterFind::runGetMore(opCtx, _request));
+            auto response = uassertStatusOK(ClusterFind::runGetMore(opCtx, _cmd));
             response.addToBSON(CursorResponse::ResponseType::SubsequentResponse, &bob);
+
+            if (getTestCommandsEnabled()) {
+                validateResult(bob.asTempObj());
+            }
         }
 
-        const GetMoreRequest _request;
+        void validateResult(const BSONObj& replyObj) {
+            CursorGetMoreReply::parse({"CursorGetMoreReply"}, replyObj.removeField("ok"));
+        }
+
+        const GetMoreCommandRequest _cmd;
     };
 
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {

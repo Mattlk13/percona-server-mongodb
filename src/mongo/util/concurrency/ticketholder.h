@@ -33,9 +33,10 @@
 #endif
 
 #include "mongo/db/operation_context.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/util/concurrency/mutex.h"
+#include "mongo/util/hierarchical_acquisition.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -87,13 +88,14 @@ private:
 
     // You can read _outof without a lock, but have to hold _resizeMutex to change.
     AtomicWord<int> _outof;
-    stdx::mutex _resizeMutex;
+    Mutex _resizeMutex =
+        MONGO_MAKE_LATCH(HierarchicalAcquisitionLevel(0), "TicketHolder::_resizeMutex");
 #else
     bool _tryAcquire();
 
     AtomicWord<int> _outof;
     int _num;
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH(HierarchicalAcquisitionLevel(0), "TicketHolder::_mutex");
     stdx::condition_variable _newTicket;
 #endif
 };
@@ -118,7 +120,7 @@ class TicketHolderReleaser {
 
 public:
     TicketHolderReleaser() {
-        _holder = NULL;
+        _holder = nullptr;
     }
 
     explicit TicketHolderReleaser(TicketHolder* holder) {
@@ -132,10 +134,10 @@ public:
     }
 
     bool hasTicket() const {
-        return _holder != NULL;
+        return _holder != nullptr;
     }
 
-    void reset(TicketHolder* holder = NULL) {
+    void reset(TicketHolder* holder = nullptr) {
         if (_holder) {
             _holder->release();
         }

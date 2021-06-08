@@ -39,16 +39,26 @@ KeysCollectionClientSharded::KeysCollectionClientSharded(ShardingCatalogClient* 
     : _catalogClient(client) {}
 
 
-StatusWith<std::vector<KeysCollectionDocument>> KeysCollectionClientSharded::getNewKeys(
-    OperationContext* opCtx, StringData purpose, const LogicalTime& newerThanThis) {
+StatusWith<std::vector<KeysCollectionDocument>> KeysCollectionClientSharded::getNewInternalKeys(
+    OperationContext* opCtx,
+    StringData purpose,
+    const LogicalTime& newerThanThis,
+    bool useMajority) {
 
     return _catalogClient->getNewKeys(
         opCtx, purpose, newerThanThis, repl::ReadConcernLevel::kMajorityReadConcern);
 }
 
+StatusWith<std::vector<ExternalKeysCollectionDocument>>
+KeysCollectionClientSharded::getAllExternalKeys(OperationContext* opCtx, StringData purpose) {
+    return std::vector<ExternalKeysCollectionDocument>{};
+}
+
 Status KeysCollectionClientSharded::insertNewKey(OperationContext* opCtx, const BSONObj& doc) {
-    return _catalogClient->insertConfigDocument(
-        opCtx, KeysCollectionDocument::ConfigNS, doc, ShardingCatalogClient::kMajorityWriteConcern);
+    return _catalogClient->insertConfigDocument(opCtx,
+                                                NamespaceString::kKeysCollectionNamespace,
+                                                doc,
+                                                ShardingCatalogClient::kMajorityWriteConcern);
 }
 
 }  // namespace mongo

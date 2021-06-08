@@ -29,6 +29,8 @@
 
 #pragma once
 
+#include <boost/optional.hpp>
+
 #include "mongo/db/matcher/expression_path.h"
 
 namespace mongo {
@@ -37,7 +39,9 @@ class InternalSchemaObjectMatchExpression final : public PathMatchExpression {
 public:
     static constexpr StringData kName = "$_internalSchemaObjectMatch"_sd;
 
-    InternalSchemaObjectMatchExpression(StringData path, std::unique_ptr<MatchExpression> expr);
+    InternalSchemaObjectMatchExpression(StringData path,
+                                        std::unique_ptr<MatchExpression> expr,
+                                        clonable_ptr<ErrorAnnotation> annotation = nullptr);
 
     bool matchesSingleElement(const BSONElement& elem, MatchDetails* details = nullptr) const final;
 
@@ -49,7 +53,7 @@ public:
 
     bool equivalent(const MatchExpression* other) const final;
 
-    std::vector<MatchExpression*>* getChildVector() final {
+    std::vector<std::unique_ptr<MatchExpression>>* getChildVector() final {
         return nullptr;
     }
 
@@ -66,6 +70,14 @@ public:
 
     MatchCategory getCategory() const final {
         return MatchCategory::kOther;
+    }
+
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
     }
 
 private:

@@ -2,7 +2,6 @@ t = db.jstests_all;
 t.drop();
 
 doTest = function() {
-
     assert.commandWorked(t.save({a: [1, 2, 3]}));
     assert.commandWorked(t.save({a: [1, 2, 4]}));
     assert.commandWorked(t.save({a: [1, 8, 5]}));
@@ -36,10 +35,9 @@ doTest = function() {
     assert.eq(5, t.find({a: {$all: [1]}}).count(), "E1");
     assert.eq(0, t.find({a: {$all: [19]}}).count(), "E2");
     assert.eq(0, t.find({a: {$all: []}}).count(), "E3");
-
 };
 
 doTest();
 t.drop();
-t.ensureIndex({a: 1});
+t.createIndex({a: 1});
 doTest();

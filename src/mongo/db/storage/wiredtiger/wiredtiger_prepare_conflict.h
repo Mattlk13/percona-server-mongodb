@@ -33,17 +33,17 @@
 #include "mongo/db/prepare_conflict_tracker.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_record_store.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_recovery_unit.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 
 namespace mongo {
 
 // When set, simulates returning WT_PREPARE_CONFLICT on WT cursor read operations.
-MONGO_FAIL_POINT_DECLARE(WTPrepareConflictForReads);
+extern FailPoint WTPrepareConflictForReads;
 
 // When set, WT_ROLLBACK is returned in place of retrying on WT_PREPARE_CONFLICT errors.
-MONGO_FAIL_POINT_DECLARE(WTSkipPrepareConflictRetries);
+extern FailPoint WTSkipPrepareConflictRetries;
 
-MONGO_FAIL_POINT_DECLARE(WTPrintPrepareConflictLog);
+extern FailPoint WTPrintPrepareConflictLog;
 
 /**
  * Logs a message with the number of prepare conflict retry attempts.
@@ -66,20 +66,33 @@ template <typename F>
 int wiredTigerPrepareConflictRetry(OperationContext* opCtx, F&& f) {
     invariant(opCtx);
 
+    // If the failpoint is enabled, don't call the function, just simulate a conflict.
+    int ret = MONGO_unlikely(WTPrepareConflictForReads.shouldFail()) ? WT_PREPARE_CONFLICT
+                                                                     : WT_READ_CHECK(f());
+    if (ret != WT_PREPARE_CONFLICT)
+        return ret;
+
     auto recoveryUnit = WiredTigerRecoveryUnit::get(opCtx);
     int attempts = 1;
     // If we return from this function, we have either returned successfully or we've returned an
     // error other than WT_PREPARE_CONFLICT. Reset PrepareConflictTracker accordingly.
-    ON_BLOCK_EXIT([opCtx] { PrepareConflictTracker::get(opCtx).endPrepareConflict(); });
-    // If the failpoint is enabled, don't call the function, just simulate a conflict.
-    int ret =
-        MONGO_FAIL_POINT(WTPrepareConflictForReads) ? WT_PREPARE_CONFLICT : WT_READ_CHECK(f());
-    if (ret != WT_PREPARE_CONFLICT)
-        return ret;
+    ON_BLOCK_EXIT([opCtx] { PrepareConflictTracker::get(opCtx).endPrepareConflict(opCtx); });
+    PrepareConflictTracker::get(opCtx).beginPrepareConflict(opCtx);
 
-    PrepareConflictTracker::get(opCtx).beginPrepareConflict();
+    auto client = opCtx->getClient();
+    if (client->isFromSystemConnection()) {
+        // System (internal) connections that hit a prepare conflict should be killable to prevent
+        // deadlocks with prepared transactions on replica set step up and step down.
+        stdx::lock_guard<Client> lk(*client);
+        invariant(client->canKillSystemOperationInStepdown(lk));
+    }
+    // It is contradictory to be running into a prepare conflict when we are ignoring interruptions,
+    // particularly when running code inside an
+    // OperationContext::runWithoutInterruptionExceptAtGlobalShutdown block. Operations executed in
+    // this way are expected to be set to ignore prepare conflicts.
+    invariant(!opCtx->isIgnoringInterrupts());
 
-    if (MONGO_FAIL_POINT(WTPrintPrepareConflictLog)) {
+    if (MONGO_unlikely(WTPrintPrepareConflictLog.shouldFail())) {
         wiredTigerPrepareConflictFailPointLog();
     }
 
@@ -105,7 +118,7 @@ int wiredTigerPrepareConflictRetry(OperationContext* opCtx, F&& f) {
                       str::stream() << lock.resourceId.toString() << " in " << modeName(lock.mode));
     }
 
-    if (MONGO_FAIL_POINT(WTSkipPrepareConflictRetries)) {
+    if (MONGO_unlikely(WTSkipPrepareConflictRetries.shouldFail())) {
         // Callers of wiredTigerPrepareConflictRetry() should eventually call wtRCToStatus() via
         // invariantWTOK() and have the WT_ROLLBACK error bubble up as a WriteConflictException.
         // Enabling the "skipWriteConflictRetries" failpoint in conjunction with the
@@ -118,8 +131,8 @@ int wiredTigerPrepareConflictRetry(OperationContext* opCtx, F&& f) {
         attempts++;
         auto lastCount = recoveryUnit->getSessionCache()->getPrepareCommitOrAbortCount();
         // If the failpoint is enabled, don't call the function, just simulate a conflict.
-        ret =
-            MONGO_FAIL_POINT(WTPrepareConflictForReads) ? WT_PREPARE_CONFLICT : WT_READ_CHECK(f());
+        ret = MONGO_unlikely(WTPrepareConflictForReads.shouldFail()) ? WT_PREPARE_CONFLICT
+                                                                     : WT_READ_CHECK(f());
 
         if (ret != WT_PREPARE_CONFLICT)
             return ret;

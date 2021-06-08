@@ -1,18 +1,19 @@
 // Test $text with $textScore projection.
+(function() {
+"use strict";
 
 load("jstests/libs/analyze_plan.js");
 
 var t = db.getSiblingDB("test").getCollection("fts_projection");
 t.drop();
 
-t.insert({_id: 0, a: "textual content"});
-t.insert({_id: 1, a: "additional content", b: -1});
-t.insert({_id: 2, a: "irrelevant content"});
-t.ensureIndex({a: "text"});
+assert.commandWorked(t.insert({_id: 0, a: "textual content"}));
+assert.commandWorked(t.insert({_id: 1, a: "additional content", b: -1}));
+assert.commandWorked(t.insert({_id: 2, a: "irrelevant content"}));
+assert.commandWorked(t.createIndex({a: "text"}));
 
 // Project the text score.
 var results = t.find({$text: {$search: "textual content -irrelevant"}}, {
-                   _idCopy: 0,
                    score: {$meta: "textScore"}
                }).toArray();
 // printjson(results);
@@ -30,15 +31,17 @@ scores[results[1]._id] = results[1].score;
 // Edge/error cases:
 //
 
-// Project text score into 2 fields.
+// Project text score into 3 fields, one nested.
 results = t.find({$text: {$search: "textual content -irrelevant"}}, {
                otherScore: {$meta: "textScore"},
-               score: {$meta: "textScore"}
+               score: {$meta: "textScore"},
+               "nestedObj.score": {$meta: "textScore"}
            }).toArray();
 assert.eq(2, results.length);
 for (var i = 0; i < results.length; ++i) {
     assert.close(scores[results[i]._id], results[i].score);
     assert.close(scores[results[i]._id], results[i].otherScore);
+    assert.close(scores[results[i]._id], results[i].nestedObj.score);
 }
 
 // printjson(results);
@@ -65,19 +68,9 @@ for (var i = 0; i < results.length; ++i) {
 
 assert.neq(-1, results[0].b);
 
-// Don't crash if we have no text score.
-var results = t.find({a: /text/}, {score: {$meta: "textScore"}}).toArray();
-// printjson(results);
-
-// No textScore proj. with nested fields
-assert.throws(function() {
-    t.find({$text: {$search: "blah"}}, {'x.y': {$meta: "textScore"}}).toArray();
-});
-
 // SERVER-12173
 // When $text operator is in $or, should evaluate first
 results = t.find({$or: [{$text: {$search: "textual content -irrelevant"}}, {_id: 1}]}, {
-               _idCopy: 0,
                score: {$meta: "textScore"}
            }).toArray();
 printjson(results);
@@ -114,10 +107,10 @@ assert.neq(-1,
 let explainOutput = t.find({$text: {$search: "textual content -irrelevant"}}, {
                          score: {$meta: "textScore"}
                      }).explain();
-assert(planHasStage(db, explainOutput.queryPlanner.winningPlan, "TEXT_OR"));
+assert(planHasStage(db, getWinningPlan(explainOutput.queryPlanner), "TEXT_OR"), explainOutput);
 
 explainOutput = t.find({$text: {$search: "textual content -irrelevant"}}).explain();
-assert(!planHasStage(db, explainOutput.queryPlanner.winningPlan, "TEXT_OR"));
+assert(!planHasStage(db, getWinningPlan(explainOutput.queryPlanner), "TEXT_OR"), explainOutput);
 
 // Scores should exist.
 assert.eq(results.length, 2);
@@ -125,3 +118,4 @@ assert(results[0].score,
        "invalid text score for " + tojson(results[0], '', true) + " when $text is in $or");
 assert(results[1].score,
        "invalid text score for " + tojson(results[0], '', true) + " when $text is in $or");
+})();

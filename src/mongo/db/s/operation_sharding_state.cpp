@@ -31,9 +31,6 @@
 
 #include "mongo/db/s/operation_sharding_state.h"
 
-#include "mongo/db/operation_context.h"
-#include "mongo/db/s/sharded_connection_info.h"
-
 namespace mongo {
 namespace {
 
@@ -48,7 +45,6 @@ const Milliseconds kMaxWaitForMovePrimaryCriticalSection = Minutes(5);
 
 // The name of the field in which the client attaches its database version.
 constexpr auto kDbVersionField = "databaseVersion"_sd;
-
 }  // namespace
 
 OperationShardingState::OperationShardingState() = default;
@@ -62,34 +58,17 @@ OperationShardingState& OperationShardingState::get(OperationContext* opCtx) {
 }
 
 bool OperationShardingState::isOperationVersioned(OperationContext* opCtx) {
-    const auto client = opCtx->getClient();
-
-    // Shard version information received from mongos may either be attached to the Client or
-    // directly to the OperationContext
-    return ShardedConnectionInfo::get(client, false) || get(opCtx).hasShardVersion();
+    const auto& oss = get(opCtx);
+    return !oss._shardVersions.empty();
 }
 
-void OperationShardingState::setAllowImplicitCollectionCreation(
-    const BSONElement& allowImplicitCollectionCreationElem) {
-    if (!allowImplicitCollectionCreationElem.eoo()) {
-        _allowImplicitCollectionCreation = allowImplicitCollectionCreationElem.Bool();
-    } else {
-        _allowImplicitCollectionCreation = true;
-    }
-}
-
-bool OperationShardingState::allowImplicitCollectionCreation() const {
-    return _allowImplicitCollectionCreation;
-}
-
-void OperationShardingState::initializeClientRoutingVersions(NamespaceString nss,
-                                                             const BSONObj& cmdObj) {
-    invariant(_shardVersions.empty());
-    invariant(_databaseVersions.empty());
-
+void OperationShardingState::initializeClientRoutingVersionsFromCommand(NamespaceString nss,
+                                                                        const BSONObj& cmdObj) {
+    boost::optional<ChunkVersion> shardVersion;
+    boost::optional<DatabaseVersion> dbVersion;
     const auto shardVersionElem = cmdObj.getField(ChunkVersion::kShardVersionField);
     if (!shardVersionElem.eoo()) {
-        _shardVersions[nss.ns()] = uassertStatusOK(ChunkVersion::parseFromCommand(cmdObj));
+        shardVersion = uassertStatusOK(ChunkVersion::parseFromCommand(cmdObj));
     }
 
     const auto dbVersionElem = cmdObj.getField(kDbVersionField);
@@ -98,30 +77,48 @@ void OperationShardingState::initializeClientRoutingVersions(NamespaceString nss
                 str::stream() << "expected databaseVersion element to be an object, got "
                               << dbVersionElem,
                 dbVersionElem.type() == BSONType::Object);
-        // Unforunately this is a bit ugly; it's because a command comes with a shardVersion or
-        // databaseVersion, and the assumption is that those versions are applied to whatever is
-        // returned by the Command's parseNs(), which can either be a full namespace or just a db.
-        _databaseVersions[nss.db().empty() ? nss.ns() : nss.db()] = DatabaseVersion::parse(
-            IDLParserErrorContext("initializeClientRoutingVersions"), dbVersionElem.Obj());
+
+        dbVersion = DatabaseVersion(dbVersionElem.Obj());
+    }
+
+    initializeClientRoutingVersions(nss, shardVersion, dbVersion);
+}
+
+void OperationShardingState::initializeClientRoutingVersions(
+    NamespaceString nss,
+    const boost::optional<ChunkVersion>& shardVersion,
+    const boost::optional<DatabaseVersion>& dbVersion) {
+    if (shardVersion) {
+        // Changing the shardVersion expected for a namespace is not safe to happen in the
+        // middle of execution, but for the cases where operation is retried on the same
+        // OperationContext it can be set twice to the same value.
+        if (_shardVersionsChecked.contains(nss.ns())) {
+            invariant(_shardVersions[nss.ns()] == *shardVersion,
+                      str::stream()
+                          << "Trying to set " << shardVersion->toString() << " for " << nss.ns()
+                          << " but it already has " << _shardVersions[nss.ns()].toString());
+        } else {
+            _shardVersions.emplace(nss.ns(), *shardVersion);
+        }
+    }
+    if (dbVersion) {
+        invariant(_databaseVersions.find(nss.db()) == _databaseVersions.end());
+        _databaseVersions[nss.db()] = *dbVersion;
     }
 }
 
-bool OperationShardingState::hasShardVersion() const {
-    return _globalUnshardedShardVersion || !_shardVersions.empty();
+bool OperationShardingState::hasShardVersion(const NamespaceString& nss) const {
+    return _shardVersions.find(nss.ns()) != _shardVersions.end();
 }
 
-ChunkVersion OperationShardingState::getShardVersion(const NamespaceString& nss) const {
-    if (_globalUnshardedShardVersion) {
-        return ChunkVersion::UNSHARDED();
-    }
-
+boost::optional<ChunkVersion> OperationShardingState::getShardVersion(const NamespaceString& nss) {
+    _shardVersionsChecked.insert(nss.ns());
     const auto it = _shardVersions.find(nss.ns());
     if (it != _shardVersions.end()) {
         return it->second;
     }
-    // If the client did not send a shardVersion for the requested namespace, assume the client
-    // expected the namespace to be unsharded.
-    return ChunkVersion::UNSHARDED();
+
+    return boost::none;
 }
 
 bool OperationShardingState::hasDbVersion() const {
@@ -137,22 +134,19 @@ boost::optional<DatabaseVersion> OperationShardingState::getDbVersion(
     return it->second;
 }
 
-void OperationShardingState::setGlobalUnshardedShardVersion() {
-    invariant(_shardVersions.empty());
-    _globalUnshardedShardVersion = true;
-}
-
 bool OperationShardingState::waitForMigrationCriticalSectionSignal(OperationContext* opCtx) {
     // Must not block while holding a lock
     invariant(!opCtx->lockState()->isLocked());
 
     if (_migrationCriticalSectionSignal) {
-        _migrationCriticalSectionSignal->waitFor(
-            opCtx,
-            opCtx->hasDeadline()
-                ? std::min(opCtx->getRemainingMaxTimeMillis(), kMaxWaitForMigrationCriticalSection)
-                : kMaxWaitForMigrationCriticalSection);
-        _migrationCriticalSectionSignal = nullptr;
+        auto deadline = opCtx->getServiceContext()->getFastClockSource()->now() +
+            std::min(opCtx->getRemainingMaxTimeMillis(), kMaxWaitForMigrationCriticalSection);
+
+        opCtx->runWithDeadline(deadline, ErrorCodes::ExceededTimeLimit, [&] {
+            _migrationCriticalSectionSignal->wait(opCtx);
+        });
+
+        _migrationCriticalSectionSignal = boost::none;
         return true;
     }
 
@@ -160,7 +154,7 @@ bool OperationShardingState::waitForMigrationCriticalSectionSignal(OperationCont
 }
 
 void OperationShardingState::setMigrationCriticalSectionSignal(
-    std::shared_ptr<Notification<void>> critSecSignal) {
+    boost::optional<SharedSemiFuture<void>> critSecSignal) {
     invariant(critSecSignal);
     _migrationCriticalSectionSignal = std::move(critSecSignal);
 }
@@ -170,12 +164,14 @@ bool OperationShardingState::waitForMovePrimaryCriticalSectionSignal(OperationCo
     invariant(!opCtx->lockState()->isLocked());
 
     if (_movePrimaryCriticalSectionSignal) {
-        _movePrimaryCriticalSectionSignal->waitFor(
-            opCtx,
-            opCtx->hasDeadline() ? std::min(opCtx->getRemainingMaxTimeMillis(),
-                                            kMaxWaitForMovePrimaryCriticalSection)
-                                 : kMaxWaitForMovePrimaryCriticalSection);
-        _movePrimaryCriticalSectionSignal = nullptr;
+        auto deadline = opCtx->getServiceContext()->getFastClockSource()->now() +
+            std::min(opCtx->getRemainingMaxTimeMillis(), kMaxWaitForMovePrimaryCriticalSection);
+
+        opCtx->runWithDeadline(deadline, ErrorCodes::ExceededTimeLimit, [&] {
+            _movePrimaryCriticalSectionSignal->wait(opCtx);
+        });
+
+        _movePrimaryCriticalSectionSignal = boost::none;
         return true;
     }
 
@@ -183,7 +179,7 @@ bool OperationShardingState::waitForMovePrimaryCriticalSectionSignal(OperationCo
 }
 
 void OperationShardingState::setMovePrimaryCriticalSectionSignal(
-    std::shared_ptr<Notification<void>> critSecSignal) {
+    boost::optional<SharedSemiFuture<void>> critSecSignal) {
     invariant(critSecSignal);
     _movePrimaryCriticalSectionSignal = std::move(critSecSignal);
 }
@@ -200,6 +196,23 @@ boost::optional<Status> OperationShardingState::resetShardingOperationFailedStat
     Status failedStatus = Status(*_shardingOperationFailedStatus);
     _shardingOperationFailedStatus = boost::none;
     return failedStatus;
+}
+
+using ScopedAllowImplicitCollectionCreate_UNSAFE =
+    OperationShardingState::ScopedAllowImplicitCollectionCreate_UNSAFE;
+
+ScopedAllowImplicitCollectionCreate_UNSAFE::ScopedAllowImplicitCollectionCreate_UNSAFE(
+    OperationContext* opCtx)
+    : _opCtx(opCtx) {
+    auto& oss = get(_opCtx);
+    invariant(!oss._allowCollectionCreation);
+    oss._allowCollectionCreation = true;
+}
+
+ScopedAllowImplicitCollectionCreate_UNSAFE::~ScopedAllowImplicitCollectionCreate_UNSAFE() {
+    auto& oss = get(_opCtx);
+    invariant(oss._allowCollectionCreation);
+    oss._allowCollectionCreation = false;
 }
 
 }  // namespace mongo

@@ -36,12 +36,14 @@
 #include "mongo/base/status.h"  // NOTE: This is safe as utils depend on base
 #include "mongo/base/status_with.h"
 #include "mongo/platform/compiler.h"
+#include "mongo/platform/source_location.h"
 #include "mongo/util/concurrency/thread_name.h"
 #include "mongo/util/debug_util.h"
+#include "mongo/util/exit_code.h"
 
-#define MONGO_INCLUDE_INVARIANT_H_WHITELISTED
+#define MONGO_ALLOW_INCLUDE_INVARIANT_H
 #include "mongo/util/invariant.h"
-#undef MONGO_INCLUDE_INVARIANT_H_WHITELISTED
+#undef MONGO_ALLOW_INCLUDE_INVARIANT_H
 
 namespace mongo {
 
@@ -55,12 +57,11 @@ public:
     AtomicWord<int> warning;
     AtomicWord<int> msg;
     AtomicWord<int> user;
+    AtomicWord<int> tripwire;
     AtomicWord<int> rollovers;
 };
 
 extern AssertionCount assertionCount;
-
-
 class DBException;
 std::string causedBy(const DBException& e);
 std::string causedBy(const std::string& e);
@@ -87,6 +88,10 @@ public:
         return _status.toString();
     }
 
+    virtual void serialize(BSONObjBuilder* builder) const {
+        _status.serialize(builder);
+    }
+
     const std::string& reason() const {
         return _status.reason();
     }
@@ -104,13 +109,13 @@ public:
      */
     template <ErrorCategory category>
     bool isA() const {
-        return ErrorCodes::isA<category>(code());
+        return ErrorCodes::isA<category>(*this);
     }
 
     /**
      * Returns the generic ErrorExtraInfo if present.
      */
-    const ErrorExtraInfo* extraInfo() const {
+    const std::shared_ptr<const ErrorExtraInfo> extraInfo() const {
         return _status.extraInfo();
     }
 
@@ -118,7 +123,7 @@ public:
      * Returns a specific subclass of ErrorExtraInfo if the error code matches that type.
      */
     template <typename ErrorDetail>
-    const ErrorDetail* extraInfo() const {
+    std::shared_ptr<const ErrorDetail> extraInfo() const {
         return _status.extraInfo<ErrorDetail>();
     }
 
@@ -182,7 +187,7 @@ public:
     // This is only a template to enable SFINAE. It will only be instantiated with the default
     // value.
     template <ErrorCodes::Error code_copy = kCode>
-    const ErrorExtraInfoFor<code_copy>* operator->() const {
+    std::shared_ptr<const ErrorExtraInfoFor<code_copy>> operator->() const {
         MONGO_STATIC_ASSERT(code_copy == kCode);
         return this->template extraInfo<ErrorExtraInfoFor<kCode>>();
     }
@@ -318,6 +323,15 @@ inline void fassertNoTraceWithLocation(int msgid,
 
 namespace error_details {
 
+inline const Status& makeStatus(const Status& s) {
+    return s;
+}
+
+template <typename T>
+const Status& makeStatus(const StatusWith<T>& sw) {
+    return sw.getStatus();
+}
+
 // This function exists so that uassert/massert can take plain int literals rather than requiring
 // ErrorCodes::Error wrapping.
 template <typename StringLike>
@@ -431,6 +445,60 @@ inline void massertStatusOKWithLocation(const Status& status, const char* file, 
     }
 }
 
+#define MONGO_BASE_ASSERT_VA_FAILED(fail_func, ...)                                              \
+    do {                                                                                         \
+        [&]() MONGO_COMPILER_COLD_FUNCTION {                                                     \
+            fail_func(::mongo::error_details::makeStatus(__VA_ARGS__), MONGO_SOURCE_LOCATION()); \
+        }();                                                                                     \
+        MONGO_COMPILER_UNREACHABLE;                                                              \
+    } while (false)
+
+#define MONGO_BASE_ASSERT_VA_4(fail_func, code, msg, cond)         \
+    do {                                                           \
+        if (MONGO_unlikely(!(cond)))                               \
+            MONGO_BASE_ASSERT_VA_FAILED(fail_func, (code), (msg)); \
+    } while (false)
+
+#define MONGO_BASE_ASSERT_VA_2(fail_func, statusExpr)                              \
+    do {                                                                           \
+        if (const auto& stLocal_ = (statusExpr); MONGO_unlikely(!stLocal_.isOK())) \
+            MONGO_BASE_ASSERT_VA_FAILED(fail_func, stLocal_);                      \
+    } while (false)
+
+#define MONGO_BASE_ASSERT_VA_DISPATCH(...) \
+    MONGO_expand(MONGO_expand(BOOST_PP_OVERLOAD(MONGO_BASE_ASSERT_VA_, __VA_ARGS__))(__VA_ARGS__))
+
+/**
+ * `iassert` is provided as an alternative for `uassert` variants (e.g., `uassertStatusOK`)
+ * to support cases where we expect a failure, the failure is recoverable, or accounting for the
+ * failure, updating assertion counters, isn't desired. `iassert` logs at D3 instead of D1,
+ * which helps with reducing the noise of assertions in production. The goal is to keep one
+ * interface (i.e., `iassert(...)`) for all possible assertion variants, and use function
+ * overloading to expand type support as needed.
+ */
+#define iassert(...) MONGO_BASE_ASSERT_VA_DISPATCH(::mongo::iassertFailed, __VA_ARGS__)
+#define iasserted(...) MONGO_BASE_ASSERT_VA_FAILED(::mongo::iassertFailed, __VA_ARGS__)
+MONGO_COMPILER_NORETURN void iassertFailed(const Status& status, SourceLocation loc);
+
+/**
+ * "tripwire/test assert". Like uassert, but with a deferred-fatality tripwire that gets
+ * checked prior to normal shutdown. Used to ensure that this assertion will both fail the
+ * operation and also cause a test suite failure.
+ */
+#define tassert(...) MONGO_BASE_ASSERT_VA_DISPATCH(::mongo::tassertFailed, __VA_ARGS__)
+#define tasserted(...) MONGO_BASE_ASSERT_VA_FAILED(::mongo::tassertFailed, __VA_ARGS__)
+MONGO_COMPILER_NORETURN void tassertFailed(const Status& status, SourceLocation loc);
+
+/**
+ * Return true if tripwire conditions have occurred.
+ */
+bool haveTripwireAssertionsOccurred();
+
+/**
+ * If tripwire conditions have occurred, warn via the log.
+ */
+void warnIfTripwireAssertionsOccurred();
+
 /**
  * verify is deprecated. It is like invariant() in debug builds and massert() in release builds.
  */
@@ -483,6 +551,56 @@ inline T invariantWithContextAndLocation(StatusWith<T> sw,
     if (MONGO_unlikely(!sw.isOK())) {
         ::mongo::invariantOKFailedWithMsg(expr, sw.getStatus(), contextExpr(), file, line);
     }
+    return std::move(sw.getValue());
+}
+
+MONGO_COMPILER_NORETURN void invariantStatusOKFailed(const Status& status,
+                                                     const char* file,
+                                                     unsigned line) noexcept;
+
+/**
+ * Like uassertStatusOK(status), but for checking if an invariant holds on a status.
+ */
+#define invariantStatusOK(...) \
+    ::mongo::invariantStatusOKWithLocation(__VA_ARGS__, __FILE__, __LINE__)
+inline void invariantStatusOKWithLocation(const Status& status, const char* file, unsigned line) {
+    if (MONGO_unlikely(!status.isOK())) {
+        invariantStatusOKFailed(status, file, line);
+    }
+}
+
+template <typename T>
+inline T invariantStatusOKWithLocation(StatusWith<T> sw, const char* file, unsigned line) {
+    invariantStatusOKWithLocation(sw.getStatus(), file, line);
+    return std::move(sw.getValue());
+}
+
+/**
+ * Similar to invariantStatusOK(status), but also takes an expression that evaluates to something
+ * convertible to std::string to add more context to error messages. This contextExpr is only
+ * evaluated if the status is not OK.
+ */
+#define invariantStatusOKWithContext(status, contextExpr) \
+    ::mongo::invariantStatusOKWithContextAndLocation(     \
+        status, [&]() -> std::string { return (contextExpr); }, __FILE__, __LINE__)
+template <typename ContextExpr>
+inline void invariantStatusOKWithContextAndLocation(const Status& status,
+                                                    ContextExpr&& contextExpr,
+                                                    const char* file,
+                                                    unsigned line) {
+    if (MONGO_unlikely(!status.isOK())) {
+        invariantStatusOKFailed(
+            status.withContext(std::forward<ContextExpr>(contextExpr)()), file, line);
+    }
+}
+
+template <typename T, typename ContextExpr>
+inline T invariantStatusOKWithContextAndLocation(StatusWith<T> sw,
+                                                 ContextExpr&& contextExpr,
+                                                 const char* file,
+                                                 unsigned line) {
+    invariantStatusOKWithContextAndLocation(
+        sw.getStatus(), std::forward<ContextExpr>(contextExpr), file, line);
     return std::move(sw.getValue());
 }
 
@@ -552,3 +670,5 @@ Status exceptionToStatus() noexcept;
  */
 
 #define MONGO_UNREACHABLE ::mongo::invariantFailed("Hit a MONGO_UNREACHABLE!", __FILE__, __LINE__);
+
+#define MONGO_UNREACHABLE_TASSERT(msgid) tasserted(msgid, "Hit a MONGO_UNREACHABLE_TASSERT!")

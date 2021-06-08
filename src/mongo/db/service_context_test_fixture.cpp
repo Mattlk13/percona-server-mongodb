@@ -33,15 +33,29 @@
 
 #include <memory>
 
+#include "mongo/client/replica_set_monitor.h"
 #include "mongo/db/client.h"
 #include "mongo/db/op_observer_registry.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/clock_source_mock.h"
+#include "mongo/util/diagnostic_info.h"
 
 namespace mongo {
 
 ScopedGlobalServiceContextForTest::ScopedGlobalServiceContextForTest() {
-    setGlobalServiceContext(ServiceContext::make());
-    auto const serviceContext = getGlobalServiceContext();
+    {
+        // Reset the global clock source
+        ClockSourceMock clkSource;
+        clkSource.reset();
+    }
+
+    auto serviceContext = [] {
+        auto serviceContext = ServiceContext::make();
+        auto serviceContextPtr = serviceContext.get();
+        setGlobalServiceContext(std::move(serviceContext));
+        return serviceContextPtr;
+    }();
+
     auto observerRegistry = std::make_unique<OpObserverRegistry>();
     serviceContext->setOpObserver(std::move(observerRegistry));
 }
@@ -56,6 +70,8 @@ ServiceContext* ScopedGlobalServiceContextForTest::getServiceContext() {
 
 
 ServiceContextTest::ServiceContextTest() : _threadClient(getServiceContext()) {}
+
+ServiceContextTest::~ServiceContextTest() = default;
 
 Client* ServiceContextTest::getClient() {
     return Client::getCurrent();

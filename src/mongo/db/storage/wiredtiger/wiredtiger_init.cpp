@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #if defined(__linux__)
 #include <sys/vfs.h>
@@ -39,7 +39,7 @@
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/storage/kv/kv_storage_engine.h"
+#include "mongo/db/storage/storage_engine_impl.h"
 #include "mongo/db/storage/storage_engine_init.h"
 #include "mongo/db/storage/storage_engine_lock_file.h"
 #include "mongo/db/storage/storage_engine_metadata.h"
@@ -51,8 +51,12 @@
 #include "mongo/db/storage/wiredtiger/wiredtiger_record_store.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_server_status.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/processinfo.h"
+
+#if __has_feature(address_sanitizer)
+#include <sanitizer/lsan_interface.h>
+#endif
 
 namespace mongo {
 
@@ -60,10 +64,11 @@ namespace {
 class WiredTigerFactory : public StorageEngine::Factory {
 public:
     virtual ~WiredTigerFactory() {}
-    virtual StorageEngine* create(const StorageGlobalParams& params,
-                                  const StorageEngineLockFile* lockFile) const {
+    virtual std::unique_ptr<StorageEngine> create(OperationContext* opCtx,
+                                                  const StorageGlobalParams& params,
+                                                  const StorageEngineLockFile* lockFile) const {
         if (lockFile && lockFile->createdByUncleanShutdown()) {
-            warning() << "Recovering data from the last clean checkpoint.";
+            LOGV2_WARNING(22302, "Recovering data from the last clean checkpoint.");
         }
 
 #if defined(__linux__)
@@ -75,13 +80,11 @@ public:
             int ret = statfs(params.dbpath.c_str(), &fs_stats);
 
             if (ret == 0 && fs_stats.f_type == EXT4_SUPER_MAGIC) {
-                log() << startupWarningsLog;
-                log() << "** WARNING: Using the XFS filesystem is strongly recommended with the "
-                         "WiredTiger storage engine"
-                      << startupWarningsLog;
-                log() << "**          See "
-                         "http://dochub.mongodb.org/core/prodnotes-filesystem"
-                      << startupWarningsLog;
+                LOGV2_OPTIONS(22297,
+                              {logv2::LogTag::kStartupWarnings},
+                              "Using the XFS filesystem is strongly recommended with the "
+                              "WiredTiger storage engine. See "
+                              "http://dochub.mongodb.org/core/prodnotes-filesystem");
             }
         }
 #endif
@@ -91,39 +94,47 @@ public:
         ProcessInfo p;
         if (p.supported()) {
             if (cacheMB > memoryThresholdPercentage * p.getMemSizeMB()) {
-                log() << startupWarningsLog;
-                log() << "** WARNING: The configured WiredTiger cache size is more than "
-                      << memoryThresholdPercentage * 100 << "% of available RAM."
-                      << startupWarningsLog;
-                log() << "**          See "
-                         "http://dochub.mongodb.org/core/faq-memory-diagnostics-wt"
-                      << startupWarningsLog;
+                LOGV2_OPTIONS(22300,
+                              {logv2::LogTag::kStartupWarnings},
+                              "The configured WiredTiger cache size is more than 80% of available "
+                              "RAM. See http://dochub.mongodb.org/core/faq-memory-diagnostics-wt");
             }
         }
         const bool ephemeral = false;
-        WiredTigerKVEngine* kv =
-            new WiredTigerKVEngine(getCanonicalName().toString(),
-                                   params.dbpath,
-                                   getGlobalServiceContext()->getFastClockSource(),
-                                   wiredTigerGlobalOptions.engineConfig,
-                                   cacheMB,
-                                   params.dur,
-                                   ephemeral,
-                                   params.repair,
-                                   params.readOnly);
+        auto kv =
+            std::make_unique<WiredTigerKVEngine>(getCanonicalName().toString(),
+                                                 params.dbpath,
+                                                 getGlobalServiceContext()->getFastClockSource(),
+                                                 wiredTigerGlobalOptions.engineConfig,
+                                                 cacheMB,
+                                                 wiredTigerGlobalOptions.getMaxHistoryFileSizeMB(),
+                                                 params.dur,
+                                                 ephemeral,
+                                                 params.repair,
+                                                 params.readOnly);
         kv->setRecordStoreExtraOptions(wiredTigerGlobalOptions.collectionConfig);
         kv->setSortedDataInterfaceExtraOptions(wiredTigerGlobalOptions.indexConfig);
-        // Intentionally leaked.
-        new WiredTigerServerStatusSection(kv);
-        auto* param = new WiredTigerEngineRuntimeConfigParameter("wiredTigerEngineRuntimeConfig",
-                                                                 ServerParameterType::kRuntimeOnly);
-        param->_data.second = kv;
 
-        KVStorageEngineOptions options;
+        // We must only add the server parameters to the global registry once during unit testing.
+        static int setupCountForUnitTests = 0;
+        if (setupCountForUnitTests == 0) {
+            ++setupCountForUnitTests;
+
+            // Intentionally leaked.
+            [[maybe_unused]] auto leakedSection = new WiredTigerServerStatusSection(kv.get());
+
+            // This allows unit tests to run this code without encountering memory leaks
+#if __has_feature(address_sanitizer)
+            __lsan_ignore_object(leakedSection);
+#endif
+        }
+
+        StorageEngineOptions options;
         options.directoryPerDB = params.directoryperdb;
         options.directoryForIndexes = wiredTigerGlobalOptions.directoryForIndexes;
         options.forRepair = params.repair;
-        return new KVStorageEngine(kv, options);
+        options.lockFileCreatedByUncleanShutdown = lockFile && lockFile->createdByUncleanShutdown();
+        return std::make_unique<StorageEngineImpl>(opCtx, std::move(kv), options);
     }
 
     virtual StringData getCanonicalName() const {

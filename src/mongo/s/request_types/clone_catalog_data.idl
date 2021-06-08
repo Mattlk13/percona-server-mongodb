@@ -37,7 +37,9 @@ imports:
 commands:
     cloneCatalogData:
         description: "The internal cloneCatalogData command on a shard"
+        command_name: cloneCatalogData
         namespace: type
+        api_version: ""
         type: namespacestring
         strict: false
         fields:

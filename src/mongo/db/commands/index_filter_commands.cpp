@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -49,8 +49,10 @@
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/query/collection_query_info.h"
+#include "mongo/db/query/query_settings_decoration.h"
+#include "mongo/logv2/log.h"
 #include "mongo/stdx/unordered_set.h"
-#include "mongo/util/log.h"
 
 
 namespace {
@@ -63,25 +65,22 @@ using namespace mongo;
  * Retrieves a collection's query settings and plan cache from the database.
  */
 static Status getQuerySettingsAndPlanCache(OperationContext* opCtx,
-                                           Collection* collection,
+                                           const CollectionPtr& collection,
                                            const string& ns,
                                            QuerySettings** querySettingsOut,
                                            PlanCache** planCacheOut) {
-    *querySettingsOut = NULL;
-    *planCacheOut = NULL;
-    if (NULL == collection) {
+    *querySettingsOut = nullptr;
+    *planCacheOut = nullptr;
+    if (!collection) {
         return Status(ErrorCodes::BadValue, "no such collection");
     }
 
-    CollectionInfoCache* infoCache = collection->infoCache();
-    invariant(infoCache);
-
-    QuerySettings* querySettings = infoCache->getQuerySettings();
+    QuerySettings* querySettings = QuerySettingsDecoration::get(collection->getSharedDecorations());
     invariant(querySettings);
 
     *querySettingsOut = querySettings;
 
-    PlanCache* planCache = infoCache->getPlanCache();
+    PlanCache* planCache = CollectionQueryInfo::get(collection).getPlanCache();
     invariant(planCache);
 
     *planCacheOut = planCache;
@@ -95,13 +94,11 @@ static Status getQuerySettingsAndPlanCache(OperationContext* opCtx,
 // available to the client.
 //
 
-MONGO_INITIALIZER_WITH_PREREQUISITES(SetupIndexFilterCommands, MONGO_NO_PREREQUISITES)
+MONGO_INITIALIZER_WITH_PREREQUISITES(SetupIndexFilterCommands, ())
 (InitializerContext* context) {
     new ListFilters();
     new ClearFilters();
     new SetFilter();
-
-    return Status::OK();
 }
 
 }  // namespace
@@ -110,8 +107,8 @@ namespace mongo {
 
 using std::string;
 using std::stringstream;
-using std::vector;
 using std::unique_ptr;
+using std::vector;
 
 IndexFilterCommand::IndexFilterCommand(const string& name, const string& helpText)
     : BasicCommand(name), helpText(helpText) {}
@@ -255,7 +252,7 @@ Status ClearFilters::clear(OperationContext* opCtx,
     // - clear hints for single query shape when a query shape is described in the
     //   command arguments.
     if (cmdObj.hasField("query")) {
-        auto statusWithCQ = PlanCacheCommand::canonicalize(opCtx, ns, cmdObj);
+        auto statusWithCQ = plan_cache_commands::canonicalize(opCtx, ns, cmdObj);
         if (!statusWithCQ.isOK()) {
             return statusWithCQ.getStatus();
         }
@@ -266,7 +263,10 @@ Status ClearFilters::clear(OperationContext* opCtx,
         // Remove entry from plan cache
         planCache->remove(*cq).transitional_ignore();
 
-        LOG(0) << "Removed index filter on " << ns << " " << redact(cq->toStringShort());
+        LOGV2(20479,
+              "Removed index filter on {query}",
+              "Removed index filter on query",
+              "query"_attr = redact(cq->toStringShort()));
 
         return Status::OK();
     }
@@ -303,15 +303,16 @@ Status ClearFilters::clear(OperationContext* opCtx,
         AllowedIndexEntry entry = *i;
 
         // Create canonical query.
-        auto qr = stdx::make_unique<QueryRequest>(nss);
-        qr->setFilter(entry.query);
-        qr->setSort(entry.sort);
-        qr->setProj(entry.projection);
-        qr->setCollation(entry.collation);
+        auto findCommand = std::make_unique<FindCommandRequest>(nss);
+        findCommand->setFilter(entry.query);
+        findCommand->setSort(entry.sort);
+        findCommand->setProjection(entry.projection);
+        findCommand->setCollation(entry.collation);
         const boost::intrusive_ptr<ExpressionContext> expCtx;
         auto statusWithCQ =
             CanonicalQuery::canonicalize(opCtx,
-                                         std::move(qr),
+                                         std::move(findCommand),
+                                         false,
                                          expCtx,
                                          extensionsCallback,
                                          MatchExpressionParser::kAllowAllSpecialFeatures);
@@ -322,7 +323,10 @@ Status ClearFilters::clear(OperationContext* opCtx,
         planCache->remove(*cq).transitional_ignore();
     }
 
-    LOG(0) << "Removed all index filters for collection: " << ns;
+    LOGV2(20480,
+          "Removed all index filters for collection: {namespace}",
+          "Removed all index filters for collection",
+          "namespace"_attr = ns);
 
     return Status::OK();
 }
@@ -387,7 +391,7 @@ Status SetFilter::set(OperationContext* opCtx,
         }
     }
 
-    auto statusWithCQ = PlanCacheCommand::canonicalize(opCtx, ns, cmdObj);
+    auto statusWithCQ = plan_cache_commands::canonicalize(opCtx, ns, cmdObj);
     if (!statusWithCQ.isOK()) {
         return statusWithCQ.getStatus();
     }
@@ -399,8 +403,11 @@ Status SetFilter::set(OperationContext* opCtx,
     // Remove entry from plan cache.
     planCache->remove(*cq).transitional_ignore();
 
-    LOG(0) << "Index filter set on " << ns << " " << redact(cq->toStringShort()) << " "
-           << indexesElt;
+    LOGV2(20481,
+          "Index filter set on {query} {indexes}",
+          "Index filter set on query",
+          "query"_attr = redact(cq->toStringShort()),
+          "indexes"_attr = indexesElt);
 
     return Status::OK();
 }

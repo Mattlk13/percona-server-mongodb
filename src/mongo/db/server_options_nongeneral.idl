@@ -48,12 +48,8 @@ configs:
         short_name: bind_ip_all
         arg_vartype: Switch
         canonicalize: canonicalizeNetBindIpAll
+        conflicts: 'net.bindIp'
 
-    'security.keyFile':
-        description: 'Private key for cluster authentication'
-        short_name: keyFile
-        arg_vartype: String
-        conflicts: noauth
     noauth:
         description: 'Run without security'
         arg_vartype: Switch
@@ -71,14 +67,6 @@ configs:
         short_name: transitionToAuth
         arg_vartype: Switch
         conflicts: noauth
-    'security.clusterAuthMode':
-        description: >-
-            Authentication mode used for cluster authentication. Alternatives are
-            (keyFile|sendKeyFile|sendX509|x509)
-        short_name: clusterAuthMode
-        arg_vartype: String
-        validator:
-            callback: validateSecurityClusterAuthModeSetting
 
     'operationProfiling.rateLimit':
         description: 'rate limiter value for profiling'
@@ -98,3 +86,7 @@ configs:
         short_name: slowOpSampleRate
         arg_vartype: Double
         default: 1.0
+    'operationProfiling.filter':
+        description: 'Query predicate to control which operations are logged and profiled'
+        short_name: profileFilter
+        arg_vartype: String

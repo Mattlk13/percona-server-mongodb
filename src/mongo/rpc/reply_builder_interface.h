@@ -113,6 +113,8 @@ public:
     /**
      * Writes data then transfers ownership of the message to the caller. The behavior of
      * calling any methods on the builder is subsequently undefined.
+     * Can throw BSONObjectTooLarge if the internal buffer has grown too large to be converted
+     * to a Message within the BSON size limit.
      */
     virtual Message done() = 0;
 
@@ -136,8 +138,33 @@ public:
      */
     virtual void reserveBytes(const std::size_t bytes) = 0;
 
+    /**
+     * For exhaust commands, returns whether the command should be run again.
+     */
+    virtual bool shouldRunAgainForExhaust() const;
+
+    /**
+     * Returns the next invocation for an exhaust command. If this is boost::none, the previous
+     * invocation should be reused for the next invocation.
+     */
+    virtual boost::optional<BSONObj> getNextInvocation() const;
+
+    /**
+     * For exhaust commands, indicates that the command should be run again and sets the next
+     * invocation.
+     */
+    virtual void setNextInvocation(boost::optional<BSONObj> nextInvocation);
+
 protected:
     ReplyBuilderInterface() = default;
+
+private:
+    // For exhaust commands, indicates whether the command should be run again.
+    bool _shouldRunAgainForExhaust = false;
+
+    // The next invocation for an exhaust command. If this is boost::none, the previous invocation
+    // should be reused for the next invocation.
+    boost::optional<BSONObj> _nextInvocation;
 };
 
 }  // namespace rpc

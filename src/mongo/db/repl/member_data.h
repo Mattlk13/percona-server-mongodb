@@ -30,6 +30,7 @@
 #pragma once
 
 #include "mongo/bson/timestamp.h"
+#include "mongo/db/repl/member_id.h"
 #include "mongo/db/repl/member_state.h"
 #include "mongo/db/repl/repl_set_heartbeat_response.h"
 #include "mongo/util/time_support.h"
@@ -76,7 +77,16 @@ public:
         return _lastResponse.hasDurableOpTime() ? _lastResponse.getDurableOpTime() : OpTime();
     }
     int getConfigVersion() const {
-        return _lastResponse.getConfigVersion();
+        return _configVersion;
+    }
+    long long getConfigTerm() const {
+        return _configTerm;
+    }
+    /**
+     * Gets the ReplSetConfig (version, term) pair from the last heartbeatResponse.
+     */
+    ConfigVersionAndTerm getConfigVersionAndTerm() const {
+        return ConfigVersionAndTerm(_configVersion, _configTerm);
     }
     bool hasAuthIssue() const {
         return _authIssue;
@@ -129,7 +139,7 @@ public:
         return _configIndex;
     }
 
-    int getMemberId() const {
+    MemberId getMemberId() const {
         return _memberId;
     }
 
@@ -141,9 +151,17 @@ public:
         return _hostAndPort;
     }
 
+    /*
+     * Returns true if the last heartbeat data explicilty stated that the node is not electable.
+     */
+    bool isUnelectable() const {
+        return _lastResponse.hasIsElectable() && !_lastResponse.isElectable();
+    }
+
     /**
      * Sets values in this object from the results of a successful heartbeat command.
-     * Returns whether or not the optimes advanced as a result of this heartbeat response.
+     * Returns true if the lastApplied/lastDurable values advanced or we've received a newer
+     * config since the last heartbeat response.
      */
     bool setUpValues(Date_t now, ReplSetHeartbeatResponse&& hbResponse);
 
@@ -228,8 +246,16 @@ public:
         _hostAndPort = hostAndPort;
     }
 
-    void setMemberId(int memberId) {
+    void setMemberId(MemberId memberId) {
         _memberId = memberId;
+    }
+
+    void setConfigVersion(int version) {
+        _configVersion = version;
+    }
+
+    void setConfigTerm(long long term) {
+        _configTerm = term;
     }
 
 private:
@@ -266,11 +292,17 @@ private:
 
     // Last known OpTime that the replica has applied and journaled to.
     OpTime _lastDurableOpTime;
-    Date_t _lastDurableWallTime = Date_t::min();
+    Date_t _lastDurableWallTime = Date_t();
 
     // Last known OpTime that the replica has applied, whether journaled or unjournaled.
     OpTime _lastAppliedOpTime;
-    Date_t _lastAppliedWallTime = Date_t::min();
+    Date_t _lastAppliedWallTime = Date_t();
+
+    // Last known configVersion.
+    int _configVersion = -1;
+
+    // Last known configTerm.
+    long long _configTerm = OpTime::kUninitializedTerm;
 
     // TODO(russotto): Since memberData is kept in config order, _configIndex
     // and _isSelf may not be necessary.
@@ -282,7 +314,7 @@ private:
 
     // This member's member ID.  memberId and hostAndPort duplicate information in the
     // set's ReplSetConfig.
-    int _memberId = -1;
+    MemberId _memberId;
 
     // Client address of this member.
     HostAndPort _hostAndPort;

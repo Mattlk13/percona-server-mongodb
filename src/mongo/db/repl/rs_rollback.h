@@ -29,12 +29,15 @@
 
 #pragma once
 
+#include <functional>
+
 #include "mongo/base/status.h"
+#include "mongo/db/catalog/index_builds.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/record_id.h"
 #include "mongo/db/repl/optime.h"
-#include "mongo/stdx/functional.h"
+#include "mongo/db/storage/storage_engine.h"
 #include "mongo/util/time_support.h"
 #include "mongo/util/uuid.h"
 
@@ -148,7 +151,7 @@ void rollback(OperationContext* opCtx,
               int requiredRBID,
               ReplicationCoordinator* replCoord,
               ReplicationProcess* replicationProcess,
-              stdx::function<void(int)> sleepSecsFn = [](int secs) { sleepsecs(secs); });
+              std::function<void(int)> sleepSecsFn = [](int secs) { sleepsecs(secs); });
 
 /**
  * Initiates the rollback process after transition to ROLLBACK.
@@ -178,6 +181,7 @@ void rollback(OperationContext* opCtx,
 Status syncRollback(OperationContext* opCtx,
                     const OplogInterface& localOplog,
                     const RollbackSource& rollbackSource,
+                    const IndexBuilds& stoppedIndexBuilds,
                     int requiredRBID,
                     ReplicationCoordinator* replCoord,
                     ReplicationProcess* replicationProcess);
@@ -259,8 +263,16 @@ struct FixUpInfo {
     // collection.
     stdx::unordered_map<UUID, std::set<std::string>, UUID::Hash> indexesToDrop;
 
+    // Key is the UUID of the collection. Value is the set of unfinished indexes by name to drop.
+    stdx::unordered_map<UUID, std::set<std::string>, UUID::Hash> unfinishedIndexesToDrop;
+
     // Key is the UUID of the collection. Value is a map from indexName to indexSpec for the index.
     stdx::unordered_map<UUID, std::map<std::string, BSONObj>, UUID::Hash> indexesToCreate;
+
+    // Set of index builds to restart. These are index builds that will be restarted in the
+    // background, but not completed. They will wait for a replicated commit or abort before
+    // finishing.
+    IndexBuilds indexBuildsToRestart;
 
     // UUIDs of collections that need to have their metadata resynced from the sync source.
     stdx::unordered_set<UUID, UUID::Hash> collectionsToResyncMetadata;

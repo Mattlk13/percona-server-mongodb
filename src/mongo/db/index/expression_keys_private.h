@@ -35,6 +35,7 @@
 #include "mongo/bson/bsonobj_comparator_interface.h"
 #include "mongo/db/hasher.h"
 #include "mongo/db/index/multikey_paths.h"
+#include "mongo/db/storage/key_string.h"
 
 namespace mongo {
 
@@ -59,13 +60,25 @@ public:
     // 2d
     //
 
-    static void get2DKeys(const BSONObj& obj, const TwoDIndexingParams& params, BSONObjSet* keys);
+    static void get2DKeys(SharedBufferFragmentBuilder& pooledBufferBuilder,
+                          const BSONObj& obj,
+                          const TwoDIndexingParams& params,
+                          KeyStringSet* keys,
+                          KeyString::Version keyStringVersion,
+                          Ordering ordering,
+                          boost::optional<RecordId> id = boost::none);
 
     //
     // FTS
     //
 
-    static void getFTSKeys(const BSONObj& obj, const fts::FTSSpec& ftsSpec, BSONObjSet* keys);
+    static void getFTSKeys(SharedBufferFragmentBuilder& pooledBufferBuilder,
+                           const BSONObj& obj,
+                           const fts::FTSSpec& ftsSpec,
+                           KeyStringSet* keys,
+                           KeyString::Version keyStringVersion,
+                           Ordering ordering,
+                           boost::optional<RecordId> id = boost::none);
 
     //
     // Hash
@@ -74,13 +87,18 @@ public:
     /**
      * Generates keys for hash access method.
      */
-    static void getHashKeys(const BSONObj& obj,
-                            const std::string& hashedField,
+    static void getHashKeys(SharedBufferFragmentBuilder& pooledBufferBuilder,
+                            const BSONObj& obj,
+                            const BSONObj& keyPattern,
                             HashSeed seed,
                             int hashVersion,
                             bool isSparse,
                             const CollatorInterface* collator,
-                            BSONObjSet* keys);
+                            KeyStringSet* keys,
+                            KeyString::Version keyStringVersion,
+                            Ordering ordering,
+                            bool ignoreArraysAlongPath,
+                            boost::optional<RecordId> id = boost::none);
 
     /**
      * Hashing function used by both getHashKeys and the cursors we create.
@@ -96,11 +114,15 @@ public:
     /**
      * Generates keys for haystack access method.
      */
-    static void getHaystackKeys(const BSONObj& obj,
+    static void getHaystackKeys(SharedBufferFragmentBuilder& pooledBufferBuilder,
+                                const BSONObj& obj,
                                 const std::string& geoField,
                                 const std::vector<std::string>& otherFields,
                                 double bucketSize,
-                                BSONObjSet* keys);
+                                KeyStringSet* keys,
+                                KeyString::Version keyStringVersion,
+                                Ordering ordering,
+                                boost::optional<RecordId> id = boost::none);
 
     /**
      * Returns a hash of a BSON element.
@@ -121,11 +143,15 @@ public:
     /**
      * Generates keys for S2 access method.
      */
-    static void getS2Keys(const BSONObj& obj,
+    static void getS2Keys(SharedBufferFragmentBuilder& pooledBufferBuilder,
+                          const BSONObj& obj,
                           const BSONObj& keyPattern,
                           const S2IndexingParams& params,
-                          BSONObjSet* keys,
-                          MultikeyPaths* multikeyPaths);
+                          KeyStringSet* keys,
+                          MultikeyPaths* multikeyPaths,
+                          KeyString::Version keyStringVersion,
+                          Ordering ordering,
+                          boost::optional<RecordId> id = boost::none);
 };
 
 }  // namespace mongo

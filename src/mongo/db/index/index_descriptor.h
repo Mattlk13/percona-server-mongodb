@@ -38,13 +38,10 @@
 #include "mongo/db/index/multikey_paths.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/server_options.h"
 
 namespace mongo {
 
-class Collection;
 class IndexCatalogEntry;
-class IndexCatalogEntryContainer;
 class OperationContext;
 
 /**
@@ -59,6 +56,13 @@ public:
     enum class IndexVersion { kV1 = 1, kV2 = 2 };
     static constexpr IndexVersion kLatestIndexVersion = IndexVersion::kV2;
 
+    // Used to report the result of a comparison between two indexes.
+    enum class Comparison {
+        kDifferent,   // Indicates that the indexes do not match.
+        kEquivalent,  // Indicates that the options which uniquely identify an index match.
+        kIdentical    // Indicates that all applicable index options match.
+    };
+
     static constexpr StringData k2dIndexBitsFieldName = "bits"_sd;
     static constexpr StringData k2dIndexMinFieldName = "min"_sd;
     static constexpr StringData k2dIndexMaxFieldName = "max"_sd;
@@ -71,11 +75,12 @@ public:
     static constexpr StringData kDropDuplicatesFieldName = "dropDups"_sd;
     static constexpr StringData kExpireAfterSecondsFieldName = "expireAfterSeconds"_sd;
     static constexpr StringData kGeoHaystackBucketSize = "bucketSize"_sd;
+    static constexpr StringData kHiddenFieldName = "hidden"_sd;
     static constexpr StringData kIndexNameFieldName = "name"_sd;
     static constexpr StringData kIndexVersionFieldName = "v"_sd;
     static constexpr StringData kKeyPatternFieldName = "key"_sd;
     static constexpr StringData kLanguageOverrideFieldName = "language_override"_sd;
-    static constexpr StringData kNamespaceFieldName = "ns"_sd;
+    static constexpr StringData kNamespaceFieldName = "ns"_sd;  // Removed in 4.4
     static constexpr StringData kPartialFilterExprFieldName = "partialFilterExpression"_sd;
     static constexpr StringData kPathProjectionFieldName = "wildcardProjection"_sd;
     static constexpr StringData kSparseFieldName = "sparse"_sd;
@@ -85,34 +90,14 @@ public:
     static constexpr StringData kWeightsFieldName = "weights"_sd;
 
     /**
-     * Given a BSONObj representing an index spec, returns a new owned BSONObj which is identical to
-     * 'spec' after replacing the 'ns' field with the value of 'newNs'.
-     */
-    static BSONObj renameNsInIndexSpec(BSONObj spec, const NamespaceString& newNs);
-
-    /**
      * infoObj is a copy of the index-describing BSONObj contained in the catalog.
      */
-    IndexDescriptor(Collection* collection, const std::string& accessMethodName, BSONObj infoObj);
+    IndexDescriptor(const std::string& accessMethodName, BSONObj infoObj);
 
     /**
      * Returns true if the specified index version is supported, and returns false otherwise.
      */
     static bool isIndexVersionSupported(IndexVersion indexVersion);
-
-    /**
-     * Returns a set of the currently supported index versions.
-     */
-    static std::set<IndexVersion> getSupportedIndexVersions();
-
-    /**
-     * Returns Status::OK() if indexes of version 'indexVersion' are allowed to be created, and
-     * returns ErrorCodes::CannotCreateIndex otherwise.
-     */
-    static Status isIndexVersionAllowedForCreation(
-        IndexVersion indexVersion,
-        const ServerGlobalParams::FeatureCompatibility& featureCompatibility,
-        const BSONObj& indexSpec);
 
     /**
      * Returns the index version to use if it isn't specified in the index specification.
@@ -140,11 +125,11 @@ public:
     }
 
     /**
-     * Test only command for testing behavior resulting from an incorrect key
-     * pattern.
+     * Returns the normalized path projection spec, if one exists. This is only applicable for '$**'
+     * indexes.
      */
-    void setKeyPatternForTest(BSONObj newKeyPattern) {
-        _keyPattern = newKeyPattern;
+    const BSONObj& normalizedPathProjection() const {
+        return _normalizedProjection;
     }
 
     // How many fields do we index / are in the key pattern?
@@ -161,16 +146,6 @@ public:
         return _indexName;
     }
 
-    // Return the name of the indexed collection.
-    const NamespaceString& parentNS() const {
-        return _parentNS;
-    }
-
-    // Return the name of this index's storage area (database.table.$index)
-    const std::string& indexNamespace() const {
-        return _indexNamespace;
-    }
-
     // Return the name of the access method we must use to access this index's data.
     const std::string& getAccessMethodName() const {
         return _accessMethodName;
@@ -179,6 +154,13 @@ public:
     // Returns the type of the index associated with this descriptor.
     IndexType getIndexType() const {
         return _indexType;
+    }
+
+    /**
+     * Return a pointer to the IndexCatalogEntry that owns this descriptor, or null if orphaned.
+     */
+    IndexCatalogEntry* getEntry() const {
+        return _entry;
     }
 
     //
@@ -195,6 +177,10 @@ public:
         return _unique;
     }
 
+    bool hidden() const {
+        return _hidden;
+    }
+
     // Is this index sparse?
     bool isSparse() const {
         return _sparse;
@@ -204,11 +190,6 @@ public:
     bool isPartial() const {
         return _partial;
     }
-
-    // Is this index multikey?
-    bool isMultikey(OperationContext* opCtx) const;
-
-    MultikeyPaths getMultikeyPaths(OperationContext* opCtx) const;
 
     bool isIdIndex() const {
         return _isIdIndex;
@@ -224,15 +205,18 @@ public:
         return _infoObj;
     }
 
-    // Both the collection and the catalog must outlive the IndexDescriptor
-    const Collection* getCollection() const {
-        return _collection;
+    BSONObj toBSON() const {
+        return _infoObj;
     }
-    const IndexCatalog* getIndexCatalog() const;
 
-    bool areIndexOptionsEquivalent(const IndexDescriptor* other) const;
-
-    void setNs(NamespaceString ns);
+    /**
+     * Compares the current IndexDescriptor against the given existing index entry 'existingIndex'.
+     * Returns kIdentical if all index options are logically identical, kEquivalent if all options
+     * which uniquely identify an index are logically identical, and kDifferent otherwise.
+     */
+    Comparison compareIndexOptions(OperationContext* opCtx,
+                                   const NamespaceString& ns,
+                                   const IndexCatalogEntry* existingIndex) const;
 
     const BSONObj& collation() const {
         return _collation;
@@ -242,20 +226,31 @@ public:
         return _partialFilterExpression;
     }
 
+    /**
+     * Returns true if the key pattern is for the _id index.
+     * The _id index must have form exactly {_id : 1} or {_id : -1}.
+     * Allows an index of form {_id : "hashed"} to exist but
+     * Do not consider it to be the primary _id index
+     */
     static bool isIdIndexPattern(const BSONObj& pattern) {
-        BSONObjIterator i(pattern);
-        BSONElement e = i.next();
-        //_id index must have form exactly {_id : 1} or {_id : -1}.
-        // Allows an index of form {_id : "hashed"} to exist but
-        // do not consider it to be the primary _id index
-        if (!(strcmp(e.fieldName(), "_id") == 0 && (e.numberInt() == 1 || e.numberInt() == -1)))
+        BSONObjIterator iter(pattern);
+        BSONElement firstElement = iter.next();
+        if (iter.next()) {
             return false;
-        return i.next().eoo();
+        }
+        if (firstElement.fieldNameStringData() != "_id"_sd) {
+            return false;
+        }
+        auto intVal = firstElement.safeNumberInt();
+        return intVal == 1 || intVal == -1;
     }
 
 private:
-    // Related catalog information of the parent collection
-    Collection* _collection;
+    // This method should only ever be called by WildcardAccessMethod, to set the
+    // '_normalizedProjection' for descriptors associated with an existing IndexCatalogEntry.
+    void _setNormalizedPathProjection(BSONObj&& proj) {
+        _normalizedProjection = std::move(proj);
+    }
 
     // What access method should we use for this index?
     std::string _accessMethodName;
@@ -270,24 +265,25 @@ private:
     int64_t _numFields;  // How many fields are indexed?
     BSONObj _keyPattern;
     BSONObj _projection;
+    BSONObj _normalizedProjection;
     std::string _indexName;
-    NamespaceString _parentNS;
-    std::string _indexNamespace;
     bool _isIdIndex;
     bool _sparse;
     bool _unique;
+    bool _hidden;
     bool _partial;
     IndexVersion _version;
     BSONObj _collation;
     BSONObj _partialFilterExpression;
 
-    // only used by IndexCatalogEntryContainer to do caching for perf
-    // users not allowed to touch, and not part of API
-    IndexCatalogEntry* _cachedEntry;
+    // Many query stages require going from an IndexDescriptor to its IndexCatalogEntry, so for
+    // now we need this.
+    IndexCatalogEntry* _entry = nullptr;
 
     friend class IndexCatalog;
     friend class IndexCatalogEntryImpl;
     friend class IndexCatalogEntryContainer;
+    friend class WildcardAccessMethod;
 };
 
 }  // namespace mongo

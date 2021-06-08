@@ -27,32 +27,34 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/free_mon/free_mon_controller.h"
 
-#include "mongo/db/ftdc/collector.h"
-#include "mongo/logger/logstream_builder.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 
 namespace {
 
 const auto getFreeMonController =
-    ServiceContext::declareDecoration<std::unique_ptr<FreeMonController>>();
+    ServiceContext::declareDecoration<synchronized_value<std::unique_ptr<FreeMonController>>>();
 
 }  // namespace
 
 FreeMonController* FreeMonController::get(ServiceContext* serviceContext) {
-    return getFreeMonController(serviceContext).get();
+    return getFreeMonController(serviceContext)->get();
 }
 
-void FreeMonController::set(ServiceContext* serviceContext,
-                            std::unique_ptr<FreeMonController> controller) {
-    getFreeMonController(serviceContext) = std::move(controller);
+void FreeMonController::init(ServiceContext* serviceContext,
+                             std::unique_ptr<FreeMonController> controller) {
+    auto fmcContainer = getFreeMonController(serviceContext).synchronize();
+    // Since FreeMonController::get() provides raw pointers, the FreeMonController can only be
+    // set once without producing memory leaks.
+    invariant(!fmcContainer->get());
+    fmcContainer = std::move(controller);
 }
 
 
@@ -61,7 +63,7 @@ FreeMonNetworkInterface::~FreeMonNetworkInterface() = default;
 void FreeMonController::addRegistrationCollector(
     std::unique_ptr<FreeMonCollectorInterface> collector) {
     {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        stdx::lock_guard<Latch> lock(_mutex);
         invariant(_state == State::kNotStarted);
 
         _registrationCollectors.add(std::move(collector));
@@ -70,7 +72,7 @@ void FreeMonController::addRegistrationCollector(
 
 void FreeMonController::addMetricsCollector(std::unique_ptr<FreeMonCollectorInterface> collector) {
     {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        stdx::lock_guard<Latch> lock(_mutex);
         invariant(_state == State::kNotStarted);
 
         _metricCollectors.add(std::move(collector));
@@ -85,7 +87,7 @@ void FreeMonController::registerServerStartup(RegistrationType registrationType,
 }
 
 boost::optional<Status> FreeMonController::registerServerCommand(Milliseconds timeout) {
-    auto msg = FreeMonRegisterCommandMessage::createNow(std::vector<std::string>());
+    auto msg = FreeMonRegisterCommandMessage::createNow({std::vector<std::string>(), boost::none});
     _enqueue(msg);
 
     if (timeout > Milliseconds::min()) {
@@ -128,7 +130,7 @@ void FreeMonController::notifyOnRollback() {
 
 void FreeMonController::_enqueue(std::shared_ptr<FreeMonMessage> msg) {
     {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        stdx::lock_guard<Latch> lock(_mutex);
         invariant(_state == State::kStarted);
     }
 
@@ -139,7 +141,7 @@ void FreeMonController::start(RegistrationType registrationType,
                               std::vector<std::string>& tags,
                               Seconds gatherMetricsInterval) {
     {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        stdx::lock_guard<Latch> lock(_mutex);
 
         invariant(_state == State::kNotStarted);
     }
@@ -154,7 +156,7 @@ void FreeMonController::start(RegistrationType registrationType,
     _thread = stdx::thread([this] { _processor->run(); });
 
     {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        stdx::lock_guard<Latch> lock(_mutex);
 
         invariant(_state == State::kNotStarted);
         _state = State::kStarted;
@@ -167,10 +169,10 @@ void FreeMonController::start(RegistrationType registrationType,
 
 void FreeMonController::stop() {
     // Stop the agent
-    log() << "Shutting down free monitoring";
+    LOGV2(20609, "Shutting down free monitoring");
 
     {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        stdx::lock_guard<Latch> lock(_mutex);
 
         bool started = (_state == State::kStarted);
 
@@ -189,23 +191,38 @@ void FreeMonController::stop() {
 
     _thread.join();
 
-    _state = State::kDone;
+    {
+        stdx::lock_guard<Latch> lock(_mutex);
+
+        _state = State::kDone;
+    }
 }
 
 void FreeMonController::turnCrankForTest(size_t countMessagesToIgnore) {
     {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        stdx::lock_guard<Latch> lock(_mutex);
         invariant(_state == State::kStarted);
     }
 
-    log() << "Turning Crank: " << countMessagesToIgnore;
+    LOGV2(20610, "Turning Crank", "count"_attr = countMessagesToIgnore);
 
     _processor->turnCrankForTest(countMessagesToIgnore);
 }
 
+void FreeMonController::deprioritizeFirstMessageForTest(FreeMonMessageType type) {
+    {
+        stdx::lock_guard<Latch> lock(_mutex);
+        invariant(_state == State::kStarted);
+    }
+
+    LOGV2(5167901, "Deprioritize message", "type"_attr = static_cast<int>(type));
+
+    _processor->deprioritizeFirstMessageForTest(type);
+}
+
 void FreeMonController::getStatus(OperationContext* opCtx, BSONObjBuilder* status) {
     {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        stdx::lock_guard<Latch> lock(_mutex);
 
         if (_state != State::kStarted) {
             status->append("state", "disabled");
@@ -218,7 +235,7 @@ void FreeMonController::getStatus(OperationContext* opCtx, BSONObjBuilder* statu
 
 void FreeMonController::getServerStatus(OperationContext* opCtx, BSONObjBuilder* status) {
     {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        stdx::lock_guard<Latch> lock(_mutex);
 
         if (_state != State::kStarted) {
             status->append("state", "disabled");

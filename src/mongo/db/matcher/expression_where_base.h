@@ -29,6 +29,8 @@
 
 #pragma once
 
+#include <boost/optional.hpp>
+
 #include "mongo/db/matcher/expression.h"
 
 namespace mongo {
@@ -40,7 +42,6 @@ class WhereMatchExpressionBase : public MatchExpression {
 public:
     struct WhereParams {
         std::string code;
-        BSONObj scope;  // Owned.
     };
 
     explicit WhereMatchExpressionBase(WhereParams params);
@@ -53,7 +54,7 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    std::vector<MatchExpression*>* getChildVector() final {
+    std::vector<std::unique_ptr<MatchExpression>>* getChildVector() final {
         return nullptr;
     }
 
@@ -63,7 +64,7 @@ public:
 
     void debugString(StringBuilder& debug, int indentationLevel = 0) const final;
 
-    void serialize(BSONObjBuilder* out) const final;
+    void serialize(BSONObjBuilder* out, bool includePath) const final;
 
     bool equivalent(const MatchExpression* other) const final;
 
@@ -76,17 +77,12 @@ protected:
         return _code;
     }
 
-    const BSONObj& getScope() const {
-        return _scope;
-    }
-
 private:
     ExpressionOptimizerFunc getOptimizer() const final {
         return [](std::unique_ptr<MatchExpression> expression) { return expression; };
     }
 
     const std::string _code;
-    const BSONObj _scope;  // Owned.
 };
 
 }  // namespace mongo

@@ -29,9 +29,10 @@
 
 #pragma once
 
+#include <memory>
+
 #include "mongo/base/clonable_ptr.h"
 #include "mongo/db/update/modifier_node.h"
-#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
@@ -45,13 +46,15 @@ namespace mongo {
 class ArrayCullingNode : public ModifierNode {
 public:
     ModifyResult updateExistingElement(mutablebson::Element* element,
-                                       std::shared_ptr<FieldRef> elementPath) const final;
+                                       const FieldRef& elementPath) const final;
 
     void validateUpdate(mutablebson::ConstElement updatedElement,
                         mutablebson::ConstElement leftSibling,
                         mutablebson::ConstElement rightSibling,
                         std::uint32_t recursionLevel,
-                        ModifyResult modifyResult) const final;
+                        ModifyResult modifyResult,
+                        const bool validateForStorage,
+                        bool* containsDotsAndDollarsField) const final;
 
     void setCollator(const CollatorInterface* collator) final {
         _matcher->setCollator(collator);

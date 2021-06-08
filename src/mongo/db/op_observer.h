@@ -34,9 +34,9 @@
 #include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/catalog/commit_quorum_options.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/repl/rollback.h"
-#include "mongo/db/s/collection_sharding_state.h"
 
 namespace mongo {
 
@@ -60,9 +60,11 @@ struct OplogUpdateEntryArgs {
         : updateArgs(std::move(updateArgs)), nss(std::move(nss)), uuid(std::move(uuid)) {}
 };
 
-struct TTLCollModInfo {
-    Seconds expireAfterSeconds;
-    Seconds oldExpireAfterSeconds;
+struct IndexCollModInfo {
+    boost::optional<Seconds> expireAfterSeconds;
+    boost::optional<Seconds> oldExpireAfterSeconds;
+    boost::optional<bool> hidden;
+    boost::optional<bool> oldHidden;
     std::string indexName;
 };
 
@@ -101,6 +103,9 @@ public:
                                    const std::vector<BSONObj>& indexes,
                                    bool fromMigrate) = 0;
 
+    virtual void onStartIndexBuildSinglePhase(OperationContext* opCtx,
+                                              const NamespaceString& nss) = 0;
+
     virtual void onCommitIndexBuild(OperationContext* opCtx,
                                     const NamespaceString& nss,
                                     CollectionUUID collUUID,
@@ -113,6 +118,7 @@ public:
                                    CollectionUUID collUUID,
                                    const UUID& indexBuildUUID,
                                    const std::vector<BSONObj>& indexes,
+                                   const Status& cause,
                                    bool fromMigrate) = 0;
 
     virtual void onInserts(OperationContext* opCtx,
@@ -125,41 +131,66 @@ public:
     virtual void aboutToDelete(OperationContext* opCtx,
                                const NamespaceString& nss,
                                const BSONObj& doc) = 0;
+
+    /**
+     * "fromMigrate" indicates whether the delete was induced by a chunk migration, and so should be
+     * ignored by the user as an internal maintenance operation and not a real delete.
+     */
+    struct OplogDeleteEntryArgs {
+        const BSONObj* deletedDoc = nullptr;
+        bool fromMigrate = false;
+        bool preImageRecordingEnabledForCollection = false;
+    };
+
     /**
      * Handles logging before document is deleted.
      *
      * "ns" name of the collection from which deleteState.idDoc will be deleted.
-     * "fromMigrate" indicates whether the delete was induced by a chunk migration, and
-     * so should be ignored by the user as an internal maintenance operation and not a
-     * real delete.
+     *
+     * "args" is a reference to information detailing whether the pre-image of the doc should be
+     * preserved with deletion.  If `args.deletedDoc != nullptr`, then the opObserver must store the
+     * pre-image to be stored in addition to the documentKey.
      */
     virtual void onDelete(OperationContext* opCtx,
                           const NamespaceString& nss,
                           OptionalCollectionUUID uuid,
                           StmtId stmtId,
-                          bool fromMigrate,
-                          const boost::optional<BSONObj>& deletedDoc) = 0;
+                          const OplogDeleteEntryArgs& args) = 0;
+
     /**
      * Logs a no-op with "msgObj" in the o field into oplog.
      *
-     * This function should only be used internally. "nss", "uuid" and the o2 field should never be
-     * exposed to users (for instance through the appendOplogNote command).
+     * This function should only be used internally. "nss", "uuid", "o2", and the opTimes should
+     * never be exposed to users (for instance through the appendOplogNote command).
      */
-    virtual void onInternalOpMessage(OperationContext* opCtx,
-                                     const NamespaceString& nss,
-                                     const boost::optional<UUID> uuid,
-                                     const BSONObj& msgObj,
-                                     const boost::optional<BSONObj> o2MsgObj) = 0;
+    virtual void onInternalOpMessage(
+        OperationContext* opCtx,
+        const NamespaceString& nss,
+        const boost::optional<UUID> uuid,
+        const BSONObj& msgObj,
+        const boost::optional<BSONObj> o2MsgObj,
+        const boost::optional<repl::OpTime> preImageOpTime,
+        const boost::optional<repl::OpTime> postImageOpTime,
+        const boost::optional<repl::OpTime> prevWriteOpTimeInTransaction,
+        const boost::optional<OplogSlot> slot) = 0;
 
     /**
      * Logs a no-op with "msgObj" in the o field into oplog.
      */
     void onOpMessage(OperationContext* opCtx, const BSONObj& msgObj) {
-        onInternalOpMessage(opCtx, {}, boost::none, msgObj, boost::none);
+        onInternalOpMessage(opCtx,
+                            {},
+                            boost::none,
+                            msgObj,
+                            boost::none,
+                            boost::none,
+                            boost::none,
+                            boost::none,
+                            boost::none);
     }
 
     virtual void onCreateCollection(OperationContext* opCtx,
-                                    Collection* coll,
+                                    const CollectionPtr& coll,
                                     const NamespaceString& collectionName,
                                     const CollectionOptions& options,
                                     const BSONObj& idIndex,
@@ -197,10 +228,10 @@ public:
      */
     virtual void onCollMod(OperationContext* opCtx,
                            const NamespaceString& nss,
-                           OptionalCollectionUUID uuid,
+                           const UUID& uuid,
                            const BSONObj& collModCmd,
                            const CollectionOptions& oldCollOptions,
-                           boost::optional<TTLCollModInfo> ttlInfo) = 0;
+                           boost::optional<IndexCollModInfo> indexInfo) = 0;
     virtual void onDropDatabase(OperationContext* opCtx, const std::string& dbName) = 0;
 
     /**
@@ -215,6 +246,15 @@ public:
                                           OptionalCollectionUUID uuid,
                                           std::uint64_t numRecords,
                                           CollectionDropType dropType) = 0;
+    virtual repl::OpTime onDropCollection(OperationContext* opCtx,
+                                          const NamespaceString& collectionName,
+                                          OptionalCollectionUUID uuid,
+                                          std::uint64_t numRecords,
+                                          CollectionDropType dropType,
+                                          bool markFromMigrate) {
+        return onDropCollection(opCtx, collectionName, uuid, numRecords, dropType);
+    }
+
 
     /**
      * This function logs an oplog entry when an index is dropped. The namespace of the index,
@@ -246,6 +286,18 @@ public:
                                              OptionalCollectionUUID dropTargetUUID,
                                              std::uint64_t numRecords,
                                              bool stayTemp) = 0;
+
+    virtual repl::OpTime preRenameCollection(OperationContext* opCtx,
+                                             const NamespaceString& fromCollection,
+                                             const NamespaceString& toCollection,
+                                             OptionalCollectionUUID uuid,
+                                             OptionalCollectionUUID dropTargetUUID,
+                                             std::uint64_t numRecords,
+                                             bool stayTemp,
+                                             bool markFromMigrate) {
+        return preRenameCollection(
+            opCtx, fromCollection, toCollection, uuid, dropTargetUUID, numRecords, stayTemp);
+    }
     /**
      * This function performs all op observer handling for a 'renameCollection' command except for
      * logging the oplog entry. It should be used specifically in instances where the optime is
@@ -270,6 +322,26 @@ public:
                                     OptionalCollectionUUID dropTargetUUID,
                                     std::uint64_t numRecords,
                                     bool stayTemp) = 0;
+    virtual void onRenameCollection(OperationContext* opCtx,
+                                    const NamespaceString& fromCollection,
+                                    const NamespaceString& toCollection,
+                                    OptionalCollectionUUID uuid,
+                                    OptionalCollectionUUID dropTargetUUID,
+                                    std::uint64_t numRecords,
+                                    bool stayTemp,
+                                    bool markFromMigrate) {
+        onRenameCollection(
+            opCtx, fromCollection, toCollection, uuid, dropTargetUUID, numRecords, stayTemp);
+    }
+
+    virtual void onImportCollection(OperationContext* opCtx,
+                                    const UUID& importUUID,
+                                    const NamespaceString& nss,
+                                    long long numRecords,
+                                    long long dataSize,
+                                    const BSONObj& catalogEntry,
+                                    const BSONObj& storageMetadata,
+                                    bool isDryRun) = 0;
 
     virtual void onApplyOps(OperationContext* opCtx,
                             const std::string& dbName,
@@ -284,9 +356,14 @@ public:
      * transaction is active.
      *
      * The 'statements' are the list of CRUD operations to be applied in this transaction.
+     *
+     * The 'numberOfPreImagesToWrite' is the number of CRUD operations that have a pre-image
+     * to write as a noop oplog entry. The op observer will reserve oplog slots for these
+     * preimages in addition to the statements.
      */
-    virtual void onUnpreparedTransactionCommit(
-        OperationContext* opCtx, const std::vector<repl::ReplOperation>& statements) = 0;
+    virtual void onUnpreparedTransactionCommit(OperationContext* opCtx,
+                                               std::vector<repl::ReplOperation>* statements,
+                                               size_t numberOfPreImagesToWrite) = 0;
     /**
      * The onPreparedTransactionCommit method is called on the commit of a prepared transaction,
      * after the RecoveryUnit onCommit() is called.  It must not be called when no transaction is
@@ -311,10 +388,15 @@ public:
      * last reserved slot represents the prepareOpTime used for the prepare oplog entry.
      *
      * The 'statements' are the list of CRUD operations to be applied in this transaction.
+     *
+     * The 'numberOfPreImagesToWrite' is the number of CRUD operations that have a pre-image
+     * to write as a noop oplog entry. The op observer will reserve oplog slots for these
+     * preimages in addition to the statements.
      */
     virtual void onTransactionPrepare(OperationContext* opCtx,
                                       const std::vector<OplogSlot>& reservedSlots,
-                                      std::vector<repl::ReplOperation>& statements) = 0;
+                                      std::vector<repl::ReplOperation>* statements,
+                                      size_t numberOfPreImagesToWrite) = 0;
 
     /**
      * The onTransactionAbort method is called when an atomic transaction aborts, before the
@@ -355,7 +437,7 @@ public:
         bool configServerConfigVersionRolledBack = false;
 
         // Maps command names to a count of the number of those commands that are being rolled back.
-        StringMap<std::uint32_t> rollbackCommandCounts;
+        StringMap<long long> rollbackCommandCounts;
     };
 
     /**
@@ -374,6 +456,16 @@ public:
      */
     virtual void onReplicationRollback(OperationContext* opCtx,
                                        const RollbackObserverInfo& rbInfo) = 0;
+
+    /**
+     * Called when the majority commit point is updated by replication.
+     *
+     * This is called while holding a very hot mutex (the ReplicationCoordinator mutex). Therefore
+     * it should avoid doing any work that can be done later, and avoid calling back into any
+     * replication functions that take this mutex (which would cause self-deadlock).
+     */
+    virtual void onMajorityCommitPointUpdate(ServiceContext* service,
+                                             const repl::OpTime& newCommitPoint) = 0;
 
     struct Times;
 

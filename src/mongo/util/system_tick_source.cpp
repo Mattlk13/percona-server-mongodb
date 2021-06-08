@@ -38,9 +38,9 @@
 #if defined(MONGO_CONFIG_HAVE_HEADER_UNISTD_H)
 #include <unistd.h>
 #endif
+#include <memory>
 
 #include "mongo/base/init.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/tick_source.h"
 #include "mongo/util/time_support.h"
@@ -142,7 +142,6 @@ void initTickSource() {}
 MONGO_INITIALIZER(SystemTickSourceInit)(InitializerContext* context) {
     initTickSource();
     SystemTickSource::get();
-    return Status::OK();
 }
 
 TickSource::Tick SystemTickSource::getTicks() {
@@ -154,7 +153,7 @@ TickSource::Tick SystemTickSource::getTicksPerSecond() {
 }
 
 SystemTickSource* SystemTickSource::get() {
-    static const auto globalSystemTickSource = stdx::make_unique<SystemTickSource>();
+    static const auto globalSystemTickSource = std::make_unique<SystemTickSource>();
     return globalSystemTickSource.get();
 }
 

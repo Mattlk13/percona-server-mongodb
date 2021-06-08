@@ -34,11 +34,12 @@
 namespace mongo {
 
 /**
- * Acts like a shared pointer and exposes sharding filtering metadata to be used by server
- * operations. It is allowed to be referenced outside of collection lock, but all implementations
- * must be able to outlive the object from which they were obtained.
+ * Contains the parts of the sharding state for a particular collection, which do not change due to
+ * chunk move, split and merge. The implementation is allowed to be tighly coupled with the
+ * CollectionShardingState from which it was derived and because of this it must not be accessed
+ * outside of a collection lock.
  */
-class ScopedCollectionMetadata {
+class ScopedCollectionDescription {
 public:
     class Impl {
     public:
@@ -50,22 +51,79 @@ public:
         Impl() = default;
     };
 
-    ScopedCollectionMetadata(std::shared_ptr<Impl> impl) : _impl(std::move(impl)) {}
+    ScopedCollectionDescription(std::shared_ptr<Impl> impl) : _impl(std::move(impl)) {}
 
-    const auto& get() const {
-        return _impl->get();
+    bool isSharded() const {
+        return _impl->get().isSharded();
     }
 
-    const auto* operator-> () const {
-        return &get();
+    bool disallowWritesForResharding(const UUID& currentCollectionUUID) const {
+        return _impl->get().disallowWritesForResharding(currentCollectionUUID);
     }
 
-    const auto& operator*() const {
-        return get();
+    bool isValidKey(const BSONObj& key) const {
+        return _impl->get().isValidKey(key);
     }
 
-private:
+    boost::optional<ShardKeyPattern> getReshardingKeyIfShouldForwardOps() const {
+        return _impl->get().getReshardingKeyIfShouldForwardOps();
+    }
+
+    void throwIfReshardingInProgress(NamespaceString const& nss) const {
+        _impl->get().throwIfReshardingInProgress(nss);
+    }
+
+    const BSONObj& getKeyPattern() const {
+        return _impl->get().getKeyPattern();
+    }
+
+    const std::vector<std::unique_ptr<FieldRef>>& getKeyPatternFields() const {
+        return _impl->get().getKeyPatternFields();
+    }
+
+    BSONObj getMinKey() const {
+        return _impl->get().getMinKey();
+    }
+
+    BSONObj getMaxKey() const {
+        return _impl->get().getMaxKey();
+    }
+
+    BSONObj extractDocumentKey(const BSONObj& doc) const {
+        return _impl->get().extractDocumentKey(doc);
+    }
+
+    bool uuidMatches(UUID uuid) const {
+        return _impl->get().uuidMatches(uuid);
+    }
+
+    const boost::optional<TypeCollectionReshardingFields>& getReshardingFields() const {
+        return _impl->get().getReshardingFields();
+    }
+
+    const boost::optional<TypeCollectionTimeseriesFields>& getTimeseriesFields() const {
+        return _impl->get().getTimeseriesFields();
+    }
+
+protected:
     std::shared_ptr<Impl> _impl;
+};
+
+/**
+ * Contains the parts of the sharding state for a particular collection, which can change due to
+ * chunk move, split and merge and represents a snapshot in time of these parts, specifically the
+ * chunk ownership. The implementation is allowed to be tightly coupled with the
+ * CollectionShardingState from which it was derived, but it must be allowed to be accessed outside
+ * of collection lock.
+ */
+class ScopedCollectionFilter : public ScopedCollectionDescription {
+public:
+    ScopedCollectionFilter(std::shared_ptr<Impl> impl)
+        : ScopedCollectionDescription(std::move(impl)) {}
+
+    bool keyBelongsToMe(const BSONObj& key) const {
+        return _impl->get().keyBelongsToMe(key);
+    }
 };
 
 }  // namespace mongo

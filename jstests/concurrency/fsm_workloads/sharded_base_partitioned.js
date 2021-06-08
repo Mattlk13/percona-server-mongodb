@@ -22,9 +22,9 @@
  */
 
 load('jstests/concurrency/fsm_workload_helpers/chunks.js');  // for chunk helpers
+load("jstests/sharding/libs/find_chunks_util.js");
 
 var $config = (function() {
-
     var data = {
         partitionSize: 1,
         // We use a non-hashed shard key of { _id: 1 } so that documents reside on their expected
@@ -61,7 +61,7 @@ var $config = (function() {
 
     // Intended for use on config servers only.
     // Get a random chunk within this thread's partition.
-    data.getRandomChunkInPartition = function getRandomChunkInPartition(conn) {
+    data.getRandomChunkInPartition = function getRandomChunkInPartition(collName, conn) {
         assert(isMongodConfigsvr(conn.getDB('admin')), 'Not connected to a mongod configsvr');
         assert(this.partition,
                'This function must be called from workloads that partition data across threads.');
@@ -69,12 +69,24 @@ var $config = (function() {
         // We must split up these cases because MinKey and MaxKey are not fully comparable.
         // This may be due to SERVER-18341, where the Matcher returns false positives in
         // comparison predicates with MinKey/MaxKey.
-        const maxField = 'max.' + this.shardKeyField;
-        const minField = 'min.' + this.shardKeyField;
+        const shardKeyField = this.shardKeyField[collName] || this.shardKeyField;
+        let maxField = 'max.';
+        let minField = 'min.';
+
+        if (Array.isArray(shardKeyField)) {
+            maxField += shardKeyField[0];
+            minField += shardKeyField[0];
+        } else {
+            maxField += shardKeyField;
+            minField += shardKeyField;
+        }
+
+        const chunksJoinClause =
+            findChunksUtil.getChunksJoinClause(conn.getDB('config'), this.partition.ns);
         if (this.partition.isLowChunk && this.partition.isHighChunk) {
             return coll
                 .aggregate([
-                    {$match: {ns: this.partition.ns}},
+                    {$match: chunksJoinClause},
                     {$sample: {size: 1}},
                 ])
                 .toArray()[0];
@@ -82,8 +94,8 @@ var $config = (function() {
             return coll
                 .aggregate([
                     {
-                      $match:
-                          {ns: this.partition.ns, [maxField]: {$lte: this.partition.chunkUpper}}
+                        $match: Object.assign({[maxField]: {$lte: this.partition.chunkUpper}},
+                                              chunksJoinClause)
                     },
                     {$sample: {size: 1}}
                 ])
@@ -92,8 +104,8 @@ var $config = (function() {
             return coll
                 .aggregate([
                     {
-                      $match:
-                          {ns: this.partition.ns, [minField]: {$gte: this.partition.chunkLower}}
+                        $match: Object.assign({[minField]: {$gte: this.partition.chunkLower}},
+                                              chunksJoinClause)
                     },
                     {$sample: {size: 1}}
                 ])
@@ -102,11 +114,11 @@ var $config = (function() {
             return coll
                 .aggregate([
                     {
-                      $match: {
-                          ns: this.partition.ns,
-                          [minField]: {$gte: this.partition.chunkLower},
-                          [maxField]: {$lte: this.partition.chunkUpper}
-                      }
+                        $match: Object.assign({
+                            [minField]: {$gte: this.partition.chunkLower},
+                            [maxField]: {$lte: this.partition.chunkUpper}
+                        },
+                                              chunksJoinClause)
                     },
                     {$sample: {size: 1}}
                 ])
@@ -115,8 +127,8 @@ var $config = (function() {
     };
 
     // This is used by the extended workloads to perform additional setup for more splitPoints.
-    data.setupAdditionalSplitPoints = function setupAdditionalSplitPoints(db, collName, partition) {
-    };
+    data.setupAdditionalSplitPoints = function setupAdditionalSplitPoints(
+        db, collName, partition) {};
 
     var states = (function() {
         // Inform this thread about its partition,
@@ -130,7 +142,7 @@ var $config = (function() {
             Object.freeze(this.partition);
 
             // Verify that there is exactly 1 chunk in our partition.
-            var config = ChunkHelper.getPrimary(connCache.config);
+            var config = connCache.rsConns.config;
             var numChunks = ChunkHelper.getNumChunks(
                 config, ns, this.partition.chunkLower, this.partition.chunkUpper);
             var chunks = ChunkHelper.getChunks(config, ns, MinKey, MaxKey);
@@ -159,7 +171,7 @@ var $config = (function() {
 
         // Sharding must be enabled on db[collName].
         msg = 'collection ' + collName + ' must be sharded.';
-        assertAlways.gte(configDB.chunks.find({ns: ns}).itcount(), 1, msg);
+        assertAlways.gte(findChunksUtil.findChunksByNs(configDB, ns).itcount(), 1, msg);
 
         for (var tid = 0; tid < this.threadCount; ++tid) {
             // Define this thread's partition.
@@ -171,7 +183,7 @@ var $config = (function() {
             for (var i = partition.lower; i < partition.upper; ++i) {
                 bulk.insert({_id: i});
             }
-            assertAlways.writeOK(bulk.execute());
+            assertAlways.commandWorked(bulk.execute());
 
             // Add split point for lower end of this thread's partition.
             // Since a split point will be created at the low end of each partition,
@@ -185,7 +197,6 @@ var $config = (function() {
 
             this.setupAdditionalSplitPoints(db, collName, partition);
         }
-
     };
 
     return {

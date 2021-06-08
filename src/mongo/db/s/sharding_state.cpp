@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -35,7 +35,7 @@
 
 #include "mongo/db/operation_context.h"
 #include "mongo/db/server_options.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 namespace {
@@ -57,7 +57,7 @@ ShardingState* ShardingState::get(OperationContext* operationContext) {
 }
 
 void ShardingState::setInitialized(ShardId shardId, OID clusterId) {
-    stdx::unique_lock<stdx::mutex> ul(_mutex);
+    stdx::unique_lock<Latch> ul(_mutex);
     invariant(_getInitializationState() == InitializationState::kNew);
 
     _shardId = std::move(shardId);
@@ -69,9 +69,12 @@ void ShardingState::setInitialized(ShardId shardId, OID clusterId) {
 
 void ShardingState::setInitialized(Status failedStatus) {
     invariant(!failedStatus.isOK());
-    log() << "Failed to initialize sharding components" << causedBy(failedStatus);
+    LOGV2(22082,
+          "Failed to initialize sharding components {error}",
+          "Failed to initialize sharding components",
+          "error"_attr = failedStatus);
 
-    stdx::unique_lock<stdx::mutex> ul(_mutex);
+    stdx::unique_lock<Latch> ul(_mutex);
     invariant(_getInitializationState() == InitializationState::kNew);
 
     _initializationStatus = std::move(failedStatus);
@@ -79,7 +82,7 @@ void ShardingState::setInitialized(Status failedStatus) {
 }
 
 boost::optional<Status> ShardingState::initializationStatus() {
-    stdx::unique_lock<stdx::mutex> ul(_mutex);
+    stdx::unique_lock<Latch> ul(_mutex);
     if (_getInitializationState() == InitializationState::kNew)
         return boost::none;
 
@@ -105,13 +108,11 @@ Status ShardingState::canAcceptShardedCommands() const {
 
 ShardId ShardingState::shardId() {
     invariant(enabled());
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
     return _shardId;
 }
 
 OID ShardingState::clusterId() {
     invariant(enabled());
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
     return _clusterId;
 }
 

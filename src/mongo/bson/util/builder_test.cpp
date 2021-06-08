@@ -48,7 +48,7 @@ TEST(Builder, StringBuilderAddress) {
     const void* longPtr = reinterpret_cast<const void*>(-1);
     const void* shortPtr = reinterpret_cast<const void*>(static_cast<uintptr_t>(0xDEADBEEF));
 
-    const void* nullPtr = NULL;
+    const void* nullPtr = nullptr;
 
     StringBuilder sb;
     sb << longPtr;
@@ -79,8 +79,8 @@ TEST(Builder, BooleanOstreamOperator) {
 }
 
 TEST(Builder, StackAllocatorShouldNotLeak) {
-    StackAllocator stackAlloc;
-    stackAlloc.malloc(StackAllocator::SZ + 1);  // Force heap allocation.
+    StackAllocator<StackSizeDefault> stackAlloc;
+    stackAlloc.malloc(StackSizeDefault + 1);  // Force heap allocation.
     // Let the builder go out of scope. If this leaks, it will trip the ASAN leak detector.
 }
 
@@ -124,4 +124,4 @@ TEST(Builder, AppendUnsignedLongLong) {
 TEST(Builder, AppendShort) {
     testStringBuilderIntegral<short>();
 }
-}
+}  // namespace mongo

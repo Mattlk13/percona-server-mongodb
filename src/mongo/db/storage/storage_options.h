@@ -95,8 +95,8 @@ struct StorageGlobalParams {
     // via an fsync operation.
     // Do not set this value on production systems.
     // In almost every situation, you should use the default setting.
-    static constexpr double kMaxSyncdelaySecs = 9.0 * 1000.0 * 1000.0;
-    AtomicDouble syncdelay;  // seconds between fsyncs
+    static constexpr double kMaxSyncdelaySecs = 60 * 60;  // 1hr
+    AtomicDouble syncdelay;                               // seconds between fsyncs
 
     // --queryableBackupMode
     // Puts MongoD into "read-only" mode. MongoD will not write any data to the underlying
@@ -110,8 +110,23 @@ struct StorageGlobalParams {
     // workloads that rely heavily on creating many collections within a database.
     bool groupCollections;
 
+    // --oplogMinRetentionHours
+    // Controls what size the oplog should be in addition to oplogSize. If set, the oplog will only
+    // be truncated if it is over the capped size, and if the bucket of oldest oplog entries fall
+    // outside of the retention window which is set by this option.
+    AtomicWord<double> oplogMinRetentionHours;
+
     // Controls whether we allow the OplogStones mechanism to delete oplog history on WT.
-    bool allowOplogTruncation = true;
+    bool allowOplogTruncation;
+
+    // Disables lock-free reads, adjustable via setParameter. Can be disabled by certain user
+    // settings with which lock-free reads are incompatible: standalone mode; and
+    // enableMajorityReadConcern=false.
+    bool disableLockFreeReads = true;
+
+    // Delay in seconds between triggering the next checkpoint after the completion of the previous
+    // one. A value of 0 indicates that checkpointing will be skipped.
+    size_t checkpointDelaySecs;
 };
 
 extern StorageGlobalParams storageGlobalParams;

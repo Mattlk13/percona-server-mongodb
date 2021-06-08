@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -35,9 +35,8 @@
 
 #include "mongo/client/remote_command_targeter_mock.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/query/query_request.h"
+#include "mongo/db/query/query_request_helper.h"
 #include "mongo/db/service_context.h"
-#include "mongo/executor/network_interface_mock.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
 #include "mongo/rpc/metadata/tracking_metadata.h"
@@ -47,7 +46,6 @@
 #include "mongo/s/cluster_identity_loader.h"
 #include "mongo/s/sharding_router_test_fixture.h"
 #include "mongo/stdx/future.h"
-#include "mongo/util/log.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -67,7 +65,8 @@ BSONObj getReplSecondaryOkMetadata() {
 
 class ClusterIdentityTest : public ShardingTestFixture {
 public:
-    ClusterIdentityTest() {
+    void setUp() {
+        ShardingTestFixture::setUp();
         configTargeter()->setFindHostReturnValue(configHost);
     }
 
@@ -77,12 +76,10 @@ public:
             ASSERT_BSONOBJ_EQ(getReplSecondaryOkMetadata(),
                               rpc::TrackingMetadata::removeTrackingData(request.metadata));
 
-            const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
-            ASSERT_EQ(nss.ns(), "config.version");
+            auto opMsg = OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj);
+            auto query = query_request_helper::makeFromFindCommandForTests(opMsg.body);
 
-            auto query = assertGet(QueryRequest::makeFromFindCommand(nss, request.cmdObj, false));
-
-            ASSERT_EQ(query->nss().ns(), "config.version");
+            ASSERT_EQ(query->getNamespaceOrUUID().nss()->ns(), "config.version");
             ASSERT_BSONOBJ_EQ(query->getFilter(), BSONObj());
             ASSERT_FALSE(query->getLimit().is_initialized());
 

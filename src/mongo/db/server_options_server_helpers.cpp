@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 #include "mongo/db/server_options_server_helpers.h"
 
@@ -37,22 +37,23 @@
 #include <boost/algorithm/string/trim.hpp>
 #include <boost/filesystem.hpp>
 #include <boost/filesystem/operations.hpp>
+#include <fmt/format.h>
 #include <ios>
 #include <iostream>
 
 #include "mongo/base/status.h"
+#include "mongo/bson/json.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/config.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_options_base.h"
 #include "mongo/db/server_options_helpers.h"
-#include "mongo/logger/log_component.h"
-#include "mongo/logger/message_event_utf8_encoder.h"
+#include "mongo/logv2/log.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/log_util.h"
 #include "mongo/transport/message_compressor_registry.h"
 #include "mongo/util/cmdline_utils/censor_cmdline.h"
-#include "mongo/util/fail_point_service.h"
-#include "mongo/util/log.h"
-#include "mongo/util/map_util.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/net/sock.h"
 #include "mongo/util/net/socket_utils.h"
 #include "mongo/util/net/ssl_options.h"
@@ -113,8 +114,17 @@ Status setParsedOpts(const moe::Environment& params) {
 }
 }  // namespace
 
-void printCommandLineOpts() {
-    log() << "options: " << serverGlobalParams.parsedOpts << endl;
+void printCommandLineOpts(std::ostream* os) {
+    if (os) {
+        *os << format(FMT_STRING("Options set by command line: {}"),
+                      tojson(serverGlobalParams.parsedOpts, ExtendedRelaxedV2_0_0, true))
+            << std::endl;
+    } else {
+        LOGV2(21951,
+              "Options set by command line: {options}",
+              "Options set by command line",
+              "options"_attr = serverGlobalParams.parsedOpts);
+    }
 }
 
 Status validateServerOptions(const moe::Environment& params) {
@@ -173,14 +183,22 @@ Status validateServerOptions(const moe::Environment& params) {
             haveAuthenticationMechanisms = false;
         }
 
-        if (parameters.find("internalValidateFeaturesAsMaster") != parameters.end()) {
-            // Command line options that are disallowed when internalValidateFeaturesAsMaster is
-            // specified.
+        bool internalValidateFeaturesAsPrimaryUsed =
+            parameters.find("internalValidateFeaturesAsPrimary") != parameters.end();
+        bool internalValidateFeaturesAsMasterUsed =
+            parameters.find("internalValidateFeaturesAsMaster") != parameters.end();
+
+        if (internalValidateFeaturesAsPrimaryUsed || internalValidateFeaturesAsMasterUsed) {
+            // Command line options that are disallowed when internalValidateFeaturesAsPrimary or
+            // internalValidateFeaturesAsMaster, the deprecated alias, is specified.
+            std::string parameterName = internalValidateFeaturesAsPrimaryUsed
+                ? "internalValidateFeaturesAsPrimary"
+                : "internalValidateFeaturesAsMaster";
             if (params.count("replication.replSet")) {
                 return Status(ErrorCodes::BadValue,
                               str::stream() <<  //
-                                  "Cannot specify both internalValidateFeaturesAsMaster and "
-                                  "replication.replSet");
+                                  "Cannot specify both " + parameterName +
+                                      " and replication.replSet");
             }
         }
     }
@@ -302,17 +320,6 @@ Status storeServerOptions(const moe::Environment& params) {
         }
     }
 
-    if (params.count("net.serviceExecutor")) {
-        auto value = params["net.serviceExecutor"].as<std::string>();
-        const auto valid = {"synchronous"_sd, "adaptive"_sd};
-        if (std::find(valid.begin(), valid.end(), value) == valid.end()) {
-            return {ErrorCodes::BadValue, "Unsupported value for serviceExecutor"};
-        }
-        serverGlobalParams.serviceExecutor = value;
-    } else {
-        serverGlobalParams.serviceExecutor = "synchronous";
-    }
-
     if (params.count("security.transitionToAuth")) {
         serverGlobalParams.transitionToAuth = params["security.transitionToAuth"].as<bool>();
     }
@@ -410,7 +417,7 @@ Status storeServerOptions(const moe::Environment& params) {
 #endif  // _WIN32
 
     if (params.count("security.redactClientLogData")) {
-        logger::globalLogDomain()->setShouldRedactLogs(params["security.redactClientLogData"].as<bool>());
+        logv2::setShouldRedactLogs(params["security.redactClientLogData"].as<bool>());
     }
 
     if (serverGlobalParams.doFork && serverGlobalParams.logpath.empty() &&

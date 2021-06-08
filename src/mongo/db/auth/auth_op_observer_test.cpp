@@ -37,7 +37,6 @@
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/keys_collection_client_sharded.h"
 #include "mongo/db/keys_collection_manager.h"
-#include "mongo/db/logical_clock.h"
 #include "mongo/db/logical_time_validator.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/oplog_interface_local.h"
@@ -46,7 +45,6 @@
 #include "mongo/db/repl/storage_interface_mock.h"
 #include "mongo/db/service_context_d_test_fixture.h"
 #include "mongo/db/session_catalog_mongod.h"
-#include "mongo/db/storage/ephemeral_for_test/ephemeral_for_test_recovery_unit.h"
 #include "mongo/db/transaction_participant.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/util/clock_source_mock.h"
@@ -65,13 +63,12 @@ public:
 
         auto service = getServiceContext();
         auto opCtx = cc().makeOperationContext();
-        repl::StorageInterface::set(service, stdx::make_unique<repl::StorageInterfaceMock>());
+        repl::StorageInterface::set(service, std::make_unique<repl::StorageInterfaceMock>());
 
         // Set up ReplicationCoordinator and create oplog.
         repl::ReplicationCoordinator::set(
             service,
-            stdx::make_unique<repl::ReplicationCoordinatorMock>(service, createReplSettings()));
-        repl::setOplogCollectionName(service);
+            std::make_unique<repl::ReplicationCoordinatorMock>(service, createReplSettings()));
         repl::createOplog(opCtx.get());
 
         // Ensure that we are primary.
@@ -137,27 +134,27 @@ TEST_F(AuthOpObserverTest, MultipleAboutToDeleteAndOnDelete) {
     AutoGetDb autoDb(opCtx.get(), nss.db(), MODE_X);
     WriteUnitOfWork wunit(opCtx.get());
     opObserver.aboutToDelete(opCtx.get(), nss, BSON("_id" << 1));
-    opObserver.onDelete(opCtx.get(), nss, uuid, {}, false, {});
+    opObserver.onDelete(opCtx.get(), nss, uuid, {}, {});
     opObserver.aboutToDelete(opCtx.get(), nss, BSON("_id" << 1));
-    opObserver.onDelete(opCtx.get(), nss, uuid, {}, false, {});
+    opObserver.onDelete(opCtx.get(), nss, uuid, {}, {});
 }
 
 DEATH_TEST_F(AuthOpObserverTest, AboutToDeleteMustPreceedOnDelete, "invariant") {
     AuthOpObserver opObserver;
     auto opCtx = cc().makeOperationContext();
-    opCtx->swapLockState(stdx::make_unique<LockerNoop>());
+    cc().swapLockState(std::make_unique<LockerNoop>());
     NamespaceString nss = {"test", "coll"};
-    opObserver.onDelete(opCtx.get(), nss, {}, {}, false, {});
+    opObserver.onDelete(opCtx.get(), nss, {}, {}, {});
 }
 
 DEATH_TEST_F(AuthOpObserverTest, EachOnDeleteRequiresAboutToDelete, "invariant") {
     AuthOpObserver opObserver;
     auto opCtx = cc().makeOperationContext();
-    opCtx->swapLockState(stdx::make_unique<LockerNoop>());
+    cc().swapLockState(std::make_unique<LockerNoop>());
     NamespaceString nss = {"test", "coll"};
     opObserver.aboutToDelete(opCtx.get(), nss, {});
-    opObserver.onDelete(opCtx.get(), nss, {}, {}, false, {});
-    opObserver.onDelete(opCtx.get(), nss, {}, {}, false, {});
+    opObserver.onDelete(opCtx.get(), nss, {}, {}, {});
+    opObserver.onDelete(opCtx.get(), nss, {}, {}, {});
 }
 
 }  // namespace

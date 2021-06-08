@@ -15,16 +15,6 @@ env.Library(
     ],
 )
 
-env.CppUnitTest(
-    target='timer_stats_test',
-    source=[
-        'timer_stats_test.cpp',
-    ],
-    LIBDEPS=[
-        'timer_stats',
-    ],
-)
-
 env.Library(
     target='top',
     source=[
@@ -32,29 +22,24 @@ env.Library(
         'operation_latency_histogram.cpp'
     ],
     LIBDEPS=[
+        '$BUILD_DIR/mongo/db/server_options_core',
         '$BUILD_DIR/mongo/db/service_context',
     ],
 )
 
-env.CppUnitTest(
-    target='top_test',
+env.Library(
+    target='api_version_metrics',
     source=[
-        'top_test.cpp',
+        'api_version_metrics.cpp',
     ],
-    LIBDEPS=[
-        'top',
-    ],
-)
-
-env.CppUnitTest(
-    target='operation_latency_histogram_test',
-    source=[
-        'operation_latency_histogram_test.cpp'
-        ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/db/stats/top',
-        ])
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/shared_request_handling',
+        '$BUILD_DIR/mongo/rpc/client_metadata',
+    ]
+)
 
 env.Library(
     target='counters',
@@ -63,6 +48,7 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/commands/server_status_core',
         '$BUILD_DIR/mongo/util/concurrency/spin_lock',
     ],
 )
@@ -72,8 +58,8 @@ env.Library(
     source=[
         'server_read_concern_metrics.cpp',
         'server_write_concern_metrics.cpp',
-        env.Idlc('read_concern_stats.idl')[0],
-        env.Idlc('server_write_concern_metrics.idl')[0],
+        'read_concern_stats.idl',
+        'server_write_concern_metrics.idl',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
@@ -88,6 +74,38 @@ env.Library(
 )
 
 env.Library(
+    target='resource_consumption_metrics',
+    source=[
+        'resource_consumption_metrics.cpp',
+        'operation_resource_consumption.idl',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/idl/idl_parser',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/commands/server_status',
+        '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
+        '$BUILD_DIR/mongo/idl/feature_flag',
+        '$BUILD_DIR/mongo/idl/server_parameter',
+    ],
+    LIBDEPS_TYPEINFO=[
+        '$BUILD_DIR/mongo/db/service_context',
+    ],
+)
+
+env.Library(
+    target="transaction_stats",
+    source=[
+        "single_transaction_stats.cpp"
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/repl/read_concern_args',
+    ],
+)
+
+env.Library(
     target='fill_locker_info',
     source=[
         'fill_locker_info.cpp',
@@ -98,31 +116,48 @@ env.Library(
     ],
 )
 
-env.CppUnitTest(
-    target='fill_locker_info_test',
-    source=[
-        'fill_locker_info_test.cpp',
-    ],
-    LIBDEPS=[
-        'fill_locker_info',
-    ],
-)
-
 env.Library(
     target='serveronly_stats',
     source=[
         "latency_server_status_section.cpp",
         "lock_server_status_section.cpp",
-        'storage_stats.cpp',
+        "storage_stats.cpp",
     ],
-    LIBDEPS=[
+    LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/catalog/database_holder',
+        '$BUILD_DIR/mongo/db/catalog/index_catalog',
+        '$BUILD_DIR/mongo/db/commands/server_status',
         '$BUILD_DIR/mongo/db/db_raii',
         '$BUILD_DIR/mongo/db/index/index_access_method',
+        '$BUILD_DIR/mongo/db/pipeline/document_sources_idl',
+        '$BUILD_DIR/mongo/db/timeseries/bucket_catalog',
         'fill_locker_info',
         'top',
     ],
-    LIBDEPS_PRIVATE=[
-        '$BUILD_DIR/mongo/db/commands/server_status',
+)
+
+env.CppUnitTest(
+    target='db_stats_test',
+    source=[
+        'api_version_metrics_test.cpp',
+        'fill_locker_info_test.cpp',
+        'operation_latency_histogram_test.cpp',
+        'resource_consumption_metrics_test.cpp',
+        'timer_stats_test.cpp',
+        'top_test.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/auth/authmocks',
+        '$BUILD_DIR/mongo/db/repl/replmocks',
+        '$BUILD_DIR/mongo/db/service_context_test_fixture',
+        '$BUILD_DIR/mongo/db/shared_request_handling',
+        '$BUILD_DIR/mongo/util/clock_source_mock',
+        'api_version_metrics',
+        'fill_locker_info',
+        'resource_consumption_metrics',
+        'timer_stats',
+        'top',
     ],
 )

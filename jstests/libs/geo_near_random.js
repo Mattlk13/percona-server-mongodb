@@ -2,13 +2,15 @@ GeoNearRandomTest = function(name, dbToUse) {
     this.name = name;
     this.db = (dbToUse || db);
     this.t = this.db[name];
-    this.nPts = 0;
+    this.reset();
+    print("Starting getNear test: " + name);
+};
 
+GeoNearRandomTest.prototype.reset = function reset() {
     // Reset state
+    this.nPts = 0;
     this.t.drop();
     Random.srand(1234);
-
-    print("Starting getNear test: " + name);
 };
 
 GeoNearRandomTest.prototype.mkPt = function mkPt(scale, indexBounds) {
@@ -24,10 +26,9 @@ GeoNearRandomTest.prototype.mkPt = function mkPt(scale, indexBounds) {
             (Random.rand() * (range - eps) + eps) + indexBounds.min
         ];
     }
-
 };
 
-GeoNearRandomTest.prototype.insertPts = function(nPts, indexBounds, scale) {
+GeoNearRandomTest.prototype.insertPts = function(nPts, indexBounds, scale, skipIndex) {
     assert.eq(this.nPts, 0, "insertPoints already called");
     this.nPts = nPts;
 
@@ -35,12 +36,14 @@ GeoNearRandomTest.prototype.insertPts = function(nPts, indexBounds, scale) {
     for (var i = 0; i < nPts; i++) {
         bulk.insert({_id: i, loc: this.mkPt(scale, indexBounds)});
     }
-    assert.writeOK(bulk.execute());
+    assert.commandWorked(bulk.execute());
 
-    if (!indexBounds)
-        this.t.ensureIndex({loc: '2d'});
-    else
-        this.t.ensureIndex({loc: '2d'}, indexBounds);
+    if (!skipIndex) {
+        if (!indexBounds)
+            this.t.createIndex({loc: '2d'});
+        else
+            this.t.createIndex({loc: '2d'}, indexBounds);
+    }
 };
 
 GeoNearRandomTest.prototype.assertIsPrefix = function(short, long, errmsg) {
@@ -74,7 +77,7 @@ GeoNearRandomTest.prototype.testPt = function(pt, opts) {
     let last = runQuery(1);
     for (var i = 2; i <= opts.nToTest; i++) {
         let ret = runQuery(i);
-        this.assertIsPrefix(last, ret, `Unexpected result when comparing ${i-1} and ${i}`);
+        this.assertIsPrefix(last, ret, `Unexpected result when comparing ${i - 1} and ${i}`);
 
         // Make sure distances are in increasing order.
         assert.gte(ret[ret.length - 1].dis, last[last.length - 1].dis);

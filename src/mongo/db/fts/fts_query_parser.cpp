@@ -137,5 +137,5 @@ QueryToken::Type FTSQueryParser::getType(char c) const {
             return QueryToken::TEXT;
     }
 }
-}
-}
+}  // namespace fts
+}  // namespace mongo

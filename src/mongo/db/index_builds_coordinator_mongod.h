@@ -60,7 +60,7 @@ public:
      * Shuts down the thread pool, signals interrupt to all index builds, then waits for all of the
      * threads to finish.
      */
-    void shutdown() override;
+    void shutdown(OperationContext* opCtx) override;
 
     /**
      * Sets up the in-memory and persisted state of the index build, then passes the build off to an
@@ -71,6 +71,7 @@ public:
      */
     StatusWith<SharedSemiFuture<ReplIndexBuildState::IndexCatalogStats>> startIndexBuild(
         OperationContext* opCtx,
+        std::string dbName,
         CollectionUUID collectionUUID,
         const std::vector<BSONObj>& specs,
         const UUID& buildUUID,
@@ -78,17 +79,21 @@ public:
         IndexBuildOptions indexBuildOptions) override;
 
     /**
-     * TODO: not yet implemented.
+     * Reconstructs the in-memory state of the index build, then passes the build off to an
+     * asynchronous thread to run. A Future is returned so that the user can await the asynchronous
+     * build result.
      */
-    Status commitIndexBuild(OperationContext* opCtx,
-                            const std::vector<BSONObj>& specs,
-                            const UUID& buildUUID) override;
+    StatusWith<SharedSemiFuture<ReplIndexBuildState::IndexCatalogStats>> resumeIndexBuild(
+        OperationContext* opCtx,
+        std::string dbName,
+        CollectionUUID collectionUUID,
+        const std::vector<BSONObj>& specs,
+        const UUID& buildUUID,
+        const ResumeIndexInfo& resumeInfo) override;
 
-    void signalChangeToPrimaryMode() override;
-    void signalChangeToSecondaryMode() override;
-    void signalChangeToInitialSyncMode() override;
-
-    Status voteCommitIndexBuild(const UUID& buildUUID, const HostAndPort& hostAndPort) override;
+    Status voteCommitIndexBuild(OperationContext* opCtx,
+                                const UUID& buildUUID,
+                                const HostAndPort& hostAndPort) override;
 
     Status setCommitQuorum(OperationContext* opCtx,
                            const NamespaceString& nss,
@@ -133,14 +138,57 @@ private:
      */
     void _refreshReplStateFromPersisted(OperationContext* opCtx, const UUID& buildUUID);
 
-    // Replication hooks will call into the Coordinator to update this on relevant state
-    // transitions. The Coordinator will then use the setting to inform how index builds are run.
-    // Index builds have different inter node communication responsibilities and error checking
-    // requirements depending on the replica set member's state.
-    ReplState _replMode = ReplState::Secondary;
+    /**
+     * Process voteCommitIndexBuild command's response.
+     */
+    bool _checkVoteCommitIndexCmdSucceeded(const BSONObj& response, const UUID& indexBuildUUID);
+
+    /**
+     * Signals index builder to commit.
+     */
+    void _sendCommitQuorumSatisfiedSignal(OperationContext* opCtx,
+                                          std::shared_ptr<ReplIndexBuildState> replState);
+
+
+    void _signalIfCommitQuorumIsSatisfied(OperationContext* opCtx,
+                                          std::shared_ptr<ReplIndexBuildState> replState) override;
+
+
+    bool _signalIfCommitQuorumNotEnabled(OperationContext* opCtx,
+                                         std::shared_ptr<ReplIndexBuildState> replState) override;
+
+    void _signalPrimaryForCommitReadiness(OperationContext* opCtx,
+                                          std::shared_ptr<ReplIndexBuildState> replState) override;
+
+    IndexBuildAction _drainSideWritesUntilNextActionIsAvailable(
+        OperationContext* opCtx, std::shared_ptr<ReplIndexBuildState> replState) override;
+
+    void _waitForNextIndexBuildActionAndCommit(OperationContext* opCtx,
+                                               std::shared_ptr<ReplIndexBuildState> replState,
+                                               const IndexBuildOptions& indexBuildOptions) override;
+
+    StatusWith<SharedSemiFuture<ReplIndexBuildState::IndexCatalogStats>> _startIndexBuild(
+        OperationContext* opCtx,
+        std::string dbName,
+        CollectionUUID collectionUUID,
+        const std::vector<BSONObj>& specs,
+        const UUID& buildUUID,
+        IndexBuildProtocol protocol,
+        IndexBuildOptions indexBuildOptions,
+        const boost::optional<ResumeIndexInfo>& resumeInfo);
 
     // Thread pool on which index builds are run.
     ThreadPool _threadPool;
+
+    // Manages _numActiveIndexBuilds and _indexBuildFinished.
+    mutable Mutex _throttlingMutex =
+        MONGO_MAKE_LATCH("IndexBuildsCoordinatorMongod::_throttlingMutex");
+
+    // Protected by _mutex.
+    int _numActiveIndexBuilds = 0;
+
+    // Condition signalled to indicate that an index build thread finished executing.
+    stdx::condition_variable _indexBuildFinished;
 };
 
 }  // namespace mongo

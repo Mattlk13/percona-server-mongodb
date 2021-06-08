@@ -4,11 +4,6 @@ selector:
   roots:
   - jstests/core/**/*.js
   exclude_files:
-  # These tests are not expected to pass with replica-sets:
-  - jstests/core/dbadmin.js
-  - jstests/core/opcounters_write_cmd.js
-  - jstests/core/read_after_optime.js
-  - jstests/core/capped_update.js
   # The set_param1.js test attempts to compare the response from running the {getParameter: "*"}
   # command multiple times, which may observe the change to the "transactionLifetimeLimitSeconds"
   # server parameter.
@@ -22,13 +17,21 @@ selector:
   # The awaitdata_getmore_cmd.js test tails the oplog and waits for the getMore batch size to equal
   # zero. The CheckReplDBHashInBackground hook consistently runs and creates sessions. At the same
   # time, the logical session cache refresh thread will flush these sessions to disk, creating more
-  # opLog entries. To prevent this infinite loop, we will blacklist the test from this suite.
+  # opLog entries. To prevent this infinite loop, we will denylist the test from this suite.
   - jstests/core/awaitdata_getmore_cmd.js
+  # These tests verify that an expected number of update operations were tracked in the server
+  # status metrics, but the logical session cache refresh causes additional updates to be recorded.
+  - jstests/core/find_and_modify_metrics.js
+  - jstests/core/update_metrics.js
+
+  exclude_with_any_tags:
+  - assumes_standalone_mongod
 
 executor:
   archive:
     hooks:
       - CheckReplDBHashInBackground
+      - ValidateCollectionsInBackground
       - CheckReplDBHash
       - CheckReplOplogs
       - ValidateCollections
@@ -41,6 +44,7 @@ executor:
   # on the secondaries, so we run the ValidateCollections hook after it to ensure we're
   # validating the entire contents of the collection.
   - class: CheckReplDBHashInBackground
+  - class: ValidateCollectionsInBackground
   - class: CheckReplOplogs
   - class: CheckReplDBHash
   - class: ValidateCollections

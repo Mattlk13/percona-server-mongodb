@@ -27,12 +27,11 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/client.h"
-#include "mongo/db/command_generic_argument.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/field_parser.h"
@@ -41,48 +40,15 @@
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/write_concern.h"
-#include "mongo/util/log.h"
+#include "mongo/idl/command_generic_argument.h"
+#include "mongo/logv2/log.h"
+#include "mongo/rpc/warn_deprecated_wire_ops.h"
 
 namespace mongo {
 namespace {
 
 using std::string;
 using std::stringstream;
-
-/* reset any errors so that getlasterror comes back clean.
-
-   useful before performing a long series of operations where we want to
-   see if any of the operations triggered an error, but don't want to check
-   after each op as that woudl be a client/server turnaround.
-*/
-class CmdResetError : public BasicCommand {
-public:
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
-        return false;
-    }
-    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
-        return AllowedOnSecondary::kAlways;
-    }
-    virtual void addRequiredPrivileges(const std::string& dbname,
-                                       const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) const {}  // No auth required
-
-    bool requiresAuth() const override {
-        return false;
-    }
-
-    std::string help() const override {
-        return "reset error state";
-    }
-    CmdResetError() : BasicCommand("resetError", "reseterror") {}
-    bool run(OperationContext* opCtx,
-             const string& db,
-             const BSONObj& cmdObj,
-             BSONObjBuilder& result) {
-        LastError::get(opCtx->getClient()).reset();
-        return true;
-    }
-} cmdResetError;
 
 class CmdGetLastError : public ErrmsgCommandDeprecated {
 public:
@@ -154,6 +120,8 @@ public:
             }
         }
 
+        warnDeprecation(c, "getLastError");
+
         // for sharding; also useful in general for debugging
         result.appendNumber("connectionId", c.getConnectionId());
 
@@ -213,23 +181,15 @@ public:
             return bob.obj();
         }());
 
-        // Use the default options if we have no gle options aside from wOpTime/wElectionId
-        const int nFields = writeConcernDoc.nFields();
-        bool useDefaultGLEOptions = (nFields == 1) || (nFields == 2 && lastOpTimePresent) ||
-            (nFields == 3 && lastOpTimePresent && electionIdPresent);
-
         WriteConcernOptions writeConcern;
-
-        if (useDefaultGLEOptions) {
-            writeConcern = repl::ReplicationCoordinator::get(opCtx)->getGetLastErrorDefault();
-        }
-
-        Status status = writeConcern.parse(writeConcernDoc);
+        auto sw = WriteConcernOptions::parse(writeConcernDoc);
+        Status status = sw.getStatus();
 
         //
         // Validate write concern no matter what, this matches 2.4 behavior
         //
         if (status.isOK()) {
+            writeConcern = sw.getValue();
             status = validateWriteConcern(opCtx, writeConcern);
         }
 
@@ -261,8 +221,13 @@ public:
                 }
             } else {
                 if (electionId != repl::ReplicationCoordinator::get(opCtx)->getElectionId()) {
-                    LOG(3) << "oid passed in is " << electionId << ", but our id is "
-                           << repl::ReplicationCoordinator::get(opCtx)->getElectionId();
+                    LOGV2_DEBUG(20476,
+                                3,
+                                "OID passed in is {passedOID}, but our id is {ourOID}",
+                                "OID mismatch during election",
+                                "passedOID"_attr = electionId,
+                                "ourOID"_attr =
+                                    repl::ReplicationCoordinator::get(opCtx)->getElectionId());
                     errmsg = "election occurred after write";
                     result.append("code", ErrorCodes::WriteConcernFailed);
                     result.append("codeName",
@@ -279,13 +244,25 @@ public:
 
         WriteConcernResult wcResult;
         status = waitForWriteConcern(opCtx, lastOpTime, writeConcern, &wcResult);
-        wcResult.appendTo(writeConcern, &result);
+        // getLastError command returns a document that contains the writtenTo array. So we compute
+        // the writtenTo array here if we have waited for replication before. The call to
+        // getHostsWrittenTo needs to lock the ReplicationCoordinator mutex to guard against
+        // topology changes. Thus, we only compute this array here for the getLastError command
+        // (instead of in waitForWriteConcern for every single write) to avoid a serialization point
+        // for all writes.
+        if (!lastOpTime.isNull() && writeConcern.needToWaitForOtherNodes()) {
+            wcResult.writtenTo = replCoord->getHostsWrittenTo(
+                lastOpTime,
+                replCoord->populateUnsetWriteConcernOptionsSyncMode(writeConcern).syncMode ==
+                    WriteConcernOptions::SyncMode::JOURNAL);
+        }
+        wcResult.appendTo(&result);
 
         // For backward compatibility with 2.4, wtimeout returns ok : 1.0
         if (wcResult.wTimedOut) {
             dassert(!wcResult.err.empty());  // so we always report err
             dassert(!status.isOK());
-            result.append("errmsg", "timed out waiting for slaves");
+            result.append("errmsg", "timed out waiting for secondaries");
             result.append("code", status.code());
             result.append("codeName", ErrorCodes::errorString(status.code()));
             return true;

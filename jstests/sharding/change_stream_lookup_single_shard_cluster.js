@@ -1,65 +1,50 @@
 // Tests that a $changeStream pipeline is split rather than forwarded even in the case where the
 // cluster only has a single shard, and that it can therefore successfully look up a document in a
 // sharded collection.
-// @tags: [uses_change_streams]
+// @tags: [
+//   requires_majority_read_concern,
+//   uses_change_streams,
+// ]
 (function() {
-    "use strict";
+"use strict";
 
-    // For supportsMajorityReadConcern.
-    load('jstests/multiVersion/libs/causal_consistency_helpers.js');
+// Create a cluster with only 1 shard.
+const st = new ShardingTest({
+    shards: 1,
+    rs: {nodes: 1, setParameter: {periodicNoopIntervalSecs: 1, writePeriodicNoops: true}}
+});
 
-    // TODO (SERVER-38673): Remove this once BACKPORT-3428, BACKPORT-3429 are completed.
-    if (!jsTestOptions().enableMajorityReadConcern &&
-        jsTestOptions().mongosBinVersion === 'last-stable') {
-        jsTestLog(
-            "Skipping test since 'last-stable' mongos doesn't support speculative majority update lookup queries.");
-        return;
-    }
+const mongosDB = st.s0.getDB(jsTestName());
+const mongosColl = mongosDB[jsTestName()];
 
-    // This test only works on storage engines that support committed reads, skip it if the
-    // configured engine doesn't support it.
-    if (!supportsMajorityReadConcern()) {
-        jsTestLog("Skipping test since storage engine doesn't support majority read concern.");
-        return;
-    }
+// Enable sharding, shard on _id, and insert a test document which will be updated later.
+assert.commandWorked(mongosDB.adminCommand({enableSharding: mongosDB.getName()}));
+assert.commandWorked(
+    mongosDB.adminCommand({shardCollection: mongosColl.getFullName(), key: {_id: 1}}));
+assert.commandWorked(mongosColl.insert({_id: 1}));
 
-    // Create a cluster with only 1 shard.
-    const st = new ShardingTest({
-        shards: 1,
-        rs: {nodes: 1, setParameter: {periodicNoopIntervalSecs: 1, writePeriodicNoops: true}}
-    });
+// Verify that the pipeline splits and merges on mongoS despite only targeting a single shard.
+const explainPlan = assert.commandWorked(
+    mongosColl.explain().aggregate([{$changeStream: {fullDocument: "updateLookup"}}]));
+assert.neq(explainPlan.splitPipeline, null);
+assert.eq(explainPlan.mergeType, "mongos");
 
-    const mongosDB = st.s0.getDB(jsTestName());
-    const mongosColl = mongosDB[jsTestName()];
+// Open a $changeStream on the collection with 'updateLookup' and update the test doc.
+const stream = mongosColl.watch([], {fullDocument: "updateLookup"});
+const wholeDbStream = mongosDB.watch([], {fullDocument: "updateLookup"});
 
-    // Enable sharding, shard on _id, and insert a test document which will be updated later.
-    assert.commandWorked(mongosDB.adminCommand({enableSharding: mongosDB.getName()}));
-    assert.commandWorked(
-        mongosDB.adminCommand({shardCollection: mongosColl.getFullName(), key: {_id: 1}}));
-    assert.writeOK(mongosColl.insert({_id: 1}));
+mongosColl.update({_id: 1}, {$set: {updated: true}});
 
-    // Verify that the pipeline splits and merges on mongoS despite only targeting a single shard.
-    const explainPlan = assert.commandWorked(
-        mongosColl.explain().aggregate([{$changeStream: {fullDocument: "updateLookup"}}]));
-    assert.neq(explainPlan.splitPipeline, null);
-    assert.eq(explainPlan.mergeType, "mongos");
+// Verify that the document is successfully retrieved from the single-collection and whole-db
+// change streams.
+assert.soon(() => stream.hasNext());
+assert.docEq(stream.next().fullDocument, {_id: 1, updated: true});
 
-    // Open a $changeStream on the collection with 'updateLookup' and update the test doc.
-    const stream = mongosColl.watch([], {fullDocument: "updateLookup"});
-    const wholeDbStream = mongosDB.watch([], {fullDocument: "updateLookup"});
+assert.soon(() => wholeDbStream.hasNext());
+assert.docEq(wholeDbStream.next().fullDocument, {_id: 1, updated: true});
 
-    mongosColl.update({_id: 1}, {$set: {updated: true}});
+stream.close();
+wholeDbStream.close();
 
-    // Verify that the document is successfully retrieved from the single-collection and whole-db
-    // change streams.
-    assert.soon(() => stream.hasNext());
-    assert.docEq(stream.next().fullDocument, {_id: 1, updated: true});
-
-    assert.soon(() => wholeDbStream.hasNext());
-    assert.docEq(wholeDbStream.next().fullDocument, {_id: 1, updated: true});
-
-    stream.close();
-    wholeDbStream.close();
-
-    st.stop();
+st.stop();
 })();

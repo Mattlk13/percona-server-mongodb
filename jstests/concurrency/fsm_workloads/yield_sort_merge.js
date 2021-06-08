@@ -5,13 +5,13 @@
  *
  * Intersperse queries which use the SORT_MERGE stage with updates and deletes of documents they
  * may match.
- * Other workloads that need an index { a: 1, b: 1 } can extend this
+ *
+ * Other workloads that need an index { a: 1, b: 1 } can extend this.
  */
 load('jstests/concurrency/fsm_libs/extend_workload.js');  // for extendWorkload
 load('jstests/concurrency/fsm_workloads/yield.js');       // for $config
 
 var $config = extendWorkload($config, function($config, $super) {
-
     /*
      * Execute a query that will use the SORT_MERGE stage.
      */
@@ -46,7 +46,7 @@ var $config = extendWorkload($config, function($config, $super) {
     $config.setup = function setup(db, collName, cluster) {
         $super.setup.apply(this, arguments);
 
-        assertAlways.commandWorked(db[collName].ensureIndex({a: 1, b: 1}));
+        assertAlways.commandWorked(db[collName].createIndex({a: 1, b: 1}));
     };
 
     return $config;

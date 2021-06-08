@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kGeo
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kGeo
 
 #include "mongo/db/geo/geoparser.h"
 
@@ -39,8 +39,6 @@
 #include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/db/geo/shapes.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/log.h"
 #include "mongo/util/str.h"
 #include "mongo/util/transitional_tools_do_not_use/vector_spooling.h"
 #include "third_party/s2/s2polygonbuilder.h"
@@ -210,7 +208,7 @@ static Status parseGeoJSONPolygonCoordinates(const BSONElement& elem,
                 "Loop must have at least 3 different vertices: " << coordinateElt.toString(false));
         }
 
-        loops.push_back(stdx::make_unique<S2Loop>(points));
+        loops.push_back(std::make_unique<S2Loop>(points));
         S2Loop* loop = loops.back().get();
 
         // Check whether this loop is valid.
@@ -231,8 +229,7 @@ static Status parseGeoJSONPolygonCoordinates(const BSONElement& elem,
                 "Secondary loops not contained by first exterior loop - "
                 "secondary loops must be holes: "
                 << coordinateElt.toString(false)
-                << " first loop: "
-                << elem.Obj().firstElement().toString(false));
+                << " first loop: " << elem.Obj().firstElement().toString(false));
         }
     }
 

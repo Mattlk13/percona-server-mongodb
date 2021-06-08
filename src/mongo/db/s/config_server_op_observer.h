@@ -30,6 +30,7 @@
 #pragma once
 
 #include "mongo/db/op_observer.h"
+#include "mongo/platform/mutex.h"
 
 namespace mongo {
 
@@ -58,6 +59,9 @@ public:
                            const std::vector<BSONObj>& indexes,
                            bool fromMigrate) override {}
 
+    void onStartIndexBuildSinglePhase(OperationContext* opCtx,
+                                      const NamespaceString& nss) override {}
+
     void onCommitIndexBuild(OperationContext* opCtx,
                             const NamespaceString& nss,
                             CollectionUUID collUUID,
@@ -70,6 +74,7 @@ public:
                            CollectionUUID collUUID,
                            const UUID& indexBuildUUID,
                            const std::vector<BSONObj>& indexes,
+                           const Status& cause,
                            bool fromMigrate) override {}
 
     void onInserts(OperationContext* opCtx,
@@ -77,7 +82,7 @@ public:
                    OptionalCollectionUUID uuid,
                    std::vector<InsertStatement>::const_iterator begin,
                    std::vector<InsertStatement>::const_iterator end,
-                   bool fromMigrate) override {}
+                   bool fromMigrate) override;
 
     void onUpdate(OperationContext* opCtx, const OplogUpdateEntryArgs& args) override {}
 
@@ -89,17 +94,20 @@ public:
                   const NamespaceString& nss,
                   OptionalCollectionUUID uuid,
                   StmtId stmtId,
-                  bool fromMigrate,
-                  const boost::optional<BSONObj>& deletedDoc) override;
+                  const OplogDeleteEntryArgs& args) override;
 
     void onInternalOpMessage(OperationContext* opCtx,
                              const NamespaceString& nss,
                              const boost::optional<UUID> uuid,
                              const BSONObj& msgObj,
-                             const boost::optional<BSONObj> o2MsgObj) override {}
+                             const boost::optional<BSONObj> o2MsgObj,
+                             const boost::optional<repl::OpTime> preImageOpTime,
+                             const boost::optional<repl::OpTime> postImageOpTime,
+                             const boost::optional<repl::OpTime> prevWriteOpTimeInTransaction,
+                             const boost::optional<OplogSlot> slot) final{};
 
     void onCreateCollection(OperationContext* opCtx,
-                            Collection* coll,
+                            const CollectionPtr& coll,
                             const NamespaceString& collectionName,
                             const CollectionOptions& options,
                             const BSONObj& idIndex,
@@ -107,13 +115,14 @@ public:
 
     void onCollMod(OperationContext* opCtx,
                    const NamespaceString& nss,
-                   OptionalCollectionUUID uuid,
+                   const UUID& uuid,
                    const BSONObj& collModCmd,
                    const CollectionOptions& oldCollOptions,
-                   boost::optional<TTLCollModInfo> ttlInfo) override {}
+                   boost::optional<IndexCollModInfo> indexInfo) override {}
 
     void onDropDatabase(OperationContext* opCtx, const std::string& dbName) override {}
 
+    using OpObserver::onDropCollection;
     repl::OpTime onDropCollection(OperationContext* opCtx,
                                   const NamespaceString& collectionName,
                                   OptionalCollectionUUID uuid,
@@ -126,6 +135,7 @@ public:
                      const std::string& indexName,
                      const BSONObj& indexInfo) override {}
 
+    using OpObserver::onRenameCollection;
     void onRenameCollection(OperationContext* opCtx,
                             const NamespaceString& fromCollection,
                             const NamespaceString& toCollection,
@@ -133,6 +143,15 @@ public:
                             OptionalCollectionUUID dropTargetUUID,
                             std::uint64_t numRecords,
                             bool stayTemp) override {}
+    void onImportCollection(OperationContext* opCtx,
+                            const UUID& importUUID,
+                            const NamespaceString& nss,
+                            long long numRecords,
+                            long long dataSize,
+                            const BSONObj& catalogEntry,
+                            const BSONObj& storageMetadata,
+                            bool isDryRun) override {}
+    using OpObserver::preRenameCollection;
     repl::OpTime preRenameCollection(OperationContext* opCtx,
                                      const NamespaceString& fromCollection,
                                      const NamespaceString& toCollection,
@@ -151,14 +170,15 @@ public:
 
     void onApplyOps(OperationContext* opCtx,
                     const std::string& dbName,
-                    const BSONObj& applyOpCmd) override {}
+                    const BSONObj& applyOpCmd) override;
 
     void onEmptyCapped(OperationContext* opCtx,
                        const NamespaceString& collectionName,
                        OptionalCollectionUUID uuid) override {}
 
-    void onUnpreparedTransactionCommit(
-        OperationContext* opCtx, const std::vector<repl::ReplOperation>& statements) override {}
+    void onUnpreparedTransactionCommit(OperationContext* opCtx,
+                                       std::vector<repl::ReplOperation>* statements,
+                                       size_t numberOfPreImagesToWrite) override {}
 
     void onPreparedTransactionCommit(
         OperationContext* opCtx,
@@ -168,12 +188,25 @@ public:
 
     void onTransactionPrepare(OperationContext* opCtx,
                               const std::vector<OplogSlot>& reservedSlots,
-                              std::vector<repl::ReplOperation>& statements) override {}
+                              std::vector<repl::ReplOperation>* statements,
+                              size_t numberOfPreImagesToWrite) override {}
 
     void onTransactionAbort(OperationContext* opCtx,
                             boost::optional<OplogSlot> abortOplogEntryOpTime) override {}
 
     void onReplicationRollback(OperationContext* opCtx, const RollbackObserverInfo& rbInfo);
+
+    void onMajorityCommitPointUpdate(ServiceContext* service,
+                                     const repl::OpTime& newCommitPoint) override;
+
+private:
+    void _registerTopologyTimeTickPoint(Timestamp newTopologyTime);
+    void _tickTopologyTimeIfNecessary(ServiceContext* service, Timestamp newCommitPointTime);
+
+    // Guards access to the instance variables below.
+    Mutex _mutex = MONGO_MAKE_LATCH("ConfigServerOpObserver");
+
+    std::vector<Timestamp> _topologyTimeTickPoints;
 };
 
 }  // namespace mongo

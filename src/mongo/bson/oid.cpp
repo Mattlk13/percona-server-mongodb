@@ -36,6 +36,7 @@
 #include <memory>
 
 #include "mongo/base/init.h"
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/random.h"
@@ -52,12 +53,11 @@ const std::size_t kIncrementOffset = kInstanceUniqueOffset + OID::kInstanceUniqu
 OID::InstanceUnique _instanceUnique;
 }  // namespace
 
-MONGO_INITIALIZER_GENERAL(OIDGeneration, MONGO_NO_PREREQUISITES, ("default"))
+MONGO_INITIALIZER_GENERAL(OIDGeneration, (), ("default"))
 (InitializerContext* context) {
-    std::unique_ptr<SecureRandom> entropy(SecureRandom::create());
-    counter = std::make_unique<AtomicWord<int64_t>>(entropy->nextInt64());
-    _instanceUnique = OID::InstanceUnique::generate(*entropy);
-    return Status::OK();
+    SecureRandom entropy;
+    counter = std::make_unique<AtomicWord<int64_t>>(entropy.nextInt64());
+    _instanceUnique = OID::InstanceUnique::generate(entropy);
 }
 
 OID::Increment OID::Increment::next() {
@@ -72,9 +72,8 @@ OID::Increment OID::Increment::next() {
 }
 
 OID::InstanceUnique OID::InstanceUnique::generate(SecureRandom& entropy) {
-    int64_t rand = entropy.nextInt64();
     OID::InstanceUnique u;
-    std::memcpy(u.bytes, &rand, kInstanceUniqueSize);
+    entropy.fill(u.bytes, kInstanceUniqueSize);
     return u;
 }
 
@@ -119,8 +118,8 @@ size_t OID::Hasher::operator()(const OID& oid) const {
 }
 
 void OID::regenMachineId() {
-    std::unique_ptr<SecureRandom> entropy(SecureRandom::create());
-    _instanceUnique = InstanceUnique::generate(*entropy);
+    SecureRandom entropy;
+    _instanceUnique = InstanceUnique::generate(entropy);
 }
 
 unsigned OID::getMachineId() {
@@ -135,7 +134,7 @@ void OID::justForked() {
 
 void OID::init() {
     // each set* method handles endianness
-    setTimestamp(time(0));
+    setTimestamp(time(nullptr));
     setInstanceUnique(_instanceUnique);
     setIncrement(Increment::next());
 }
@@ -150,11 +149,8 @@ void OID::initFromTermNumber(int64_t term) {
 
 void OID::init(const std::string& s) {
     verify(s.size() == 24);
-    const char* p = s.c_str();
-    for (std::size_t i = 0; i < kOIDSize; i++) {
-        _data[i] = uassertStatusOK(fromHex(p));
-        p += 2;
-    }
+    std::string blob = hexblob::decode(StringData(s).substr(0, 2 * kOIDSize));
+    std::copy(blob.begin(), blob.end(), _data);
 }
 
 void OID::init(Date_t date, bool max) {
@@ -168,11 +164,11 @@ time_t OID::asTimeT() const {
 }
 
 std::string OID::toString() const {
-    return toHexLower(_data, kOIDSize);
+    return hexblob::encodeLower(_data, kOIDSize);
 }
 
 std::string OID::toIncString() const {
-    return toHexLower(getIncrement().bytes, kIncrementSize);
+    return hexblob::encodeLower(getIncrement().bytes, kIncrementSize);
 }
 
 }  // namespace mongo

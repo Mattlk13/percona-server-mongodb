@@ -9,7 +9,6 @@ load('jstests/concurrency/fsm_libs/extend_workload.js');  // for extendWorkload
 load('jstests/concurrency/fsm_workloads/agg_base.js');    // for $config
 
 var $config = extendWorkload($config, function($config, $super) {
-
     $config.data.getOutCollName = function getOutCollName(collName) {
         return collName + '_out_agg_match';
     };
@@ -21,7 +20,7 @@ var $config = extendWorkload($config, function($config, $super) {
         assertAlways.eq(0, cursor.itcount(), 'cursor returned by $out should always be empty');
         // NOTE: This relies on the fast-path for .count().
         // NOTE: There's a bug, SERVER-33753, where "fast" .count() is wrong on sharded
-        // collections, so we blacklisted this test for sharded clusters.
+        // collections, so we denylisted this test for sharded clusters.
         assertWhenOwnColl.eq(db[collName].count() / 2, db[otherCollName].count());
     };
 

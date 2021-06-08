@@ -31,33 +31,35 @@
 
 #include "mongo/db/matcher/expression_expr.h"
 
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 
 namespace mongo {
 
 MONGO_FAIL_POINT_DEFINE(ExprMatchExpressionMatchesReturnsFalseOnException);
 
 ExprMatchExpression::ExprMatchExpression(boost::intrusive_ptr<Expression> expr,
-                                         const boost::intrusive_ptr<ExpressionContext>& expCtx)
-    : MatchExpression(MatchType::EXPRESSION), _expCtx(expCtx), _expression(expr) {}
+                                         const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                         clonable_ptr<ErrorAnnotation> annotation)
+    : MatchExpression(MatchType::EXPRESSION, std::move(annotation)),
+      _expCtx(expCtx),
+      _expression(expr) {}
 
 ExprMatchExpression::ExprMatchExpression(BSONElement elem,
-                                         const boost::intrusive_ptr<ExpressionContext>& expCtx)
-    : ExprMatchExpression(Expression::parseOperand(expCtx, elem, expCtx->variablesParseState),
-                          expCtx) {}
+                                         const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                         clonable_ptr<ErrorAnnotation> annotation)
+    : ExprMatchExpression(Expression::parseOperand(expCtx.get(), elem, expCtx->variablesParseState),
+                          expCtx,
+                          std::move(annotation)) {}
 
 bool ExprMatchExpression::matches(const MatchableDocument* doc, MatchDetails* details) const {
     if (_rewriteResult && _rewriteResult->matchExpression() &&
         !_rewriteResult->matchExpression()->matches(doc, details)) {
         return false;
     }
-
-    Document document(doc->toBSON());
     try {
-        auto value = _expression->evaluate(document);
-        return value.coerceToBool();
+        return evaluateExpression(doc).coerceToBool();
     } catch (const DBException&) {
-        if (MONGO_FAIL_POINT(ExprMatchExpressionMatchesReturnsFalseOnException)) {
+        if (MONGO_unlikely(ExprMatchExpressionMatchesReturnsFalseOnException.shouldFail())) {
             return false;
         }
 
@@ -65,7 +67,17 @@ bool ExprMatchExpression::matches(const MatchableDocument* doc, MatchDetails* de
     }
 }
 
-void ExprMatchExpression::serialize(BSONObjBuilder* out) const {
+Value ExprMatchExpression::evaluateExpression(const MatchableDocument* doc) const {
+    Document document(doc->toBSON());
+
+    // 'Variables' is not thread safe, and ExprMatchExpression may be used in a validator which
+    // processes documents from multiple threads simultaneously. Hence we make a copy of the
+    // 'Variables' object per-caller.
+    Variables variables = _expCtx->variables;
+    return _expression->evaluate(document, &variables);
+}
+
+void ExprMatchExpression::serialize(BSONObjBuilder* out, bool includePath) const {
     *out << "$expr" << _expression->serialize(false);
 }
 
@@ -87,8 +99,12 @@ bool ExprMatchExpression::equivalent(const MatchExpression* other) const {
 }
 
 void ExprMatchExpression::_doSetCollator(const CollatorInterface* collator) {
-    _expCtx->setCollator(collator);
-
+    // This function is used to give match expression nodes which don't keep a pointer to the
+    // ExpressionContext access to the ExpressionContext's collator. Since the operation only ever
+    // has a single CollatorInterface, and since that collator is kept on the ExpressionContext,
+    // the collator pointer that we're propagating throughout the MatchExpression tree must match
+    // the one inside the ExpressionContext.
+    invariant(collator == _expCtx->getCollator());
     if (_rewriteResult && _rewriteResult->matchExpression()) {
         _rewriteResult->matchExpression()->setCollator(collator);
     }
@@ -99,14 +115,15 @@ std::unique_ptr<MatchExpression> ExprMatchExpression::shallowClone() const {
     // TODO SERVER-31003: Replace Expression clone via serialization with Expression::clone().
     BSONObjBuilder bob;
     bob << "" << _expression->serialize(false);
-    boost::intrusive_ptr<Expression> clonedExpr =
-        Expression::parseOperand(_expCtx, bob.obj().firstElement(), _expCtx->variablesParseState);
+    boost::intrusive_ptr<Expression> clonedExpr = Expression::parseOperand(
+        _expCtx.get(), bob.obj().firstElement(), _expCtx->variablesParseState);
 
-    auto clone = stdx::make_unique<ExprMatchExpression>(std::move(clonedExpr), _expCtx);
+    auto clone =
+        std::make_unique<ExprMatchExpression>(std::move(clonedExpr), _expCtx, _errorAnnotation);
     if (_rewriteResult) {
         clone->_rewriteResult = _rewriteResult->clone();
     }
-    return std::move(clone);
+    return clone;
 }
 
 MatchExpression::ExpressionOptimizerFunc ExprMatchExpression::getOptimizer() const {
@@ -126,9 +143,9 @@ MatchExpression::ExpressionOptimizerFunc ExprMatchExpression::getOptimizer() con
             RewriteExpr::rewrite(exprMatchExpr._expression, exprMatchExpr._expCtx->getCollator());
 
         if (exprMatchExpr._rewriteResult->matchExpression()) {
-            auto andMatch = stdx::make_unique<AndMatchExpression>();
-            andMatch->add(exprMatchExpr._rewriteResult->releaseMatchExpression().release());
-            andMatch->add(expression.release());
+            auto andMatch = std::make_unique<AndMatchExpression>();
+            andMatch->add(exprMatchExpr._rewriteResult->releaseMatchExpression());
+            andMatch->add(std::move(expression));
             // Re-optimize the new AND in order to make sure that any AND children are absorbed.
             expression = MatchExpression::optimize(std::move(andMatch));
         }

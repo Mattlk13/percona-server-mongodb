@@ -27,16 +27,17 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/util/net/ssl_parameters.h"
 
+#include "mongo/bson/json.h"
 #include "mongo/config.h"
 #include "mongo/db/auth/sasl_command_constants.h"
 #include "mongo/db/server_options.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/net/ssl_options.h"
 #include "mongo/util/net/ssl_parameters_gen.h"
 
@@ -70,9 +71,9 @@ StatusWith<ServerGlobalParams::ClusterAuthModes> clusterAuthModeParse(StringData
     } else if (strMode == "x509") {
         return ServerGlobalParams::ClusterAuthMode_x509;
     } else {
-        return Status(
-            ErrorCodes::BadValue,
-            str::stream() << "Invalid clusterAuthMode '" << strMode
+        return Status(ErrorCodes::BadValue,
+                      str::stream()
+                          << "Invalid clusterAuthMode '" << strMode
                           << "', expected one of: 'keyFile', 'sendKeyFile', 'sendX509', or 'x509'");
     }
 }
@@ -97,18 +98,23 @@ StatusWith<SSLParams::SSLModes> checkTLSModeTransition(T modeToString,
         return {ErrorCodes::BadValue,
                 str::stream() << "Illegal state transition for " << parameterName
                               << ", attempt to change from "
-                              << modeToString(static_cast<SSLParams::SSLModes>(oldMode))
-                              << " to "
+                              << modeToString(static_cast<SSLParams::SSLModes>(oldMode)) << " to "
                               << strMode};
     }
 }
+
+std::once_flag warnForSSLMode;
 
 }  // namespace
 
 void SSLModeServerParameter::append(OperationContext*,
                                     BSONObjBuilder& builder,
                                     const std::string& fieldName) {
-    warning() << "Use of deprecared server parameter 'sslMode', please use 'tlsMode' instead.";
+    std::call_once(warnForSSLMode, [] {
+        LOGV2_WARNING(
+            23803, "Use of deprecated server parameter 'sslMode', please use 'tlsMode' instead.");
+    });
+
     builder.append(fieldName, SSLParams::sslModeFormat(sslGlobalParams.sslMode.load()));
 }
 
@@ -121,7 +127,10 @@ void TLSModeServerParameter::append(OperationContext*,
 }
 
 Status SSLModeServerParameter::setFromString(const std::string& strMode) {
-    warning() << "Use of deprecared server parameter 'sslMode', please use 'tlsMode' instead.";
+    std::call_once(warnForSSLMode, [] {
+        LOGV2_WARNING(
+            23804, "Use of deprecated server parameter 'sslMode', please use 'tlsMode' instead.");
+    });
 
     auto swNewMode = checkTLSModeTransition(
         SSLParams::sslModeFormat, SSLParams::sslModeParse, "sslMode", strMode);
@@ -142,10 +151,101 @@ Status TLSModeServerParameter::setFromString(const std::string& strMode) {
     return Status::OK();
 }
 
+void TLSCATrustsSetParameter::append(OperationContext*,
+                                     BSONObjBuilder& b,
+                                     const std::string& name) {
+    if (!sslGlobalParams.tlsCATrusts) {
+        b.appendNull(name);
+        return;
+    }
+
+    BSONArrayBuilder trusts;
+
+    for (const auto& cait : sslGlobalParams.tlsCATrusts.get()) {
+        BSONArrayBuilder roles;
+
+        for (const auto& rolename : cait.second) {
+            BSONObjBuilder role;
+            role.append("role", rolename.getRole());
+            role.append("db", rolename.getDB());
+            roles.append(role.obj());
+        }
+
+        BSONObjBuilder ca;
+        ca.append("sha256", cait.first.toHexString());
+        ca.append("roles", roles.arr());
+
+        trusts.append(ca.obj());
+    }
+
+    b.append(name, trusts.arr());
+}
+
+/**
+ * tlsCATrusts takes the form of an array of documents describing
+ * a set of roles which a given certificate authority may grant.
+ *
+ * [
+ *   {
+ *     "sha256": "0123456789abcdef...",   // SHA256 digest of a CA, as hex.
+ *     "roles": [                         // Array of grantable RoleNames
+ *       { role: "read", db: "foo" },
+ *       { role: "readWrite", "db: "bar" },
+ *       // etc...
+ *     ],
+ *   },
+ *   // { "sha256": "...", roles: [...]}, // Additional documents...
+ * ]
+ *
+ * If this list has been set, and a client connects with a certificate
+ * containing roles which it has not been authorized to grant,
+ * then the connection will be refused.
+ *
+ * Wilcard roles may be defined by omitting the role and/or db portions:
+ *
+ *   { role: "", db: "foo" }       // May grant any role on the 'foo' DB.
+ *   { role: "read", db: "" }      // May grant 'read' role on any DB.
+ *   { role: "", db: "" }          // May grant any role on any DB.
+ */
+Status TLSCATrustsSetParameter::set(const BSONElement& element) try {
+    if ((element.type() != Object) || !element.Obj().couldBeArray()) {
+        return {ErrorCodes::BadValue, "Value must be an array"};
+    }
+
+    SSLParams::TLSCATrusts trusts;
+    for (const auto& trustElement : BSONArray(element.Obj())) {
+        if (trustElement.type() != Object) {
+            return {ErrorCodes::BadValue, "Value must be an array of trust definitions"};
+        }
+
+        IDLParserErrorContext ctx("tlsCATrusts");
+        auto trust = TLSCATrust::parse(ctx, trustElement.Obj());
+
+        if (trusts.find(trust.getSha256()) != trusts.end()) {
+            return {ErrorCodes::BadValue,
+                    str::stream() << "Duplicate thumbprint: " << trust.getSha256().toString()};
+        }
+
+        const auto& roles = trust.getRoles();
+        trusts[std::move(trust.getSha256())] = std::set<RoleName>(roles.begin(), roles.end());
+    }
+
+    sslGlobalParams.tlsCATrusts = std::move(trusts);
+    return Status::OK();
+} catch (...) {
+    return exceptionToStatus();
+}
+
+Status TLSCATrustsSetParameter::setFromString(const std::string& json) try {
+    return set(BSON("" << fromjson(json)).firstElement());
+} catch (...) {
+    return exceptionToStatus();
+}
+
 }  // namespace mongo
 
 mongo::Status mongo::validateOpensslCipherConfig(const std::string&) {
-    if (!sslGlobalParams.sslCipherConfig.empty()) {
+    if (sslGlobalParams.sslCipherConfig != kSSLCipherConfigDefault) {
         return {ErrorCodes::BadValue,
                 "opensslCipherConfig setParameter is incompatible with net.tls.tlsCipherConfig"};
     }

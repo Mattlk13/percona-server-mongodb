@@ -27,27 +27,21 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
-
 #include <string>
 #include <vector>
 
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/privilege.h"
-#include "mongo/db/background.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_compact.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/curop.h"
-#include "mongo/db/db_raii.h"
-#include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/views/view_catalog.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -79,10 +73,8 @@ public:
         return "compact collection\n"
                "warning: this operation locks the database and is slow. you can cancel with "
                "killOp()\n"
-               "{ compact : <collection_name>, [force:<bool>], [validate:<bool>] }\n"
-               "  force - allows to run on a replica set primary\n"
-               "  validate - check records are noncorrupt before adding to newly compacting "
-               "extents. slower but safer (defaults to true in this version)\n";
+               "{ compact : <collection_name>, [force:<bool>] }\n"
+               "  force - allows to run on a replica set primary\n";
     }
     CompactCmd() : ErrmsgCommandDeprecated("compact") {}
 
@@ -101,52 +93,26 @@ public:
             return false;
         }
 
-        if (!nss.isNormal()) {
-            errmsg = "bad namespace name";
-            return false;
-        }
-
         if (nss.isSystem()) {
             // Items in system.* cannot be moved as there might be pointers to them.
             errmsg = "can't compact a system namespace";
             return false;
         }
 
-        CompactOptions compactOptions;
-
-        if (cmdObj.hasElement("validate"))
-            compactOptions.validateDocuments = cmdObj["validate"].trueValue();
-
-        AutoGetDb autoDb(opCtx, db, MODE_X);
-        Database* const collDB = autoDb.getDb();
-
-        Collection* collection = collDB ? collDB->getCollection(opCtx, nss) : nullptr;
-        auto view =
-            collDB && !collection ? ViewCatalog::get(collDB)->lookup(opCtx, nss.ns()) : nullptr;
-
-        // If db/collection does not exist, short circuit and return.
-        if (!collDB || !collection) {
-            if (view)
-                uasserted(ErrorCodes::CommandNotSupportedOnView, "can't compact a view");
-            else
-                uasserted(ErrorCodes::NamespaceNotFound, "collection does not exist");
-        }
-
-        OldClientContext ctx(opCtx, nss.ns());
-        BackgroundOperation::assertNoBgOpInProgForNs(nss.ns());
-        invariant(collection->uuid());
-        IndexBuildsCoordinator::get(opCtx)->assertNoIndexBuildInProgForCollection(
-            collection->uuid().get());
-
-        log() << "compact " << nss.ns() << " begin, options: " << compactOptions;
-
-        StatusWith<CompactStats> status = compactCollection(opCtx, collection, &compactOptions);
+        StatusWith<int64_t> status = compactCollection(opCtx, nss);
         uassertStatusOK(status.getStatus());
 
-        log() << "compact " << nss.ns() << " end";
+        int64_t bytesFreed = status.getValue();
+        if (bytesFreed < 0) {
+            // When compacting a collection that is actively being written to, it is possible that
+            // the collection is larger at the completion of compaction than when it started.
+            bytesFreed = 0;
+        }
+
+        result.appendNumber("bytesFreed", static_cast<long long>(bytesFreed));
 
         return true;
     }
 };
 static CompactCmd compactCmd;
-}
+}  // namespace mongo

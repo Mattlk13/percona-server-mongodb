@@ -44,6 +44,37 @@ class BSONObjBuilder;
 class OperationContext;
 
 /**
+ * The PrepareConflictBehavior specifies how operations should behave when encountering prepare
+ * conflicts.
+ */
+enum class PrepareConflictBehavior {
+    /**
+     * When prepare conflicts are encountered, block until the conflict is resolved.
+     */
+    kEnforce,
+
+    /**
+     * Ignore prepare conflicts when they are encountered.
+     *
+     * When a prepared update is encountered, the previous version of a record will be returned.
+     * This behavior can result in reading different versions of a record within the same snapshot
+     * if the prepared update is committed during that snapshot. For this reason, operations that
+     * ignore prepared updates may only perform reads. This is to prevent updating a record based on
+     * an older version of itself, because a write conflict will not be generated in this scenario.
+     */
+    kIgnoreConflicts,
+
+    /**
+     * Ignore prepare conflicts when they are encountered, and allow operations to perform writes,
+     * an exception to the rule of kIgnoreConflicts.
+     *
+     * This should only be used in cases where this is known to be impossible to perform writes
+     * based on other prepared updates.
+     */
+    kIgnoreConflictsAllowWrites
+};
+
+/**
  * Storage statistics management class, with interfaces to provide the statistics in the BSON format
  * and an operator to add the statistics values.
  */
@@ -83,6 +114,8 @@ class RecoveryUnit {
     RecoveryUnit& operator=(const RecoveryUnit&) = delete;
 
 public:
+    void commitRegisteredChanges(boost::optional<Timestamp> commitTimestamp);
+    void abortRegisteredChanges();
     virtual ~RecoveryUnit() {}
 
     /**
@@ -99,7 +132,10 @@ public:
      *
      * Should be called through WriteUnitOfWork rather than directly.
      */
-    virtual void commitUnitOfWork() = 0;
+    void commitUnitOfWork() {
+        doCommitUnitOfWork();
+        assignNextSnapshotId();
+    }
 
     /**
      * Marks the end of a unit of work and rolls back all changes registered by calls to onRollback
@@ -108,7 +144,10 @@ public:
      *
      * Should be called through WriteUnitOfWork rather than directly.
      */
-    virtual void abortUnitOfWork() = 0;
+    void abortUnitOfWork() {
+        doAbortUnitOfWork();
+        assignNextSnapshotId();
+    }
 
     /**
      * Transitions the active unit of work to the "prepared" state. Must be called after
@@ -125,18 +164,17 @@ public:
     }
 
     /**
-     * Sets whether or not to ignore prepared transactions if supported by this storage engine. When
-     * 'ignore' is true, allows reading data from before prepared transactions, but will not show
-     * prepared data. This may not be called while a transaction is already open.
+     * Sets the behavior of handling conflicts that are encountered due to prepared transactions, if
+     * supported by this storage engine. See PrepareConflictBehavior.
      */
-    virtual void setIgnorePrepared(bool ignore) {}
+    virtual void setPrepareConflictBehavior(PrepareConflictBehavior behavior) {}
 
     /**
-     * Returns whether or not we are ignoring prepared conflicts. Defaults to false if prepared
-     * transactions are not supported by this storage engine.
+     * Returns the behavior of handling conflicts that are encountered due to prepared transactions.
+     * Defaults to kEnforce if prepared transactions are not supported by this storage engine.
      */
-    virtual bool getIgnorePrepared() const {
-        return false;
+    virtual PrepareConflictBehavior getPrepareConflictBehavior() const {
+        return PrepareConflictBehavior::kEnforce;
     }
 
     /**
@@ -155,9 +193,11 @@ public:
      * Waits until all commits that happened before this call are durable in the journal. Returns
      * true, unless the storage engine cannot guarantee durability, which should never happen when
      * isDurable() returned true. This cannot be called from inside a unit of work, and should
-     * fail if it is.
+     * fail if it is. This method invariants if the caller holds any locks, except for repair.
+     *
+     * Can throw write interruption errors from the JournalListener.
      */
-    virtual bool waitUntilDurable() = 0;
+    virtual bool waitUntilDurable(OperationContext* opCtx) = 0;
 
     /**
      * Unlike `waitUntilDurable`, this method takes a stable checkpoint, making durable any writes
@@ -168,15 +208,18 @@ public:
      * This must not be called by a system taking user writes until after a stable timestamp is
      * passed to the storage engine.
      */
-    virtual bool waitUntilUnjournaledWritesDurable(bool stableCheckpoint = true) {
-        return waitUntilDurable();
+    virtual bool waitUntilUnjournaledWritesDurable(OperationContext* opCtx, bool stableCheckpoint) {
+        return waitUntilDurable(opCtx);
     }
 
     /**
      * If there is an open transaction, it is closed. On return no transaction is active. This
      * cannot be called inside of a WriteUnitOfWork, and should fail if it is.
      */
-    virtual void abandonSnapshot() = 0;
+    void abandonSnapshot() {
+        doAbandonSnapshot();
+        assignNextSnapshotId();
+    }
 
     /**
      * Informs the RecoveryUnit that a snapshot will be needed soon, if one was not already
@@ -187,20 +230,27 @@ public:
     virtual void preallocateSnapshot() {}
 
     /**
-     * Obtains a majority committed snapshot. Snapshots should still be separately acquired and
-     * newer committed snapshots should be used if available whenever implementations would normally
-     * change snapshots.
+     * Like preallocateSnapshot() above but also indicates that the snapshot will be used for
+     * reading the oplog.
      *
-     * If no snapshot has yet been marked as Majority Committed, returns a status with error code
+     * StorageEngines may not implement this in which case it works like preallocateSnapshot.
+     */
+    virtual void preallocateSnapshotForOplogRead() {
+        preallocateSnapshot();
+    }
+
+    /**
+     * Returns whether or not a majority commmitted snapshot is available. If no snapshot has yet
+     * been marked as Majority Committed, returns a status with error code
      * ReadConcernMajorityNotAvailableYet. After this returns successfully, at any point where
      * implementations attempt to acquire committed snapshot, if there are none available due to a
-     * call to SnapshotManager::dropAllSnapshots(), a AssertionException with the same code should
-     * be thrown.
+     * call to SnapshotManager::clearCommittedSnapshot(), a AssertionException with the same code
+     * should be thrown.
      *
      * StorageEngines that don't support a SnapshotManager should use the default
      * implementation.
      */
-    virtual Status obtainMajorityCommittedSnapshot() {
+    virtual Status majorityCommittedSnapshotAvailable() const {
         return {ErrorCodes::CommandNotSupported,
                 "Current storage engine does not support majority readConcerns"};
     }
@@ -210,17 +260,16 @@ public:
      * a point in time. Any point in time returned will reflect one of the following:
      *  - when using ReadSource::kProvided, the timestamp provided.
      *  - when using ReadSource::kNoOverlap, the timestamp chosen by the storage engine.
-     *  - when using ReadSource::kAllCommittedSnapshot, the timestamp chosen using the storage
-     * engine's all-committed timestamp.
-     *  - when using ReadSource::kLastApplied, the timestamp chosen using the storage engine's last
-     * applied timestamp. Can return boost::none if no timestamp has been established.
+     *  - when using ReadSource::kAllDurableSnapshot, the timestamp chosen using the storage
+     * engine's all_durable timestamp.
+     *  - when using ReadSource::kLastAppplied, the last applied timestamp. Can return boost::none
+     * if no timestamp has been established.
      *  - when using ReadSource::kMajorityCommitted, the majority committed timestamp chosen by the
-     * storage engine after a transaction has been opened or after a call to
-     * obtainMajorityCommittedSnapshot().
+     * storage engine after a transaction has been opened.
      *
      * This may passively start a storage engine transaction to establish a read timestamp.
      */
-    virtual boost::optional<Timestamp> getPointInTimeReadTimestamp() {
+    virtual boost::optional<Timestamp> getPointInTimeReadTimestamp(OperationContext* opCtx) {
         return boost::none;
     }
 
@@ -231,7 +280,9 @@ public:
      *
      * This is unrelated to Timestamp which must be globally comparable.
      */
-    virtual SnapshotId getSnapshotId() const = 0;
+    SnapshotId getSnapshotId() const {
+        return SnapshotId{_mySnapshotId};
+    }
 
     /**
      * Sets a timestamp to assign to future writes in a transaction.
@@ -247,6 +298,14 @@ public:
      */
     virtual Status setTimestamp(Timestamp timestamp) {
         return Status::OK();
+    }
+
+    /**
+     * Returns true if a commit timestamp has been assigned to writes in this transaction.
+     * Otherwise, returns false.
+     */
+    virtual bool isTimestamped() const {
+        return false;
     }
 
     /**
@@ -305,6 +364,29 @@ public:
     }
 
     /**
+     * Sets catalog conflicting timestamp.
+     * This cannot be called after WiredTigerRecoveryUnit::_txnOpen.
+     *
+     * This value must be set when both of the following conditions are true:
+     * - A storage engine snapshot is opened without a read timestamp
+     * (RecoveryUnit::ReadSource::kNoTimestamp).
+     * - The transaction may touch collections it does not yet have locks for.
+     * In this circumstance, the catalog conflicting timestamp serves as a substitute for a read
+     * timestamp. This value must be set to a valid (i.e: no-holes) read timestamp prior to
+     * acquiring a storage engine snapshot. This timestamp will be used to determine if any changes
+     * had happened to the in-memory catalog after a storage engine snapshot got opened for that
+     * transaction.
+     */
+    virtual void setCatalogConflictingTimestamp(Timestamp timestamp) {}
+
+    /**
+     * Returns the catalog conflicting timestamp.
+     */
+    virtual Timestamp getCatalogConflictingTimestamp() const {
+        return {};
+    }
+
+    /**
      * Fetches the storage level statistics.
      */
     virtual std::shared_ptr<StorageStats> getOperationStatistics() const {
@@ -312,20 +394,22 @@ public:
     }
 
     /**
+     * Refreshes a read transaction by starting a new one at the same read timestamp and then ending
+     * the current one.
+     */
+    virtual void refreshSnapshot() {}
+
+    /**
      * The ReadSource indicates which external or provided timestamp to read from for future
      * transactions.
      */
     enum ReadSource {
         /**
-         * Do not read from a timestamp. This is the default.
-         */
-        kUnset,
-        /**
-         * Read without a timestamp explicitly.
+         * Read without a timestamp. This is the default.
          */
         kNoTimestamp,
         /**
-         * Read from the majority all-commmitted timestamp.
+         * Read from the majority all-committed timestamp.
          */
         kMajorityCommitted,
         /**
@@ -333,20 +417,37 @@ public:
          */
         kNoOverlap,
         /**
-         * Read from the last applied timestamp. New transactions start at the most up-to-date
-         * timestamp.
+         * Read from the lastApplied timestamp.
          */
         kLastApplied,
         /**
-         * Read from the all-committed timestamp. New transactions will always read from the same
+         * Read from the all_durable timestamp. New transactions will always read from the same
          * timestamp and never advance.
          */
-        kAllCommittedSnapshot,
+        kAllDurableSnapshot,
         /**
          * Read from the timestamp provided to setTimestampReadSource.
          */
         kProvided
     };
+
+    static std::string toString(ReadSource rs) {
+        switch (rs) {
+            case ReadSource::kNoTimestamp:
+                return "kNoTimestamp";
+            case ReadSource::kMajorityCommitted:
+                return "kMajorityCommitted";
+            case ReadSource::kNoOverlap:
+                return "kNoOverlap";
+            case ReadSource::kLastApplied:
+                return "kLastApplied";
+            case ReadSource::kAllDurableSnapshot:
+                return "kAllDurableSnapshot";
+            case ReadSource::kProvided:
+                return "kProvided";
+        }
+        MONGO_UNREACHABLE;
+    }
 
     /**
      * Sets which timestamp to use for read transactions. If 'provided' is supplied, only kProvided
@@ -361,7 +462,7 @@ public:
                                         boost::optional<Timestamp> provided = boost::none) {}
 
     virtual ReadSource getTimestampReadSource() const {
-        return ReadSource::kUnset;
+        return ReadSource::kNoTimestamp;
     };
 
     /**
@@ -375,6 +476,32 @@ public:
     virtual bool getReadOnce() const {
         return false;
     };
+
+    /**
+     * Indicates whether the RecoveryUnit has an open snapshot. A snapshot can be opened inside or
+     * outside of a WriteUnitOfWork.
+     */
+    virtual bool isActive() const {
+        return _isActive();
+    };
+
+    /**
+     * When called, the WriteUnitOfWork ignores the multi timestamp constraint for the remainder of
+     * the WriteUnitOfWork, where if within a WriteUnitOfWork multiple timestamps are set, the first
+     * timestamp must be set prior to any writes.
+     *
+     * Must be reset when the WriteUnitOfWork is either committed or rolled back.
+     */
+    virtual void ignoreAllMultiTimestampConstraints(){};
+
+    /**
+     * Registers a callback to be called prior to a WriteUnitOfWork committing the storage
+     * transaction. This callback may throw a WriteConflictException which will abort the
+     * transaction.
+     */
+    virtual void registerPreCommitHook(std::function<void(OperationContext*)> callback);
+
+    virtual void runPreCommitHooks(OperationContext* opCtx);
 
     /**
      * A Change is an action that is registerChange()'d while a WriteUnitOfWork exists. The
@@ -408,7 +535,25 @@ public:
      * The registerChange() method may only be called when a WriteUnitOfWork is active, and
      * may not be called during commit or rollback.
      */
-    virtual void registerChange(Change* change) = 0;
+    void registerChange(std::unique_ptr<Change> change);
+
+    /**
+     * Like registerChange() above but should only be used to make new state visible in the
+     * in-memory catalog. Only one change of this kind may be registered at a given time to ensure
+     * catalog updates are atomic. Change registered with this function will commit after the commit
+     * changes registered with registerChange and rollback will run before the rollback changes
+     * registered with registerChange.
+     *
+     * This separation ensures that regular Changes that can modify state are run before the Change
+     * to install the new state in the in-memory catalog, after which there should be no further
+     * changes.
+     */
+    void registerChangeForCatalogVisibility(std::unique_ptr<Change> change);
+
+    /**
+     * Returns true if a change has been registered with registerChangeForCatalogVisibility() above.
+     */
+    bool hasRegisteredChangeForCatalogVisibility();
 
     /**
      * Registers a callback to be called if the current WriteUnitOfWork rolls back.
@@ -429,7 +574,7 @@ public:
             Callback _callback;
         };
 
-        registerChange(new OnRollbackChange(std::move(callback)));
+        registerChange(std::make_unique<OnRollbackChange>(std::move(callback)));
     }
 
     /**
@@ -451,13 +596,170 @@ public:
             Callback _callback;
         };
 
-        registerChange(new OnCommitChange(std::move(callback)));
+        registerChange(std::make_unique<OnCommitChange>(std::move(callback)));
     }
 
     virtual void setOrderedCommit(bool orderedCommit) = 0;
 
+    /**
+     * State transitions:
+     *
+     *   /------------------------> Inactive <-----------------------------\
+     *   |                             |                                   |
+     *   |                             |                                   |
+     *   |              /--------------+--------------\                    |
+     *   |              |                             |                    | abandonSnapshot()
+     *   |              |                             |                    |
+     *   |   beginUOW() |                             | _txnOpen()         |
+     *   |              |                             |                    |
+     *   |              V                             V                    |
+     *   |    InactiveInUnitOfWork          ActiveNotInUnitOfWork ---------/
+     *   |              |                             |
+     *   |              |                             |
+     *   |   _txnOpen() |                             | beginUOW()
+     *   |              |                             |
+     *   |              \--------------+--------------/
+     *   |                             |
+     *   |                             |
+     *   |                             V
+     *   |                           Active
+     *   |                             |
+     *   |                             |
+     *   |              /--------------+--------------\
+     *   |              |                             |
+     *   |              |                             |
+     *   |   abortUOW() |                             | commitUOW()
+     *   |              |                             |
+     *   |              V                             V
+     *   |          Aborting                      Committing
+     *   |              |                             |
+     *   |              |                             |
+     *   |              |                             |
+     *   \--------------+-----------------------------/
+     *
+     */
+    enum class State {
+        kInactive,
+        kInactiveInUnitOfWork,
+        kActiveNotInUnitOfWork,
+        kActive,
+        kAborting,
+        kCommitting,
+    };
+
+    static std::string toString(State state) {
+        switch (state) {
+            case State::kInactive:
+                return "Inactive";
+            case State::kInactiveInUnitOfWork:
+                return "InactiveInUnitOfWork";
+            case State::kActiveNotInUnitOfWork:
+                return "ActiveNotInUnitOfWork";
+            case State::kActive:
+                return "Active";
+            case State::kCommitting:
+                return "Committing";
+            case State::kAborting:
+                return "Aborting";
+        }
+        MONGO_UNREACHABLE;
+    }
+
+    /**
+     * Exposed for debugging purposes.
+     */
+    State getState() {
+        return _getState();
+    }
+
+    void setMustBeTimestamped() {
+        _mustBeTimestamped = true;
+    }
+
+    void setNoEvictionAfterRollback() {
+        _noEvictionAfterRollback = true;
+    }
+
+    bool getNoEvictionAfterRollback() const {
+        return _noEvictionAfterRollback;
+    }
+
+    /**
+     * Returns true if this is an instance of RecoveryUnitNoop.
+     */
+    virtual bool isNoop() const {
+        return false;
+    }
+
 protected:
-    RecoveryUnit() {}
+    RecoveryUnit();
+
+    /**
+     * Returns the current state.
+     */
+    State _getState() const {
+        return _state;
+    }
+
+    /**
+     * Transitions to new state.
+     */
+    void _setState(State newState) {
+        _state = newState;
+    }
+
+    /**
+     * Returns true if active.
+     */
+    bool _isActive() const {
+        return State::kActiveNotInUnitOfWork == _state || State::kActive == _state;
+    }
+
+    /**
+     * Returns true if currently managed by a WriteUnitOfWork.
+     */
+    bool _inUnitOfWork() const {
+        return State::kInactiveInUnitOfWork == _state || State::kActive == _state;
+    }
+
+    /**
+     * Returns true if currently running commit or rollback handlers
+     */
+    bool _isCommittingOrAborting() const {
+        return State::kCommitting == _state || State::kAborting == _state;
+    }
+
+    /**
+     * Executes all registered commit handlers and clears all registered changes
+     */
+    void _executeCommitHandlers(boost::optional<Timestamp> commitTimestamp);
+
+    /**
+     * Executes all registered rollback handlers and clears all registered changes
+     */
+    void _executeRollbackHandlers();
+
+    bool _mustBeTimestamped = false;
+
+    bool _noEvictionAfterRollback = false;
+
+private:
+    // Sets the snapshot associated with this RecoveryUnit to a new globally unique id number.
+    void assignNextSnapshotId();
+
+    virtual void doAbandonSnapshot() = 0;
+    virtual void doCommitUnitOfWork() = 0;
+    virtual void doAbortUnitOfWork() = 0;
+
+    virtual void validateInUnitOfWork() const;
+
+    std::vector<std::function<void(OperationContext*)>> _preCommitHooks;
+
+    typedef std::vector<std::unique_ptr<Change>> Changes;
+    Changes _changes;
+    std::unique_ptr<Change> _changeForCatalogVisibility;
+    State _state = State::kInactive;
+    uint64_t _mySnapshotId;
 };
 
 }  // namespace mongo

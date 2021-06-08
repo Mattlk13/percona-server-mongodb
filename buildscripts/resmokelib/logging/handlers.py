@@ -2,7 +2,6 @@
 
 import json
 import logging
-import sys
 import threading
 import warnings
 
@@ -18,10 +17,10 @@ except ImportError:
 
 import urllib3.util.retry as urllib3_retry
 
-from . import flush
-from .. import utils
+from buildscripts.resmokelib.logging import flush
+from buildscripts.resmokelib import utils
 
-_TIMEOUT_SECS = 10
+_TIMEOUT_SECS = 65
 
 
 class BufferedHandler(logging.Handler):
@@ -176,7 +175,7 @@ class HTTPHandler(object):
             retry_status = [500, 502, 503, 504]  # Retry for these statuses.
             retry = urllib3_retry.Retry(
                 backoff_factor=0.1,  # Enable backoff starting at 0.1s.
-                method_whitelist=False,  # Support all HTTP verbs.
+                allowed_methods=False,  # Support all HTTP verbs.
                 status_forcelist=retry_status)
 
             adapter = requests.adapters.HTTPAdapter(max_retries=retry)

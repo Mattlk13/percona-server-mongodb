@@ -38,18 +38,19 @@ MONGO_FAIL_POINT_DEFINE(ScopedTaskExecutorHangBeforeSchedule);
 MONGO_FAIL_POINT_DEFINE(ScopedTaskExecutorHangExitBeforeSchedule);
 MONGO_FAIL_POINT_DEFINE(ScopedTaskExecutorHangAfterSchedule);
 
+namespace {
+static const inline auto kDefaultShutdownStatus =
+    Status(ErrorCodes::ShutdownInProgress, "Shutting down ScopedTaskExecutor");
+}
+
 /**
  * Implements the wrapping indirection needed to satisfy the ScopedTaskExecutor contract.  Note
  * that at least shutdown() must be called on this type before destruction.
  */
-class ScopedTaskExecutor::Impl : public std::enable_shared_from_this<ScopedTaskExecutor::Impl>,
-                                 public TaskExecutor {
-
-    static const inline auto kShutdownStatus =
-        Status(ErrorCodes::ShutdownInProgress, "Shutting down ScopedTaskExecutor::Impl");
-
+class ScopedTaskExecutor::Impl : public TaskExecutor {
 public:
-    explicit Impl(TaskExecutor* executor) : _executor(executor) {}
+    Impl(std::shared_ptr<TaskExecutor> executor, Status shutdownStatus)
+        : _executor(std::move(executor)), _shutdownStatus(std::move(shutdownStatus)) {}
 
     ~Impl() {
         // The ScopedTaskExecutor dtor calls shutdown, so this is guaranteed.
@@ -63,12 +64,18 @@ public:
     void shutdown() override {
         auto handles = [&] {
             stdx::lock_guard lk(_mutex);
+            if (!_inShutdown && _cbHandles.empty()) {
+                // We are guaranteed that no more callbacks can be added to _cbHandles after
+                // _inShutdown is set to true. If there aren't any callbacks outstanding, then it is
+                // shutdown()'s responsibility to make the futures returned by joinAll() ready.
+                _promise.emplaceValue();
+            }
             _inShutdown = true;
 
             return _cbHandles;
         }();
 
-        for (auto & [ id, handle ] : handles) {
+        for (auto& [id, handle] : handles) {
             // If we don't have a handle yet, it means there's a scheduling thread that's
             // dropped the lock but hasn't yet stashed it (or failed to schedule it on the
             // underlying executor).
@@ -81,8 +88,16 @@ public:
     }
 
     void join() override {
-        stdx::unique_lock lk(_mutex);
-        _cv.wait(lk, [&] { return _inShutdown && _cbHandles.empty(); });
+        joinAsync().wait();
+    }
+
+    SharedSemiFuture<void> joinAsync() override {
+        return _promise.getFuture();
+    }
+
+    bool isShuttingDown() const override {
+        stdx::lock_guard lk(_mutex);
+        return _inShutdown;
     }
 
     void appendDiagnosticBSON(BSONObjBuilder* b) const override {
@@ -95,7 +110,7 @@ public:
 
     StatusWith<EventHandle> makeEvent() override {
         if (stdx::lock_guard lk(_mutex); _inShutdown) {
-            return kShutdownStatus;
+            return _shutdownStatus;
         }
 
         return _executor->makeEvent();
@@ -131,14 +146,30 @@ public:
             std::move(work));
     }
 
-    StatusWith<CallbackHandle> scheduleRemoteCommand(const RemoteCommandRequest& request,
-                                                     const RemoteCommandCallbackFn& cb,
-                                                     const BatonHandle& baton = nullptr) override {
+    StatusWith<CallbackHandle> scheduleRemoteCommandOnAny(
+        const RemoteCommandRequestOnAny& request,
+        const RemoteCommandOnAnyCallbackFn& cb,
+        const BatonHandle& baton = nullptr) override {
         return _wrapCallback(
             [&](auto&& x) {
-                return _executor->scheduleRemoteCommand(request, std::move(x), baton);
+                return _executor->scheduleRemoteCommandOnAny(request, std::move(x), baton);
             },
             cb);
+    }
+
+    StatusWith<CallbackHandle> scheduleExhaustRemoteCommandOnAny(
+        const RemoteCommandRequestOnAny& request,
+        const RemoteCommandOnAnyCallbackFn& cb,
+        const BatonHandle& baton = nullptr) override {
+        return _wrapCallback(
+            [&](auto&& x) {
+                return _executor->scheduleExhaustRemoteCommandOnAny(request, std::move(x), baton);
+            },
+            cb);
+    }
+
+    bool hasTasks() {
+        return _executor->hasTasks();
     }
 
     void cancel(const CallbackHandle& cbHandle) override {
@@ -155,6 +186,17 @@ public:
     }
 
 private:
+    /**
+     * Helper function to get a shared_ptr<ScopedTaskExecutor::Impl> to this object, akin to
+     * shared_from_this(). TaskExecutor (the parent class of ScopedTaskExecutor::Impl) inherits from
+     * std::enable_shared_from_this, so shared_from_this() returns a std::shared_ptr<TaskExecutor>,
+     * which means we need to cast it to use it as a pointer to the subclass
+     * ScopedTaskExecutor::Impl.
+     */
+    std::shared_ptr<ScopedTaskExecutor::Impl> shared_self() {
+        return std::static_pointer_cast<ScopedTaskExecutor::Impl>(shared_from_this());
+    }
+
     /**
      * Wraps a scheduling call, along with its callback, so that:
      *
@@ -205,7 +247,7 @@ private:
 
             // No clean up needed because we never ran or recorded anything
             if (_inShutdown) {
-                return kShutdownStatus;
+                return _shutdownStatus;
             }
 
             id = _id++;
@@ -214,18 +256,18 @@ private:
                 std::piecewise_construct, std::forward_as_tuple(id), std::forward_as_tuple());
         };
 
-        if (MONGO_FAIL_POINT(ScopedTaskExecutorHangBeforeSchedule)) {
+        if (MONGO_unlikely(ScopedTaskExecutorHangBeforeSchedule.shouldFail())) {
             ScopedTaskExecutorHangBeforeSchedule.setMode(FailPoint::off);
 
-            MONGO_FAIL_POINT_PAUSE_WHILE_SET(ScopedTaskExecutorHangExitBeforeSchedule);
+            ScopedTaskExecutorHangExitBeforeSchedule.pauseWhileSet();
         }
 
         // State 2 - Indeterminate state.  We don't know yet if the task will get scheduled.
         auto swCbHandle = std::forward<ScheduleCall>(schedule)(
-            [ id, work = std::forward<Work>(work), self = shared_from_this() ](const auto& cargs) {
+            [id, work = std::forward<Work>(work), self = shared_self()](const auto& cargs) {
                 using ArgsT = std::decay_t<decltype(cargs)>;
 
-                stdx::unique_lock<stdx::mutex> lk(self->_mutex);
+                stdx::unique_lock<Latch> lk(self->_mutex);
 
                 auto doWorkAndNotify = [&](const ArgsT& x) noexcept {
                     lk.unlock();
@@ -246,20 +288,19 @@ private:
                 // modify the status field.
                 auto args = cargs;
 
-                IF_CONSTEXPR(std::is_same_v<ArgsT, CallbackArgs>) {
-                    args.status = kShutdownStatus;
-                }
-                else {
-                    static_assert(std::is_same_v<ArgsT, RemoteCommandCallbackArgs>,
+                if constexpr (std::is_same_v<ArgsT, CallbackArgs>) {
+                    args.status = self->_shutdownStatus;
+                } else {
+                    static_assert(std::is_same_v<ArgsT, RemoteCommandOnAnyCallbackArgs>,
                                   "_wrapCallback only supports CallbackArgs and "
-                                  "RemoteCommandCallbackArgs");
-                    args.response.status = kShutdownStatus;
+                                  "RemoteCommandOnAnyCallbackArgs");
+                    args.response.status = self->_shutdownStatus;
                 }
 
                 doWorkAndNotify(args);
             });
 
-        MONGO_FAIL_POINT_PAUSE_WHILE_SET(ScopedTaskExecutorHangAfterSchedule);
+        ScopedTaskExecutorHangAfterSchedule.pauseWhileSet();
 
         stdx::unique_lock lk(_mutex);
 
@@ -297,23 +338,31 @@ private:
         invariant(_cbHandles.erase(id) == 1);
 
         if (_inShutdown && _cbHandles.empty()) {
-            _cv.notify_all();
+            // We are guaranteed that no more callbacks can be added to _cbHandles after _inShutdown
+            // is set to true. If there are no more callbacks outstanding, then it is the last
+            // callback's responsibility to make the futures returned by joinAll() ready.
+            _promise.emplaceValue();
         }
     }
 
-    stdx::mutex _mutex;
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("ScopedTaskExecutor::_mutex");
     bool _inShutdown = false;
-    TaskExecutor* const _executor;
+    std::shared_ptr<TaskExecutor> _executor;
+    Status _shutdownStatus;
     size_t _id = 0;
     stdx::unordered_map<size_t, CallbackHandle> _cbHandles;
 
-    // condition variable that callers of join wait on and outstanding callbacks potentially
-    // notify
-    stdx::condition_variable _cv;
+    // Promise that is set when the executor has been shut down and there aren't any outstanding
+    // callbacks. Callers of joinAsync() extract futures from this promise.
+    SharedPromise<void> _promise;
 };
 
-ScopedTaskExecutor::ScopedTaskExecutor(TaskExecutor* executor)
-    : _executor(std::make_shared<Impl>(executor)) {}
+ScopedTaskExecutor::ScopedTaskExecutor(std::shared_ptr<TaskExecutor> executor)
+    : _executor(std::make_shared<Impl>(std::move(executor), kDefaultShutdownStatus)) {}
+
+ScopedTaskExecutor::ScopedTaskExecutor(std::shared_ptr<TaskExecutor> executor,
+                                       Status shutdownStatus)
+    : _executor(std::make_shared<Impl>(std::move(executor), std::move(shutdownStatus))) {}
 
 ScopedTaskExecutor::~ScopedTaskExecutor() {
     _executor->shutdown();

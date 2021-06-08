@@ -27,15 +27,15 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/db/auth/authorization_checks.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/health_log.h"
-#include "mongo/db/command_generic_argument.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
@@ -45,9 +45,10 @@
 #include "mongo/db/repl/dbcheck.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/optime.h"
+#include "mongo/idl/command_generic_argument.h"
 #include "mongo/util/background.h"
 
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 
@@ -84,7 +85,6 @@ bool canRunDbCheckOn(const NamespaceString& nss) {
     // TODO: SERVER-30826.
     const std::set<StringData> replicatedSystemCollections{"system.backup_users",
                                                            "system.js",
-                                                           "system.new_users",
                                                            "system.roles",
                                                            "system.users",
                                                            "system.version",
@@ -118,7 +118,7 @@ std::unique_ptr<DbCheckRun> singleCollectionRun(OperationContext* opCtx,
     auto maxSize = invocation.getMaxSize();
     auto maxRate = invocation.getMaxCountPerSecond();
     auto info = DbCheckCollectionInfo{nss, start, end, maxCount, maxSize, maxRate};
-    auto result = stdx::make_unique<DbCheckRun>();
+    auto result = std::make_unique<DbCheckRun>();
     result->push_back(info);
     return result;
 }
@@ -132,14 +132,15 @@ std::unique_ptr<DbCheckRun> fullDatabaseRun(OperationContext* opCtx,
     // Read the list of collections in a database-level lock.
     AutoGetDb agd(opCtx, StringData(dbName), MODE_S);
     auto db = agd.getDb();
-    auto result = stdx::make_unique<DbCheckRun>();
+    auto result = std::make_unique<DbCheckRun>();
 
     uassert(ErrorCodes::NamespaceNotFound, "Database " + dbName + " not found", agd.getDb());
 
     int64_t max = std::numeric_limits<int64_t>::max();
     auto rate = invocation.getMaxCountPerSecond();
 
-    for (auto collIt = db->begin(opCtx); collIt != db->end(opCtx); ++collIt) {
+    auto catalog = CollectionCatalog::get(opCtx);
+    for (auto collIt = catalog->begin(opCtx, db->name()); collIt != catalog->end(opCtx); ++collIt) {
         auto coll = *collIt;
         if (!coll) {
             break;
@@ -210,7 +211,7 @@ protected:
             }
 
             if (_done) {
-                log() << "dbCheck terminated due to stepdown";
+                LOGV2(20451, "dbCheck terminated due to stepdown");
                 return;
             }
         }
@@ -334,18 +335,13 @@ private:
             return false;
         }
 
-        auto collection = db->getCollection(opCtx, info.nss);
+        auto collection =
+            CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, info.nss);
         if (!collection) {
             return false;
         }
 
-        auto uuid = collection->uuid();
-        // Check if UUID exists.
-        if (!uuid) {
-            return false;
-        }
-
-        auto[prev, next] = getPrevAndNextUUIDs(opCtx, collection);
+        auto [prev, next] = getPrevAndNextUUIDs(opCtx, collection);
 
         // Find and report collection metadata.
         auto indices = collectionIndexInfo(opCtx, collection);
@@ -353,7 +349,7 @@ private:
 
         DbCheckOplogCollection entry;
         entry.setNss(collection->ns());
-        entry.setUuid(*collection->uuid());
+        entry.setUuid(collection->uuid());
         if (prev) {
             entry.setPrev(*prev);
         }
@@ -375,7 +371,7 @@ private:
         collectionInfo.options = entry.getOptions();
 
         auto hle = dbCheckCollectionEntry(
-            collection->ns(), *collection->uuid(), collectionInfo, collectionInfo, optime);
+            collection->ns(), collection->uuid(), collectionInfo, collectionInfo, optime);
 
         HealthLog::get(opCtx).log(*hle);
 
@@ -399,7 +395,7 @@ private:
             return Status(ErrorCodes::PrimarySteppedDown, "dbCheck terminated due to stepdown");
         }
 
-        auto collection = agc.getCollection();
+        const auto& collection = agc.getCollection();
 
         if (!collection) {
             return {ErrorCodes::NamespaceNotFound, "dbCheck collection no longer exists"};
@@ -465,26 +461,20 @@ private:
 
     repl::OpTime _logOp(OperationContext* opCtx,
                         const NamespaceString& nss,
-                        OptionalCollectionUUID uuid,
+                        const UUID& uuid,
                         const BSONObj& obj) {
+        repl::MutableOplogEntry oplogEntry;
+        oplogEntry.setOpType(repl::OpTypeEnum::kCommand);
+        oplogEntry.setNss(nss);
+        oplogEntry.setUuid(uuid);
+        oplogEntry.setObject(obj);
         return writeConflictRetry(
             opCtx, "dbCheck oplog entry", NamespaceString::kRsOplogNamespace.ns(), [&] {
                 auto const clockSource = opCtx->getServiceContext()->getFastClockSource();
-                const auto wallClockTime = clockSource->now();
+                oplogEntry.setWallClockTime(clockSource->now());
 
                 WriteUnitOfWork uow(opCtx);
-                repl::OpTime result = repl::logOp(opCtx,
-                                                  "c",
-                                                  nss,
-                                                  uuid,
-                                                  obj,
-                                                  nullptr,
-                                                  false,
-                                                  wallClockTime,
-                                                  {},
-                                                  kUninitializedStmtId,
-                                                  {},
-                                                  OplogSlot());
+                repl::OpTime result = repl::logOp(opCtx, &oplogEntry);
                 uow.commit();
                 return result;
             });
@@ -500,6 +490,10 @@ public:
 
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
+    }
+
+    bool maintenanceOk() const override {
+        return false;
     }
 
     virtual bool adminOnly() const {
@@ -529,14 +523,15 @@ public:
         const NamespaceString nss(parseNs(dbname, cmdObj));
 
         // First, check that we can read this collection.
-        Status status = AuthorizationSession::get(client)->checkAuthForFind(nss, false);
+        auto authSession = AuthorizationSession::get(client);
+        Status status = auth::checkAuthForFind(authSession, nss, false);
 
         if (!status.isOK()) {
             return status;
         }
 
         // Then check that we can read the health log.
-        return AuthorizationSession::get(client)->checkAuthForFind(HealthLog::nss, false);
+        return auth::checkAuthForFind(authSession, HealthLog::nss, false);
     }
 
     virtual bool run(OperationContext* opCtx,
@@ -558,4 +553,4 @@ public:
 
 MONGO_REGISTER_TEST_COMMAND(DbCheckCmd);
 }  // namespace
-}
+}  // namespace mongo

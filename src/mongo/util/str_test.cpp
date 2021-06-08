@@ -27,13 +27,18 @@
  *    it in the license file.
  */
 
+#include <bitset>
+#include <fmt/format.h>
+
 #include "mongo/unittest/unittest.h"
 
+#include "mongo/util/ctype.h"
 #include "mongo/util/hex.h"
 #include "mongo/util/str.h"
 
 namespace mongo::str {
 
+using namespace fmt::literals;
 using std::string;
 
 TEST(StringUtilsTest, Basic) {
@@ -70,7 +75,7 @@ void assertCmp(int expected, StringData s1, StringData s2, bool lexOnly = false)
 }
 
 TEST(StringUtilsTest, Simple2) {
-    ASSERT(!isdigit((char)255));
+    ASSERT(!ctype::isDigit((char)255));
 
     assertCmp(0, "a", "a");
     assertCmp(-1, "a", "aa");
@@ -180,25 +185,25 @@ TEST(StringUtilsTest, Substring1) {
     assertCmp(0, StringData("0001", 3), StringData("0000", 3), false);
 }
 
-TEST(StringUtilsTest, VariousConversions) {
-    ASSERT_EQUALS(std::string("0"), integerToHex(0));
-    ASSERT_EQUALS(std::string("1"), integerToHex(1));
-    ASSERT_EQUALS(std::string("1337"), integerToHex(0x1337));
-    ASSERT_EQUALS(std::string("FFFFD499"), integerToHex(-11111));
-    ASSERT_EQUALS(std::string("F1FE60C4"), integerToHex(-234987324));
-    ASSERT_EQUALS(std::string("80000000"), integerToHex(std::numeric_limits<int>::min()));
-    ASSERT_EQUALS(std::string("7FFFFFFF"), integerToHex(std::numeric_limits<int>::max()));
-    ASSERT_EQUALS(std::string("7FFFFFFFFFFFFFFF"),
-                  integerToHex(std::numeric_limits<long long>::max()));
-    ASSERT_EQUALS(std::string("8000000000000000"),
-                  integerToHex(std::numeric_limits<long long>::min()));
+TEST(StringUtilsTest, UnsignedHex) {
+    ASSERT_EQUALS(unsignedHex(0), "0");
+    ASSERT_EQUALS(unsignedHex(1), "1");
+    ASSERT_EQUALS(unsignedHex(0x1337), "1337");
+    ASSERT_EQUALS(unsignedHex(-11111), "FFFFD499");
+    ASSERT_EQUALS(unsignedHex(-234987324), "F1FE60C4");
+    ASSERT_EQUALS(unsignedHex(std::numeric_limits<int>::min()), "80000000");
+    ASSERT_EQUALS(unsignedHex(std::numeric_limits<int>::max()), "7FFFFFFF");
+    ASSERT_EQUALS(unsignedHex(std::numeric_limits<long long>::max()), "7FFFFFFFFFFFFFFF");
+    ASSERT_EQUALS(unsignedHex(std::numeric_limits<long long>::min()), "8000000000000000");
 }
 
-TEST(StringUtilsTest, unsignedFixedLengthHex) {
-    ASSERT_EQUALS(unsignedIntToFixedLengthHex(std::numeric_limits<uint32_t>::max()),
-                  std::string("FFFFFFFF"));
-    ASSERT_EQUALS(unsignedIntToFixedLengthHex(0), std::string("00000000"));
-    ASSERT_EQUALS(unsignedIntToFixedLengthHex(123), std::string("0000007B"));
+TEST(StringUtilsTest, ZeroPaddedHex) {
+    ASSERT_EQUALS(zeroPaddedHex(std::numeric_limits<uint32_t>::max()), "FFFFFFFF");
+    ASSERT_EQUALS(zeroPaddedHex(uint32_t{123}), "0000007B");
+    ASSERT_EQUALS(zeroPaddedHex(uint8_t{0}), "00");
+    ASSERT_EQUALS(zeroPaddedHex(uint16_t{0}), "0000");
+    ASSERT_EQUALS(zeroPaddedHex(uint32_t{0}), "00000000");
+    ASSERT_EQUALS(zeroPaddedHex(uint64_t{0}), "0000000000000000");
 }
 
 TEST(StringUtilsTest, CanParseZero) {
@@ -270,4 +275,54 @@ TEST(StringUtilsTest, WhitespaceWithinNumberFailsToParse) {
     boost::optional<size_t> result = parseUnsignedBase10Integer(" 10");
     ASSERT(!result);
 }
+
+TEST(StringUtilsTest, ConvertDoubleToStringWithProperPrecision) {
+    ASSERT_EQUALS(std::string("1.9876543219876543"), convertDoubleToString(1.98765432198765432));
+    ASSERT_EQUALS(std::string("1.987654321"), convertDoubleToString(1.987654321, 10));
+    ASSERT_EQUALS(std::string("1.988"), convertDoubleToString(1.987654321, 4));
+    ASSERT_EQUALS(std::string("6e-07"), convertDoubleToString(6E-7, 10));
+    ASSERT_EQUALS(std::string("6e-07"), convertDoubleToString(6E-7, 6));
+    ASSERT_EQUALS(std::string("0.1000000006"), convertDoubleToString(0.1 + 6E-10, 10));
+    ASSERT_EQUALS(std::string("0.1"), convertDoubleToString(0.1 + 6E-8, 6));
+}
+
+TEST(StringUtilsTest, UTF8SafeTruncation) {
+    // Empty string and ASCII works like normal truncation
+    ASSERT_EQUALS(UTF8SafeTruncation(""_sd, 10), ""_sd);
+    ASSERT_EQUALS(UTF8SafeTruncation("abcdefg"_sd, 5), "abcde"_sd);
+
+    // Valid 2 Octet sequences, LATIN SMALL LETTER N WITH TILDE
+    ASSERT_EQUALS(UTF8SafeTruncation("\u00f1\u00f1\u00f1"_sd, 1), ""_sd);
+    ASSERT_EQUALS(UTF8SafeTruncation("\u00f1\u00f1\u00f1"_sd, 4), "\u00f1\u00f1"_sd);
+    ASSERT_EQUALS(UTF8SafeTruncation("\u00f1\u00f1\u00f1"_sd, 5), "\u00f1\u00f1"_sd);
+    ASSERT_EQUALS(UTF8SafeTruncation("\u00f1\u00f1\u00f1"_sd, 6), "\u00f1\u00f1\u00f1"_sd);
+
+    // Valid 3 Octet sequences, RUNIC LETTER TIWAZ TIR TYR T
+    ASSERT_EQUALS(UTF8SafeTruncation("\u16cf\u16cf"_sd, 2), ""_sd);
+    ASSERT_EQUALS(UTF8SafeTruncation("\u16cf\u16cf"_sd, 3), "\u16cf"_sd);
+    ASSERT_EQUALS(UTF8SafeTruncation("\u16cf\u16cf"_sd, 4), "\u16cf"_sd);
+    ASSERT_EQUALS(UTF8SafeTruncation("\u16cf\u16cf"_sd, 5), "\u16cf"_sd);
+    ASSERT_EQUALS(UTF8SafeTruncation("\u16cf\u16cf"_sd, 6), "\u16cf\u16cf"_sd);
+
+    // Valid 4 Octet sequences, GOTHIC LETTER MANNA
+    ASSERT_EQUALS(UTF8SafeTruncation("\U0001033c\U0001033c"_sd, 4), "\U0001033c"_sd);
+    ASSERT_EQUALS(UTF8SafeTruncation("\U0001033c\U0001033c"_sd, 5), "\U0001033c"_sd);
+    ASSERT_EQUALS(UTF8SafeTruncation("\U0001033c\U0001033c"_sd, 6), "\U0001033c"_sd);
+    ASSERT_EQUALS(UTF8SafeTruncation("\U0001033c\U0001033c"_sd, 7), "\U0001033c"_sd);
+    ASSERT_EQUALS(UTF8SafeTruncation("\U0001033c\U0001033c"_sd, 8), "\U0001033c\U0001033c"_sd);
+}
+
+TEST(StringUtilsTest, GetCodePointLength) {
+    for (int i = 0x0; i < 0x100; ++i) {
+        size_t n = 0;
+        for (std::bitset<8> bs(i); n < bs.size() && bs[7 - n]; ++n) {
+        }
+        if (n == 1)
+            continue;  // Avoid the invariant on 0b10xx'xxxx continuation bytes.
+        if (n == 0)
+            n = 1;  // 7-bit single byte code point.
+        ASSERT_EQUALS(getCodePointLength(static_cast<char>(i)), n) << " i:0x{:02x}"_format(i);
+    }
+}
+
 }  // namespace mongo::str

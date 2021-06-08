@@ -43,6 +43,10 @@ index key was too long.  The documents would not be included in the index.
 Newer versions of MongoDB will not insert or update the documents with the
 failure.  By setting this value to false, the old behavior is enabled.
 
+This parameter is deprecated in version 4.2 and removed in version 4.4.
+Starting from version 4.2 server correctly handles long index keys (see
+SERVER-36278).
+
 ## internalQueryPlannerEnableIndexIntersection
 
 Command Line:

@@ -57,9 +57,9 @@ class MergeSortStageParams;
  */
 class MergeSortStage final : public PlanStage {
 public:
-    MergeSortStage(OperationContext* opCtx, const MergeSortStageParams& params, WorkingSet* ws);
+    MergeSortStage(ExpressionContext* expCtx, const MergeSortStageParams& params, WorkingSet* ws);
 
-    void addChild(PlanStage* child);
+    void addChild(std::unique_ptr<PlanStage> child);
 
     bool isEOF() final;
     StageState doWork(WorkingSetID* out) final;
@@ -76,7 +76,7 @@ public:
 
 private:
     struct StageWithValue {
-        StageWithValue() : id(WorkingSet::INVALID_ID), stage(NULL) {}
+        StageWithValue() : id(WorkingSet::INVALID_ID), stage(nullptr) {}
         WorkingSetID id;
         PlanStage* stage;
     };
@@ -97,6 +97,9 @@ private:
         bool operator()(const MergingRef& lhs, const MergingRef& rhs);
 
     private:
+        // Encodes sort key part 'keyPart' according to the collation of the query.
+        BSONObj encodeKeyPartWithCollation(const BSONElement& keyPart);
+
         WorkingSet* _ws;
         BSONObj _pattern;
         const CollatorInterface* _collator;
@@ -135,7 +138,7 @@ private:
 // Parameters that must be provided to a MergeSortStage
 class MergeSortStageParams {
 public:
-    MergeSortStageParams() : collator(NULL), dedup(true) {}
+    MergeSortStageParams() : collator(nullptr), dedup(true) {}
 
     // How we're sorting.
     BSONObj pattern;

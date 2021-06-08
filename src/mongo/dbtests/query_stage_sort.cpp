@@ -29,6 +29,8 @@
 
 #include "mongo/platform/basic.h"
 
+#include <memory>
+
 #include "mongo/client/dbclient_cursor.h"
 #include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/db/catalog/collection.h"
@@ -41,9 +43,9 @@
 #include "mongo/db/exec/queued_data_stage.h"
 #include "mongo/db/exec/sort.h"
 #include "mongo/db/json.h"
-#include "mongo/db/query/plan_executor.h"
+#include "mongo/db/query/plan_executor_factory.h"
+#include "mongo/db/query/plan_executor_impl.h"
 #include "mongo/dbtests/dbtests.h"
-#include "mongo/stdx/memory.h"
 
 /**
  * This file tests db/exec/sort.cpp
@@ -53,7 +55,6 @@ namespace QueryStageSortTests {
 
 using std::set;
 using std::unique_ptr;
-using stdx::make_unique;
 
 namespace dps = ::mongo::dotted_path_support;
 
@@ -75,7 +76,7 @@ public:
         _client.insert(ns(), obj);
     }
 
-    void getRecordIds(set<RecordId>* out, Collection* coll) {
+    void getRecordIds(set<RecordId>* out, const CollectionPtr& coll) {
         auto cursor = coll->getCursor(&_opCtx);
         while (auto record = cursor->next()) {
             out->insert(record->id);
@@ -85,7 +86,7 @@ public:
     /**
      * We feed a mix of (key, unowned, owned) data to the sort stage.
      */
-    void insertVarietyOfObjects(WorkingSet* ws, QueuedDataStage* ms, Collection* coll) {
+    void insertVarietyOfObjects(WorkingSet* ws, QueuedDataStage* ms, const CollectionPtr& coll) {
         set<RecordId> recordIds;
         getRecordIds(&recordIds, coll);
 
@@ -98,7 +99,8 @@ public:
             WorkingSetID id = ws->allocate();
             WorkingSetMember* member = ws->get(id);
             member->recordId = *it;
-            member->obj = coll->docFor(&_opCtx, *it);
+            auto snapshotBson = coll->docFor(&_opCtx, *it);
+            member->doc = {snapshotBson.snapshotId(), Document{snapshotBson.value()}};
             ws->transitionToRecordIdAndObj(id);
             ms->pushBack(id);
         }
@@ -109,25 +111,34 @@ public:
      * which is owned by the caller.
      */
     unique_ptr<PlanExecutor, PlanExecutor::Deleter> makePlanExecutorWithSortStage(
-        Collection* coll) {
+        const CollectionPtr& coll) {
         // Build the mock scan stage which feeds the data.
-        auto ws = make_unique<WorkingSet>();
-        auto queuedDataStage = make_unique<QueuedDataStage>(&_opCtx, ws.get());
+        auto ws = std::make_unique<WorkingSet>();
+        _workingSet = ws.get();
+        auto queuedDataStage = std::make_unique<QueuedDataStage>(_expCtx.get(), ws.get());
         insertVarietyOfObjects(ws.get(), queuedDataStage.get(), coll);
 
-        SortStageParams params;
-        params.pattern = BSON("foo" << 1);
-        params.limit = limit();
+        auto sortPattern = BSON("foo" << 1);
+        auto keyGenStage = std::make_unique<SortKeyGeneratorStage>(
+            _expCtx, std::move(queuedDataStage), ws.get(), sortPattern);
 
-        auto keyGenStage = make_unique<SortKeyGeneratorStage>(
-            &_opCtx, queuedDataStage.release(), ws.get(), params.pattern, nullptr);
-
-        auto ss = make_unique<SortStage>(&_opCtx, params, ws.get(), keyGenStage.release());
+        auto ss = std::make_unique<SortStageDefault>(_expCtx,
+                                                     ws.get(),
+                                                     SortPattern{sortPattern, _expCtx},
+                                                     limit(),
+                                                     maxMemoryUsageBytes(),
+                                                     false,  // addSortKeyMetadata
+                                                     std::move(keyGenStage));
 
         // The PlanExecutor will be automatically registered on construction due to the auto
         // yield policy, so it can receive invalidations when we remove documents later.
-        auto statusWithPlanExecutor = PlanExecutor::make(
-            &_opCtx, std::move(ws), std::move(ss), coll, PlanExecutor::YIELD_AUTO);
+        auto statusWithPlanExecutor =
+            plan_executor_factory::make(_expCtx,
+                                        std::move(ws),
+                                        std::move(ss),
+                                        &coll,
+                                        PlanYieldPolicy::YieldPolicy::YIELD_AUTO,
+                                        QueryPlannerParams::DEFAULT);
         invariant(statusWithPlanExecutor.isOK());
         return std::move(statusWithPlanExecutor.getValue());
     }
@@ -146,35 +157,43 @@ public:
      * If extAllowed is true, sorting will use use external sorting if available.
      * If limit is not zero, we limit the output of the sort stage to 'limit' results.
      */
-    void sortAndCheck(int direction, Collection* coll) {
-        auto ws = make_unique<WorkingSet>();
-        auto queuedDataStage = make_unique<QueuedDataStage>(&_opCtx, ws.get());
+    void sortAndCheck(int direction, const CollectionPtr& coll) {
+        auto ws = std::make_unique<WorkingSet>();
+        auto queuedDataStage = std::make_unique<QueuedDataStage>(_expCtx.get(), ws.get());
 
         // Insert a mix of the various types of data.
         insertVarietyOfObjects(ws.get(), queuedDataStage.get(), coll);
 
-        SortStageParams params;
-        params.pattern = BSON("foo" << direction);
-        params.limit = limit();
+        auto sortPattern = BSON("foo" << direction);
+        auto keyGenStage = std::make_unique<SortKeyGeneratorStage>(
+            _expCtx, std::move(queuedDataStage), ws.get(), sortPattern);
 
-        auto keyGenStage = make_unique<SortKeyGeneratorStage>(
-            &_opCtx, queuedDataStage.release(), ws.get(), params.pattern, nullptr);
+        auto sortStage = std::make_unique<SortStageDefault>(_expCtx,
+                                                            ws.get(),
+                                                            SortPattern{sortPattern, _expCtx},
+                                                            limit(),
+                                                            maxMemoryUsageBytes(),
+                                                            false,  // addSortKeyMetadata
+                                                            std::move(keyGenStage));
 
-        auto sortStage = make_unique<SortStage>(&_opCtx, params, ws.get(), keyGenStage.release());
-
-        auto fetchStage =
-            make_unique<FetchStage>(&_opCtx, ws.get(), sortStage.release(), nullptr, coll);
+        auto fetchStage = std::make_unique<FetchStage>(
+            _expCtx.get(), ws.get(), std::move(sortStage), nullptr, coll);
 
         // Must fetch so we can look at the doc as a BSONObj.
-        auto statusWithPlanExecutor = PlanExecutor::make(
-            &_opCtx, std::move(ws), std::move(fetchStage), coll, PlanExecutor::NO_YIELD);
+        auto statusWithPlanExecutor =
+            plan_executor_factory::make(_expCtx,
+                                        std::move(ws),
+                                        std::move(fetchStage),
+                                        &coll,
+                                        PlanYieldPolicy::YieldPolicy::NO_YIELD,
+                                        QueryPlannerParams::DEFAULT);
         ASSERT_OK(statusWithPlanExecutor.getStatus());
         auto exec = std::move(statusWithPlanExecutor.getValue());
 
         // Look at pairs of objects to make sure that the sort order is pairwise (and therefore
         // totally) correct.
         BSONObj last;
-        ASSERT_EQUALS(PlanExecutor::ADVANCED, exec->getNext(&last, NULL));
+        ASSERT_EQUALS(PlanExecutor::ADVANCED, exec->getNext(&last, nullptr));
         last = last.getOwned();
 
         // Count 'last'.
@@ -182,8 +201,8 @@ public:
 
         BSONObj current;
         PlanExecutor::ExecState state;
-        while (PlanExecutor::ADVANCED == (state = exec->getNext(&current, NULL))) {
-            int cmp = sgn(dps::compareObjectsAccordingToSort(current, last, params.pattern));
+        while (PlanExecutor::ADVANCED == (state = exec->getNext(&current, nullptr))) {
+            int cmp = sgn(dps::compareObjectsAccordingToSort(current, last, sortPattern));
             // The next object should be equal to the previous or oriented according to the sort
             // pattern.
             ASSERT(cmp == 0 || cmp == 1);
@@ -215,6 +234,9 @@ public:
         return 0;
     };
 
+    uint64_t maxMemoryUsageBytes() const {
+        return internalQueryMaxBlockingSortMemoryUsageBytes.load();
+    }
 
     static const char* ns() {
         return "unittests.QueryStageSort";
@@ -226,7 +248,10 @@ public:
 protected:
     const ServiceContext::UniqueOperationContext _txnPtr = cc().makeOperationContext();
     OperationContext& _opCtx = *_txnPtr;
+    boost::intrusive_ptr<ExpressionContext> _expCtx =
+        new ExpressionContext(&_opCtx, nullptr, nss());
     DBDirectClient _client;
+    WorkingSet* _workingSet = nullptr;
 };
 
 
@@ -240,7 +265,8 @@ public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
         Database* db = ctx.db();
-        Collection* coll = db->getCollection(&_opCtx, nss());
+        CollectionPtr coll =
+            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss());
         if (!coll) {
             WriteUnitOfWork wuow(&_opCtx);
             coll = db->createCollection(&_opCtx, nss());
@@ -262,7 +288,8 @@ public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
         Database* db = ctx.db();
-        Collection* coll = db->getCollection(&_opCtx, nss());
+        CollectionPtr coll =
+            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss());
         if (!coll) {
             WriteUnitOfWork wuow(&_opCtx);
             coll = db->createCollection(&_opCtx, nss());
@@ -293,7 +320,8 @@ public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
         Database* db = ctx.db();
-        Collection* coll = db->getCollection(&_opCtx, nss());
+        CollectionPtr coll =
+            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss());
         if (!coll) {
             WriteUnitOfWork wuow(&_opCtx);
             coll = db->createCollection(&_opCtx, nss());
@@ -318,7 +346,8 @@ public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
         Database* db = ctx.db();
-        Collection* coll = db->getCollection(&_opCtx, nss());
+        CollectionPtr coll =
+            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss());
         if (!coll) {
             WriteUnitOfWork wuow(&_opCtx);
             coll = db->createCollection(&_opCtx, nss());
@@ -332,7 +361,13 @@ public:
         getRecordIds(&recordIds, coll);
 
         auto exec = makePlanExecutorWithSortStage(coll);
-        SortStage* ss = static_cast<SortStage*>(exec->getRootStage());
+
+        // This test is specifically for the classic PlanStage execution engine, so assert that we
+        // have the right kind of PlanExecutor.
+        auto execImpl = dynamic_cast<PlanExecutorImpl*>(exec.get());
+        ASSERT(execImpl);
+
+        SortStage* ss = static_cast<SortStageDefault*>(execImpl->getRootStage());
         SortKeyGeneratorStage* keyGenStage =
             static_cast<SortKeyGeneratorStage*>(ss->getChildren()[0].get());
         QueuedDataStage* queuedDataStage =
@@ -363,10 +398,10 @@ public:
         CollectionUpdateArgs args;
         {
             WriteUnitOfWork wuow(&_opCtx);
-            coll->updateDocument(&_opCtx, *it, oldDoc, newDoc(oldDoc), false, NULL, &args);
+            coll->updateDocument(&_opCtx, *it, oldDoc, newDoc(oldDoc), false, nullptr, &args);
             wuow.commit();
         }
-        exec->restoreState();
+        exec->restoreState(&coll);
 
         // Read the rest of the data from the queued data stage.
         while (!queuedDataStage->isEOF()) {
@@ -381,11 +416,11 @@ public:
             oldDoc = coll->docFor(&_opCtx, *it);
             {
                 WriteUnitOfWork wuow(&_opCtx);
-                coll->updateDocument(&_opCtx, *it++, oldDoc, newDoc(oldDoc), false, NULL, &args);
+                coll->updateDocument(&_opCtx, *it++, oldDoc, newDoc(oldDoc), false, nullptr, &args);
                 wuow.commit();
             }
         }
-        exec->restoreState();
+        exec->restoreState(&coll);
 
         // Verify that it's sorted, the right number of documents are returned, and they're all
         // in the expected range.
@@ -396,15 +431,14 @@ public:
             WorkingSetID id = WorkingSet::INVALID_ID;
             PlanStage::StageState status = ss->work(&id);
             if (PlanStage::ADVANCED != status) {
-                ASSERT_NE(status, PlanStage::FAILURE);
                 continue;
             }
-            WorkingSetMember* member = exec->getWorkingSet()->get(id);
+            WorkingSetMember* member = _workingSet->get(id);
             ASSERT(member->hasObj());
-            if (member->obj.value().getField("_id").OID() == updatedId) {
-                ASSERT(idBeforeUpdate == member->obj.snapshotId());
+            if (member->doc.value().getField("_id").getOid() == updatedId) {
+                ASSERT(idBeforeUpdate == member->doc.snapshotId());
             }
-            thisVal = member->obj.value().getField("foo").Int();
+            thisVal = member->doc.value().getField("foo").getInt();
             ASSERT_LTE(lastVal, thisVal);
             // Expect docs in range [0, limit)
             ASSERT_LTE(0, thisVal);
@@ -427,7 +461,8 @@ public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
         Database* db = ctx.db();
-        Collection* coll = db->getCollection(&_opCtx, nss());
+        CollectionPtr coll =
+            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss());
         if (!coll) {
             WriteUnitOfWork wuow(&_opCtx);
             coll = db->createCollection(&_opCtx, nss());
@@ -441,7 +476,13 @@ public:
         getRecordIds(&recordIds, coll);
 
         auto exec = makePlanExecutorWithSortStage(coll);
-        SortStage* ss = static_cast<SortStage*>(exec->getRootStage());
+
+        // This test is specifically for the classic PlanStage execution engine, so assert that we
+        // have the right kind of PlanExecutor.
+        auto execImpl = dynamic_cast<PlanExecutorImpl*>(exec.get());
+        ASSERT(execImpl);
+
+        SortStage* ss = static_cast<SortStageDefault*>(execImpl->getRootStage());
         SortKeyGeneratorStage* keyGenStage =
             static_cast<SortKeyGeneratorStage*>(ss->getChildren()[0].get());
         QueuedDataStage* queuedDataStage =
@@ -464,7 +505,7 @@ public:
             coll->deleteDocument(&_opCtx, kUninitializedStmtId, *it++, nullOpDebug);
             wuow.commit();
         }
-        exec->restoreState();
+        exec->restoreState(&coll);
 
         // Read the rest of the data from the queued data stage.
         while (!queuedDataStage->isEOF()) {
@@ -481,7 +522,7 @@ public:
                 wuow.commit();
             }
         }
-        exec->restoreState();
+        exec->restoreState(&coll);
 
         // Regardless of storage engine, all the documents should come back with their objects
         int count = 0;
@@ -489,10 +530,9 @@ public:
             WorkingSetID id = WorkingSet::INVALID_ID;
             PlanStage::StageState status = ss->work(&id);
             if (PlanStage::ADVANCED != status) {
-                ASSERT_NE(status, PlanStage::FAILURE);
                 continue;
             }
-            WorkingSetMember* member = exec->getWorkingSet()->get(id);
+            WorkingSetMember* member = _workingSet->get(id);
             ASSERT(member->hasObj());
             ++count;
         }
@@ -525,58 +565,71 @@ public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
         Database* db = ctx.db();
-        Collection* coll = db->getCollection(&_opCtx, nss());
+        CollectionPtr coll =
+            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss());
         if (!coll) {
             WriteUnitOfWork wuow(&_opCtx);
             coll = db->createCollection(&_opCtx, nss());
             wuow.commit();
         }
 
-        auto ws = make_unique<WorkingSet>();
-        auto queuedDataStage = make_unique<QueuedDataStage>(&_opCtx, ws.get());
+        auto ws = std::make_unique<WorkingSet>();
+        auto queuedDataStage = std::make_unique<QueuedDataStage>(_expCtx.get(), ws.get());
 
         for (int i = 0; i < numObj(); ++i) {
             {
                 WorkingSetID id = ws->allocate();
                 WorkingSetMember* member = ws->get(id);
-                member->obj = Snapshotted<BSONObj>(
-                    SnapshotId(), fromjson("{a: [1,2,3], b:[1,2,3], c:[1,2,3], d:[1,2,3,4]}"));
+                member->doc = {
+                    SnapshotId(),
+                    Document{fromjson("{a: [1,2,3], b:[1,2,3], c:[1,2,3], d:[1,2,3,4]}")}};
                 member->transitionToOwnedObj();
                 queuedDataStage->pushBack(id);
             }
             {
                 WorkingSetID id = ws->allocate();
                 WorkingSetMember* member = ws->get(id);
-                member->obj = Snapshotted<BSONObj>(SnapshotId(), fromjson("{a:1, b:1, c:1}"));
+                member->doc = {SnapshotId(), Document{fromjson("{a:1, b:1, c:1}")}};
                 member->transitionToOwnedObj();
                 queuedDataStage->pushBack(id);
             }
         }
 
-        SortStageParams params;
-        params.pattern = BSON("b" << -1 << "c" << 1 << "a" << 1);
+        auto sortPattern = BSON("b" << -1 << "c" << 1 << "a" << 1);
 
-        auto keyGenStage = make_unique<SortKeyGeneratorStage>(
-            &_opCtx, queuedDataStage.release(), ws.get(), params.pattern, nullptr);
+        auto keyGenStage = std::make_unique<SortKeyGeneratorStage>(
+            _expCtx, std::move(queuedDataStage), ws.get(), sortPattern);
 
-        auto sortStage = make_unique<SortStage>(&_opCtx, params, ws.get(), keyGenStage.release());
+        auto sortStage = std::make_unique<SortStageDefault>(_expCtx,
+                                                            ws.get(),
+                                                            SortPattern{sortPattern, _expCtx},
+                                                            0u,
+                                                            maxMemoryUsageBytes(),
+                                                            false,  // addSortKeyMetadata
+                                                            std::move(keyGenStage));
 
-        auto fetchStage =
-            make_unique<FetchStage>(&_opCtx, ws.get(), sortStage.release(), nullptr, coll);
+        auto fetchStage = std::make_unique<FetchStage>(
+            _expCtx.get(), ws.get(), std::move(sortStage), nullptr, coll);
 
         // We don't get results back since we're sorting some parallel arrays.
-        auto statusWithPlanExecutor = PlanExecutor::make(
-            &_opCtx, std::move(ws), std::move(fetchStage), coll, PlanExecutor::NO_YIELD);
+        auto statusWithPlanExecutor =
+            plan_executor_factory::make(_expCtx,
+                                        std::move(ws),
+                                        std::move(fetchStage),
+                                        &coll,
+                                        PlanYieldPolicy::YieldPolicy::NO_YIELD,
+                                        QueryPlannerParams::DEFAULT);
         auto exec = std::move(statusWithPlanExecutor.getValue());
 
-        PlanExecutor::ExecState runnerState = exec->getNext(NULL, NULL);
-        ASSERT_EQUALS(PlanExecutor::FAILURE, runnerState);
+        ASSERT_THROWS_CODE(exec->getNext(static_cast<BSONObj*>(nullptr), nullptr),
+                           DBException,
+                           ErrorCodes::BadValue);
     }
 };
 
-class All : public Suite {
+class All : public OldStyleSuiteSpecification {
 public:
-    All() : Suite("query_stage_sort") {}
+    All() : OldStyleSuiteSpecification("query_stage_sort") {}
 
     void setupTests() {
         add<QueryStageSortInc>();
@@ -594,6 +647,6 @@ public:
     }
 };
 
-SuiteInstance<All> queryStageSortTest;
+OldStyleSuiteInitializer<All> queryStageSortTest;
 
-}  // namespace
+}  // namespace QueryStageSortTests

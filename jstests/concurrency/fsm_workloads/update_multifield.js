@@ -7,11 +7,10 @@
  * The collection has an index for each field, and a compound index for all fields.
  */
 
-// For isMongod and supportsDocumentLevelConcurrency.
+// For isMongod.
 load('jstests/concurrency/fsm_workload_helpers/server_types.js');
 
 var $config = (function() {
-
     function makeQuery(options) {
         var query = {};
         if (!options.multi) {
@@ -53,10 +52,10 @@ var $config = (function() {
     var transitions = {update: {update: 1}};
 
     function setup(db, collName, cluster) {
-        assertAlways.commandWorked(db[collName].ensureIndex({x: 1}));
-        assertAlways.commandWorked(db[collName].ensureIndex({y: 1}));
-        assertAlways.commandWorked(db[collName].ensureIndex({z: 1}));
-        assertAlways.commandWorked(db[collName].ensureIndex({x: 1, y: 1, z: 1}));
+        assertAlways.commandWorked(db[collName].createIndex({x: 1}));
+        assertAlways.commandWorked(db[collName].createIndex({y: 1}));
+        assertAlways.commandWorked(db[collName].createIndex({z: 1}));
+        assertAlways.commandWorked(db[collName].createIndex({x: 1, y: 1, z: 1}));
 
         // numDocs should be much less than threadCount, to make more threads use the same docs.
         this.numDocs = Math.floor(this.threadCount / 3);
@@ -64,7 +63,7 @@ var $config = (function() {
 
         for (var i = 0; i < this.numDocs; ++i) {
             var res = db[collName].insert({_id: i});
-            assertWhenOwnColl.writeOK(res);
+            assertWhenOwnColl.commandWorked(res);
             assertWhenOwnColl.eq(1, res.nInserted);
         }
     }
@@ -79,10 +78,9 @@ var $config = (function() {
             assertResult: function(res, db, collName, query) {
                 assertAlways.eq(0, res.nUpserted, tojson(res));
 
-                if (isMongod(db) && supportsDocumentLevelConcurrency(db)) {
-                    // Storage engines which support document-level concurrency will automatically
-                    // retry any operations when there are conflicts, so we should always see a
-                    // matching document.
+                if (isMongod(db)) {
+                    // Storage engines will automatically retry any operations when there are
+                    // conflicts, so we should always see a matching document.
                     assertWhenOwnColl.eq(res.nMatched, 1, tojson(res));
                     if (db.getMongo().writeMode() === 'commands') {
                         assertWhenOwnColl.eq(res.nModified, 1, tojson(res));
@@ -103,5 +101,4 @@ var $config = (function() {
         },
         setup: setup
     };
-
 })();

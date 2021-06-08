@@ -46,18 +46,18 @@ namespace {
  *   - No MatchExpression (when full or superset rewrite is not possible)
  */
 void testExprRewrite(BSONObj expr, BSONObj expectedMatch) {
-    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto expCtx = ExpressionContextForTest{};
 
     auto expression =
-        Expression::parseOperand(expCtx, expr.firstElement(), expCtx->variablesParseState);
+        Expression::parseOperand(&expCtx, expr.firstElement(), expCtx.variablesParseState);
 
-    auto result = RewriteExpr::rewrite(expression, expCtx->getCollator());
+    auto result = RewriteExpr::rewrite(expression, expCtx.getCollator());
 
     // Confirm expected match.
     if (!expectedMatch.isEmpty()) {
         ASSERT(result.matchExpression());
         BSONObjBuilder bob;
-        result.matchExpression()->serialize(&bob);
+        result.matchExpression()->serialize(&bob, true);
         ASSERT_BSONOBJ_EQ(expectedMatch, bob.obj());
     } else {
         ASSERT_FALSE(result.matchExpression());

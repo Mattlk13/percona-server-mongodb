@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -36,36 +36,38 @@
 #include <algorithm>
 
 #include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/storage/ident.h"
 #include "mongo/db/storage/write_unit_of_work.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 
 KVDropPendingIdentReaper::KVDropPendingIdentReaper(KVEngine* engine) : _engine(engine) {}
 
 void KVDropPendingIdentReaper::addDropPendingIdent(const Timestamp& dropTimestamp,
-                                                   const NamespaceString& nss,
-                                                   StringData ident) {
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
+                                                   std::shared_ptr<Ident> ident,
+                                                   StorageEngine::DropIdentCallback&& onDrop) {
+    stdx::lock_guard<Latch> lock(_mutex);
     const auto equalRange = _dropPendingIdents.equal_range(dropTimestamp);
     const auto& lowerBound = equalRange.first;
     const auto& upperBound = equalRange.second;
-    auto matcher = [ident](const auto& pair) { return pair.second.ident == ident; };
+    auto matcher = [ident](const auto& pair) { return pair.second.identName == ident->getIdent(); };
     if (std::find_if(lowerBound, upperBound, matcher) == upperBound) {
         IdentInfo info;
-        info.nss = nss;
-        info.ident = ident.toString();
+        info.identName = ident->getIdent();
+        info.dropToken = ident;
+        info.onDrop = std::move(onDrop);
         _dropPendingIdents.insert(std::make_pair(dropTimestamp, info));
     } else {
-        severe() << "Failed to add drop-pending ident " << ident << " (" << nss << ")"
-                 << " with drop timestamp " << dropTimestamp
-                 << ": duplicate timestamp and ident pair.";
-        fassertFailedNoTrace(51023);
+        LOGV2_FATAL_NOTRACE(51023,
+                            "Failed to add drop-pending ident, duplicate timestamp and ident pair",
+                            "ident"_attr = ident->getIdent(),
+                            "dropTimestamp"_attr = dropTimestamp);
     }
 }
 
 boost::optional<Timestamp> KVDropPendingIdentReaper::getEarliestDropTimestamp() const {
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    stdx::lock_guard<Latch> lock(_mutex);
     auto it = _dropPendingIdents.cbegin();
     if (it == _dropPendingIdents.cend()) {
         return boost::none;
@@ -73,25 +75,30 @@ boost::optional<Timestamp> KVDropPendingIdentReaper::getEarliestDropTimestamp() 
     return it->first;
 }
 
-std::set<std::string> KVDropPendingIdentReaper::getAllIdents() const {
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
-    std::set<std::string> idents;
+std::set<std::string> KVDropPendingIdentReaper::getAllIdentNames() const {
+    stdx::lock_guard<Latch> lock(_mutex);
+    std::set<std::string> identNames;
     for (const auto& entry : _dropPendingIdents) {
         const auto& identInfo = entry.second;
-        const auto& ident = identInfo.ident;
-        idents.insert(ident);
+        const auto& identName = identInfo.identName;
+        identNames.insert(identName);
     }
-    return idents;
+    return identNames;
 }
 
 void KVDropPendingIdentReaper::dropIdentsOlderThan(OperationContext* opCtx, const Timestamp& ts) {
     DropPendingIdents toDrop;
     {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        stdx::lock_guard<Latch> lock(_mutex);
         for (auto it = _dropPendingIdents.cbegin();
-             it != _dropPendingIdents.cend() && it->first < ts;
+             it != _dropPendingIdents.cend() && (it->first < ts || it->first == Timestamp::min());
              ++it) {
-            toDrop.insert(*it);
+            // This collection/index satisfies the 'ts' requirement to be safe to drop, but we must
+            // also check that there are no active operations remaining that still retain a
+            // reference by which to access the collection/index data.
+            if (it->second.dropToken.expired()) {
+                toDrop.insert(*it);
+            }
         }
     }
 
@@ -99,43 +106,56 @@ void KVDropPendingIdentReaper::dropIdentsOlderThan(OperationContext* opCtx, cons
         return;
     }
 
-
-    {
-        // Guards against catalog changes while dropping idents using KVEngine::dropIdent().
+    for (auto& timestampAndIdentInfo : toDrop) {
+        // Guards against catalog changes while dropping idents using KVEngine::dropIdent(). Yields
+        // after dropping each ident.
         Lock::GlobalLock globalLock(opCtx, MODE_IX);
 
-        for (const auto& timestampAndIdentInfo : toDrop) {
-            const auto& dropTimestamp = timestampAndIdentInfo.first;
-            const auto& identInfo = timestampAndIdentInfo.second;
-            const auto& nss = identInfo.nss;
-            const auto& ident = identInfo.ident;
-            log() << "Completing drop for ident " << ident << " (ns: " << nss
-                  << ") with drop timestamp " << dropTimestamp;
-            WriteUnitOfWork wuow(opCtx);
-            auto status = _engine->dropIdent(opCtx, ident);
-            if (!status.isOK()) {
-                severe() << "Failed to remove drop-pending ident " << ident << "(ns: " << nss
-                         << ") with drop timestamp " << dropTimestamp << ": " << status;
-                fassertFailedNoTrace(51022);
-            }
-            wuow.commit();
+        const auto& dropTimestamp = timestampAndIdentInfo.first;
+        auto& identInfo = timestampAndIdentInfo.second;
+        const auto& identName = identInfo.identName;
+        LOGV2(22237,
+              "Completing drop for ident",
+              "ident"_attr = identName,
+              "dropTimestamp"_attr = dropTimestamp);
+        WriteUnitOfWork wuow(opCtx);
+        auto status =
+            _engine->dropIdent(opCtx->recoveryUnit(), identName, std::move(identInfo.onDrop));
+        if (!status.isOK()) {
+            LOGV2_FATAL_NOTRACE(51022,
+                                "Failed to remove drop-pending ident",
+                                "ident"_attr = identName,
+                                "dropTimestamp"_attr = dropTimestamp,
+                                "error"_attr = status);
         }
+        wuow.commit();
     }
 
     {
         // Entries must be removed AFTER drops are completed, so that getEarliestDropTimestamp()
-        // returns appropriate results.
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        // returns correct results while the success of the drop operations above are uncertain.
+
+        stdx::lock_guard<Latch> lock(_mutex);
         for (const auto& timestampAndIdentInfo : toDrop) {
-            const auto& dropTimestamp = timestampAndIdentInfo.first;
-            // This may return zero if _dropPendingIdents was cleared using clearDropPendingState().
-            _dropPendingIdents.erase(dropTimestamp);
+            // Some idents with drop timestamps safe to drop may not have been dropped because they
+            // are still in use by another operation. Therefore, we must iterate the entries in the
+            // multimap matching a particular timestamp and erase only the entry with a match on the
+            // ident as well as the timestamp.
+            auto beginEndPair = _dropPendingIdents.equal_range(timestampAndIdentInfo.first);
+            for (auto it = beginEndPair.first; it != beginEndPair.second;) {
+                if (it->second.identName == timestampAndIdentInfo.second.identName) {
+                    it = _dropPendingIdents.erase(it);
+                    break;
+                } else {
+                    ++it;
+                }
+            }
         }
     }
 }
 
 void KVDropPendingIdentReaper::clearDropPendingState() {
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    stdx::lock_guard<Latch> lock(_mutex);
     _dropPendingIdents.clear();
 }
 

@@ -40,29 +40,33 @@
 
 namespace mongo {
 namespace optionenvironment {
+namespace {
 
 MONGO_STARTUP_OPTIONS_PARSE(StartupOptions)(InitializerContext* context) {
     OptionsParser parser;
-    Status ret = parser.run(startupOptions, context->args(), context->env(), &startupOptionsParsed);
+    Status ret = parser.run(startupOptions, context->args(), &startupOptionsParsed);
     if (!ret.isOK()) {
         std::cerr << ret.reason() << std::endl;
         // TODO: Figure out if there's a use case for this help message ever being different
         std::cerr << "try '" << context->args()[0] << " --help' for more information" << std::endl;
         quickExit(EXIT_BADOPTIONS);
     }
+}
+
+MONGO_INITIALIZER_GENERAL(OutputConfig,
+                          ("EndStartupOptionValidation"),
+                          ("BeginStartupOptionStorage"))
+(InitializerContext*) {
     if (startupOptionsParsed.count("outputConfig")) {
         bool output = false;
-        auto status = startupOptionsParsed.get(Key("outputConfig"), &output);
-        if (!status.isOK()) {
-            return status;
-        }
+        uassertStatusOK(startupOptionsParsed.get(Key("outputConfig"), &output));
         if (output) {
             std::cout << startupOptionsParsed.toYAML() << std::endl;
             quickExit(EXIT_CLEAN);
         }
     }
-    return Status::OK();
 }
 
+}  // namespace
 }  // namespace optionenvironment
 }  // namespace mongo

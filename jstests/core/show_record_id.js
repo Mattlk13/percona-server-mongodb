@@ -1,4 +1,6 @@
-// @tags: [requires_getmore]
+// @tags: [
+//   requires_getmore,
+// ]
 
 // Sanity check for the showRecordId option.
 
@@ -22,7 +24,7 @@ t.save({});
 checkResults(t.find().batchSize(2).showRecordId().toArray());
 
 // Check with a covered index.
-t.ensureIndex({a: 1});
+t.createIndex({a: 1});
 checkResults(t.find({}, {_id: 0, a: 1}).hint({a: 1}).showRecordId().toArray());
 checkResults(t.find({}, {_id: 0, a: 1}).hint({a: 1}).showRecordId().toArray());
 

@@ -29,6 +29,8 @@
 
 #include "mongo/platform/basic.h"
 
+#include <memory>
+
 #include "mongo/client/connection_string.h"
 #include "mongo/client/remote_command_targeter_mock.h"
 #include "mongo/db/concurrency/d_concurrency.h"
@@ -40,8 +42,11 @@
 #include "mongo/db/ops/write_ops_exec.h"
 #include "mongo/db/ops/write_ops_gen.h"
 #include "mongo/db/repl/oplog_entry.h"
+#include "mongo/db/repl/storage_interface_impl.h"
+#include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/migration_session_id.h"
 #include "mongo/db/s/session_catalog_migration_destination.h"
+#include "mongo/db/s/shard_server_test_fixture.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/session_catalog_mongod.h"
 #include "mongo/db/session_txn_record_gen.h"
@@ -51,10 +56,7 @@
 #include "mongo/s/catalog/sharding_catalog_client_mock.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/shard_server_test_fixture.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/stdx/thread.h"
-#include "mongo/unittest/unittest.h"
 
 namespace mongo {
 namespace {
@@ -85,26 +87,29 @@ repl::OplogEntry makeOplogEntry(repl::OpTime opTime,
                                 BSONObj object,
                                 boost::optional<BSONObj> object2,
                                 OperationSessionInfo sessionInfo,
-                                boost::optional<Date_t> wallClockTime,
-                                boost::optional<StmtId> stmtId,
+                                Date_t wallClockTime,
+                                const std::vector<StmtId>& stmtIds,
                                 boost::optional<repl::OpTime> preImageOpTime = boost::none,
                                 boost::optional<repl::OpTime> postImageOpTime = boost::none) {
-    return repl::OplogEntry(opTime,            // optime
-                            0,                 // hash
-                            opType,            // opType
-                            kNs,               // namespace
-                            boost::none,       // uuid
-                            boost::none,       // fromMigrate
-                            0,                 // version
-                            object,            // o
-                            object2,           // o2
-                            sessionInfo,       // sessionInfo
-                            boost::none,       // isUpsert
-                            wallClockTime,     // wall clock time
-                            stmtId,            // statement id
-                            boost::none,       // optime of previous write within same transaction
-                            preImageOpTime,    // pre-image optime
-                            postImageOpTime);  // post-image optime
+    return {
+        repl::DurableOplogEntry(opTime,          // optime
+                                0,               // hash
+                                opType,          // opType
+                                kNs,             // namespace
+                                boost::none,     // uuid
+                                boost::none,     // fromMigrate
+                                0,               // version
+                                object,          // o
+                                object2,         // o2
+                                sessionInfo,     // sessionInfo
+                                boost::none,     // isUpsert
+                                wallClockTime,   // wall clock time
+                                stmtIds,         // statement ids
+                                boost::none,     // optime of previous write within same transaction
+                                preImageOpTime,  // pre-image optime
+                                postImageOpTime,  // post-image optime
+                                boost::none,      // ShardId of resharding recipient
+                                boost::none)};    // _id
 }
 
 repl::OplogEntry extractInnerOplog(const repl::OplogEntry& oplog) {
@@ -130,9 +135,13 @@ public:
             RemoteCommandTargeterMock::get(donorShard->getTargeter())
                 ->setFindHostReturnValue(kDonorConnStr.getServers()[0]);
         }
-
+        // onStepUp() relies on the storage interface to create the config.transactions table.
+        repl::StorageInterface::set(getServiceContext(),
+                                    std::make_unique<repl::StorageInterfaceImpl>());
         MongoDSessionCatalog::onStepUp(operationContext());
-        LogicalSessionCache::set(getServiceContext(), stdx::make_unique<LogicalSessionCacheNoop>());
+        LogicalSessionCache::set(getServiceContext(), std::make_unique<LogicalSessionCacheNoop>());
+
+        setUnshardedFilteringMetadata(kNs);
     }
 
     void returnOplog(const std::vector<OplogEntry>& oplogList) {
@@ -141,7 +150,7 @@ public:
             BSONArrayBuilder arrBuilder(builder.subarrayStart("oplog"));
 
             for (const auto& oplog : oplogList) {
-                arrBuilder.append(oplog.toBSON());
+                arrBuilder.append(oplog.getEntry().toBSON());
             }
 
             arrBuilder.doneFast();
@@ -217,16 +226,16 @@ public:
                                   StmtId stmtId) {
         // Do write on a separate thread in order not to pollute this thread's opCtx.
         stdx::thread insertThread([sessionInfo, ns, doc, stmtId] {
-            write_ops::WriteCommandBase cmdBase;
+            write_ops::WriteCommandRequestBase cmdBase;
             std::vector<StmtId> stmtIds;
             stmtIds.push_back(stmtId);
             cmdBase.setStmtIds(stmtIds);
 
-            write_ops::Insert insertRequest(ns);
+            write_ops::InsertCommandRequest insertRequest(ns);
             std::vector<BSONObj> documents;
             documents.push_back(doc);
             insertRequest.setDocuments(documents);
-            insertRequest.setWriteCommandBase(cmdBase);
+            insertRequest.setWriteCommandRequestBase(cmdBase);
 
             BSONObjBuilder insertBuilder;
             insertRequest.serialize({}, &insertBuilder);
@@ -235,17 +244,13 @@ public:
             Client::initThread("test-insert-thread");
             auto innerOpCtx = Client::getCurrent()->makeOperationContext();
 
-            // The ephemeral for test storage engine doesn't support document-level locking, so
-            // requests with txnNumbers aren't allowed. To get around this, we have to manually set
-            // up the session state and perform the insert.
-            initializeOperationSessionInfo(
-                innerOpCtx.get(), insertBuilder.obj(), true, true, true, true);
+            initializeOperationSessionInfo(innerOpCtx.get(), insertBuilder.obj(), true, true, true);
             MongoDOperationContextSession sessionTxnState(innerOpCtx.get());
             auto txnParticipant = TransactionParticipant::get(innerOpCtx.get());
             txnParticipant.beginOrContinue(
                 innerOpCtx.get(), *sessionInfo.getTxnNumber(), boost::none, boost::none);
 
-            const auto reply = performInserts(innerOpCtx.get(), insertRequest);
+            const auto reply = write_ops_exec::performInserts(innerOpCtx.get(), insertRequest);
             ASSERT(reply.results.size() == 1);
             ASSERT(reply.results[0].isOK());
         });
@@ -265,12 +270,18 @@ public:
                     sessionMigration->getState());
     }
 
+    void setUnshardedFilteringMetadata(const NamespaceString& nss) {
+        AutoGetDb autoDb(operationContext(), nss.db(), MODE_IX);
+        Lock::CollectionLock collLock(operationContext(), nss, MODE_IX);
+        CollectionShardingRuntime::get(operationContext(), nss)
+            ->setFilteringMetadata(operationContext(), CollectionMetadata());
+    }
+
 private:
-    std::unique_ptr<ShardingCatalogClient> makeShardingCatalogClient(
-        std::unique_ptr<DistLockManager> distLockManager) override {
+    std::unique_ptr<ShardingCatalogClient> makeShardingCatalogClient() override {
         class StaticCatalogClient final : public ShardingCatalogClientMock {
         public:
-            StaticCatalogClient() : ShardingCatalogClientMock(nullptr) {}
+            StaticCatalogClient() = default;
 
             StatusWith<repl::OpTimeWith<std::vector<ShardType>>> getAllShards(
                 OperationContext* opCtx, repl::ReadConcernLevel readConcern) override {
@@ -283,15 +294,19 @@ private:
             }
         };
 
-        return stdx::make_unique<StaticCatalogClient>();
+        return std::make_unique<StaticCatalogClient>();
     }
 
     void _checkOplogExceptO2(const repl::OplogEntry& originalOplog,
                              const repl::OplogEntry& oplogToCheck) {
         ASSERT_TRUE(oplogToCheck.getOpType() == OpTypeEnum::kNoop);
 
-        ASSERT_TRUE(oplogToCheck.getStatementId());
-        ASSERT_EQ(*originalOplog.getStatementId(), *oplogToCheck.getStatementId());
+        auto originalStmtIds = originalOplog.getStatementIds();
+        auto checkStmtIds = oplogToCheck.getStatementIds();
+        ASSERT_EQ(originalStmtIds.size(), checkStmtIds.size());
+        for (size_t i = 0; i < originalStmtIds.size(); ++i) {
+            ASSERT_EQ(originalStmtIds[i], checkStmtIds[i]);
+        }
 
         const auto origSessionInfo = originalOplog.getOperationSessionInfo();
         const auto sessionInfoToCheck = oplogToCheck.getOperationSessionInfo();
@@ -309,7 +324,7 @@ private:
 };
 
 TEST_F(SessionCatalogMigrationDestinationTest, ShouldJoinProperlyWhenNothingToTransfer) {
-    SessionCatalogMigrationDestination sessionMigration(kFromShard, migrationId());
+    SessionCatalogMigrationDestination sessionMigration(kNs, kFromShard, migrationId());
 
     sessionMigration.start(getServiceContext());
     finishSessionExpectSuccess(&sessionMigration);
@@ -318,7 +333,7 @@ TEST_F(SessionCatalogMigrationDestinationTest, ShouldJoinProperlyWhenNothingToTr
 TEST_F(SessionCatalogMigrationDestinationTest, OplogEntriesWithSameTxn) {
     const auto sessionId = makeLogicalSessionIdForTest();
 
-    SessionCatalogMigrationDestination sessionMigration(kFromShard, migrationId());
+    SessionCatalogMigrationDestination sessionMigration(kNs, kFromShard, migrationId());
     sessionMigration.start(getServiceContext());
 
     OperationSessionInfo sessionInfo;
@@ -331,7 +346,7 @@ TEST_F(SessionCatalogMigrationDestinationTest, OplogEntriesWithSameTxn) {
                                  boost::none,                   // o2
                                  sessionInfo,                   // session info
                                  Date_t::now(),                 // wall clock time
-                                 23);                           // statement id
+                                 {23});                         // statement ids
 
     auto oplog2 = makeOplogEntry(OpTime(Timestamp(80, 2), 1),  // optime
                                  OpTypeEnum::kInsert,          // op type
@@ -339,7 +354,7 @@ TEST_F(SessionCatalogMigrationDestinationTest, OplogEntriesWithSameTxn) {
                                  boost::none,                  // o2
                                  sessionInfo,                  // session info
                                  Date_t::now(),                // wall clock time
-                                 45);                          // statement id
+                                 {45});                        // statement ids
 
     auto oplog3 = makeOplogEntry(OpTime(Timestamp(60, 2), 1),  // optime
                                  OpTypeEnum::kInsert,          // op type
@@ -347,7 +362,7 @@ TEST_F(SessionCatalogMigrationDestinationTest, OplogEntriesWithSameTxn) {
                                  boost::none,                  // o2
                                  sessionInfo,                  // sessionInfo
                                  Date_t::now(),                // wall clock time
-                                 5);                           // statement id
+                                 {5});                         // statement ids
 
     returnOplog({oplog1, oplog2, oplog3});
 
@@ -375,10 +390,73 @@ TEST_F(SessionCatalogMigrationDestinationTest, OplogEntriesWithSameTxn) {
     checkStatementExecuted(opCtx, 2, 5, oplog3);
 }
 
+TEST_F(SessionCatalogMigrationDestinationTest, OplogEntriesWithMultiStmtIds) {
+    const auto sessionId = makeLogicalSessionIdForTest();
+
+    SessionCatalogMigrationDestination sessionMigration(kNs, kFromShard, migrationId());
+    sessionMigration.start(getServiceContext());
+
+    OperationSessionInfo sessionInfo;
+    sessionInfo.setSessionId(sessionId);
+    sessionInfo.setTxnNumber(2);
+
+    auto oplog1 = makeOplogEntry(OpTime(Timestamp(100, 2), 1),  // optime
+                                 OpTypeEnum::kInsert,           // op type
+                                 BSON("x" << 100),              // o
+                                 boost::none,                   // o2
+                                 sessionInfo,                   // session info
+                                 Date_t::now(),                 // wall clock time
+                                 {23, 24});                     // statement ids
+
+    auto oplog2 = makeOplogEntry(OpTime(Timestamp(80, 2), 1),  // optime
+                                 OpTypeEnum::kInsert,          // op type
+                                 BSON("x" << 80),              // o
+                                 boost::none,                  // o2
+                                 sessionInfo,                  // session info
+                                 Date_t::now(),                // wall clock time
+                                 {45, 46});                    // statement ids
+
+    auto oplog3 = makeOplogEntry(OpTime(Timestamp(60, 2), 1),  // optime
+                                 OpTypeEnum::kInsert,          // op type
+                                 BSON("x" << 60),              // o
+                                 boost::none,                  // o2
+                                 sessionInfo,                  // sessionInfo
+                                 Date_t::now(),                // wall clock time
+                                 {5, 6});                      // statement ids
+
+    returnOplog({oplog1, oplog2, oplog3});
+
+    finishSessionExpectSuccess(&sessionMigration);
+    auto opCtx = operationContext();
+    setUpSessionWithTxn(opCtx, sessionId, 2);
+    MongoDOperationContextSession ocs(opCtx);
+    auto txnParticipant = TransactionParticipant::get(opCtx);
+
+    TransactionHistoryIterator historyIter(txnParticipant.getLastWriteOpTime());
+
+    ASSERT_TRUE(historyIter.hasNext());
+    checkOplogWithNestedOplog(oplog3, historyIter.next(opCtx));
+
+    ASSERT_TRUE(historyIter.hasNext());
+    checkOplogWithNestedOplog(oplog2, historyIter.next(opCtx));
+
+    ASSERT_TRUE(historyIter.hasNext());
+    checkOplogWithNestedOplog(oplog1, historyIter.next(opCtx));
+
+    ASSERT_FALSE(historyIter.hasNext());
+
+    checkStatementExecuted(opCtx, 2, 23, oplog1);
+    checkStatementExecuted(opCtx, 2, 24, oplog1);
+    checkStatementExecuted(opCtx, 2, 45, oplog2);
+    checkStatementExecuted(opCtx, 2, 46, oplog2);
+    checkStatementExecuted(opCtx, 2, 5, oplog3);
+    checkStatementExecuted(opCtx, 2, 6, oplog3);
+}
+
 TEST_F(SessionCatalogMigrationDestinationTest, ShouldOnlyStoreHistoryOfLatestTxn) {
     const auto sessionId = makeLogicalSessionIdForTest();
 
-    SessionCatalogMigrationDestination sessionMigration(kFromShard, migrationId());
+    SessionCatalogMigrationDestination sessionMigration(kNs, kFromShard, migrationId());
     sessionMigration.start(getServiceContext());
 
     OperationSessionInfo sessionInfo;
@@ -392,7 +470,7 @@ TEST_F(SessionCatalogMigrationDestinationTest, ShouldOnlyStoreHistoryOfLatestTxn
                                  boost::none,                   // o2
                                  sessionInfo,                   // session info
                                  Date_t::now(),                 // wall clock time
-                                 23);                           // statement id
+                                 {23});                         // statement ids
 
     sessionInfo.setTxnNumber(txnNum++);
     auto oplog2 = makeOplogEntry(OpTime(Timestamp(80, 2), 1),  // optime
@@ -401,7 +479,7 @@ TEST_F(SessionCatalogMigrationDestinationTest, ShouldOnlyStoreHistoryOfLatestTxn
                                  boost::none,                  // o2
                                  sessionInfo,                  // session info
                                  Date_t::now(),                // wall clock time
-                                 45);                          // statement id
+                                 {45});                        // statement ids
 
     sessionInfo.setTxnNumber(txnNum);
     auto oplog3 = makeOplogEntry(OpTime(Timestamp(60, 2), 1),  // optime
@@ -410,7 +488,7 @@ TEST_F(SessionCatalogMigrationDestinationTest, ShouldOnlyStoreHistoryOfLatestTxn
                                  boost::none,                  // o2
                                  sessionInfo,                  // session info
                                  Date_t::now(),                // wall clock time
-                                 5);                           // statement id
+                                 {5});                         // statement ids
 
     returnOplog({oplog1, oplog2, oplog3});
 
@@ -433,7 +511,7 @@ TEST_F(SessionCatalogMigrationDestinationTest, ShouldOnlyStoreHistoryOfLatestTxn
 TEST_F(SessionCatalogMigrationDestinationTest, OplogEntriesWithSameTxnInSeparateBatches) {
     const auto sessionId = makeLogicalSessionIdForTest();
 
-    SessionCatalogMigrationDestination sessionMigration(kFromShard, migrationId());
+    SessionCatalogMigrationDestination sessionMigration(kNs, kFromShard, migrationId());
     sessionMigration.start(getServiceContext());
 
     OperationSessionInfo sessionInfo;
@@ -446,7 +524,7 @@ TEST_F(SessionCatalogMigrationDestinationTest, OplogEntriesWithSameTxnInSeparate
                                  boost::none,                   // o2
                                  sessionInfo,                   // session info
                                  Date_t::now(),                 // wall clock time
-                                 23);                           // statement id
+                                 {23});                         // statement ids
 
     auto oplog2 = makeOplogEntry(OpTime(Timestamp(80, 2), 1),  // optime
                                  OpTypeEnum::kInsert,          // op type
@@ -454,7 +532,7 @@ TEST_F(SessionCatalogMigrationDestinationTest, OplogEntriesWithSameTxnInSeparate
                                  boost::none,                  // o2
                                  sessionInfo,                  // session info
                                  Date_t::now(),                // wall clock time
-                                 45);                          // statement id
+                                 {45});                        // statement ids
 
     auto oplog3 = makeOplogEntry(OpTime(Timestamp(60, 2), 1),  // optime
                                  OpTypeEnum::kInsert,          // op type
@@ -462,7 +540,7 @@ TEST_F(SessionCatalogMigrationDestinationTest, OplogEntriesWithSameTxnInSeparate
                                  boost::none,                  // o2
                                  sessionInfo,                  // session info
                                  Date_t::now(),                // wall clock time
-                                 5);                           // statement id
+                                 {5});                         // statement ids
 
     // Return in 2 batches
     returnOplog({oplog1, oplog2});
@@ -497,7 +575,7 @@ TEST_F(SessionCatalogMigrationDestinationTest, OplogEntriesWithDifferentSession)
     const auto sessionId1 = makeLogicalSessionIdForTest();
     const auto sessionId2 = makeLogicalSessionIdForTest();
 
-    SessionCatalogMigrationDestination sessionMigration(kFromShard, migrationId());
+    SessionCatalogMigrationDestination sessionMigration(kNs, kFromShard, migrationId());
     sessionMigration.start(getServiceContext());
 
     OperationSessionInfo sessionInfo1;
@@ -514,7 +592,7 @@ TEST_F(SessionCatalogMigrationDestinationTest, OplogEntriesWithDifferentSession)
                                  boost::none,                   // o2
                                  sessionInfo1,                  // session info
                                  Date_t::now(),                 // wall clock time
-                                 23);                           // statement id
+                                 {23});                         // statement ids
 
     auto oplog2 = makeOplogEntry(OpTime(Timestamp(80, 2), 1),  // optime
                                  OpTypeEnum::kInsert,          // op type
@@ -522,7 +600,7 @@ TEST_F(SessionCatalogMigrationDestinationTest, OplogEntriesWithDifferentSession)
                                  boost::none,                  // o2
                                  sessionInfo2,                 // session info
                                  Date_t::now(),                // wall clock time
-                                 45);                          // statement id
+                                 {45});                        // statement ids
 
     auto oplog3 = makeOplogEntry(OpTime(Timestamp(60, 2), 1),  // optime
                                  OpTypeEnum::kInsert,          // op type
@@ -530,7 +608,7 @@ TEST_F(SessionCatalogMigrationDestinationTest, OplogEntriesWithDifferentSession)
                                  boost::none,                  // o2
                                  sessionInfo2,                 // session info
                                  Date_t::now(),                // wall clock time
-                                 5);                           // statement id
+                                 {5});                         // statement ids
 
     returnOplog({oplog1, oplog2, oplog3});
 
@@ -580,7 +658,7 @@ TEST_F(SessionCatalogMigrationDestinationTest, OplogEntriesWithDifferentSession)
 TEST_F(SessionCatalogMigrationDestinationTest, ShouldNotNestAlreadyNestedOplog) {
     const auto sessionId = makeLogicalSessionIdForTest();
 
-    SessionCatalogMigrationDestination sessionMigration(kFromShard, migrationId());
+    SessionCatalogMigrationDestination sessionMigration(kNs, kFromShard, migrationId());
     sessionMigration.start(getServiceContext());
 
     OperationSessionInfo sessionInfo;
@@ -592,32 +670,32 @@ TEST_F(SessionCatalogMigrationDestinationTest, ShouldNotNestAlreadyNestedOplog) 
                                           BSON("x" << 100),              // o
                                           boost::none,                   // o2
                                           sessionInfo,                   // session info
-                                          boost::none,                   // wall clock time
-                                          23);                           // statement id
+                                          Date_t(),                      // wall clock time
+                                          {23});                         // statement ids
 
     auto origInnerOplog2 = makeOplogEntry(OpTime(Timestamp(80, 2), 1),  // optime
                                           OpTypeEnum::kInsert,          // op type
                                           BSON("x" << 80),              // o
                                           boost::none,                  // o2
                                           sessionInfo,                  // session info
-                                          boost::none,                  // wall clock time
-                                          45);                          // statement id
+                                          Date_t(),                     // wall clock time
+                                          {45});                        // statement ids
 
-    auto oplog1 = makeOplogEntry(OpTime(Timestamp(1100, 2), 1),  // optime
-                                 OpTypeEnum::kNoop,              // op type
-                                 BSONObj(),                      // o
-                                 origInnerOplog1.toBSON(),       // o2
-                                 sessionInfo,                    // session info
-                                 Date_t::now(),                  // wall clock time
-                                 23);                            // statement id
+    auto oplog1 = makeOplogEntry(OpTime(Timestamp(1100, 2), 1),        // optime
+                                 OpTypeEnum::kNoop,                    // op type
+                                 BSONObj(),                            // o
+                                 origInnerOplog1.getEntry().toBSON(),  // o2
+                                 sessionInfo,                          // session info
+                                 Date_t::now(),                        // wall clock time
+                                 {23});                                // statement ids
 
-    auto oplog2 = makeOplogEntry(OpTime(Timestamp(1080, 2), 1),  // optime
-                                 OpTypeEnum::kNoop,              // op type
-                                 BSONObj(),                      // o
-                                 origInnerOplog2.toBSON(),       // o2
-                                 sessionInfo,                    // session info
-                                 Date_t::now(),                  // wall clock time
-                                 45);                            // statement id
+    auto oplog2 = makeOplogEntry(OpTime(Timestamp(1080, 2), 1),        // optime
+                                 OpTypeEnum::kNoop,                    // op type
+                                 BSONObj(),                            // o
+                                 origInnerOplog2.getEntry().toBSON(),  // o2
+                                 sessionInfo,                          // session info
+                                 Date_t::now(),                        // wall clock time
+                                 {45});                                // statement ids
 
     returnOplog({oplog1, oplog2});
 
@@ -645,7 +723,7 @@ TEST_F(SessionCatalogMigrationDestinationTest, ShouldNotNestAlreadyNestedOplog) 
 TEST_F(SessionCatalogMigrationDestinationTest, ShouldBeAbleToHandlePreImageFindAndModify) {
     const auto sessionId = makeLogicalSessionIdForTest();
 
-    SessionCatalogMigrationDestination sessionMigration(kFromShard, migrationId());
+    SessionCatalogMigrationDestination sessionMigration(kNs, kFromShard, migrationId());
 
     sessionMigration.start(getServiceContext());
 
@@ -659,7 +737,7 @@ TEST_F(SessionCatalogMigrationDestinationTest, ShouldBeAbleToHandlePreImageFindA
                                         boost::none,                   // o2
                                         sessionInfo,                   // session info
                                         Date_t::now(),                 // wall clock time
-                                        45);                           // statement id
+                                        {45});                         // statement ids
 
     auto updateOplog = makeOplogEntry(OpTime(Timestamp(80, 2), 1),         // optime
                                       OpTypeEnum::kUpdate,                 // op type
@@ -667,7 +745,7 @@ TEST_F(SessionCatalogMigrationDestinationTest, ShouldBeAbleToHandlePreImageFindA
                                       BSON("$set" << BSON("x" << 101)),    // o2
                                       sessionInfo,                         // session info
                                       Date_t::now(),                       // wall clock time
-                                      45,                                  // statement id
+                                      {45},                                // statement ids
                                       repl::OpTime(Timestamp(100, 2), 1),  // pre-image optime
                                       boost::none);                        // post-image optime
 
@@ -687,8 +765,8 @@ TEST_F(SessionCatalogMigrationDestinationTest, ShouldBeAbleToHandlePreImageFindA
     auto nextOplog = historyIter.next(opCtx);
     ASSERT_TRUE(nextOplog.getOpType() == OpTypeEnum::kNoop);
 
-    ASSERT_TRUE(nextOplog.getStatementId());
-    ASSERT_EQ(45, nextOplog.getStatementId().value());
+    ASSERT_EQ(1, nextOplog.getStatementIds().size());
+    ASSERT_EQ(45, nextOplog.getStatementIds().front());
 
     auto nextSessionInfo = nextOplog.getOperationSessionInfo();
 
@@ -716,8 +794,8 @@ TEST_F(SessionCatalogMigrationDestinationTest, ShouldBeAbleToHandlePreImageFindA
     auto preImageOpTime = nextOplog.getPreImageOpTime().value();
     auto newPreImageOplog = getOplog(opCtx, preImageOpTime);
 
-    ASSERT_TRUE(newPreImageOplog.getStatementId());
-    ASSERT_EQ(45, newPreImageOplog.getStatementId().value());
+    ASSERT_EQ(1, newPreImageOplog.getStatementIds().size());
+    ASSERT_EQ(45, newPreImageOplog.getStatementIds().front());
 
     auto preImageSessionInfo = newPreImageOplog.getOperationSessionInfo();
 
@@ -737,7 +815,7 @@ TEST_F(SessionCatalogMigrationDestinationTest, ShouldBeAbleToHandlePreImageFindA
 TEST_F(SessionCatalogMigrationDestinationTest, ShouldBeAbleToHandlePostImageFindAndModify) {
     const auto sessionId = makeLogicalSessionIdForTest();
 
-    SessionCatalogMigrationDestination sessionMigration(kFromShard, migrationId());
+    SessionCatalogMigrationDestination sessionMigration(kNs, kFromShard, migrationId());
     sessionMigration.start(getServiceContext());
 
     OperationSessionInfo sessionInfo;
@@ -750,7 +828,7 @@ TEST_F(SessionCatalogMigrationDestinationTest, ShouldBeAbleToHandlePostImageFind
                                          boost::none,                   // o2
                                          sessionInfo,                   // session info
                                          Date_t::now(),                 // wall clock time
-                                         45);                           // statement id
+                                         {45});                         // statement ids
 
     auto updateOplog = makeOplogEntry(OpTime(Timestamp(80, 2), 1),  // optime
                                       OpTypeEnum::kUpdate,          // op type
@@ -758,7 +836,7 @@ TEST_F(SessionCatalogMigrationDestinationTest, ShouldBeAbleToHandlePostImageFind
                                       BSON("$set" << BSON("x" << 101)),
                                       sessionInfo,                          // session info
                                       Date_t::now(),                        // wall clock time
-                                      45,                                   // statement id
+                                      {45},                                 // statement ids
                                       boost::none,                          // pre-image optime
                                       repl::OpTime(Timestamp(100, 2), 1));  // post-image optime
 
@@ -777,8 +855,8 @@ TEST_F(SessionCatalogMigrationDestinationTest, ShouldBeAbleToHandlePostImageFind
     auto nextOplog = historyIter.next(opCtx);
     ASSERT_TRUE(nextOplog.getOpType() == OpTypeEnum::kNoop);
 
-    ASSERT_TRUE(nextOplog.getStatementId());
-    ASSERT_EQ(45, nextOplog.getStatementId().value());
+    ASSERT_EQ(1, nextOplog.getStatementIds().size());
+    ASSERT_EQ(45, nextOplog.getStatementIds().front());
 
     auto nextSessionInfo = nextOplog.getOperationSessionInfo();
 
@@ -806,8 +884,8 @@ TEST_F(SessionCatalogMigrationDestinationTest, ShouldBeAbleToHandlePostImageFind
     auto postImageOpTime = nextOplog.getPostImageOpTime().value();
     auto newPostImageOplog = getOplog(opCtx, postImageOpTime);
 
-    ASSERT_TRUE(newPostImageOplog.getStatementId());
-    ASSERT_EQ(45, newPostImageOplog.getStatementId().value());
+    ASSERT_EQ(1, newPostImageOplog.getStatementIds().size());
+    ASSERT_EQ(45, newPostImageOplog.getStatementIds().front());
 
     auto preImageSessionInfo = newPostImageOplog.getOperationSessionInfo();
 
@@ -827,7 +905,7 @@ TEST_F(SessionCatalogMigrationDestinationTest, ShouldBeAbleToHandlePostImageFind
 TEST_F(SessionCatalogMigrationDestinationTest, ShouldBeAbleToHandleFindAndModifySplitIn2Batches) {
     const auto sessionId = makeLogicalSessionIdForTest();
 
-    SessionCatalogMigrationDestination sessionMigration(kFromShard, migrationId());
+    SessionCatalogMigrationDestination sessionMigration(kNs, kFromShard, migrationId());
     sessionMigration.start(getServiceContext());
 
     OperationSessionInfo sessionInfo;
@@ -840,7 +918,7 @@ TEST_F(SessionCatalogMigrationDestinationTest, ShouldBeAbleToHandleFindAndModify
                                         boost::none,                   // o2
                                         sessionInfo,                   // session info
                                         Date_t::now(),                 // wall clock time
-                                        45);                           // statement id
+                                        {45});                         // statement ids
 
     auto updateOplog = makeOplogEntry(OpTime(Timestamp(80, 2), 1),         // optime
                                       OpTypeEnum::kUpdate,                 // op type
@@ -848,7 +926,7 @@ TEST_F(SessionCatalogMigrationDestinationTest, ShouldBeAbleToHandleFindAndModify
                                       BSON("$set" << BSON("x" << 101)),    // o2
                                       sessionInfo,                         // session info
                                       Date_t::now(),                       // wall clock time
-                                      45,                                  // statement id
+                                      {45},                                // statement ids
                                       repl::OpTime(Timestamp(100, 2), 1),  // pre-image optime
                                       boost::none);
 
@@ -871,8 +949,8 @@ TEST_F(SessionCatalogMigrationDestinationTest, ShouldBeAbleToHandleFindAndModify
     auto nextOplog = historyIter.next(opCtx);
     ASSERT_TRUE(nextOplog.getOpType() == OpTypeEnum::kNoop);
 
-    ASSERT_TRUE(nextOplog.getStatementId());
-    ASSERT_EQ(45, nextOplog.getStatementId().value());
+    ASSERT_EQ(1, nextOplog.getStatementIds().size());
+    ASSERT_EQ(45, nextOplog.getStatementIds().front());
 
     auto nextSessionInfo = nextOplog.getOperationSessionInfo();
 
@@ -900,8 +978,8 @@ TEST_F(SessionCatalogMigrationDestinationTest, ShouldBeAbleToHandleFindAndModify
     auto preImageOpTime = nextOplog.getPreImageOpTime().value();
     auto newPreImageOplog = getOplog(opCtx, preImageOpTime);
 
-    ASSERT_TRUE(newPreImageOplog.getStatementId());
-    ASSERT_EQ(45, newPreImageOplog.getStatementId().value());
+    ASSERT_EQ(1, nextOplog.getStatementIds().size());
+    ASSERT_EQ(45, newPreImageOplog.getStatementIds().front());
 
     auto preImageSessionInfo = newPreImageOplog.getOperationSessionInfo();
 
@@ -933,7 +1011,7 @@ TEST_F(SessionCatalogMigrationDestinationTest, OlderTxnShouldBeIgnored) {
                                   << "newerSess"),
                              0);
 
-    SessionCatalogMigrationDestination sessionMigration(kFromShard, migrationId());
+    SessionCatalogMigrationDestination sessionMigration(kNs, kFromShard, migrationId());
     sessionMigration.start(getServiceContext());
 
     OperationSessionInfo oldSessionInfo;
@@ -946,7 +1024,7 @@ TEST_F(SessionCatalogMigrationDestinationTest, OlderTxnShouldBeIgnored) {
                                  boost::none,                   // o2
                                  oldSessionInfo,                // session info
                                  Date_t::now(),                 // wall clock time
-                                 23);                           // statement id
+                                 {23});                         // statement ids
 
     auto oplog2 = makeOplogEntry(OpTime(Timestamp(80, 2), 1),  // optime
                                  OpTypeEnum::kInsert,          // op type
@@ -954,7 +1032,7 @@ TEST_F(SessionCatalogMigrationDestinationTest, OlderTxnShouldBeIgnored) {
                                  boost::none,                  // o2
                                  oldSessionInfo,               // session info
                                  Date_t::now(),                // wall clock time
-                                 45);                          // statement id
+                                 {45});                        // statement ids
 
     returnOplog({oplog1, oplog2});
 
@@ -984,7 +1062,7 @@ TEST_F(SessionCatalogMigrationDestinationTest, NewerTxnWriteShouldNotBeOverwritt
 
     auto opCtx = operationContext();
 
-    SessionCatalogMigrationDestination sessionMigration(kFromShard, migrationId());
+    SessionCatalogMigrationDestination sessionMigration(kNs, kFromShard, migrationId());
     sessionMigration.start(getServiceContext());
 
     OperationSessionInfo oldSessionInfo;
@@ -997,7 +1075,7 @@ TEST_F(SessionCatalogMigrationDestinationTest, NewerTxnWriteShouldNotBeOverwritt
                                  boost::none,                   // o2
                                  oldSessionInfo,
                                  Date_t::now(),  // wall clock time
-                                 23);            // statement id
+                                 {23});          // statement ids
 
     returnOplog({oplog1});
 
@@ -1020,7 +1098,7 @@ TEST_F(SessionCatalogMigrationDestinationTest, NewerTxnWriteShouldNotBeOverwritt
                                  boost::none,                  // o2
                                  oldSessionInfo,               // session info
                                  Date_t::now(),                // wall clock time
-                                 45);                          // statement id
+                                 {45});                        // statement ids
 
     returnOplog({oplog2});
 
@@ -1041,7 +1119,7 @@ TEST_F(SessionCatalogMigrationDestinationTest, NewerTxnWriteShouldNotBeOverwritt
 }
 
 TEST_F(SessionCatalogMigrationDestinationTest, ShouldJoinProperlyAfterNetworkError) {
-    SessionCatalogMigrationDestination sessionMigration(kFromShard, migrationId());
+    SessionCatalogMigrationDestination sessionMigration(kNs, kFromShard, migrationId());
     sessionMigration.start(getServiceContext());
     sessionMigration.finish();
 
@@ -1056,7 +1134,7 @@ TEST_F(SessionCatalogMigrationDestinationTest, ShouldJoinProperlyAfterNetworkErr
 }
 
 TEST_F(SessionCatalogMigrationDestinationTest, ShouldJoinProperlyForResponseWithNoOplog) {
-    SessionCatalogMigrationDestination sessionMigration(kFromShard, migrationId());
+    SessionCatalogMigrationDestination sessionMigration(kNs, kFromShard, migrationId());
     sessionMigration.start(getServiceContext());
     sessionMigration.finish();
 
@@ -1071,7 +1149,7 @@ TEST_F(SessionCatalogMigrationDestinationTest, ShouldJoinProperlyForResponseWith
 }
 
 TEST_F(SessionCatalogMigrationDestinationTest, ShouldJoinProperlyForResponseWithBadOplogFormat) {
-    SessionCatalogMigrationDestination sessionMigration(kFromShard, migrationId());
+    SessionCatalogMigrationDestination sessionMigration(kNs, kFromShard, migrationId());
     sessionMigration.start(getServiceContext());
     sessionMigration.finish();
 
@@ -1090,7 +1168,7 @@ TEST_F(SessionCatalogMigrationDestinationTest, ShouldJoinProperlyForResponseWith
 }
 
 TEST_F(SessionCatalogMigrationDestinationTest, ShouldJoinProperlyForResponseWithNoSessionId) {
-    SessionCatalogMigrationDestination sessionMigration(kFromShard, migrationId());
+    SessionCatalogMigrationDestination sessionMigration(kNs, kFromShard, migrationId());
 
     sessionMigration.start(getServiceContext());
     sessionMigration.finish();
@@ -1104,7 +1182,7 @@ TEST_F(SessionCatalogMigrationDestinationTest, ShouldJoinProperlyForResponseWith
                                 boost::none,                   // o2
                                 sessionInfo,                   // session info
                                 Date_t::now(),                 // wall clock time
-                                23);                           // statement id
+                                {23});                         // statement ids
 
     returnOplog({oplog});
 
@@ -1115,7 +1193,7 @@ TEST_F(SessionCatalogMigrationDestinationTest, ShouldJoinProperlyForResponseWith
 }
 
 TEST_F(SessionCatalogMigrationDestinationTest, ShouldJoinProperlyForResponseWithNoTxnNumber) {
-    SessionCatalogMigrationDestination sessionMigration(kFromShard, migrationId());
+    SessionCatalogMigrationDestination sessionMigration(kNs, kFromShard, migrationId());
     sessionMigration.start(getServiceContext());
     sessionMigration.finish();
 
@@ -1128,7 +1206,7 @@ TEST_F(SessionCatalogMigrationDestinationTest, ShouldJoinProperlyForResponseWith
                                 boost::none,                   // o2
                                 sessionInfo,                   // session info
                                 Date_t::now(),                 // wall clock time
-                                23);                           // statement id
+                                {23});                         // statement ids
 
     returnOplog({oplog});
 
@@ -1139,7 +1217,7 @@ TEST_F(SessionCatalogMigrationDestinationTest, ShouldJoinProperlyForResponseWith
 }
 
 TEST_F(SessionCatalogMigrationDestinationTest, ShouldJoinProperlyForResponseWithNoStmtId) {
-    SessionCatalogMigrationDestination sessionMigration(kFromShard, migrationId());
+    SessionCatalogMigrationDestination sessionMigration(kNs, kFromShard, migrationId());
 
     sessionMigration.start(getServiceContext());
     sessionMigration.finish();
@@ -1154,7 +1232,7 @@ TEST_F(SessionCatalogMigrationDestinationTest, ShouldJoinProperlyForResponseWith
                                 boost::none,                   // o2
                                 sessionInfo,                   // session info
                                 Date_t::now(),                 // wall clock time
-                                boost::none);                  // statement id
+                                {});                           // statement ids
 
     returnOplog({oplog});
 
@@ -1169,7 +1247,7 @@ TEST_F(SessionCatalogMigrationDestinationTest,
     const auto sessionId = makeLogicalSessionIdForTest();
     auto opCtx = operationContext();
 
-    SessionCatalogMigrationDestination sessionMigration(kFromShard, migrationId());
+    SessionCatalogMigrationDestination sessionMigration(kNs, kFromShard, migrationId());
     sessionMigration.start(getServiceContext());
 
     OperationSessionInfo sessionInfo;
@@ -1182,7 +1260,7 @@ TEST_F(SessionCatalogMigrationDestinationTest,
                                  boost::none,                   // o2
                                  sessionInfo,                   // session info
                                  Date_t::now(),                 // wall clock time
-                                 23);                           // statement id
+                                 {23});                         // statement ids
 
     returnOplog({oplog1});
 
@@ -1201,7 +1279,7 @@ TEST_F(SessionCatalogMigrationDestinationTest,
                                  boost::none,                  // o2
                                  sessionInfo,                  // session info
                                  Date_t::now(),                // wall clock time
-                                 45);                          // statement id
+                                 {45});                        // statement ids
 
     returnOplog({oplog2});
 
@@ -1234,7 +1312,7 @@ TEST_F(SessionCatalogMigrationDestinationTest,
 TEST_F(SessionCatalogMigrationDestinationTest, ShouldErrorForConsecutivePreImageOplog) {
     const auto sessionId = makeLogicalSessionIdForTest();
 
-    SessionCatalogMigrationDestination sessionMigration(kFromShard, migrationId());
+    SessionCatalogMigrationDestination sessionMigration(kNs, kFromShard, migrationId());
 
     sessionMigration.start(getServiceContext());
 
@@ -1250,7 +1328,7 @@ TEST_F(SessionCatalogMigrationDestinationTest, ShouldErrorForConsecutivePreImage
                                          boost::none,                   // o2
                                          sessionInfo,                   // session info
                                          Date_t::now(),                 // wall clock time
-                                         45);                           // statement id
+                                         {45});                         // statement ids
 
     auto preImageOplog2 = makeOplogEntry(OpTime(Timestamp(100, 2), 1),  // optime
                                          OpTypeEnum::kNoop,             // op type
@@ -1258,7 +1336,7 @@ TEST_F(SessionCatalogMigrationDestinationTest, ShouldErrorForConsecutivePreImage
                                          boost::none,                   // o2
                                          sessionInfo,                   // session info
                                          Date_t::now(),                 // wall clock time
-                                         45);                           // statement id
+                                         {45});                         // statement ids
 
     returnOplog({preImageOplog1, preImageOplog2});
 
@@ -1272,7 +1350,7 @@ TEST_F(SessionCatalogMigrationDestinationTest, ShouldErrorForConsecutivePreImage
 TEST_F(SessionCatalogMigrationDestinationTest,
        ShouldErrorForPreImageOplogWithNonMatchingSessionId) {
 
-    SessionCatalogMigrationDestination sessionMigration(kFromShard, migrationId());
+    SessionCatalogMigrationDestination sessionMigration(kNs, kFromShard, migrationId());
 
     sessionMigration.start(getServiceContext());
 
@@ -1288,7 +1366,7 @@ TEST_F(SessionCatalogMigrationDestinationTest,
                                         boost::none,                   // o2
                                         sessionInfo,                   // session info
                                         Date_t::now(),                 // wall clock time
-                                        45);                           // statement id
+                                        {45});                         // statement ids
 
     sessionInfo.setSessionId(makeLogicalSessionIdForTest());
     auto updateOplog = makeOplogEntry(OpTime(Timestamp(80, 2), 1),  // optime
@@ -1297,7 +1375,7 @@ TEST_F(SessionCatalogMigrationDestinationTest,
                                       BSON("$set" << BSON("x" << 101)),
                                       sessionInfo,                         // session info
                                       Date_t::now(),                       // wall clock time
-                                      45,                                  // statement id
+                                      {45},                                // statement ids
                                       repl::OpTime(Timestamp(100, 2), 1),  // pre-image optime
                                       boost::none);                        // post-image optime
 
@@ -1313,7 +1391,7 @@ TEST_F(SessionCatalogMigrationDestinationTest,
 TEST_F(SessionCatalogMigrationDestinationTest, ShouldErrorForPreImageOplogWithNonMatchingTxnNum) {
     const auto sessionId = makeLogicalSessionIdForTest();
 
-    SessionCatalogMigrationDestination sessionMigration(kFromShard, migrationId());
+    SessionCatalogMigrationDestination sessionMigration(kNs, kFromShard, migrationId());
 
     sessionMigration.start(getServiceContext());
 
@@ -1329,7 +1407,7 @@ TEST_F(SessionCatalogMigrationDestinationTest, ShouldErrorForPreImageOplogWithNo
                                         boost::none,                   // o2
                                         sessionInfo,                   // session info
                                         Date_t::now(),                 // wall clock time
-                                        45);                           // statement id
+                                        {45});                         // statement ids
 
     sessionInfo.setTxnNumber(56);
     auto updateOplog = makeOplogEntry(OpTime(Timestamp(80, 2), 1),         // optime
@@ -1338,7 +1416,7 @@ TEST_F(SessionCatalogMigrationDestinationTest, ShouldErrorForPreImageOplogWithNo
                                       BSON("$set" << BSON("x" << 101)),    // o2
                                       sessionInfo,                         // session info
                                       Date_t::now(),                       // wall clock time
-                                      45,                                  // statement id
+                                      {45},                                // statement ids
                                       repl::OpTime(Timestamp(100, 2), 1),  // pre-image optime
                                       boost::none);                        // post-image optime
 
@@ -1355,7 +1433,7 @@ TEST_F(SessionCatalogMigrationDestinationTest,
        ShouldErrorIfPreImageOplogFollowWithOplogWithNoPreImageLink) {
     const auto sessionId = makeLogicalSessionIdForTest();
 
-    SessionCatalogMigrationDestination sessionMigration(kFromShard, migrationId());
+    SessionCatalogMigrationDestination sessionMigration(kNs, kFromShard, migrationId());
 
     sessionMigration.start(getServiceContext());
 
@@ -1371,7 +1449,7 @@ TEST_F(SessionCatalogMigrationDestinationTest,
                                         boost::none,                   // o2
                                         sessionInfo,                   // session info
                                         Date_t::now(),                 // wall clock time
-                                        45);                           // statement id
+                                        {45});                         // statement ids
 
     auto updateOplog = makeOplogEntry(OpTime(Timestamp(80, 2), 1),       // optime
                                       OpTypeEnum::kUpdate,               // op type
@@ -1379,7 +1457,7 @@ TEST_F(SessionCatalogMigrationDestinationTest,
                                       BSON("$set" << BSON("x" << 101)),  // o2
                                       sessionInfo,                       // session info
                                       Date_t::now(),                     // wall clock time
-                                      45);                               // statement id
+                                      {45});                             // statement ids
 
     returnOplog({preImageOplog, updateOplog});
 
@@ -1394,7 +1472,7 @@ TEST_F(SessionCatalogMigrationDestinationTest,
        ShouldErrorIfOplogWithPreImageLinkIsPrecededByNormalOplog) {
     const auto sessionId = makeLogicalSessionIdForTest();
 
-    SessionCatalogMigrationDestination sessionMigration(kFromShard, migrationId());
+    SessionCatalogMigrationDestination sessionMigration(kNs, kFromShard, migrationId());
 
     sessionMigration.start(getServiceContext());
 
@@ -1410,7 +1488,7 @@ TEST_F(SessionCatalogMigrationDestinationTest,
                                  boost::none,                   // o2
                                  sessionInfo,                   // session info
                                  Date_t::now(),                 // wall clock time
-                                 23);                           // statement id
+                                 {23});                         // statement ids
 
     auto updateOplog = makeOplogEntry(OpTime(Timestamp(80, 2), 1),         // optime
                                       OpTypeEnum::kUpdate,                 // op type
@@ -1418,7 +1496,7 @@ TEST_F(SessionCatalogMigrationDestinationTest,
                                       BSON("$set" << BSON("x" << 101)),    // o2
                                       sessionInfo,                         // session info
                                       Date_t::now(),                       // wall clock time
-                                      45,                                  // statement id
+                                      {45},                                // statement ids
                                       repl::OpTime(Timestamp(100, 2), 1),  // pre-image optime
                                       boost::none);                        // post-image optime
 
@@ -1435,7 +1513,7 @@ TEST_F(SessionCatalogMigrationDestinationTest,
        ShouldErrorIfOplogWithPostImageLinkIsPrecededByNormalOplog) {
     const auto sessionId = makeLogicalSessionIdForTest();
 
-    SessionCatalogMigrationDestination sessionMigration(kFromShard, migrationId());
+    SessionCatalogMigrationDestination sessionMigration(kNs, kFromShard, migrationId());
 
     sessionMigration.start(getServiceContext());
 
@@ -1451,7 +1529,7 @@ TEST_F(SessionCatalogMigrationDestinationTest,
                                  boost::none,                   // o2
                                  sessionInfo,                   // session info
                                  Date_t::now(),                 // wall clock time
-                                 23);                           // statement id
+                                 {23});                         // statement ids
 
     auto updateOplog = makeOplogEntry(OpTime(Timestamp(80, 2), 1),          // optime
                                       OpTypeEnum::kUpdate,                  // op type
@@ -1459,7 +1537,7 @@ TEST_F(SessionCatalogMigrationDestinationTest,
                                       BSON("$set" << BSON("x" << 101)),     // o2
                                       sessionInfo,                          // session info
                                       Date_t::now(),                        // wall clock time
-                                      45,                                   // statement id
+                                      {45},                                 // statement ids
                                       boost::none,                          // pre-image optime
                                       repl::OpTime(Timestamp(100, 2), 1));  // post-image optime
 
@@ -1482,7 +1560,7 @@ TEST_F(SessionCatalogMigrationDestinationTest, ShouldIgnoreAlreadyExecutedStatem
 
     insertDocWithSessionInfo(sessionInfo, kNs, BSON("_id" << 46), 30);
 
-    SessionCatalogMigrationDestination sessionMigration(kFromShard, migrationId());
+    SessionCatalogMigrationDestination sessionMigration(kNs, kFromShard, migrationId());
     sessionMigration.start(getServiceContext());
 
     auto oplog1 = makeOplogEntry(OpTime(Timestamp(60, 2), 1),  // optime
@@ -1491,7 +1569,7 @@ TEST_F(SessionCatalogMigrationDestinationTest, ShouldIgnoreAlreadyExecutedStatem
                                  boost::none,                  // o2
                                  sessionInfo,                  // session info
                                  Date_t::now(),                // wall clock time
-                                 23);                          // statement id
+                                 {23});                        // statement ids
 
     auto oplog2 = makeOplogEntry(OpTime(Timestamp(70, 2), 1),  // optime
                                  OpTypeEnum::kInsert,          // op type
@@ -1499,7 +1577,7 @@ TEST_F(SessionCatalogMigrationDestinationTest, ShouldIgnoreAlreadyExecutedStatem
                                  boost::none,                  // o2
                                  sessionInfo,                  // session info
                                  Date_t::now(),                // wall clock time
-                                 30);                          // statement id
+                                 {30});                        // statement ids
 
     auto oplog3 = makeOplogEntry(OpTime(Timestamp(80, 2), 1),  // optime
                                  OpTypeEnum::kInsert,          // op type
@@ -1507,7 +1585,7 @@ TEST_F(SessionCatalogMigrationDestinationTest, ShouldIgnoreAlreadyExecutedStatem
                                  boost::none,                  // o2
                                  sessionInfo,                  // session info
                                  Date_t::now(),                // wall clock time
-                                 45);                          // statement id
+                                 {45});                        // statement ids
 
     returnOplog({oplog1, oplog2, oplog3});
 
@@ -1529,8 +1607,8 @@ TEST_F(SessionCatalogMigrationDestinationTest, ShouldIgnoreAlreadyExecutedStatem
 
     ASSERT_TRUE(firstInsertOplog.getOpType() == OpTypeEnum::kInsert);
     ASSERT_BSONOBJ_EQ(BSON("_id" << 46), firstInsertOplog.getObject());
-    ASSERT_TRUE(firstInsertOplog.getStatementId());
-    ASSERT_EQ(30, *firstInsertOplog.getStatementId());
+    ASSERT_EQ(1, firstInsertOplog.getStatementIds().size());
+    ASSERT_EQ(30, firstInsertOplog.getStatementIds().front());
 
     checkStatementExecuted(opCtx, 19, 23, oplog1);
     checkStatementExecuted(opCtx, 19, 30);
@@ -1548,14 +1626,14 @@ TEST_F(SessionCatalogMigrationDestinationTest, OplogEntriesWithIncompleteHistory
                        boost::none,                               // o2
                        sessionInfo,                               // session info
                        Date_t::now(),                             // wall clock time
-                       23),                                       // statement id
+                       {23}),                                     // statement ids
         makeOplogEntry(OpTime(Timestamp(80, 2), 1),               // optime
                        OpTypeEnum::kNoop,                         // op type
                        {},                                        // o
                        TransactionParticipant::kDeadEndSentinel,  // o2
                        sessionInfo,                               // session info
                        Date_t::now(),                             // wall clock time
-                       kIncompleteHistoryStmtId),                 // statement id
+                       {kIncompleteHistoryStmtId}),               // statement ids
         // This will get ignored since previous entry will make the history 'incomplete'.
         makeOplogEntry(OpTime(Timestamp(60, 2), 1),  // optime
                        OpTypeEnum::kInsert,          // op type
@@ -1563,9 +1641,9 @@ TEST_F(SessionCatalogMigrationDestinationTest, OplogEntriesWithIncompleteHistory
                        boost::none,                  // o2
                        sessionInfo,                  // session info
                        Date_t::now(),                // wall clock time
-                       5)};                          // statement id
+                       {5})};                        // statement ids
 
-    SessionCatalogMigrationDestination sessionMigration(kFromShard, migrationId());
+    SessionCatalogMigrationDestination sessionMigration(kNs, kFromShard, migrationId());
     sessionMigration.start(getServiceContext());
     sessionMigration.finish();
 
@@ -1626,7 +1704,7 @@ TEST_F(SessionCatalogMigrationDestinationTest,
                        boost::none,                   // o2
                        sessionInfo1,                  // session info
                        Date_t::now(),                 // wall clock time
-                       23),                           // statement id
+                       {23}),                         // statement ids
 
         // Session 2 entries
         makeOplogEntry(OpTime(Timestamp(50, 2), 1),  // optime
@@ -1635,16 +1713,16 @@ TEST_F(SessionCatalogMigrationDestinationTest,
                        boost::none,                  // o2
                        sessionInfo2,                 // session info
                        Date_t::now(),                // wall clock time
-                       56),                          // statement id
+                       {56}),                        // statement ids
         makeOplogEntry(OpTime(Timestamp(20, 2), 1),  // optime
                        OpTypeEnum::kInsert,          // op type
                        BSON("x" << 20),              // o
                        boost::none,                  // o2
                        sessionInfo2,                 // session info
                        Date_t::now(),                // wall clock time
-                       55)};                         // statement id
+                       {55})};                       // statement ids
 
-    SessionCatalogMigrationDestination sessionMigration(kFromShard, migrationId());
+    SessionCatalogMigrationDestination sessionMigration(kNs, kFromShard, migrationId());
     sessionMigration.start(getServiceContext());
     sessionMigration.finish();
 
@@ -1717,7 +1795,10 @@ TEST_F(SessionCatalogMigrationDestinationTest, MigratingKnownStmtWhileOplogTrunc
 
     {
         AutoGetCollection oplogColl(opCtx, NamespaceString::kRsOplogNamespace, MODE_X);
-        ASSERT_OK(oplogColl.getCollection()->truncate(opCtx));  // Empties the oplog collection.
+        WriteUnitOfWork wuow(opCtx);
+        ASSERT_OK(
+            oplogColl.getWritableCollection()->truncate(opCtx));  // Empties the oplog collection.
+        wuow.commit();
     }
 
     {
@@ -1733,9 +1814,9 @@ TEST_F(SessionCatalogMigrationDestinationTest, MigratingKnownStmtWhileOplogTrunc
                                         boost::none,                   // o2
                                         sessionInfo,                   // session info
                                         Date_t::now(),                 // wall clock time
-                                        kStmtId);                      // statement id
+                                        {kStmtId});                    // statement ids
 
-    SessionCatalogMigrationDestination sessionMigration(kFromShard, migrationId());
+    SessionCatalogMigrationDestination sessionMigration(kNs, kFromShard, migrationId());
     sessionMigration.start(getServiceContext());
     sessionMigration.finish();
 

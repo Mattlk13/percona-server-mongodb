@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -41,6 +41,7 @@ namespace mongo {
 
 ChunkInfo::ChunkInfo(const ChunkType& from)
     : _range(from.getMin(), from.getMax()),
+      _maxKeyString(ShardKeyPattern::toKeyString(from.getMax())),
       _shardId(from.getShard()),
       _lastmod(from.getVersion()),
       _history(from.getHistory()),
@@ -49,10 +50,24 @@ ChunkInfo::ChunkInfo(const ChunkType& from)
     uassertStatusOK(from.validate());
 }
 
+ChunkInfo::ChunkInfo(ChunkRange range,
+                     std::string maxKeyString,
+                     ShardId shardId,
+                     ChunkVersion version,
+                     std::vector<ChunkHistory> history,
+                     bool jumbo,
+                     std::shared_ptr<ChunkWritesTracker> writesTracker)
+    : _range(std::move(range)),
+      _maxKeyString(std::move(maxKeyString)),
+      _shardId(shardId),
+      _lastmod(std::move(version)),
+      _history(std::move(history)),
+      _jumbo(jumbo),
+      _writesTracker(writesTracker) {}
+
 const ShardId& ChunkInfo::getShardIdAt(const boost::optional<Timestamp>& ts) const {
     // This chunk was refreshed from FCV 3.6 config server so it doesn't have history
     if (_history.empty()) {
-        // TODO: SERVER-34619 - add uassert
         return _shardId;
     }
 
@@ -88,8 +103,7 @@ void ChunkInfo::throwIfMovedSince(const Timestamp& ts) const {
 
     uasserted(ErrorCodes::MigrationConflict,
               str::stream() << "Chunk has moved since timestamp: " << ts.toString()
-                            << ", most recently at timestamp: "
-                            << latestValidAfter.toString());
+                            << ", most recently at timestamp: " << latestValidAfter.toString());
 }
 
 bool ChunkInfo::containsKey(const BSONObj& shardKey) const {

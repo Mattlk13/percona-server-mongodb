@@ -29,11 +29,11 @@ if (1) {
     var a = timed();
 
     // print("index");
-    t.ensureIndex({x: 1});
+    t.createIndex({x: 1});
     // print("index");
-    t.ensureIndex({y: 1});
+    t.createIndex({y: 1});
     // print("index");
-    t.ensureIndex({z: 1});
+    t.createIndex({z: 1});
 
     a += timed();
 
@@ -49,7 +49,7 @@ if (1) {
         assert(res.ok);
 
         // print("validate");
-        var v = t.validate(true);
+        var v = t.validate({full: true});
 
         assert(v.ok);
         assert(t.getIndexes().length == 4);

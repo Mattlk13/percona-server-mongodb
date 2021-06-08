@@ -1,93 +1,93 @@
 // tests to make sure that tag ranges are added/removed/updated successfully
 (function() {
-    'use strict';
+'use strict';
 
-    const st = new ShardingTest({shards: 2, mongos: 1});
+load("jstests/sharding/libs/find_chunks_util.js");
 
-    assert.commandWorked(st.s0.adminCommand({enableSharding: 'test'}));
-    st.ensurePrimaryShard('test', st.shard1.shardName);
-    assert.commandWorked(st.s0.adminCommand({shardCollection: 'test.tag_range', key: {_id: 1}}));
+const st = new ShardingTest({shards: 2, mongos: 1});
 
-    function countTags(num, message) {
-        assert.eq(st.config.tags.count(), num, message);
-    }
+assert.commandWorked(st.s0.adminCommand({enableSharding: 'test'}));
+st.ensurePrimaryShard('test', st.shard1.shardName);
+assert.commandWorked(st.s0.adminCommand({shardCollection: 'test.tag_range', key: {_id: 1}}));
 
-    assert.eq(1, st.config.chunks.count({"ns": "test.tag_range"}));
+function countTags(num, message) {
+    assert.eq(st.config.tags.count(), num, message);
+}
 
-    st.addShardTag(st.shard0.shardName, 'a');
-    st.addShardTag(st.shard0.shardName, 'b');
-    st.addShardTag(st.shard0.shardName, 'c');
+assert.eq(1, findChunksUtil.countChunksForNs(st.config, "test.tag_range"));
 
-    // add two ranges, verify the additions
+st.addShardTag(st.shard0.shardName, 'a');
+st.addShardTag(st.shard0.shardName, 'b');
+st.addShardTag(st.shard0.shardName, 'c');
 
-    assert.commandWorked(st.addTagRange('test.tag_range', {_id: 5}, {_id: 10}, 'a'));
-    assert.commandWorked(st.addTagRange('test.tag_range', {_id: 10}, {_id: 15}, 'b'));
+// add two ranges, verify the additions
 
-    countTags(2, 'tag ranges were not successfully added');
+assert.commandWorked(st.addTagRange('test.tag_range', {_id: 5}, {_id: 10}, 'a'));
+assert.commandWorked(st.addTagRange('test.tag_range', {_id: 10}, {_id: 15}, 'b'));
 
-    // remove the second range, should be left with one
+countTags(2, 'tag ranges were not successfully added');
 
-    assert.commandWorked(st.removeTagRange('test.tag_range', {_id: 10}, {_id: 15}, 'b'));
+// remove the second range, should be left with one
 
-    countTags(1, 'tag range not removed successfully');
+assert.commandWorked(st.removeTagRange('test.tag_range', {_id: 10}, {_id: 15}, 'b'));
 
-    // add range min=max, verify the additions
+countTags(1, 'tag range not removed successfully');
 
-    try {
-        st.addTagRange('test.tag_range', {_id: 20}, {_id: 20}, 'a');
-    } catch (e) {
-        countTags(1, 'tag range should not have been added');
-    }
+// add range min=max, verify the additions
 
-    // Test that a dotted path is allowed in a tag range if it includes the shard key.
-    assert.commandWorked(
-        st.s0.adminCommand({shardCollection: 'test.tag_range_dotted', key: {"_id.a": 1}}));
-    assert.commandWorked(st.addTagRange('test.tag_range_dotted', {"_id.a": 5}, {"_id.a": 10}, 'c'));
-    countTags(2, 'Dotted path tag range not successfully added.');
+try {
+    st.addTagRange('test.tag_range', {_id: 20}, {_id: 20}, 'a');
+} catch (e) {
+    countTags(1, 'tag range should not have been added');
+}
 
-    assert.commandWorked(
-        st.removeTagRange('test.tag_range_dotted', {"_id.a": 5}, {"_id.a": 10}, 'c'));
-    assert.commandFailed(st.addTagRange('test.tag_range_dotted', {"_id.b": 5}, {"_id.b": 10}, 'c'));
-    countTags(1, 'Incorrectly added tag range.');
+// Test that a dotted path is allowed in a tag range if it includes the shard key.
+assert.commandWorked(
+    st.s0.adminCommand({shardCollection: 'test.tag_range_dotted', key: {"_id.a": 1}}));
+assert.commandWorked(st.addTagRange('test.tag_range_dotted', {"_id.a": 5}, {"_id.a": 10}, 'c'));
+countTags(2, 'Dotted path tag range not successfully added.');
 
-    // Test that ranges on embedded fields of the shard key are not allowed.
-    assert.commandFailed(
-        st.addTagRange('test.tag_range_dotted', {_id: {a: 5}}, {_id: {a: 10}}, 'c'));
-    countTags(1, 'Incorrectly added embedded field tag range');
+assert.commandWorked(st.removeTagRange('test.tag_range_dotted', {"_id.a": 5}, {"_id.a": 10}, 'c'));
+assert.commandFailed(st.addTagRange('test.tag_range_dotted', {"_id.b": 5}, {"_id.b": 10}, 'c'));
+countTags(1, 'Incorrectly added tag range.');
 
-    // removeTagRange tests for tag ranges that do not exist
+// Test that ranges on embedded fields of the shard key are not allowed.
+assert.commandFailed(st.addTagRange('test.tag_range_dotted', {_id: {a: 5}}, {_id: {a: 10}}, 'c'));
+countTags(1, 'Incorrectly added embedded field tag range');
 
-    // Bad namespace
-    assert.commandFailed(st.removeTagRange('badns', {_id: 5}, {_id: 11}, 'a'));
-    countTags(1, 'Bad namespace: tag range does not exist');
+// removeTagRange tests for tag ranges that do not exist
 
-    // Bad tag
-    assert.commandWorked(st.removeTagRange('test.tag_range', {_id: 5}, {_id: 11}, 'badtag'));
-    countTags(1, 'Bad tag: tag range does not exist');
+// Bad namespace
+assert.commandFailed(st.removeTagRange('badns', {_id: 5}, {_id: 11}, 'a'));
+countTags(1, 'Bad namespace: tag range does not exist');
 
-    // Bad min
-    assert.commandWorked(st.removeTagRange('test.tag_range', {_id: 0}, {_id: 11}, 'a'));
-    countTags(1, 'Bad min: tag range does not exist');
+// Bad tag
+assert.commandWorked(st.removeTagRange('test.tag_range', {_id: 5}, {_id: 11}, 'badtag'));
+countTags(1, 'Bad tag: tag range does not exist');
 
-    // Bad max
-    assert.commandWorked(st.removeTagRange('test.tag_range', {_id: 5}, {_id: 12}, 'a'));
-    countTags(1, 'Bad max: tag range does not exist');
+// Bad min
+assert.commandWorked(st.removeTagRange('test.tag_range', {_id: 0}, {_id: 11}, 'a'));
+countTags(1, 'Bad min: tag range does not exist');
 
-    // Invalid namesapce
-    assert.commandFailed(st.removeTagRange(35, {_id: 5}, {_id: 11}, 'a'));
-    countTags(1, 'Invalid namespace: tag range does not exist');
+// Bad max
+assert.commandWorked(st.removeTagRange('test.tag_range', {_id: 5}, {_id: 12}, 'a'));
+countTags(1, 'Bad max: tag range does not exist');
 
-    // Invalid tag
-    assert.commandWorked(st.removeTagRange('test.tag_range', {_id: 5}, {_id: 11}, 35));
-    countTags(1, 'Invalid tag: tag range does not exist');
+// Invalid namesapce
+assert.commandFailed(st.removeTagRange(35, {_id: 5}, {_id: 11}, 'a'));
+countTags(1, 'Invalid namespace: tag range does not exist');
 
-    // Invalid min
-    assert.commandFailed(st.removeTagRange('test.tag_range', 35, {_id: 11}, 'a'));
-    countTags(1, 'Invalid min: tag range does not exist');
+// Invalid tag
+assert.commandWorked(st.removeTagRange('test.tag_range', {_id: 5}, {_id: 11}, 35));
+countTags(1, 'Invalid tag: tag range does not exist');
 
-    // Invalid max
-    assert.commandFailed(st.removeTagRange('test.tag_range', {_id: 5}, 35, 'a'));
-    countTags(1, 'Invalid max: tag range does not exist');
+// Invalid min
+assert.commandFailed(st.removeTagRange('test.tag_range', 35, {_id: 11}, 'a'));
+countTags(1, 'Invalid min: tag range does not exist');
 
-    st.stop();
+// Invalid max
+assert.commandFailed(st.removeTagRange('test.tag_range', {_id: 5}, 35, 'a'));
+countTags(1, 'Invalid max: tag range does not exist');
+
+st.stop();
 })();

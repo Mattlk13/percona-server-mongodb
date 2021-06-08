@@ -34,6 +34,7 @@
 #include <boost/optional.hpp>
 #include <cstdint>
 #include <memory>
+#include <stack>
 #include <vector>
 
 #include "mongo/base/checked_cast.h"
@@ -48,9 +49,10 @@
 
 namespace mongo {
 
-using IgnorePrepared = WiredTigerBeginTxnBlock::IgnorePrepared;
 using RoundUpPreparedTimestamps = WiredTigerBeginTxnBlock::RoundUpPreparedTimestamps;
 using RoundUpReadTimestamp = WiredTigerBeginTxnBlock::RoundUpReadTimestamp;
+
+extern AtomicWord<std::int64_t> snapshotTooOldErrorCount;
 
 class BSONObjBuilder;
 
@@ -105,25 +107,23 @@ public:
 
     void beginUnitOfWork(OperationContext* opCtx) override;
     void prepareUnitOfWork() override;
-    void commitUnitOfWork() override;
-    void abortUnitOfWork() override;
 
-    bool waitUntilDurable() override;
+    bool waitUntilDurable(OperationContext* opCtx) override;
 
-    bool waitUntilUnjournaledWritesDurable(bool stableCheckpoint = true) override;
+    bool waitUntilUnjournaledWritesDurable(OperationContext* opCtx, bool stableCheckpoint) override;
 
-    void registerChange(Change* change) override;
-
-    void abandonSnapshot() override;
     void preallocateSnapshot() override;
+    void preallocateSnapshotForOplogRead() override;
 
-    Status obtainMajorityCommittedSnapshot() override;
+    Status majorityCommittedSnapshotAvailable() const override;
 
-    boost::optional<Timestamp> getPointInTimeReadTimestamp() override;
-
-    SnapshotId getSnapshotId() const override;
+    boost::optional<Timestamp> getPointInTimeReadTimestamp(OperationContext* opCtx) override;
 
     Status setTimestamp(Timestamp timestamp) override;
+
+    bool isTimestamped() const override {
+        return _isTimestamped;
+    }
 
     void setCommitTimestamp(Timestamp timestamp) override;
 
@@ -139,11 +139,15 @@ public:
 
     Timestamp getPrepareTimestamp() const override;
 
-    void setIgnorePrepared(bool ignore) override;
+    void setPrepareConflictBehavior(PrepareConflictBehavior behavior) override;
 
-    bool getIgnorePrepared() const override;
+    PrepareConflictBehavior getPrepareConflictBehavior() const override;
 
     void setRoundUpPreparedTimestamps(bool value) override;
+
+    void setCatalogConflictingTimestamp(Timestamp timestamp) override;
+
+    Timestamp getCatalogConflictingTimestamp() const override;
 
     void setTimestampReadSource(ReadSource source,
                                 boost::optional<Timestamp> provided = boost::none) override;
@@ -166,11 +170,21 @@ public:
 
     std::shared_ptr<StorageStats> getOperationStatistics() const override;
 
+    void refreshSnapshot() override;
+
+    void ignoreAllMultiTimestampConstraints() {
+        _multiTimestampConstraintTracker.ignoreAllMultiTimestampConstraints = true;
+    }
+
     // ---- WT STUFF
 
     WiredTigerSession* getSession();
     void setIsOplogReader() {
         _isOplogReader = true;
+    }
+
+    bool getIsOplogReader() const {
+        return _isOplogReader;
     }
 
     /**
@@ -189,10 +203,16 @@ public:
     WiredTigerSessionCache* getSessionCache() {
         return _sessionCache;
     }
-    bool inActiveTxn() const {
-        return _isActive();
-    }
+
     void assertInActiveTxn() const;
+
+    /**
+     * This function must be called when a write operation is performed on the active transaction
+     * for the first time.
+     *
+     * Must be reset when the active transaction is either committed or rolled back.
+     */
+    void setTxnModified();
 
     boost::optional<int64_t> getOplogVisibilityTs();
 
@@ -202,54 +222,12 @@ public:
 
     static void appendGlobalStats(BSONObjBuilder& b);
 
-    /**
-     * State transitions:
-     *
-     *   /------------------------> Inactive <-----------------------------\
-     *   |                             |                                   |
-     *   |                             |                                   |
-     *   |              /--------------+--------------\                    |
-     *   |              |                             |                    | abandonSnapshot()
-     *   |              |                             |                    |
-     *   |   beginUOW() |                             | _txnOpen()         |
-     *   |              |                             |                    |
-     *   |              V                             V                    |
-     *   |    InactiveInUnitOfWork          ActiveNotInUnitOfWork ---------/
-     *   |              |                             |
-     *   |              |                             |
-     *   |   _txnOpen() |                             | beginUOW()
-     *   |              |                             |
-     *   |              \--------------+--------------/
-     *   |                             |
-     *   |                             |
-     *   |                             V
-     *   |                           Active
-     *   |                             |
-     *   |                             |
-     *   |              /--------------+--------------\
-     *   |              |                             |
-     *   |              |                             |
-     *   |   abortUOW() |                             | commitUOW()
-     *   |              |                             |
-     *   |              V                             V
-     *   |          Aborting                      Committing
-     *   |              |                             |
-     *   |              |                             |
-     *   |              |                             |
-     *   \--------------+-----------------------------/
-     *
-     */
-    enum class State {
-        kInactive,
-        kInactiveInUnitOfWork,
-        kActiveNotInUnitOfWork,
-        kActive,
-        kAborting,
-        kCommitting,
-    };
-    State getState_forTest() const;
-
 private:
+    void doCommitUnitOfWork() override;
+    void doAbortUnitOfWork() override;
+
+    void doAbandonSnapshot() override;
+
     void _abort();
     void _commit();
 
@@ -258,10 +236,10 @@ private:
     void _txnOpen();
 
     /**
-     * Starts a transaction at the current all-committed timestamp.
+     * Starts a transaction at the current all_durable timestamp.
      * Returns the timestamp the transaction was started at.
      */
-    Timestamp _beginTransactionAtAllCommittedTimestamp(WT_SESSION* session);
+    Timestamp _beginTransactionAtAllDurableTimestamp(WT_SESSION* session);
 
     /**
      * Starts a transaction at the no-overlap timestamp. Returns the timestamp the transaction
@@ -270,38 +248,39 @@ private:
     Timestamp _beginTransactionAtNoOverlapTimestamp(WT_SESSION* session);
 
     /**
+     * Starts a transaction at the lastApplied timestamp. Returns the timestamp at which the
+     * transaction was started.
+     */
+    Timestamp _beginTransactionAtLastAppliedTimestamp(WT_SESSION* session);
+
+    /**
      * Returns the timestamp at which the current transaction is reading.
      */
     Timestamp _getTransactionReadTimestamp(WT_SESSION* session);
 
     /**
-     * Transitions to new state.
+     * Keeps track of constraint violations on multi timestamp transactions. If a transaction sets
+     * multiple timestamps, the first timestamp must be set prior to any writes. Vice-versa, if a
+     * transaction writes a document before setting a timestamp, it must not set multiple
+     * timestamps.
      */
-    void _setState(State newState);
-
-    /**
-     * Returns true if active.
-     */
-    bool _isActive() const;
-
-    /**
-     * Returns true if currently managed by a WriteUnitOfWork.
-     */
-    bool _inUnitOfWork() const;
-
-    /**
-     * Returns true if currently running commit or rollback handlers
-     */
-    bool _isCommittingOrAborting() const;
+    void _updateMultiTimestampConstraint(Timestamp timestamp);
 
     WiredTigerSessionCache* _sessionCache;  // not owned
     WiredTigerOplogManager* _oplogManager;  // not owned
     UniqueWiredTigerSession _session;
-    State _state = State::kInactive;
     bool _isTimestamped = false;
 
+    // Helpers used to keep track of multi timestamp constraint violations on the transaction.
+    struct MultiTimestampConstraintTracker {
+        bool isTxnModified = false;
+        bool txnHasNonTimestampedWrite = false;
+        bool ignoreAllMultiTimestampConstraints = false;
+        std::stack<Timestamp> timestampOrder = {};
+    } _multiTimestampConstraintTracker;
+
     // Specifies which external source to use when setting read timestamps on transactions.
-    ReadSource _timestampReadSource = ReadSource::kUnset;
+    ReadSource _timestampReadSource = ReadSource::kNoTimestamp;
 
     // Commits are assumed ordered.  Unordered commits are assumed to always need to reserve a
     // new optime, and thus always call oplogDiskLocRegister() on the record store.
@@ -310,23 +289,19 @@ private:
     // When 'true', data read from disk should not be kept in the storage engine cache.
     bool _readOnce = false;
 
-    // If set to kIgnore, updates from prepared transactions will not return prepare conflicts and
-    // will not allow seeing prepared data.
-    IgnorePrepared _ignorePrepared{IgnorePrepared::kNoIgnore};
+    // The behavior of handling prepare conflicts.
+    PrepareConflictBehavior _prepareConflictBehavior{PrepareConflictBehavior::kEnforce};
     // Dictates whether to round up prepare and commit timestamp of a prepared transaction.
     RoundUpPreparedTimestamps _roundUpPreparedTimestamps{RoundUpPreparedTimestamps::kNoRound};
     Timestamp _commitTimestamp;
     Timestamp _durableTimestamp;
     Timestamp _prepareTimestamp;
     boost::optional<Timestamp> _lastTimestampSet;
-    uint64_t _mySnapshotId;
-    Timestamp _majorityCommittedSnapshot;
     Timestamp _readAtTimestamp;
+    Timestamp _catalogConflictTimestamp;
     std::unique_ptr<Timer> _timer;
     bool _isOplogReader = false;
     boost::optional<int64_t> _oplogVisibleTs = boost::none;
-    typedef std::vector<std::unique_ptr<Change>> Changes;
-    Changes _changes;
 };
 
 }  // namespace mongo

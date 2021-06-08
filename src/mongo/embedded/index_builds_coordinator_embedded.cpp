@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -36,15 +36,15 @@
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
-#include "mongo/util/log.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
 
-void IndexBuildsCoordinatorEmbedded::shutdown() {}
+void IndexBuildsCoordinatorEmbedded::shutdown(OperationContext* opCtx) {}
 
 StatusWith<SharedSemiFuture<ReplIndexBuildState::IndexCatalogStats>>
 IndexBuildsCoordinatorEmbedded::startIndexBuild(OperationContext* opCtx,
+                                                std::string dbName,
                                                 CollectionUUID collectionUUID,
                                                 const std::vector<BSONObj>& specs,
                                                 const UUID& buildUUID,
@@ -52,52 +52,49 @@ IndexBuildsCoordinatorEmbedded::startIndexBuild(OperationContext* opCtx,
                                                 IndexBuildOptions indexBuildOptions) {
     invariant(!opCtx->lockState()->isLocked());
 
-    auto statusWithOptionalResult = _registerAndSetUpIndexBuild(
-        opCtx, collectionUUID, specs, buildUUID, protocol, indexBuildOptions.commitQuorum);
+    auto statusWithOptionalResult =
+        _filterSpecsAndRegisterBuild(opCtx, dbName, collectionUUID, specs, buildUUID, protocol);
     if (!statusWithOptionalResult.isOK()) {
         return statusWithOptionalResult.getStatus();
     }
 
     if (statusWithOptionalResult.getValue()) {
-        // TODO (SERVER-37644): when joining is implemented, the returned Future will no longer
-        // always be set.
         invariant(statusWithOptionalResult.getValue()->isReady());
         // The requested index (specs) are already built or are being built. Return success early
         // (this is v4.0 behavior compatible).
         return statusWithOptionalResult.getValue().get();
     }
 
-    auto replState = [&]() {
-        stdx::unique_lock<stdx::mutex> lk(_mutex);
-        auto it = _allIndexBuilds.find(buildUUID);
-        invariant(it != _allIndexBuilds.end());
-        return it->second;
-    }();
+    auto status = _setUpIndexBuild(opCtx, buildUUID, Timestamp(), indexBuildOptions);
+    if (!status.isOK()) {
+        return status;
+    }
+    _runIndexBuild(opCtx, buildUUID, indexBuildOptions, boost::none /* resumeInfo */);
 
-    _runIndexBuild(opCtx, buildUUID);
-
+    auto replState = invariant(_getIndexBuild(buildUUID));
     return replState->sharedPromise.getFuture();
 }
 
-Status IndexBuildsCoordinatorEmbedded::commitIndexBuild(OperationContext* opCtx,
-                                                        const std::vector<BSONObj>& specs,
-                                                        const UUID& buildUUID) {
+StatusWith<SharedSemiFuture<ReplIndexBuildState::IndexCatalogStats>>
+IndexBuildsCoordinatorEmbedded::resumeIndexBuild(OperationContext* opCtx,
+                                                 std::string dbName,
+                                                 CollectionUUID collectionUUID,
+                                                 const std::vector<BSONObj>& specs,
+                                                 const UUID& buildUUID,
+                                                 const ResumeIndexInfo& resumeInfo) {
     MONGO_UNREACHABLE;
 }
 
-void IndexBuildsCoordinatorEmbedded::signalChangeToPrimaryMode() {
-    MONGO_UNREACHABLE;
-}
+void IndexBuildsCoordinatorEmbedded::_signalPrimaryForCommitReadiness(
+    OperationContext* opCtx, std::shared_ptr<ReplIndexBuildState> replState) {}
 
-void IndexBuildsCoordinatorEmbedded::signalChangeToSecondaryMode() {
-    MONGO_UNREACHABLE;
-}
+void IndexBuildsCoordinatorEmbedded::_waitForNextIndexBuildActionAndCommit(
+    OperationContext* opCtx,
+    std::shared_ptr<ReplIndexBuildState> replState,
+    const IndexBuildOptions& indexBuildOptions) {}
 
-void IndexBuildsCoordinatorEmbedded::signalChangeToInitialSyncMode() {
-    MONGO_UNREACHABLE;
-}
-
-Status IndexBuildsCoordinatorEmbedded::voteCommitIndexBuild(const UUID& buildUUID,
+Status IndexBuildsCoordinatorEmbedded::voteCommitIndexBuild(OperationContext* opCtx,
+                                                            const UUID& buildUUID,
                                                             const HostAndPort& hostAndPort) {
     MONGO_UNREACHABLE;
 }
@@ -106,6 +103,16 @@ Status IndexBuildsCoordinatorEmbedded::setCommitQuorum(OperationContext* opCtx,
                                                        const NamespaceString& nss,
                                                        const std::vector<StringData>& indexNames,
                                                        const CommitQuorumOptions& newCommitQuorum) {
+    MONGO_UNREACHABLE;
+}
+
+void IndexBuildsCoordinatorEmbedded::_signalIfCommitQuorumIsSatisfied(
+    OperationContext* opCtx, std::shared_ptr<ReplIndexBuildState> replState) {
+    MONGO_UNREACHABLE;
+}
+
+bool IndexBuildsCoordinatorEmbedded::_signalIfCommitQuorumNotEnabled(
+    OperationContext* opCtx, std::shared_ptr<ReplIndexBuildState> replState) {
     MONGO_UNREACHABLE;
 }
 

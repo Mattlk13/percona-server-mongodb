@@ -36,8 +36,8 @@ Copyright (C) 2018-present Percona and/or its affiliates. All rights reserved.
 #include <boost/multiprecision/cpp_int.hpp>
 #include <wiredtiger.h>
 
+#include "mongo/platform/mutex.h"
 #include "mongo/platform/random.h"
-#include "mongo/stdx/mutex.h"
 
 namespace mongo {
 
@@ -78,14 +78,26 @@ public:
     // get connection for hot backup procedure to create backup
     WT_CONNECTION*  getConnection() const { return _conn; }
 
+    // reconfigure wiredtiger (used for downgrade)
+    // after reconfiguration this instance is not fully functional
+    // for example _sess pointer is null
+    void reconfigure(const char *);
+
+    // generate secure encryption key
+    // _srng use protected by _lock_key
+    void generate_secure_key(unsigned char* key);
+
 private:
     typedef boost::multiprecision::uint128_t _gcm_iv_type;
 
     EncryptionKeyDB(const bool just_created, const std::string& path, const bool rotation);
 
+    int _openWiredTiger(const std::string& path, const std::string& wtOpenConfig);
+
+    void close_handles();
     int store_gcm_iv_reserved();
     int reserve_gcm_iv_range();
-    void generate_secure_key(char key[]); // uses _srng without locks
+    void generate_secure_key_inlock(char key[]);  // uses _srng without locks
 
     void init_masterkey();
 
@@ -93,11 +105,12 @@ private:
     const bool _just_created;
     const bool _rotation;
     const std::string _path;
+    std::string _wtOpenConfig;
     unsigned char _masterkey[_key_len];
     WT_CONNECTION *_conn = nullptr;
     stdx::recursive_mutex _lock;  // _prng, _gcm_iv, _gcm_iv_reserved
-    stdx::mutex _lock_sess;  // _sess
-    stdx::mutex _lock_key;  // serialize access to the encryption keys table, also protects _srng
+    Mutex _lock_sess = MONGO_MAKE_LATCH("EncryptionKeyDB::_lock_sess");  // _sess
+    Mutex _lock_key = MONGO_MAKE_LATCH("EncryptionKeyDB::_lock_key");  // serialize access to the encryption keys table, also protects _srng
     WT_SESSION *_sess = nullptr;
     std::unique_ptr<SecureRandom> _srng;
     std::unique_ptr<PseudoRandom> _prng;

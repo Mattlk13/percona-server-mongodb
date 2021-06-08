@@ -37,16 +37,20 @@
 
 #include <boost/preprocessor/cat.hpp>
 #include <cmath>
+#include <fmt/format.h>
+#include <functional>
+#include <pcrecpp.h>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 #include <vector>
 
 #include "mongo/base/status_with.h"
-#include "mongo/logger/logstream_builder.h"
-#include "mongo/logger/message_log_domain.h"
-#include "mongo/stdx/functional.h"
+#include "mongo/base/string_data.h"
+#include "mongo/logv2/log_debug.h"
+#include "mongo/logv2/log_detail.h"
 #include "mongo/unittest/bson_test_util.h"
 #include "mongo/unittest/unittest_helpers.h"
 #include "mongo/util/assert_util.h"
@@ -61,8 +65,10 @@
  * Fails unless "EXPRESSION" is true.
  */
 #define ASSERT_TRUE(EXPRESSION) \
-    if (!(EXPRESSION))          \
-    FAIL("Expected: " #EXPRESSION)
+    if (EXPRESSION) {           \
+    } else                      \
+        FAIL("Expected: " #EXPRESSION)
+
 #define ASSERT(EXPRESSION) ASSERT_TRUE(EXPRESSION)
 
 /**
@@ -102,11 +108,15 @@
 /**
  * Binary comparison utility macro. Do not use directly.
  */
-#define ASSERT_COMPARISON_(OP, a, b)                                                           \
+#define ASSERT_COMPARISON_(OP, a, b) ASSERT_COMPARISON_STR_(OP, a, b, #a, #b)
+
+#define ASSERT_COMPARISON_STR_(OP, a, b, aExpr, bExpr)                                         \
     if (auto ca =                                                                              \
             ::mongo::unittest::ComparisonAssertion<::mongo::unittest::ComparisonOp::OP>::make( \
-                __FILE__, __LINE__, #a, #b, a, b))                                             \
-    ca.failure().stream()
+                __FILE__, __LINE__, aExpr, bExpr, a, b);                                       \
+        !ca) {                                                                                 \
+    } else                                                                                     \
+        ca.failure().stream()
 
 /**
  * Approximate equality assertion. Useful for comparisons on limited precision floating point
@@ -115,25 +125,22 @@
 #define ASSERT_APPROX_EQUAL(a, b, ABSOLUTE_ERR) ASSERT_LTE(std::abs((a) - (b)), ABSOLUTE_ERR)
 
 /**
- * ASCII case-insensitive comparison.
- */
-#define ASSERT_EQUALS_CI(a, b) ASSERT_EQUALS(str::toLower(a), str::toLower(b))
-
-/**
  * Assert a function call returns its input unchanged.
  */
-#define ASSERT_IDENTITY(INPUT, FUNCTION)                                                        \
-    [&](auto&& v) {                                                                             \
-        if (auto ca = ::mongo::unittest::ComparisonAssertion<                                   \
-                ::mongo::unittest::ComparisonOp::kEq>::make(__FILE__,                           \
-                                                            __LINE__,                           \
-                                                            #INPUT,                             \
-                                                            #FUNCTION "(" #INPUT ")",           \
-                                                            v,                                  \
-                                                            FUNCTION(                           \
-                                                                std::forward<decltype(v)>(v)))) \
-            ca.failure().stream();                                                              \
-    }(INPUT)
+#define ASSERT_IDENTITY(INPUT, FUNCTION)                                                  \
+    if (auto ca =                                                                         \
+            [&](const auto& v, const auto& fn) {                                          \
+                return ::mongo::unittest::ComparisonAssertion<                            \
+                    ::mongo::unittest::ComparisonOp::kEq>::make(__FILE__,                 \
+                                                                __LINE__,                 \
+                                                                #INPUT,                   \
+                                                                #FUNCTION "(" #INPUT ")", \
+                                                                v,                        \
+                                                                fn(v));                   \
+            }(INPUT, [&](auto&& x) { return FUNCTION(x); });                              \
+        !ca) {                                                                            \
+    } else                                                                                \
+        ca.failure().stream()
 
 /**
  * Verify that the evaluation of "EXPRESSION" throws an exception of type EXCEPTION_TYPE.
@@ -142,26 +149,26 @@
  * of a subtype of "EXCEPTION_TYPE", the test is considered a failure and further evaluation
  * halts.
  */
-#define ASSERT_THROWS(STATEMENT, EXCEPTION_TYPE) \
-    ASSERT_THROWS_WITH_CHECK(STATEMENT, EXCEPTION_TYPE, ([](const EXCEPTION_TYPE&) {}))
+#define ASSERT_THROWS(EXPRESSION, EXCEPTION_TYPE) \
+    ASSERT_THROWS_WITH_CHECK(EXPRESSION, EXCEPTION_TYPE, ([](const EXCEPTION_TYPE&) {}))
 
 /**
  * Behaves like ASSERT_THROWS, above, but also fails if calling what() on the thrown exception
  * does not return a string equal to EXPECTED_WHAT.
  */
-#define ASSERT_THROWS_WHAT(STATEMENT, EXCEPTION_TYPE, EXPECTED_WHAT)                     \
-    ASSERT_THROWS_WITH_CHECK(STATEMENT, EXCEPTION_TYPE, ([&](const EXCEPTION_TYPE& ex) { \
-                                 ASSERT_EQ(::mongo::StringData(ex.what()),               \
-                                           ::mongo::StringData(EXPECTED_WHAT));          \
+#define ASSERT_THROWS_WHAT(EXPRESSION, EXCEPTION_TYPE, EXPECTED_WHAT)                     \
+    ASSERT_THROWS_WITH_CHECK(EXPRESSION, EXCEPTION_TYPE, ([&](const EXCEPTION_TYPE& ex) { \
+                                 ASSERT_EQ(::mongo::StringData(ex.what()),                \
+                                           ::mongo::StringData(EXPECTED_WHAT));           \
                              }))
 
 /**
  * Behaves like ASSERT_THROWS, above, but also fails if calling getCode() on the thrown exception
  * does not return an error code equal to EXPECTED_CODE.
  */
-#define ASSERT_THROWS_CODE(STATEMENT, EXCEPTION_TYPE, EXPECTED_CODE)                     \
-    ASSERT_THROWS_WITH_CHECK(STATEMENT, EXCEPTION_TYPE, ([&](const EXCEPTION_TYPE& ex) { \
-                                 ASSERT_EQ(ex.toStatus().code(), EXPECTED_CODE);         \
+#define ASSERT_THROWS_CODE(EXPRESSION, EXCEPTION_TYPE, EXPECTED_CODE)                     \
+    ASSERT_THROWS_WITH_CHECK(EXPRESSION, EXCEPTION_TYPE, ([&](const EXCEPTION_TYPE& ex) { \
+                                 ASSERT_EQ(ex.toStatus().code(), EXPECTED_CODE);          \
                              }))
 
 /**
@@ -169,11 +176,11 @@
  * does not return an error code equal to EXPECTED_CODE or if calling what() on the thrown exception
  * does not return a string equal to EXPECTED_WHAT.
  */
-#define ASSERT_THROWS_CODE_AND_WHAT(STATEMENT, EXCEPTION_TYPE, EXPECTED_CODE, EXPECTED_WHAT) \
-    ASSERT_THROWS_WITH_CHECK(STATEMENT, EXCEPTION_TYPE, ([&](const EXCEPTION_TYPE& ex) {     \
-                                 ASSERT_EQ(ex.toStatus().code(), EXPECTED_CODE);             \
-                                 ASSERT_EQ(::mongo::StringData(ex.what()),                   \
-                                           ::mongo::StringData(EXPECTED_WHAT));              \
+#define ASSERT_THROWS_CODE_AND_WHAT(EXPRESSION, EXCEPTION_TYPE, EXPECTED_CODE, EXPECTED_WHAT) \
+    ASSERT_THROWS_WITH_CHECK(EXPRESSION, EXCEPTION_TYPE, ([&](const EXCEPTION_TYPE& ex) {     \
+                                 ASSERT_EQ(ex.toStatus().code(), EXPECTED_CODE);              \
+                                 ASSERT_EQ(::mongo::StringData(ex.what()),                    \
+                                           ::mongo::StringData(EXPECTED_WHAT));               \
                              }))
 
 
@@ -196,13 +203,16 @@
  *     ASSERT_DOES_NOT_COMPILE(bool B = true, std::enable_if_t<B, int>{});
  *
  */
-#define ASSERT_DOES_NOT_COMPILE(Alias, /*expr*/...)                          \
-    static auto BOOST_PP_CAT(compileCheck_, __LINE__)(...)->std::true_type;  \
-    template <Alias>                                                         \
-    static auto BOOST_PP_CAT(compileCheck_, __LINE__)(int)                   \
-        ->std::conditional_t<true, std::false_type, decltype(__VA_ARGS__)>;  \
-    static_assert(decltype(BOOST_PP_CAT(compileCheck_, __LINE__)(0))::value, \
-                  "Expression '" #__VA_ARGS__ "' [with " #Alias "] shouldn't compile.");
+#define ASSERT_DOES_NOT_COMPILE(Alias, /*expr*/...) \
+    ASSERT_DOES_NOT_COMPILE_1_(                     \
+        BOOST_PP_CAT(compileCheck_, __LINE__), Alias, #Alias, (__VA_ARGS__), #__VA_ARGS__)
+
+#define ASSERT_DOES_NOT_COMPILE_1_(Id, Alias, AliasString, Expr, ExprString)        \
+    static auto Id(...)->std::true_type;                                            \
+    template <Alias>                                                                \
+    static auto Id(int)->std::conditional_t<true, std::false_type, decltype(Expr)>; \
+    static_assert(decltype(Id(0))::value,                                           \
+                  "Expression '" ExprString "' [with " AliasString "] shouldn't compile.");
 
 /**
  * This internal helper is used to ignore warnings about unused results.  Some unit tests which test
@@ -225,43 +235,65 @@
  * Behaves like ASSERT_THROWS, above, but also calls CHECK(caughtException) which may contain
  * additional assertions.
  */
-#define ASSERT_THROWS_WITH_CHECK(STATEMENT, EXCEPTION_TYPE, CHECK)             \
-    do {                                                                       \
-        try {                                                                  \
-            UNIT_TEST_INTERNALS_IGNORE_UNUSED_RESULT_WARNINGS(STATEMENT);      \
-            FAIL("Expected statement " #STATEMENT " to throw " #EXCEPTION_TYPE \
-                 " but it threw nothing.");                                    \
-        } catch (const EXCEPTION_TYPE& ex) {                                   \
-            CHECK(ex);                                                         \
-        }                                                                      \
-    } while (false)
+#define ASSERT_THROWS_WITH_CHECK(EXPRESSION, EXCEPTION_TYPE, CHECK)                \
+    if ([&] {                                                                      \
+            try {                                                                  \
+                UNIT_TEST_INTERNALS_IGNORE_UNUSED_RESULT_WARNINGS(EXPRESSION);     \
+                return false;                                                      \
+            } catch (const EXCEPTION_TYPE& ex) {                                   \
+                CHECK(ex);                                                         \
+                return true;                                                       \
+            }                                                                      \
+        }()) {                                                                     \
+    } else                                                                         \
+        /* Fail outside of the try/catch, this way the code in the `FAIL` macro */ \
+        /* doesn't have the potential to throw an exception which we might also */ \
+        /* be checking for. */                                                     \
+        FAIL("Expected expression " #EXPRESSION " to throw " #EXCEPTION_TYPE       \
+             " but it threw nothing.")
 
-#define ASSERT_STRING_CONTAINS(BIG_STRING, CONTAINS)                                            \
-    do {                                                                                        \
-        std::string myString(BIG_STRING);                                                       \
-        std::string myContains(CONTAINS);                                                       \
-        if (myString.find(myContains) == std::string::npos) {                                   \
-            ::mongo::str::stream err;                                                           \
-            err << "Expected to find " #CONTAINS " (" << myContains << ") in " #BIG_STRING " (" \
-                << myString << ")";                                                             \
-            ::mongo::unittest::TestAssertionFailure(__FILE__, __LINE__, err).stream();          \
-        }                                                                                       \
-    } while (false)
+#define ASSERT_STRING_CONTAINS(BIG_STRING, CONTAINS)                            \
+    if (auto tup_ = std::tuple(std::string(BIG_STRING), std::string(CONTAINS)); \
+        std::get<0>(tup_).find(std::get<1>(tup_)) != std::string::npos) {       \
+    } else                                                                      \
+        FAIL(([&] {                                                             \
+            const auto& [haystack, sub] = tup_;                                 \
+            return format(FMT_STRING("Expected to find {} ({}) in {} ({})"),    \
+                          #CONTAINS,                                            \
+                          sub,                                                  \
+                          #BIG_STRING,                                          \
+                          haystack);                                            \
+        }()))
 
-#define ASSERT_STRING_OMITS(BIG_STRING, OMITS)                                                  \
-    do {                                                                                        \
-        std::string myString(BIG_STRING);                                                       \
-        std::string myOmits(OMITS);                                                             \
-        if (myString.find(myOmits) != std::string::npos) {                                      \
-            ::mongo::str::stream err;                                                           \
-            err << "Did not expect to find " #OMITS " (" << myOmits << ") in " #BIG_STRING " (" \
-                << myString << ")";                                                             \
-            ::mongo::unittest::TestAssertionFailure(__FILE__, __LINE__, err).stream();          \
-        }                                                                                       \
-    } while (false)
+#define ASSERT_STRING_OMITS(BIG_STRING, OMITS)                                     \
+    if (auto tup_ = std::tuple(std::string(BIG_STRING), std::string(OMITS));       \
+        std::get<0>(tup_).find(std::get<1>(tup_)) == std::string::npos) {          \
+    } else                                                                         \
+        FAIL(([&] {                                                                \
+            const auto& [haystack, omits] = tup_;                                  \
+            return format(FMT_STRING("Did not expect to find {} ({}) in {} ({})"), \
+                          #OMITS,                                                  \
+                          omits,                                                   \
+                          #BIG_STRING,                                             \
+                          haystack);                                               \
+        }()))
+
+#define ASSERT_STRING_SEARCH_REGEX(BIG_STRING, REGEX)                                           \
+    if (auto tup_ = std::tuple(std::string(BIG_STRING), std::string(REGEX));                    \
+        ::mongo::unittest::searchRegex(std::get<1>(tup_), std::get<0>(tup_))) {                 \
+    } else                                                                                      \
+        FAIL(([&] {                                                                             \
+            const auto& [haystack, sub] = tup_;                                                 \
+            return format(FMT_STRING("Expected to find regular expression {} /{}/ in {} ({})"), \
+                          #REGEX,                                                               \
+                          sub,                                                                  \
+                          #BIG_STRING,                                                          \
+                          haystack);                                                            \
+        }()))
+
 
 /**
- * Construct a single test, named "TEST_NAME" within the test case "CASE_NAME".
+ * Construct a single test, named `TEST_NAME` within the test Suite `SUITE_NAME`.
  *
  * Usage:
  *
@@ -269,20 +301,12 @@
  *     ASSERT_EQUALS(error_success, foo(invalidValue));
  * }
  */
-#define TEST(CASE_NAME, TEST_NAME)                                                          \
-    class _TEST_TYPE_NAME(CASE_NAME, TEST_NAME) : public ::mongo::unittest::Test {          \
-    private:                                                                                \
-        virtual void _doTest();                                                             \
-                                                                                            \
-        static const RegistrationAgent<_TEST_TYPE_NAME(CASE_NAME, TEST_NAME)> _agent;       \
-    };                                                                                      \
-    const ::mongo::unittest::Test::RegistrationAgent<_TEST_TYPE_NAME(CASE_NAME, TEST_NAME)> \
-        _TEST_TYPE_NAME(CASE_NAME, TEST_NAME)::_agent(#CASE_NAME, #TEST_NAME);              \
-    void _TEST_TYPE_NAME(CASE_NAME, TEST_NAME)::_doTest()
+#define TEST(SUITE_NAME, TEST_NAME) \
+    UNIT_TEST_DETAIL_DEFINE_TEST_(SUITE_NAME, TEST_NAME, ::mongo::unittest::Test)
 
 /**
  * Construct a single test named TEST_NAME that has access to a common class (a "fixture")
- * named "FIXTURE_NAME".
+ * named "FIXTURE_NAME". FIXTURE_NAME will be the name of the Suite in which the test appears.
  *
  * Usage:
  *
@@ -296,77 +320,187 @@
  *     ASSERT_EQUALS(10, myVar);
  * }
  */
-#define TEST_F(FIXTURE_NAME, TEST_NAME)                                                        \
-    class _TEST_TYPE_NAME(FIXTURE_NAME, TEST_NAME) : public FIXTURE_NAME {                     \
+#define TEST_F(FIXTURE_NAME, TEST_NAME) \
+    UNIT_TEST_DETAIL_DEFINE_TEST_(FIXTURE_NAME, TEST_NAME, FIXTURE_NAME)
+
+#define UNIT_TEST_DETAIL_DEFINE_TEST_(SUITE_NAME, TEST_NAME, TEST_BASE) \
+    UNIT_TEST_DETAIL_DEFINE_TEST_PRIMITIVE_(                            \
+        SUITE_NAME, TEST_NAME, UNIT_TEST_DETAIL_TEST_TYPE_NAME(SUITE_NAME, TEST_NAME), TEST_BASE)
+
+#define UNIT_TEST_DETAIL_DEFINE_TEST_PRIMITIVE_(FIXTURE_NAME, TEST_NAME, TEST_TYPE, TEST_BASE) \
+    class TEST_TYPE : public TEST_BASE {                                                       \
     private:                                                                                   \
-        virtual void _doTest();                                                                \
-                                                                                               \
-        static const RegistrationAgent<_TEST_TYPE_NAME(FIXTURE_NAME, TEST_NAME)> _agent;       \
+        void _doTest() override;                                                               \
+        static inline const RegistrationAgent<TEST_TYPE> _agent{                               \
+            #FIXTURE_NAME, #TEST_NAME, __FILE__};                                              \
     };                                                                                         \
-    const ::mongo::unittest::Test::RegistrationAgent<_TEST_TYPE_NAME(FIXTURE_NAME, TEST_NAME)> \
-        _TEST_TYPE_NAME(FIXTURE_NAME, TEST_NAME)::_agent(#FIXTURE_NAME, #TEST_NAME);           \
-    void _TEST_TYPE_NAME(FIXTURE_NAME, TEST_NAME)::_doTest()
+    void TEST_TYPE::_doTest()
 
 /**
- * Macro to construct a type name for a test, from its "CASE_NAME" and "TEST_NAME".
+ * Macro to construct a type name for a test, from its `SUITE_NAME` and `TEST_NAME`.
  * Do not use directly in test code.
  */
-#define _TEST_TYPE_NAME(CASE_NAME, TEST_NAME) UnitTest__##CASE_NAME##__##TEST_NAME
+#define UNIT_TEST_DETAIL_TEST_TYPE_NAME(SUITE_NAME, TEST_NAME) \
+    UnitTest_SuiteName##SUITE_NAME##TestName##TEST_NAME
 
-namespace mongo {
-namespace unittest {
+namespace mongo::unittest {
+
+bool searchRegex(const std::string& pattern, const std::string& string);
 
 class Result;
 
-void setupTestLogger();
-
 /**
- * Gets a LogstreamBuilder for logging to the unittest log domain, which may have
- * different target from the global log domain.
+ * Representation of a collection of tests.
+ *
+ * One Suite is constructed for each SUITE_NAME when using the TEST macro.
+ *
+ * See `OldStyleSuiteSpecification` which adapts dbtests into this framework.
  */
-mongo::logger::LogstreamBuilder log();
-mongo::logger::LogstreamBuilder warning();
+class Suite : public std::enable_shared_from_this<Suite> {
+private:
+    struct SuiteTest {
+        std::string name;
+        std::string fileName;
+        std::function<void()> fn;
+    };
 
-/**
- * Type representing the function composing a test.
- */
-typedef stdx::function<void(void)> TestFunction;
-
-/**
- * Container holding a test function and its name.  Suites
- * contain lists of these.
- */
-class TestHolder {
-    TestHolder(const TestHolder&) = delete;
-    TestHolder& operator=(const TestHolder&) = delete;
+    struct ConstructorEnable {
+        explicit ConstructorEnable() = default;
+    };
 
 public:
-    TestHolder(const std::string& name, const TestFunction& fn) : _name(name), _fn(fn) {}
+    explicit Suite(ConstructorEnable, std::string name);
+    Suite(const Suite&) = delete;
+    Suite& operator=(const Suite&) = delete;
 
-    ~TestHolder() {}
-    void run() const {
-        _fn();
-    }
-    std::string getName() const {
+    void add(std::string name, std::string fileName, std::function<void()> testFn);
+
+    std::unique_ptr<Result> run(const std::string& filter,
+                                const std::string& fileNameFilter,
+                                int runsPerTest);
+
+    static int run(const std::vector<std::string>& suites,
+                   const std::string& filter,
+                   const std::string& fileNameFilter,
+                   int runsPerTest);
+
+    /**
+     * Get a suite with the given name, creating and registering it if necessary.
+     * This is the only way to make a Suite object.
+     *
+     * Safe to call during static initialization.
+     */
+    static Suite& getSuite(StringData name);
+
+private:
+    /** Points to the string data of the _name field. */
+    StringData key() const {
         return _name;
+    }
+
+    std::string _name;
+    std::vector<SuiteTest> _tests;
+};
+
+/**
+ * Adaptor to set up a Suite from a dbtest-style suite.
+ * Support for deprecated dbtest-style test suites. Tests are are added by overriding setupTests()
+ * in a subclass of OldStyleSuiteSpecification, and defining an OldStyleSuiteInstance<T> object.
+ * This approach is
+ * deprecated.
+ *
+ * Example:
+ *     class All : public OldStyleSuiteSpecification {
+ *     public:
+ *         All() : OldStyleSuiteSpecification("BunchaTests") {}
+ *         void setupTests() {
+ *            add<TestThis>();
+ *            add<TestThat>();
+ *            add<TestTheOtherThing>();
+ *         }
+ *     };
+ *     OldStyleSuiteInitializer<All> all;
+ */
+class OldStyleSuiteSpecification {
+public:
+    struct SuiteTest {
+        std::string name;
+        std::function<void()> fn;
+    };
+
+    OldStyleSuiteSpecification(std::string name) : _name(std::move(name)) {}
+    virtual ~OldStyleSuiteSpecification() = default;
+
+    // Note: setupTests() is run by a OldStyleSuiteInitializer at static initialization time.
+    // It should in most cases be just a simple sequence of add<T>() calls.
+    virtual void setupTests() = 0;
+
+    const std::string& name() const {
+        return _name;
+    }
+
+    const std::vector<SuiteTest>& tests() const {
+        return _tests;
+    }
+
+    /**
+     * Add an old-style test of type `T` to this Suite, saving any test constructor args
+     * that would be needed at test run time.
+     * The added test's name will be synthesized as the demangled typename of T.
+     * At test run time, the test will be created and run with `T(args...).run()`.
+     */
+    template <typename T, typename... Args>
+    void add(Args&&... args) {
+        addNameCallback(nameForTestClass<T>(), [=] { T(args...).run(); });
+    }
+
+    void addNameCallback(std::string name, std::function<void()> cb) {
+        _tests.push_back({std::move(name), std::move(cb)});
+    }
+
+    template <typename T>
+    static std::string nameForTestClass() {
+        return demangleName(typeid(T));
     }
 
 private:
     std::string _name;
-    TestFunction _fn;
+    std::vector<SuiteTest> _tests;
 };
+
+/**
+ * Define a namespace-scope instance of `OldStyleSuiteInitializer<T>` to properly create and
+ * initialize an instance of `T` (an `OldStyleSuiteSpecification`). See
+ * `OldStyleSuiteSpecification`.
+ */
+template <typename T>
+struct OldStyleSuiteInitializer {
+    template <typename... Args>
+    explicit OldStyleSuiteInitializer(Args&&... args) {
+        T t(std::forward<Args>(args)...);
+        init(t);
+    }
+
+    void init(OldStyleSuiteSpecification& suiteSpec) const {
+        suiteSpec.setupTests();
+        auto& suite = Suite::getSuite(suiteSpec.name());
+        for (auto&& t : suiteSpec.tests()) {
+            suite.add(t.name, "", t.fn);
+        }
+    }
+};
+
 
 /**
  * Base type for unit test fixtures.  Also, the default fixture type used
  * by the TEST() macro.
  */
 class Test {
-    Test(const Test&) = delete;
-    Test& operator=(const Test&) = delete;
-
 public:
     Test();
     virtual ~Test();
+    Test(const Test&) = delete;
+    Test& operator=(const Test&) = delete;
 
     void run();
 
@@ -382,21 +516,38 @@ public:
 
 protected:
     /**
-     * Registration agent for adding tests to suites, used by TEST macro.
+     * Adds a Test to a Suite, used by TEST/TEST_F macros.
      */
     template <typename T>
     class RegistrationAgent {
-        RegistrationAgent(const RegistrationAgent&) = delete;
-        RegistrationAgent& operator=(const RegistrationAgent&) = delete;
-
     public:
-        RegistrationAgent(const std::string& suiteName, const std::string& testName);
-        std::string getSuiteName() const;
-        std::string getTestName() const;
+        /**
+         * These StringData must point to data that outlives this RegistrationAgent.
+         * In the case of TEST/TEST_F, these are string literals.
+         */
+        RegistrationAgent(StringData suiteName, StringData testName, StringData fileName)
+            : _suiteName{suiteName}, _testName{testName}, _fileName{fileName} {
+            Suite::getSuite(_suiteName).add(std::string{_testName}, std::string{_fileName}, [] {
+                T{}.run();
+            });
+        }
+
+        StringData getSuiteName() const {
+            return _suiteName;
+        }
+
+        StringData getTestName() const {
+            return _testName;
+        }
+
+        StringData getFileName() const {
+            return _fileName;
+        }
 
     private:
-        const std::string _suiteName;
-        const std::string _testName;
+        StringData _suiteName;
+        StringData _testName;
+        StringData _fileName;
     };
 
     /**
@@ -424,128 +575,40 @@ protected:
      * Gets a vector of strings, one log line per string, captured since
      * the last call to startCapturingLogMessages() in this test.
      */
-    const std::vector<std::string>& getCapturedLogMessages() const {
-        return _capturedLogMessages;
-    }
+    const std::vector<std::string>& getCapturedTextFormatLogMessages() const;
+    std::vector<BSONObj> getCapturedBSONFormatLogMessages() const;
 
     /**
      * Returns the number of collected log lines containing "needle".
      */
-    int64_t countLogLinesContaining(const std::string& needle);
+    int64_t countTextFormatLogLinesContaining(const std::string& needle);
+
+    /**
+     * Returns the number of collected log lines where "needle" is a subset of a line.
+     *
+     * Does a Depth-First-Search of a BSON document. Validates each element in "needle" exists in
+     * "haystack". It ignores extra elements in "haystack".
+     *
+     * In example haystack:     { i : 1, a : { b : 1 } },
+     * a valid needles include: { i : 1}  or  {a : { b : 1}}
+     * It will not find { b: 1 } since it does not search recursively for sub-tree matches.
+     *
+     * If a BSON Element is undefined, it simply checks for its existence, not its type or value.
+     * This allows callers to test for the existence of elements in variable length log lines.
+     */
+    int64_t countBSONFormatLogLinesIsSubset(const BSONObj& needle);
 
     /**
      * Prints the captured log lines.
      */
-    void printCapturedLogLines() const;
+    void printCapturedTextFormatLogLines() const;
 
 private:
     /**
      * The test itself.
      */
     virtual void _doTest() = 0;
-
-    bool _isCapturingLogMessages;
-    std::vector<std::string> _capturedLogMessages;
-    logger::MessageLogDomain::AppenderHandle _captureAppenderHandle;
-    std::unique_ptr<logger::MessageLogDomain::EventAppender> _captureAppender;
 };
-
-/**
- * Representation of a collection of tests.
- *
- * One suite is constructed for each "CASE_NAME" when using the TEST macro.
- * Additionally, tests that are part of dbtests are manually assigned to suites
- * by the programmer by overriding setupTests() in a subclass of Suite.  This
- * approach is deprecated.
- */
-class Suite {
-    Suite(const Suite&) = delete;
-    Suite& operator=(const Suite&) = delete;
-
-public:
-    Suite(const std::string& name);
-    virtual ~Suite();
-
-    template <class T>
-    void add() {
-        add<T>(demangleName(typeid(T)));
-    }
-
-    template <class T, class A>
-    void add(const A& a) {
-        add(demangleName(typeid(T)), [a] {
-            T testObj(a);
-            testObj.run();
-        });
-    }
-
-    template <class T>
-    void add(const std::string& name) {
-        add(name, [] {
-            T testObj;
-            testObj.run();
-        });
-    }
-
-    void add(const std::string& name, const TestFunction& testFn);
-
-    Result* run(const std::string& filter, int runsPerTest);
-
-    static int run(const std::vector<std::string>& suites,
-                   const std::string& filter,
-                   int runsPerTest);
-
-    /**
-     * Get a suite with the given name, creating it if necessary.
-     *
-     * The implementation of this function must be safe to call during the global static
-     * initialization block before main() executes.
-     */
-    static Suite* getSuite(const std::string& name);
-
-protected:
-    virtual void setupTests();
-
-private:
-    typedef std::vector<std::unique_ptr<TestHolder>> TestHolderList;
-
-    std::string _name;
-    TestHolderList _tests;
-    bool _ran;
-
-    void registerSuite(const std::string& name, Suite* s);
-};
-
-// A type that makes it easy to declare a self registering suite for old style test
-// declarations. Suites are self registering so this is *not* a memory leak.
-template <typename T>
-struct SuiteInstance {
-    SuiteInstance() {
-        new T;
-    }
-
-    template <typename U>
-    SuiteInstance(const U& u) {
-        new T(u);
-    }
-};
-
-template <typename T>
-Test::RegistrationAgent<T>::RegistrationAgent(const std::string& suiteName,
-                                              const std::string& testName)
-    : _suiteName(suiteName), _testName(testName) {
-    Suite::getSuite(suiteName)->add<T>(testName);
-}
-
-template <typename T>
-std::string Test::RegistrationAgent<T>::getSuiteName() const {
-    return _suiteName;
-}
-
-template <typename T>
-std::string Test::RegistrationAgent<T>::getTestName() const {
-    return _testName;
-}
 
 /**
  * Exception thrown when a test assertion fails.
@@ -613,62 +676,64 @@ enum class ComparisonOp { kEq, kNe, kLt, kLe, kGt, kGe };
 template <ComparisonOp op>
 class ComparisonAssertion {
 private:
-    template <ComparisonOp val>
-    using OpTag = std::integral_constant<ComparisonOp, val>;
-
-    static auto comparator(OpTag<ComparisonOp::kEq>) {
-        return [](auto&& a, auto&& b) { return a == b; };
-    }
-    static auto comparator(OpTag<ComparisonOp::kNe>) {
-        return [](auto&& a, auto&& b) { return a != b; };
-    }
-    static auto comparator(OpTag<ComparisonOp::kLt>) {
-        return [](auto&& a, auto&& b) { return a < b; };
-    }
-    static auto comparator(OpTag<ComparisonOp::kLe>) {
-        return [](auto&& a, auto&& b) { return a <= b; };
-    }
-    static auto comparator(OpTag<ComparisonOp::kGt>) {
-        return [](auto&& a, auto&& b) { return a > b; };
-    }
-    static auto comparator(OpTag<ComparisonOp::kGe>) {
-        return [](auto&& a, auto&& b) { return a >= b; };
+    static constexpr auto comparator() {
+        if constexpr (op == ComparisonOp::kEq) {
+            return std::equal_to<>{};
+        } else if constexpr (op == ComparisonOp::kNe) {
+            return std::not_equal_to<>{};
+        } else if constexpr (op == ComparisonOp::kLt) {
+            return std::less<>{};
+        } else if constexpr (op == ComparisonOp::kLe) {
+            return std::less_equal<>{};
+        } else if constexpr (op == ComparisonOp::kGt) {
+            return std::greater<>{};
+        } else if constexpr (op == ComparisonOp::kGe) {
+            return std::greater_equal<>{};
+        }
     }
 
-    static constexpr StringData name(OpTag<ComparisonOp::kEq>) {
-        return "=="_sd;
-    }
-    static constexpr StringData name(OpTag<ComparisonOp::kNe>) {
-        return "!="_sd;
-    }
-    static constexpr StringData name(OpTag<ComparisonOp::kLt>) {
-        return "<"_sd;
-    }
-    static constexpr StringData name(OpTag<ComparisonOp::kLe>) {
-        return "<="_sd;
-    }
-    static constexpr StringData name(OpTag<ComparisonOp::kGt>) {
-        return ">"_sd;
-    }
-    static constexpr StringData name(OpTag<ComparisonOp::kGe>) {
-        return ">="_sd;
+    static constexpr StringData name() {
+        if constexpr (op == ComparisonOp::kEq) {
+            return "=="_sd;
+        } else if constexpr (op == ComparisonOp::kNe) {
+            return "!="_sd;
+        } else if constexpr (op == ComparisonOp::kLt) {
+            return "<"_sd;
+        } else if constexpr (op == ComparisonOp::kLe) {
+            return "<="_sd;
+        } else if constexpr (op == ComparisonOp::kGt) {
+            return ">"_sd;
+        } else if constexpr (op == ComparisonOp::kGe) {
+            return ">="_sd;
+        }
     }
 
     template <typename A, typename B>
-    NOINLINE_DECL ComparisonAssertion(const char* theFile,
-                                      unsigned theLine,
-                                      StringData aExpression,
-                                      StringData bExpression,
-                                      const A& a,
-                                      const B& b) {
-        if (comparator(OpTag<op>{})(a, b)) {
+    MONGO_COMPILER_NOINLINE ComparisonAssertion(const char* theFile,
+                                                unsigned theLine,
+                                                StringData aExpression,
+                                                StringData bExpression,
+                                                const A& a,
+                                                const B& b) {
+        if (comparator()(a, b)) {
             return;
         }
+        _assertion = std::make_unique<TestAssertionFailure>(
+            theFile,
+            theLine,
+            format(FMT_STRING("Expected {1} {0} {2} ({3} {0} {4})"),
+                   name(),
+                   aExpression,
+                   bExpression,
+                   _stringify(a),
+                   _stringify(b)));
+    }
+
+    template <typename T>
+    static std::string _stringify(const T& t) {
         std::ostringstream os;
-        StringData opName = name(OpTag<op>{});
-        os << "Expected " << aExpression << " " << opName << " " << bExpression << " (" << a << " "
-           << opName << " " << b << ")";
-        _assertion = std::make_unique<TestAssertionFailure>(theFile, theLine, os.str());
+        os << t;
+        return os.str();
     }
 
 public:
@@ -716,61 +781,57 @@ private:
     std::unique_ptr<TestAssertionFailure> _assertion;
 };
 
+// Explicit instantiation of ComparisonAssertion ctor and factory, for "A OP B".
+#define TEMPLATE_COMPARISON_ASSERTION_CTOR_A_OP_B(EXTERN, OP, A, B)             \
+    EXTERN template ComparisonAssertion<ComparisonOp::OP>::ComparisonAssertion( \
+        const char*, unsigned, StringData, StringData, const A&, const B&);     \
+    EXTERN template ComparisonAssertion<ComparisonOp::OP>                       \
+    ComparisonAssertion<ComparisonOp::OP>::make(                                \
+        const char*, unsigned, StringData, StringData, const A&, const B&);
+
 // Explicit instantiation of ComparisonAssertion ctor and factory for a pair of types.
-#define TEMPLATE_COMPARISON_ASSERTION_CTOR_CROSS(EXTERN, OP, A, B)              \
-    EXTERN template ComparisonAssertion<ComparisonOp::OP>::ComparisonAssertion( \
-        const char*, unsigned, StringData, StringData, const A&, const B&);     \
-    EXTERN template ComparisonAssertion<ComparisonOp::OP>                       \
-    ComparisonAssertion<ComparisonOp::OP>::make(                                \
-        const char*, unsigned, StringData, StringData, const A&, const B&);     \
-    EXTERN template ComparisonAssertion<ComparisonOp::OP>::ComparisonAssertion( \
-        const char*, unsigned, StringData, StringData, const B&, const A&);     \
-    EXTERN template ComparisonAssertion<ComparisonOp::OP>                       \
-    ComparisonAssertion<ComparisonOp::OP>::make(                                \
-        const char*, unsigned, StringData, StringData, const B&, const A&)
+#define TEMPLATE_COMPARISON_ASSERTION_CTOR_SYMMETRIC(EXTERN, OP, A, B) \
+    TEMPLATE_COMPARISON_ASSERTION_CTOR_A_OP_B(EXTERN, OP, A, B)        \
+    TEMPLATE_COMPARISON_ASSERTION_CTOR_A_OP_B(EXTERN, OP, B, A)
 
 // Explicit instantiation of ComparisonAssertion ctor and factory for a single type.
-#define TEMPLATE_COMPARISON_ASSERTION_CTOR_SELF(EXTERN, OP, T)                  \
-    EXTERN template ComparisonAssertion<ComparisonOp::OP>::ComparisonAssertion( \
-        const char*, unsigned, StringData, StringData, const T&, const T&);     \
-    EXTERN template ComparisonAssertion<ComparisonOp::OP>                       \
-    ComparisonAssertion<ComparisonOp::OP>::make(                                \
-        const char*, unsigned, StringData, StringData, const T&, const T&)
+#define TEMPLATE_COMPARISON_ASSERTION_CTOR_REFLEXIVE(EXTERN, OP, T) \
+    TEMPLATE_COMPARISON_ASSERTION_CTOR_A_OP_B(EXTERN, OP, T, T)
 
 // Call with `extern` to declace extern instantiations, and with no args to explicitly instantiate.
-#define INSTANTIATE_COMPARISON_ASSERTION_CTORS(...)                                          \
-    __VA_ARGS__ template class ComparisonAssertion<ComparisonOp::kEq>;                       \
-    __VA_ARGS__ template class ComparisonAssertion<ComparisonOp::kNe>;                       \
-    __VA_ARGS__ template class ComparisonAssertion<ComparisonOp::kGt>;                       \
-    __VA_ARGS__ template class ComparisonAssertion<ComparisonOp::kGe>;                       \
-    __VA_ARGS__ template class ComparisonAssertion<ComparisonOp::kLt>;                       \
-    __VA_ARGS__ template class ComparisonAssertion<ComparisonOp::kLe>;                       \
-                                                                                             \
-    TEMPLATE_COMPARISON_ASSERTION_CTOR_SELF(__VA_ARGS__, kEq, int);                          \
-    TEMPLATE_COMPARISON_ASSERTION_CTOR_SELF(__VA_ARGS__, kEq, long);                         \
-    TEMPLATE_COMPARISON_ASSERTION_CTOR_SELF(__VA_ARGS__, kEq, long long);                    \
-    TEMPLATE_COMPARISON_ASSERTION_CTOR_SELF(__VA_ARGS__, kEq, unsigned int);                 \
-    TEMPLATE_COMPARISON_ASSERTION_CTOR_SELF(__VA_ARGS__, kEq, unsigned long);                \
-    TEMPLATE_COMPARISON_ASSERTION_CTOR_SELF(__VA_ARGS__, kEq, unsigned long long);           \
-    TEMPLATE_COMPARISON_ASSERTION_CTOR_SELF(__VA_ARGS__, kEq, bool);                         \
-    TEMPLATE_COMPARISON_ASSERTION_CTOR_SELF(__VA_ARGS__, kEq, double);                       \
-    TEMPLATE_COMPARISON_ASSERTION_CTOR_SELF(__VA_ARGS__, kEq, OID);                          \
-    TEMPLATE_COMPARISON_ASSERTION_CTOR_SELF(__VA_ARGS__, kEq, BSONType);                     \
-    TEMPLATE_COMPARISON_ASSERTION_CTOR_SELF(__VA_ARGS__, kEq, Timestamp);                    \
-    TEMPLATE_COMPARISON_ASSERTION_CTOR_SELF(__VA_ARGS__, kEq, Date_t);                       \
-    TEMPLATE_COMPARISON_ASSERTION_CTOR_SELF(__VA_ARGS__, kEq, Status);                       \
-    TEMPLATE_COMPARISON_ASSERTION_CTOR_SELF(__VA_ARGS__, kEq, ErrorCodes::Error);            \
-                                                                                             \
-    TEMPLATE_COMPARISON_ASSERTION_CTOR_CROSS(__VA_ARGS__, kEq, int, long);                   \
-    TEMPLATE_COMPARISON_ASSERTION_CTOR_CROSS(__VA_ARGS__, kEq, int, long long);              \
-    TEMPLATE_COMPARISON_ASSERTION_CTOR_CROSS(__VA_ARGS__, kEq, long, long long);             \
-    TEMPLATE_COMPARISON_ASSERTION_CTOR_CROSS(__VA_ARGS__, kEq, unsigned int, unsigned long); \
-    TEMPLATE_COMPARISON_ASSERTION_CTOR_CROSS(__VA_ARGS__, kEq, Status, ErrorCodes::Error);   \
-    TEMPLATE_COMPARISON_ASSERTION_CTOR_CROSS(__VA_ARGS__, kEq, ErrorCodes::Error, int);      \
-                                                                                             \
-    /* These are the only types that are often used with ASSERT_NE*/                         \
-    TEMPLATE_COMPARISON_ASSERTION_CTOR_SELF(__VA_ARGS__, kNe, Status);                       \
-    TEMPLATE_COMPARISON_ASSERTION_CTOR_SELF(__VA_ARGS__, kNe, unsigned long);
+#define INSTANTIATE_COMPARISON_ASSERTION_CTORS(...)                                             \
+    __VA_ARGS__ template class ComparisonAssertion<ComparisonOp::kEq>;                          \
+    __VA_ARGS__ template class ComparisonAssertion<ComparisonOp::kNe>;                          \
+    __VA_ARGS__ template class ComparisonAssertion<ComparisonOp::kGt>;                          \
+    __VA_ARGS__ template class ComparisonAssertion<ComparisonOp::kGe>;                          \
+    __VA_ARGS__ template class ComparisonAssertion<ComparisonOp::kLt>;                          \
+    __VA_ARGS__ template class ComparisonAssertion<ComparisonOp::kLe>;                          \
+                                                                                                \
+    TEMPLATE_COMPARISON_ASSERTION_CTOR_REFLEXIVE(__VA_ARGS__, kEq, int)                         \
+    TEMPLATE_COMPARISON_ASSERTION_CTOR_REFLEXIVE(__VA_ARGS__, kEq, long)                        \
+    TEMPLATE_COMPARISON_ASSERTION_CTOR_REFLEXIVE(__VA_ARGS__, kEq, long long)                   \
+    TEMPLATE_COMPARISON_ASSERTION_CTOR_REFLEXIVE(__VA_ARGS__, kEq, unsigned int)                \
+    TEMPLATE_COMPARISON_ASSERTION_CTOR_REFLEXIVE(__VA_ARGS__, kEq, unsigned long)               \
+    TEMPLATE_COMPARISON_ASSERTION_CTOR_REFLEXIVE(__VA_ARGS__, kEq, unsigned long long)          \
+    TEMPLATE_COMPARISON_ASSERTION_CTOR_REFLEXIVE(__VA_ARGS__, kEq, bool)                        \
+    TEMPLATE_COMPARISON_ASSERTION_CTOR_REFLEXIVE(__VA_ARGS__, kEq, double)                      \
+    TEMPLATE_COMPARISON_ASSERTION_CTOR_REFLEXIVE(__VA_ARGS__, kEq, OID)                         \
+    TEMPLATE_COMPARISON_ASSERTION_CTOR_REFLEXIVE(__VA_ARGS__, kEq, BSONType)                    \
+    TEMPLATE_COMPARISON_ASSERTION_CTOR_REFLEXIVE(__VA_ARGS__, kEq, Timestamp)                   \
+    TEMPLATE_COMPARISON_ASSERTION_CTOR_REFLEXIVE(__VA_ARGS__, kEq, Date_t)                      \
+    TEMPLATE_COMPARISON_ASSERTION_CTOR_REFLEXIVE(__VA_ARGS__, kEq, Status)                      \
+    TEMPLATE_COMPARISON_ASSERTION_CTOR_REFLEXIVE(__VA_ARGS__, kEq, ErrorCodes::Error)           \
+                                                                                                \
+    TEMPLATE_COMPARISON_ASSERTION_CTOR_SYMMETRIC(__VA_ARGS__, kEq, int, long)                   \
+    TEMPLATE_COMPARISON_ASSERTION_CTOR_SYMMETRIC(__VA_ARGS__, kEq, int, long long)              \
+    TEMPLATE_COMPARISON_ASSERTION_CTOR_SYMMETRIC(__VA_ARGS__, kEq, long, long long)             \
+    TEMPLATE_COMPARISON_ASSERTION_CTOR_SYMMETRIC(__VA_ARGS__, kEq, unsigned int, unsigned long) \
+    TEMPLATE_COMPARISON_ASSERTION_CTOR_SYMMETRIC(__VA_ARGS__, kEq, Status, ErrorCodes::Error)   \
+    TEMPLATE_COMPARISON_ASSERTION_CTOR_SYMMETRIC(__VA_ARGS__, kEq, ErrorCodes::Error, int)      \
+                                                                                                \
+    /* These are the only types that are often used with ASSERT_NE*/                            \
+    TEMPLATE_COMPARISON_ASSERTION_CTOR_REFLEXIVE(__VA_ARGS__, kNe, Status)                      \
+    TEMPLATE_COMPARISON_ASSERTION_CTOR_REFLEXIVE(__VA_ARGS__, kNe, unsigned long)
 
 // Declare that these definitions will be provided in unittest.cpp.
 INSTANTIATE_COMPARISON_ASSERTION_CTORS(extern);
@@ -795,5 +856,4 @@ T assertGet(StatusWith<T>&& swt) {
  */
 std::vector<std::string> getAllSuiteNames();
 
-}  // namespace unittest
-}  // namespace mongo
+}  // namespace mongo::unittest

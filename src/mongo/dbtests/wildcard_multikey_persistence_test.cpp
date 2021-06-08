@@ -27,24 +27,27 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kIndex
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include <memory>
 
 #include "mongo/db/catalog/multi_index_block.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index/wildcard_access_method.h"
+#include "mongo/db/query/wildcard_multikey_paths.h"
+#include "mongo/db/record_id_helpers.h"
 #include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/storage/sorted_data_interface.h"
+#include "mongo/logv2/log.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
 
 using namespace unittest;
 
-static const RecordId kMetadataId = RecordId::minReserved();
+static const RecordId kMetadataId = record_id_helpers::reservedIdFor(
+    record_id_helpers::ReservationId::kWildcardMultikeyMetadataId, KeyFormat::Long);
 
 static const int kIndexVersion = static_cast<int>(IndexDescriptor::kLatestIndexVersion);
 static const NamespaceString kDefaultNSS{"wildcard_multikey_persistence.test"};
@@ -93,15 +96,19 @@ protected:
                                    const NamespaceString& nss = kDefaultNSS,
                                    const std::string& indexName = kDefaultIndexName) {
         // Subsequent operations must take place under a collection lock.
-        AutoGetCollectionForRead autoColl(opCtx(), nss);
-        auto collection = autoColl.getCollection();
+        AutoGetCollectionForRead collection(opCtx(), nss);
 
         // Verify whether or not the index has been marked as multikey.
-        ASSERT_EQ(expectIndexIsMultikey, getIndexDesc(collection, indexName)->isMultikey(opCtx()));
+        ASSERT_EQ(expectIndexIsMultikey,
+                  getIndexDesc(collection.getCollection(), indexName)->getEntry()->isMultikey());
 
         // Obtain a cursor over the index, and confirm that the keys are present in order.
-        auto indexCursor = getIndexCursor(collection, indexName);
-        auto indexKey = indexCursor->seek(kMinBSONKey, true);
+        auto indexCursor = getIndexCursor(collection.getCollection(), indexName);
+
+        KeyString::Value keyStringForSeek = IndexEntryComparison::makeKeyStringFromBSONKeyForSeek(
+            BSONObj(), KeyString::Version::V1, Ordering::make(BSONObj()), true, true);
+
+        auto indexKey = indexCursor->seek(keyStringForSeek);
         try {
             for (const auto& expectedKey : expectedKeys) {
                 ASSERT(indexKey);
@@ -112,9 +119,12 @@ protected:
             // Confirm that there are no further keys in the index.
             ASSERT(!indexKey);
         } catch (const TestAssertionFailureException& ex) {
-            log() << "Writing remaining index keys to debug log:";
+            LOGV2(22518, "Writing remaining index keys to debug log:");
             while (indexKey) {
-                log() << "{ key: " << indexKey->key << ", loc: " << indexKey->loc << " }";
+                LOGV2(22519,
+                      "{{ key: {indexKey_key}, loc: {indexKey_loc} }}",
+                      "indexKey_key"_attr = indexKey->key,
+                      "indexKey_loc"_attr = indexKey->loc);
                 indexKey = indexCursor->next();
             }
             throw ex;
@@ -135,11 +145,12 @@ protected:
         }
         ASSERT_EQ(expectedPaths.size(), expectedFieldRefs.size());
 
-        AutoGetCollectionForRead autoColl(opCtx(), nss);
-        auto collection = autoColl.getCollection();
-        auto indexAccessMethod = getIndex(collection, indexName);
+        AutoGetCollectionForRead collection(opCtx(), nss);
+        auto indexAccessMethod = getIndex(collection.getCollection(), indexName);
         MultikeyMetadataAccessStats stats;
-        auto multikeyPathSet = indexAccessMethod->getMultikeyPathSet(opCtx(), &stats);
+        auto wam = dynamic_cast<const WildcardAccessMethod*>(indexAccessMethod);
+        ASSERT(wam != nullptr);
+        auto multikeyPathSet = getWildcardMultikeyPathSet(wam, opCtx(), &stats);
 
         ASSERT(expectedFieldRefs == multikeyPathSet);
     }
@@ -181,8 +192,7 @@ protected:
                                   BSONObj key,
                                   BSONObj pathProjection,
                                   bool background) {
-        BSONObjBuilder bob =
-            std::move(BSONObjBuilder() << "ns" << nss.ns() << "name" << name << "key" << key);
+        BSONObjBuilder bob = std::move(BSONObjBuilder() << "name" << name << "key" << key);
 
         if (!pathProjection.isEmpty())
             bob << IndexDescriptor::kPathProjectionFieldName << pathProjection;
@@ -191,19 +201,24 @@ protected:
 
         Lock::DBLock dbLock(opCtx(), nss.db(), MODE_X);
         AutoGetCollection autoColl(opCtx(), nss, MODE_X);
-        auto coll = autoColl.getCollection();
+        CollectionWriter coll(autoColl);
 
         MultiIndexBlock indexer;
-        ON_BLOCK_EXIT([&] { indexer.cleanUpAfterBuild(opCtx(), coll); });
+        auto abortOnExit = makeGuard(
+            [&] { indexer.abortIndexBuild(opCtx(), coll, MultiIndexBlock::kNoopOnCleanUpFn); });
 
         // Initialize the index builder and add all documents currently in the collection.
         ASSERT_OK(
             indexer.init(opCtx(), coll, indexSpec, MultiIndexBlock::kNoopOnInitFn).getStatus());
-        ASSERT_OK(indexer.insertAllDocumentsInCollection(opCtx(), coll));
+        ASSERT_OK(indexer.insertAllDocumentsInCollection(opCtx(), coll.get()));
+        ASSERT_OK(indexer.checkConstraints(opCtx(), coll.get()));
 
         WriteUnitOfWork wunit(opCtx());
-        ASSERT_OK(indexer.commit(
-            opCtx(), coll, MultiIndexBlock::kNoopOnCreateEachFn, MultiIndexBlock::kNoopOnCommitFn));
+        ASSERT_OK(indexer.commit(opCtx(),
+                                 coll.getWritableCollection(),
+                                 MultiIndexBlock::kNoopOnCreateEachFn,
+                                 MultiIndexBlock::kNoopOnCommitFn));
+        abortOnExit.dismiss();
         wunit.commit();
     }
 
@@ -216,17 +231,18 @@ protected:
         return docs;
     }
 
-    const IndexDescriptor* getIndexDesc(const Collection* collection, const StringData indexName) {
+    const IndexDescriptor* getIndexDesc(const CollectionPtr& collection,
+                                        const StringData indexName) {
         return collection->getIndexCatalog()->findIndexByName(opCtx(), indexName);
     }
 
-    const IndexAccessMethod* getIndex(Collection* collection, const StringData indexName) {
+    const IndexAccessMethod* getIndex(const CollectionPtr& collection, const StringData indexName) {
         return collection->getIndexCatalog()
             ->getEntry(getIndexDesc(collection, indexName))
             ->accessMethod();
     }
 
-    std::unique_ptr<SortedDataInterface::Cursor> getIndexCursor(Collection* collection,
+    std::unique_ptr<SortedDataInterface::Cursor> getIndexCursor(const CollectionPtr& collection,
                                                                 const StringData indexName) {
         return getIndex(collection, indexName)->newCursor(opCtx());
     }

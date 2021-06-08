@@ -31,9 +31,13 @@
 
 #include "mongo/transport/session.h"
 
+#include "mongo/config.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/transport/transport_layer.h"
+#ifdef MONGO_CONFIG_SSL
+#include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/net/ssl_types.h"
+#endif
 
 namespace mongo {
 namespace transport {
@@ -54,7 +58,7 @@ void Session::unsetTags(TagMask tagsToUnset) {
     mutateTags([tagsToUnset](TagMask originalTags) { return (originalTags & ~tagsToUnset); });
 }
 
-void Session::mutateTags(const stdx::function<TagMask(TagMask)>& mutateFunc) {
+void Session::mutateTags(const std::function<TagMask(TagMask)>& mutateFunc) {
     TagMask oldValue, newValue;
     do {
         oldValue = _tags.load();
@@ -62,7 +66,7 @@ void Session::mutateTags(const stdx::function<TagMask(TagMask)>& mutateFunc) {
 
         // Any change to the session tags automatically clears kPending status.
         newValue &= ~kPending;
-    } while (_tags.compareAndSwap(oldValue, newValue) != oldValue);
+    } while (!_tags.compareAndSwap(&oldValue, newValue));
 }
 
 Session::TagMask Session::getTags() const {

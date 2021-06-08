@@ -9,6 +9,8 @@ import mock
 from buildscripts.resmokelib import errors
 from buildscripts.resmokelib.testing import job
 from buildscripts.resmokelib.testing import queue_element
+from buildscripts.resmokelib.testing.fixtures import interface as _fixtures
+from buildscripts.resmokelib.testing.fixtures.fixturelib import FixtureLib
 from buildscripts.resmokelib.utils import queue as _queue
 
 # pylint: disable=missing-docstring,protected-access
@@ -191,14 +193,8 @@ class MockTime(object):
 
 class UnitJob(job.Job):  # pylint: disable=too-many-instance-attributes
     def __init__(self, suite_options):  #pylint: disable=super-init-not-called
-        self.job_num = 0
-        self.logger = logging.getLogger("job_unittest")
-        self.fixture = None
-        self.hooks = []
-        self.report = None
-        self.archival = None
-        self.suite_options = suite_options
-        self.test_queue_logger = logging.getLogger("job_unittest")
+        super(UnitJob, self).__init__(0, logging.getLogger("job_unittest"), None, [], None, None,
+                                      suite_options, logging.getLogger("job_unittest"))
         self.total_test_num = 0
         self.tests = {}
 
@@ -220,8 +216,8 @@ class TestFixtureSetupAndTeardown(unittest.TestCase):
         # Initialize the Job instance such that its setup_fixture() and teardown_fixture() methods
         # always indicate success. The settings for these mocked method will be changed in the
         # individual test cases below.
-        self.__job_object.setup_fixture = mock.Mock(return_value=True)
-        self.__job_object.teardown_fixture = mock.Mock(return_value=True)
+        self.__job_object.manager.setup_fixture = mock.Mock(return_value=True)
+        self.__job_object.manager.teardown_fixture = mock.Mock(return_value=True)
 
     def __assert_when_run_tests(self, setup_succeeded=True, teardown_succeeded=True):
         queue = _queue.Queue()
@@ -232,35 +228,67 @@ class TestFixtureSetupAndTeardown(unittest.TestCase):
         self.__job_object(queue, interrupt_flag, setup_flag, teardown_flag)
 
         self.assertEqual(setup_succeeded, not interrupt_flag.is_set())
+        self.assertEqual(setup_succeeded, not setup_flag.is_set())
         self.assertEqual(teardown_succeeded, not teardown_flag.is_set())
+
+        # teardown_fixture() should be called even if setup_fixture() raises an exception.
+        self.__job_object.manager.setup_fixture.assert_called()
+        self.__job_object.manager.teardown_fixture.assert_called()
 
     def test_setup_and_teardown_both_succeed(self):
         self.__assert_when_run_tests()
 
     def test_setup_returns_failure(self):
-        self.__job_object.setup_fixture.return_value = False
+        self.__job_object.manager.setup_fixture.return_value = False
         self.__assert_when_run_tests(setup_succeeded=False)
 
     def test_setup_raises_logging_config_exception(self):
-        self.__job_object.setup_fixture.side_effect = errors.LoggerRuntimeConfigError(
+        self.__job_object.manager.setup_fixture.side_effect = errors.LoggerRuntimeConfigError(
             "Logging configuration error intentionally raised in unit test")
         self.__assert_when_run_tests(setup_succeeded=False)
 
     def test_setup_raises_unexpected_exception(self):
-        self.__job_object.setup_fixture.side_effect = Exception(
+        self.__job_object.manager.setup_fixture.side_effect = Exception(
             "Generic error intentionally raised in unit test")
         self.__assert_when_run_tests(setup_succeeded=False)
 
     def test_teardown_returns_failure(self):
-        self.__job_object.teardown_fixture.return_value = False
+        self.__job_object.manager.teardown_fixture.return_value = False
         self.__assert_when_run_tests(teardown_succeeded=False)
 
     def test_teardown_raises_logging_config_exception(self):
-        self.__job_object.teardown_fixture.side_effect = errors.LoggerRuntimeConfigError(
+        self.__job_object.manager.teardown_fixture.side_effect = errors.LoggerRuntimeConfigError(
             "Logging configuration error intentionally raised in unit test")
         self.__assert_when_run_tests(teardown_succeeded=False)
 
     def test_teardown_raises_unexpected_exception(self):
-        self.__job_object.teardown_fixture.side_effect = Exception(
+        self.__job_object.manager.teardown_fixture.side_effect = Exception(
             "Generic error intentionally raised in unit test")
         self.__assert_when_run_tests(teardown_succeeded=False)
+
+
+class TestNoOpFixtureSetupAndTeardown(unittest.TestCase):
+    """Test cases for NoOpFixture handling in setup_fixture() and teardown_fixture()."""
+
+    def setUp(self):
+        self.logger = logging.getLogger("job_unittest")
+        fixturelib = FixtureLib()
+        self.__noop_fixture = _fixtures.NoOpFixture(logger=self.logger, job_num=0,
+                                                    fixturelib=fixturelib)
+        self.__noop_fixture.setup = mock.Mock()
+        self.__noop_fixture.teardown = mock.Mock()
+
+        test_report = mock.Mock()
+        test_report.find_test_info().status = "pass"
+
+        self.__job_object = job.Job(job_num=0, logger=self.logger, fixture=self.__noop_fixture,
+                                    hooks=[], report=test_report, archival=None, suite_options=None,
+                                    test_queue_logger=self.logger)
+
+    def test_setup_called_for_noop_fixture(self):
+        self.assertTrue(self.__job_object.manager.setup_fixture(self.logger))
+        self.__noop_fixture.setup.assert_called_once_with()
+
+    def test_teardown_called_for_noop_fixture(self):
+        self.assertTrue(self.__job_object.manager.teardown_fixture(self.logger))
+        self.__noop_fixture.teardown.assert_called_once_with(finished=True)

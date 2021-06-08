@@ -38,7 +38,7 @@ namespace mongo {
 
 namespace {
 BackupCursorHooks::InitializerFunction initializer = [](StorageEngine* storageEngine) {
-    return stdx::make_unique<BackupCursorHooks>();
+    return std::make_unique<BackupCursorHooks>();
 };
 
 struct BackupCursorHooksHolder {
@@ -77,7 +77,8 @@ void BackupCursorHooks::fsyncUnlock(OperationContext* opCtx) {
     MONGO_UNREACHABLE;
 }
 
-BackupCursorState BackupCursorHooks::openBackupCursor(OperationContext* opCtx) {
+BackupCursorState BackupCursorHooks::openBackupCursor(OperationContext* opCtx,
+                                                      const StorageEngine::BackupOptions& options) {
     MONGO_UNREACHABLE;
 }
 

@@ -42,8 +42,8 @@ class RecordStoreFastCountStage final : public RequiresCollectionStage {
 public:
     static const char* kStageType;
 
-    RecordStoreFastCountStage(OperationContext* opCtx,
-                              Collection* collection,
+    RecordStoreFastCountStage(ExpressionContext* expCtx,
+                              const CollectionPtr& collection,
                               long long skip,
                               long long limit);
 
@@ -75,4 +75,4 @@ private:
     CountStats _specificStats;
 };
 
-}  // namepace mongo
+}  // namespace mongo

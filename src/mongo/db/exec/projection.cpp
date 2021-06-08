@@ -27,126 +27,101 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
-
 #include "mongo/db/exec/projection.h"
 
-#include "boost/optional.hpp"
+#include <boost/optional.hpp>
+#include <memory>
 
+#include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/exec/projection_executor_builder.h"
 #include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set_common.h"
-#include "mongo/db/exec/working_set_computed_data.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/record_id.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/log.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
-
-static const char* kIdField = "_id";
-
 namespace {
 
-BSONObj indexKey(const WorkingSetMember& member) {
-    return static_cast<const IndexKeyComputedData*>(member.getComputed(WSM_INDEX_KEY))->getKey();
-}
-
-BSONObj sortKey(const WorkingSetMember& member) {
-    return static_cast<const SortKeyComputedData*>(member.getComputed(WSM_SORT_KEY))->getSortKey();
-}
-
-double geoDistance(const WorkingSetMember& member) {
-    return static_cast<const GeoDistanceComputedData*>(
-               member.getComputed(WSM_COMPUTED_GEO_DISTANCE))
-        ->getDist();
-}
-
-BSONObj geoPoint(const WorkingSetMember& member) {
-    return static_cast<const GeoNearPointComputedData*>(member.getComputed(WSM_GEO_NEAR_POINT))
-        ->getPoint();
-}
-
-double textScore(const WorkingSetMember& member) {
-    if (member.hasComputed(WSM_COMPUTED_TEXT_SCORE))
-        return static_cast<const TextScoreComputedData*>(
-                   member.getComputed(WSM_COMPUTED_TEXT_SCORE))
-            ->getScore();
-    // It is permitted to request a text score when none has been computed. Zero is returned as an
-    // empty value in this case.
-    else
-        return 0.0;
-}
-
-void transitionMemberToOwnedObj(const BSONObj& bo, WorkingSetMember* member) {
+void transitionMemberToOwnedObj(Document&& doc, WorkingSetMember* member) {
     member->keyData.clear();
-    member->recordId = RecordId();
-    member->obj = Snapshotted<BSONObj>(SnapshotId(), bo);
+    member->recordId = {};
+    member->doc = {{}, std::move(doc)};
     member->transitionToOwnedObj();
 }
 
-StatusWith<BSONObj> provideMetaFieldsAndPerformExec(const ProjectionExec& exec,
-                                                    const WorkingSetMember& member) {
-    if (exec.needsGeoNearDistance() && !member.hasComputed(WSM_COMPUTED_GEO_DISTANCE))
-        return Status(ErrorCodes::InternalError, "near loc dist requested but no data available");
+void transitionMemberToOwnedObj(const BSONObj& bo, WorkingSetMember* member) {
+    // Use the DocumentStorage that already exists on the WorkingSetMember's document
+    // field if possible.
+    MutableDocument md(std::move(member->doc.value()));
+    md.reset(bo, false);
+    transitionMemberToOwnedObj(md.freeze(), member);
+}
 
-    if (exec.needsGeoNearPoint() && !member.hasComputed(WSM_GEO_NEAR_POINT))
-        return Status(ErrorCodes::InternalError, "near loc proj requested but no data available");
+/**
+ * Moves document metadata fields from the WSM into the given document 'doc', and returns the same
+ * document but with populated metadata.
+ */
+auto attachMetadataToDocument(Document&& doc, WorkingSetMember* member) {
+    MutableDocument md{std::move(doc)};
+    md.setMetadata(member->releaseMetadata());
+    return md.freeze();
+}
 
-    return member.hasObj()
-        ? exec.project(member.obj.value(),
-                       exec.needsGeoNearDistance()
-                           ? boost::optional<const double>(geoDistance(member))
-                           : boost::none,
-                       exec.needsGeoNearPoint() ? geoPoint(member) : BSONObj(),
-                       exec.needsSortKey() ? sortKey(member) : BSONObj(),
-                       exec.needsTextScore() ? boost::optional<const double>(textScore(member))
-                                             : boost::none,
-                       member.recordId.repr())
-        : exec.projectCovered(
-              member.keyData,
-              exec.needsGeoNearDistance() ? boost::optional<const double>(geoDistance(member))
-                                          : boost::none,
-              exec.needsGeoNearPoint() ? geoPoint(member) : BSONObj(),
-              exec.needsSortKey() ? sortKey(member) : BSONObj(),
-              exec.needsTextScore() ? boost::optional<const double>(textScore(member))
-                                    : boost::none,
-              member.recordId.repr());
+/**
+ * Moves document metadata fields from the document 'doc' into the WSM, and returns the same
+ * document but without metadata.
+ */
+auto attachMetadataToWorkingSetMember(Document&& doc, WorkingSetMember* member) {
+    MutableDocument md{std::move(doc)};
+    member->setMetadata(md.releaseMetadata());
+    return md.freeze();
+}
+
+/**
+ * Given an index key 'dehyratedKey' with no field names, returns a new Document representing the
+ * index key after adding field names according to 'keyPattern'.
+ *
+ * For example, given:
+ *    - the 'keyPatern' of {'a.b': 1, c: 1}
+ *    - the 'dehydratedKey' of {'': 'abc', '': 10}
+ *
+ * The resulting document will be: {a: {b: 'abc'}, c: 10}
+ */
+auto rehydrateIndexKey(const BSONObj& keyPattern, const BSONObj& dehydratedKey) {
+    MutableDocument md;
+    BSONObjIterator keyIter{keyPattern};
+    BSONObjIterator valueIter{dehydratedKey};
+
+    while (keyIter.more() && valueIter.more()) {
+        auto fieldName = keyIter.next().fieldNameStringData();
+        auto value = valueIter.next();
+
+        // Skip the $** index virtual field, as it's not part of the actual index key.
+        if (fieldName == "$_path") {
+            continue;
+        }
+
+        md.setNestedField(fieldName, Value{value});
+    }
+
+    invariant(!keyIter.more());
+    invariant(!valueIter.more());
+
+    return md.freeze();
 }
 }  // namespace
 
-ProjectionStage::ProjectionStage(OperationContext* opCtx,
+ProjectionStage::ProjectionStage(ExpressionContext* expCtx,
                                  const BSONObj& projObj,
                                  WorkingSet* ws,
                                  std::unique_ptr<PlanStage> child,
                                  const char* stageType)
-    : PlanStage(opCtx, std::move(child), stageType), _projObj(projObj), _ws(*ws) {}
-
-// static
-void ProjectionStage::getSimpleInclusionFields(const BSONObj& projObj, FieldSet* includedFields) {
-    // The _id is included by default.
-    bool includeId = true;
-
-    // Figure out what fields are in the projection.  TODO: we can get this from the
-    // ParsedProjection...modify that to have this type instead of a vector.
-    BSONObjIterator projObjIt(projObj);
-    while (projObjIt.more()) {
-        BSONElement elt = projObjIt.next();
-        // Must deal with the _id case separately as there is an implicit _id: 1 in the
-        // projection.
-        if ((elt.fieldNameStringData() == kIdField) && !elt.trueValue()) {
-            includeId = false;
-            continue;
-        }
-        (*includedFields)[elt.fieldNameStringData()] = true;
-    }
-
-    if (includeId) {
-        (*includedFields)[kIdField] = true;
-    }
-}
+    : PlanStage{expCtx, std::move(child), stageType},
+      _projObj{expCtx->explain ? boost::make_optional(projObj.getOwned()) : boost::none},
+      _ws{*ws} {}
 
 bool ProjectionStage::isEOF() {
     return child()->isEOF();
@@ -161,18 +136,7 @@ PlanStage::StageState ProjectionStage::doWork(WorkingSetID* out) {
     if (PlanStage::ADVANCED == status) {
         WorkingSetMember* member = _ws.get(id);
         // Punt to our specific projection impl.
-        Status projStatus = transform(member);
-        if (!projStatus.isOK()) {
-            warning() << "Couldn't execute projection, status = " << redact(projStatus);
-            *out = WorkingSetCommon::allocateStatusMember(&_ws, projStatus);
-            return PlanStage::FAILURE;
-        }
-
-        *out = id;
-    } else if (PlanStage::FAILURE == status) {
-        // The stage which produces a failure is responsible for allocating a working set member
-        // with error details.
-        invariant(WorkingSet::INVALID_ID != id);
+        transform(member);
         *out = id;
     } else if (PlanStage::NEED_YIELD == status) {
         *out = id;
@@ -186,59 +150,77 @@ std::unique_ptr<PlanStageStats> ProjectionStage::getStats() {
     auto ret = std::make_unique<PlanStageStats>(_commonStats, stageType());
 
     auto projStats = std::make_unique<ProjectionStats>(_specificStats);
-    projStats->projObj = _projObj;
+    projStats->projObj = _projObj.value_or(BSONObj{});
     ret->specific = std::move(projStats);
 
     ret->children.emplace_back(child()->getStats());
     return ret;
 }
 
-ProjectionStageDefault::ProjectionStageDefault(OperationContext* opCtx,
+ProjectionStageDefault::ProjectionStageDefault(boost::intrusive_ptr<ExpressionContext> expCtx,
                                                const BSONObj& projObj,
+                                               const projection_ast::Projection* projection,
                                                WorkingSet* ws,
-                                               std::unique_ptr<PlanStage> child,
-                                               const MatchExpression& fullExpression,
-                                               const CollatorInterface* collator)
-    : ProjectionStage(opCtx, projObj, ws, std::move(child), "PROJECTION_DEFAULT"),
-      _exec(opCtx, projObj, &fullExpression, collator) {}
+                                               std::unique_ptr<PlanStage> child)
+    : ProjectionStage{expCtx.get(), projObj, ws, std::move(child), "PROJECTION_DEFAULT"},
+      _requestedMetadata{projection->metadataDeps()},
+      _projectType{projection->type()},
+      _executor{projection_executor::buildProjectionExecutor(
+          expCtx, projection, {}, projection_executor::kDefaultBuilderParams)} {}
 
-Status ProjectionStageDefault::transform(WorkingSetMember* member) const {
-    // The default no-fast-path case.
-    if (_exec.needsSortKey() && !member->hasComputed(WSM_SORT_KEY))
-        return Status(ErrorCodes::InternalError,
-                      "sortKey meta-projection requested but no data available");
+void ProjectionStageDefault::transform(WorkingSetMember* member) const {
+    Document input;
 
-    if (_exec.returnKey()) {
-        auto keys = _exec.computeReturnKeyProjection(
-            member->hasComputed(WSM_INDEX_KEY) ? indexKey(*member) : BSONObj(),
-            _exec.needsSortKey() ? sortKey(*member) : BSONObj());
-        if (!keys.isOK())
-            return keys.getStatus();
-
-        transitionMemberToOwnedObj(keys.getValue(), member);
-        return Status::OK();
+    // Most metadata should have already been stored within the WSM when we project out a document.
+    // The recordId metadata is different though, because it's a fundamental part of the WSM and
+    // we store it within the WSM itself rather than WSM metadata, so we need to transfer it into
+    // the metadata object if the projection has a recordId $meta expression.
+    if (_requestedMetadata[DocumentMetadataFields::kRecordId] &&
+        !member->metadata().hasRecordId()) {
+        member->metadata().setRecordId(member->recordId);
     }
 
-    auto projected = provideMetaFieldsAndPerformExec(_exec, *member);
+    if (member->hasObj()) {
+        input = std::move(member->doc.value());
+    } else {
+        // We have a covered projection, which is only supported in inclusion mode.
+        invariant(_projectType == projection_ast::ProjectType::kInclusion);
+        // We're pulling data from an index key, so there must be exactly one key entry in the WSM
+        // as the planner guarantees that it will never generate a covered plan in the case of index
+        // intersection.
+        invariant(member->keyData.size() == 1);
 
-    if (!projected.isOK())
-        return projected.getStatus();
+        // For covered projection we will rehydrate in index key into a Document and then pass it
+        // through the projection executor to include only required fields, including metadata
+        // fields.
+        input = rehydrateIndexKey(member->keyData[0].indexKeyPattern, member->keyData[0].keyData);
+    }
 
-    transitionMemberToOwnedObj(projected.getValue(), member);
+    // If the projection doesn't need any metadata, then we'll just apply the projection to the
+    // input document. Otherwise, before applying the projection, we will move document metadata
+    // from the WSM into the document itself, and will move it back to the WSM once the projection
+    // has been applied.
+    auto projected = _requestedMetadata.any()
+        ? attachMetadataToWorkingSetMember(
+              _executor->applyTransformation(attachMetadataToDocument(std::move(input), member)),
+              member)
+        : _executor->applyTransformation(input);
 
-    return Status::OK();
+    // An exclusion projection can return an unowned object since the output document is
+    // constructed from the input one backed by BSON which is owned by the storage system, so we
+    // need to  make sure we transition an owned document.
+    transitionMemberToOwnedObj(projected.getOwned(), member);
 }
 
-ProjectionStageCovered::ProjectionStageCovered(OperationContext* opCtx,
+ProjectionStageCovered::ProjectionStageCovered(ExpressionContext* expCtx,
                                                const BSONObj& projObj,
+                                               const projection_ast::Projection* projection,
                                                WorkingSet* ws,
                                                std::unique_ptr<PlanStage> child,
                                                const BSONObj& coveredKeyObj)
-    : ProjectionStage(opCtx, projObj, ws, std::move(child), "PROJECTION_COVERED"),
-      _coveredKeyObj(coveredKeyObj) {
-    invariant(projObjHasOwnedData());
-    // Figure out what fields are in the projection.
-    getSimpleInclusionFields(_projObj, &_includedFields);
+    : ProjectionStage{expCtx, projObj, ws, std::move(child), "PROJECTION_COVERED"},
+      _coveredKeyObj{coveredKeyObj} {
+    invariant(projection->isSimple());
 
     // If we're pulling data out of one index we can pre-compute the indices of the fields
     // in the key that we pull data from and avoid looking up the field name each time.
@@ -246,6 +228,8 @@ ProjectionStageCovered::ProjectionStageCovered(OperationContext* opCtx,
     // Sanity-check.
     invariant(_coveredKeyObj.isOwned());
 
+    _includedFields = {projection->getRequiredFields().begin(),
+                       projection->getRequiredFields().end()};
     BSONObjIterator kpIt(_coveredKeyObj);
     while (kpIt.more()) {
         BSONElement elt = kpIt.next();
@@ -257,13 +241,13 @@ ProjectionStageCovered::ProjectionStageCovered(OperationContext* opCtx,
             _includeKey.push_back(false);
         } else {
             // If we are including this key field store its field name.
-            _keyFieldNames.push_back(fieldIt->first);
+            _keyFieldNames.push_back(*fieldIt);
             _includeKey.push_back(true);
         }
     }
 }
 
-Status ProjectionStageCovered::transform(WorkingSetMember* member) const {
+void ProjectionStageCovered::transform(WorkingSetMember* member) const {
     BSONObjBuilder bob;
 
     // We're pulling data out of the key.
@@ -281,22 +265,21 @@ Status ProjectionStageCovered::transform(WorkingSetMember* member) const {
         }
         ++keyIndex;
     }
-
     transitionMemberToOwnedObj(bob.obj(), member);
-    return Status::OK();
 }
 
-ProjectionStageSimple::ProjectionStageSimple(OperationContext* opCtx,
+ProjectionStageSimple::ProjectionStageSimple(ExpressionContext* expCtx,
                                              const BSONObj& projObj,
+                                             const projection_ast::Projection* projection,
                                              WorkingSet* ws,
                                              std::unique_ptr<PlanStage> child)
-    : ProjectionStage(opCtx, projObj, ws, std::move(child), "PROJECTION_SIMPLE") {
-    invariant(projObjHasOwnedData());
-    // Figure out what fields are in the projection.
-    getSimpleInclusionFields(_projObj, &_includedFields);
+    : ProjectionStage{expCtx, projObj, ws, std::move(child), "PROJECTION_SIMPLE"} {
+    invariant(projection->isSimple());
+    _includedFields = {projection->getRequiredFields().begin(),
+                       projection->getRequiredFields().end()};
 }
 
-Status ProjectionStageSimple::transform(WorkingSetMember* member) const {
+void ProjectionStageSimple::transform(WorkingSetMember* member) const {
     BSONObjBuilder bob;
     // SIMPLE_DOC implies that we expect an object so it's kind of redundant.
     // If we got here because of SIMPLE_DOC the planner shouldn't have messed up.
@@ -304,18 +287,20 @@ Status ProjectionStageSimple::transform(WorkingSetMember* member) const {
 
     // Apply the SIMPLE_DOC projection.
     // Look at every field in the source document and see if we're including it.
-    BSONObjIterator inputIt(member->obj.value());
-    while (inputIt.more()) {
-        BSONElement elt = inputIt.next();
-        auto fieldIt = _includedFields.find(elt.fieldNameStringData());
-        if (_includedFields.end() != fieldIt) {
-            // If so, add it to the builder.
+    auto objToProject = member->doc.value().toBson();
+    auto nFieldsNeeded = _includedFields.size();
+    for (auto&& elt : objToProject) {
+        auto fieldName{elt.fieldNameStringData()};
+        absl::string_view fieldNameKey{fieldName.rawData(), fieldName.size()};
+        if (auto fieldIt = _includedFields.find(fieldNameKey); _includedFields.end() != fieldIt) {
             bob.append(elt);
+            if (--nFieldsNeeded == 0) {
+                break;
+            }
         }
     }
 
     transitionMemberToOwnedObj(bob.obj(), member);
-    return Status::OK();
 }
 
 }  // namespace mongo

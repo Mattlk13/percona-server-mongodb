@@ -102,7 +102,6 @@
  * configRS - If the config servers are a replset, this will contain the config ReplSetTest object
  */
 var ShardingTest = function(params) {
-
     if (!(this instanceof ShardingTest)) {
         return new ShardingTest(params);
     }
@@ -122,6 +121,19 @@ var ShardingTest = function(params) {
     var kDefaultWTimeoutMs = 5 * 60 * 1000;
 
     // Publicly exposed variables
+
+    /**
+     * Tries to load the 'jstests/libs/parallelTester.js' dependency. Returns true if the file is
+     * loaded successfully, and false otherwise.
+     */
+    function tryLoadParallelTester() {
+        try {
+            load("jstests/libs/parallelTester.js");  // For Thread.
+            return true;
+        } catch (e) {
+            return false;
+        }
+    }
 
     /**
      * Attempts to open a connection to the specified connection string or throws if unable to
@@ -217,8 +229,12 @@ var ShardingTest = function(params) {
         if (!otherParams.enableBalancer) {
             self.stopBalancer();
         }
+
         if (!otherParams.enableAutoSplit) {
             self.disableAutoSplit();
+        } else if (!otherParams.enableBalancer) {
+            // Turn on autoSplit since disabling balancer also turns auto split off.
+            self.enableAutoSplit();
         }
     }
 
@@ -288,16 +304,16 @@ var ShardingTest = function(params) {
             countDBsFound++;
             printjson(db);
         });
-        throw Error("couldn't find dbname: " + dbname + " in config.databases. Total DBs: " +
-                    countDBsFound);
+        throw Error("couldn't find dbname: " + dbname +
+                    " in config.databases. Total DBs: " + countDBsFound);
     };
 
     this.getNonPrimaries = function(dbname) {
         var x = this.config.databases.findOne({_id: dbname});
         if (!x) {
             this.config.databases.find().forEach(printjson);
-            throw Error("couldn't find dbname: " + dbname + " total: " +
-                        this.config.databases.count());
+            throw Error("couldn't find dbname: " + dbname +
+                        " total: " + this.config.databases.count());
         }
 
         return this.config.shards.find({_id: {$ne: x.primary}}).map(z => z._id);
@@ -330,8 +346,8 @@ var ShardingTest = function(params) {
             }
         }
 
-        throw Error("can't find server connection for db '" + dbname + "'s primary shard: " +
-                    tojson(primaryShard));
+        throw Error("can't find server connection for db '" + dbname +
+                    "'s primary shard: " + tojson(primaryShard));
     };
 
     this.normalize = function(x) {
@@ -377,25 +393,7 @@ var ShardingTest = function(params) {
         }
     };
 
-    this.stopAllMongos = function(opts) {
-        for (var i = 0; i < this._mongos.length; i++) {
-            this.stopMongos(i, opts);
-        }
-    };
-
-    this.stop = function(opts) {
-        this.checkUUIDsConsistentAcrossCluster();
-
-        this.stopAllMongos(opts);
-
-        for (var i = 0; i < this._connections.length; i++) {
-            if (this._rs[i]) {
-                this._rs[i].test.stopSet(15, undefined, opts);
-            } else {
-                this.stopMongod(i, opts);
-            }
-        }
-
+    this.stopAllConfigServers = function(opts) {
         if (this.configRS) {
             this.configRS.stopSet(undefined, undefined, opts);
         } else {
@@ -404,8 +402,46 @@ var ShardingTest = function(params) {
                 this.stopConfigServer(i, opts);
             }
         }
+    };
 
-        if (!opts || !opts.noCleanData) {
+    this.stopAllShards = function(opts) {
+        for (var i = 0; i < this._connections.length; i++) {
+            if (this._rs[i]) {
+                this._rs[i].test.stopSet(15, undefined, opts);
+            } else {
+                this.stopMongod(i, opts);
+            }
+        }
+    };
+
+    this.stopAllMongos = function(opts) {
+        for (var i = 0; i < this._mongos.length; i++) {
+            this.stopMongos(i, opts);
+        }
+    };
+
+    this.stop = function(opts = {}) {
+        this.checkUUIDsConsistentAcrossCluster();
+        this.checkIndexesConsistentAcrossCluster();
+        this.checkOrphansAreDeleted();
+
+        if (jsTestOptions().alwaysUseLogFiles) {
+            if (opts.noCleanData === false) {
+                throw new Error("Always using log files, but received conflicting option.");
+            }
+
+            opts.noCleanData = true;
+        }
+
+        this.stopAllMongos(opts);
+
+        let startTime = new Date();  // Measure the execution time of shutting down shards.
+        this.stopAllShards(opts);
+        print("ShardingTest stopped all shards, took " + (new Date() - startTime) + "ms for " +
+              this._connections.length + " shards.");
+
+        this.stopAllConfigServers(opts);
+        if (!opts.noCleanData) {
             print("ShardingTest stop deleting all dbpaths");
             for (var i = 0; i < _alldbpaths.length; i++) {
                 resetDbpath(MongoRunner.dataPath + _alldbpaths[i]);
@@ -434,6 +470,18 @@ var ShardingTest = function(params) {
 
     this.forEachConnection = function(fn) {
         this._connections.forEach(function(conn) {
+            fn(conn);
+        });
+    };
+
+    this.forEachMongos = function(fn) {
+        this._mongos.forEach(function(conn) {
+            fn(conn);
+        });
+    };
+
+    this.forEachConfigServer = function(fn) {
+        this._configServers.forEach(function(conn) {
             fn(conn);
         });
     };
@@ -506,38 +554,21 @@ var ShardingTest = function(params) {
         print("ShardingTest " + out);
     };
 
-    this.sync = function() {
-        this.adminCommand("connpoolsync");
+    /**
+     * Returns the number of shards which contain the given dbName.collName collection
+     */
+    this.onNumShards = function(dbName, collName) {
+        return this.shardCounts(dbName, collName)
+            .reduce((total, currentValue) => total + (currentValue > 0 ? 1 : 0), 0);
     };
 
-    this.onNumShards = function(collName, dbName) {
-        dbName = dbName || "test";
-
-        // We should sync since we're going directly to mongod here
-        this.sync();
-
-        var num = 0;
-        for (var i = 0; i < this._connections.length; i++) {
-            if (this._connections[i].getDB(dbName).getCollection(collName).count() > 0) {
-                num++;
-            }
-        }
-
-        return num;
-    };
-
-    this.shardCounts = function(collName, dbName) {
-        dbName = dbName || "test";
-
-        // We should sync since we're going directly to mongod here
-        this.sync();
-
-        var counts = {};
-        for (var i = 0; i < this._connections.length; i++) {
-            counts[i] = this._connections[i].getDB(dbName).getCollection(collName).count();
-        }
-
-        return counts;
+    /**
+     * Returns an array of the size of numShards where each element is the number of documents on
+     * that particular shard
+     */
+    this.shardCounts = function(dbName, collName) {
+        return this._connections.map((connection) =>
+                                         connection.getDB(dbName).getCollection(collName).count());
     };
 
     this.chunkCounts = function(collName, dbName) {
@@ -548,7 +579,16 @@ var ShardingTest = function(params) {
             x[z._id] = 0;
         });
 
-        this.config.chunks.find({ns: dbName + "." + collName}).forEach(function(z) {
+        var coll = this.config.collections.findOne({_id: dbName + "." + collName});
+        var chunksQuery = (function() {
+            if (coll.timestamp != null) {
+                return {uuid: coll.uuid};
+            } else {
+                return {ns: dbName + "." + collName};
+            }
+        }());
+
+        this.config.chunks.find(chunksQuery).forEach(function(z) {
             if (x[z.shard])
                 x[z.shard]++;
             else
@@ -561,7 +601,7 @@ var ShardingTest = function(params) {
     this.chunkDiff = function(collName, dbName) {
         var c = this.chunkCounts(collName, dbName);
 
-        var min = 100000000;
+        var min = Number.MAX_VALUE;
         var max = 0;
         for (var s in c) {
             if (c[s] < min)
@@ -711,14 +751,84 @@ var ShardingTest = function(params) {
     };
 
     /**
-     * Kills the mongos with index n.
+     * Wait for sharding to be initialized.
      */
-    this.stopMongos = function(n, opts) {
+    this.waitForShardingInitialized = function(timeoutMs = 60 * 1000) {
+        const getShardVersion = (client, timeout) => {
+            assert.soon(() => {
+                // The choice of namespace (local.fooCollection) does not affect the output.
+                var res = client.adminCommand({getShardVersion: "local.fooCollection"});
+                return res.ok == 1;
+            }, "timeout waiting for sharding to be initialized on mongod", timeout, 0.1);
+        };
+
+        var start = new Date();
+
+        for (var i = 0; i < this._rs.length; ++i) {
+            var replSet = this._rs[i];
+            if (!replSet)
+                continue;
+            nodes = replSet.test.nodes;
+            keyFileUsed = replSet.test.keyFile;
+
+            for (var j = 0; j < nodes.length; ++j) {
+                diff = (new Date()).getTime() - start.getTime();
+                var currNode = nodes[j];
+                // Skip arbiters
+                if (currNode.getDB('admin')._helloOrLegacyHello().arbiterOnly) {
+                    continue;
+                }
+
+                const x509AuthRequired = (conn.fullOptions && conn.fullOptions.clusterAuthMode &&
+                                          conn.fullOptions.clusterAuthMode === "x509" &&
+                                          (currNode.fullOptions.sslMode === "requireSSL" ||
+                                           currNode.fullOptions.tlsMode === "requireTLS"));
+
+                if (keyFileUsed) {
+                    authutil.asCluster(currNode, keyFileUsed, () => {
+                        getShardVersion(currNode, timeoutMs - diff);
+                    });
+                } else if (x509AuthRequired) {
+                    const exitCode = _runMongoProgram(
+                        ...["mongo",
+                            currNode.host,
+                            "--tls",
+                            "--tlsAllowInvalidHostnames",
+                            "--tlsCertificateKeyFile",
+                            currNode.fullOptions.tlsCertificateKeyFile
+                                ? currNode.fullOptions.tlsCertificateKeyFile
+                                : currNode.fullOptions.sslPEMKeyFile,
+                            "--tlsCAFile",
+                            currNode.fullOptions.tlsCAFile ? currNode.fullOptions.tlsCAFile
+                                                           : currNode.fullOptions.sslCAFile,
+                            "--authenticationDatabase=$external",
+                            "--authenticationMechanism=MONGODB-X509",
+                            "--eval",
+                            `(${getShardVersion.toString()})(db.getMongo(), ` +
+                                (timeoutMs - diff).toString() + `)`,
+                    ]);
+                    assert.eq(0, exitCode, "parallel shell for x509 auth failed");
+                } else {
+                    getShardVersion(currNode, timeoutMs - diff);
+                }
+            }
+        }
+    };
+
+    /**
+     * Kills the mongos with index n.
+     *
+     * @param {boolean} [extraOptions.waitPid=true] if true, we will wait for the process to
+     * terminate after stopping it.
+     */
+    this.stopMongos = function(n, opts, {
+        waitpid: waitpid = true,
+    } = {}) {
         if (otherParams.useBridge) {
-            MongoRunner.stopMongos(unbridgedMongos[n], undefined, opts);
+            MongoRunner.stopMongos(unbridgedMongos[n], undefined, opts, waitpid);
             this["s" + n].stop();
         } else {
-            MongoRunner.stopMongos(this["s" + n], undefined, opts);
+            MongoRunner.stopMongos(this["s" + n], undefined, opts, waitpid);
         }
     };
 
@@ -855,9 +965,9 @@ var ShardingTest = function(params) {
         }
 
         if (arguments.length >= 3) {
-            if (typeof(beforeRestartCallback) !== "function") {
+            if (typeof (beforeRestartCallback) !== "function") {
                 throw new Error("beforeRestartCallback must be a function but was of type " +
-                                typeof(beforeRestartCallback));
+                                typeof (beforeRestartCallback));
             }
             beforeRestartCallback();
         }
@@ -963,77 +1073,101 @@ var ShardingTest = function(params) {
     };
 
     /**
-     * Returns whether any settings to ShardingTest or jsTestOptions indicate this is a multiversion
-     * cluster.
+     * Returns a document {isMixedVersion: <bool>, oldestBinVersion: <string>}.
+     * The 'isMixedVersion' field is true if any settings to ShardingTest or jsTestOptions indicate
+     * this is a multiversion cluster.
+     * The 'oldestBinVersion' field is set to the oldest binary version used in this cluster, one of
+     * 'latest', 'last-continuous' and 'last-lts'.
+     * Note: Mixed version cluster with binary versions older than 'last-lts' is not supported. If
+     * such binary exists in the cluster, this function assumes this is not a mixed version cluster
+     * and returns 'oldestBinVersion' as 'latest'.
      *
-     * Checks for 'last-stable' bin versions via:
+     * Checks for bin versions via:
      *     jsTestOptions().shardMixedBinVersions, jsTestOptions().mongosBinVersion,
      *     otherParams.configOptions.binVersion, otherParams.shardOptions.binVersion,
      *     otherParams.mongosOptions.binVersion
      */
-    function _isMixedVersionCluster() {
-        var lastStableBinVersion = MongoRunner.getBinVersionFor('last-stable');
+    this.getClusterVersionInfo = function() {
+        function clusterHasBinVersion(version) {
+            const binVersion = MongoRunner.getBinVersionFor(version);
+            const hasBinVersionInParams = (params) => {
+                return params && params.binVersion &&
+                    MongoRunner.areBinVersionsTheSame(
+                        binVersion, MongoRunner.getBinVersionFor(params.binVersion));
+            };
 
-        // Must check shardMixedBinVersion because it causes shardOptions.binVersion to be an object
-        // (versionIterator) rather than a version string. Must check mongosBinVersion, as well,
-        // because it does not update mongosOptions.binVersion.
-        if (jsTestOptions().shardMixedBinVersions ||
-            (jsTestOptions().mongosBinVersion &&
-             MongoRunner.areBinVersionsTheSame(lastStableBinVersion,
-                                               jsTestOptions().mongosBinVersion))) {
-            return true;
-        }
-
-        // Check for 'last-stable' config servers.
-        if (otherParams.configOptions && otherParams.configOptions.binVersion &&
-            MongoRunner.areBinVersionsTheSame(
-                lastStableBinVersion,
-                MongoRunner.getBinVersionFor(otherParams.configOptions.binVersion))) {
-            return true;
-        }
-        for (var i = 0; i < numConfigs; ++i) {
-            if (otherParams['c' + i] && otherParams['c' + i].binVersion &&
-                MongoRunner.areBinVersionsTheSame(
-                    lastStableBinVersion,
-                    MongoRunner.getBinVersionFor(otherParams['c' + i].binVersion))) {
+            // Must check shardMixedBinVersion because it causes shardOptions.binVersion to be an
+            // object (versionIterator) rather than a version string. Must check mongosBinVersion,
+            // as well, because it does not update mongosOptions.binVersion.
+            // TODO SERVER-50389: Differentiate between 'last-lts' and 'last-continuous' when
+            // last-continuous is supported with shardMixedBinVersions.
+            if ((MongoRunner.areBinVersionsTheSame(binVersion, "last-lts") &&
+                 jsTestOptions().shardMixedBinVersions) ||
+                (jsTestOptions().mongosBinVersion &&
+                 MongoRunner.areBinVersionsTheSame(binVersion, jsTestOptions().mongosBinVersion))) {
                 return true;
             }
-        }
 
-        // Check for 'last-stable' mongod servers.
-        if (otherParams.shardOptions && otherParams.shardOptions.binVersion &&
-            MongoRunner.areBinVersionsTheSame(
-                lastStableBinVersion,
-                MongoRunner.getBinVersionFor(otherParams.shardOptions.binVersion))) {
-            return true;
-        }
-        for (var i = 0; i < numShards; ++i) {
-            if (otherParams['d' + i] && otherParams['d' + i].binVersion &&
-                MongoRunner.areBinVersionsTheSame(
-                    lastStableBinVersion,
-                    MongoRunner.getBinVersionFor(otherParams['d' + i].binVersion))) {
+            // Check for config servers.
+            if (hasBinVersionInParams(otherParams.configOptions)) {
                 return true;
             }
-        }
+            for (let i = 0; i < numConfigs; ++i) {
+                if (hasBinVersionInParams(otherParams['c' + i])) {
+                    return true;
+                }
+            }
 
-        // Check for 'last-stable' mongos servers.
-        if (otherParams.mongosOptions && otherParams.mongosOptions.binVersion &&
-            MongoRunner.areBinVersionsTheSame(
-                lastStableBinVersion,
-                MongoRunner.getBinVersionFor(otherParams.mongosOptions.binVersion))) {
-            return true;
-        }
-        for (var i = 0; i < numMongos; ++i) {
-            if (otherParams['s' + i] && otherParams['s' + i].binVersion &&
-                MongoRunner.areBinVersionsTheSame(
-                    lastStableBinVersion,
-                    MongoRunner.getBinVersionFor(otherParams['s' + i].binVersion))) {
+            // Check for mongod servers.
+            if (hasBinVersionInParams(otherParams.shardOptions)) {
                 return true;
             }
+            if (hasBinVersionInParams(otherParams.rs)) {
+                return true;
+            }
+            for (let i = 0; i < numShards; ++i) {
+                if (hasBinVersionInParams(otherParams['d' + i])) {
+                    return true;
+                }
+                if (hasBinVersionInParams(otherParams['rs' + i])) {
+                    return true;
+                }
+            }
+
+            // Check for mongos servers.
+            if (hasBinVersionInParams(otherParams.mongosOptions)) {
+                return true;
+            }
+            for (let i = 0; i < numMongos; ++i) {
+                if (hasBinVersionInParams(otherParams['s' + i])) {
+                    return true;
+                }
+            }
+
+            return false;
         }
 
-        return false;
-    }
+        let hasLastLTS = clusterHasBinVersion("last-lts");
+        let hasLastContinuous = clusterHasBinVersion("last-continuous");
+        if ((lastLTSFCV !== lastContinuousFCV) && hasLastLTS && hasLastContinuous) {
+            throw new Error("Can only specify one of 'last-lts' and 'last-continuous' " +
+                            "in binVersion, not both.");
+        }
+        if (hasLastLTS) {
+            return {isMixedVersion: true, oldestBinVersion: "last-lts"};
+        } else if (hasLastContinuous) {
+            return {isMixedVersion: true, oldestBinVersion: "last-continuous"};
+        } else {
+            return {isMixedVersion: false, oldestBinVersion: "latest"};
+        }
+    };
+
+    /**
+     * Runs a find on the namespace to force a refresh of the node's catalog cache.
+     */
+    this.refreshCatalogCacheForNs = function(node, ns) {
+        node.getCollection(ns).findOne();
+    };
 
     /**
      * Returns if there is a new feature compatibility version for the "latest" version. This must
@@ -1041,6 +1175,21 @@ var ShardingTest = function(params) {
      */
     function _hasNewFeatureCompatibilityVersion() {
         return true;
+    }
+
+    /**
+     * Returns the total number of mongod nodes across all shards, excluding config server nodes.
+     * Used only for diagnostic logging.
+     */
+    function totalNumShardNodes(shardsAsReplSets) {
+        // Standalone mongod shards.
+        if (!shardsAsReplSets) {
+            return self._connections.length;
+        }
+
+        // Replica set shards.
+        const numNodesPerReplSet = self._rs.map(r => r.test.nodes.length);
+        return numNodesPerReplSet.reduce((a, b) => a + b, 0);
     }
 
     // ShardingTest initialization
@@ -1129,8 +1278,8 @@ var ShardingTest = function(params) {
             jsTestOptions().networkMessageCompressors;
     }
 
-    var keyFile = otherParams.keyFile;
-    var hostName = getHostName();
+    this.keyFile = otherParams.keyFile;
+    var hostName = otherParams.host === undefined ? getHostName() : otherParams.host;
 
     this._testName = testName;
     this._otherParams = otherParams;
@@ -1192,9 +1341,25 @@ var ShardingTest = function(params) {
     otherParams.migrationLockAcquisitionMaxWaitMS =
         otherParams.migrationLockAcquisitionMaxWaitMS || 30000;
 
-    // Start the MongoD servers (shards)
+    let randomSeedAlreadySet = false;
+
+    if (jsTest.options().useRandomBinVersionsWithinReplicaSet) {
+        // We avoid setting the random seed unequivocally to avoid unexpected behavior in tests
+        // that already make use of Random.setRandomSeed(). This conditional can be removed if
+        // it becomes the standard to always be generating the seed through ShardingTest.
+        Random.setRandomSeed(jsTest.options().seed);
+        randomSeedAlreadySet = true;
+    }
+
+    // Should we start up shards as replica sets.
+    const shardsAsReplSets = (otherParams.rs || otherParams["rs" + i] || startShardsAsRS);
+
+    //
+    // Start each shard replica set or standalone mongod.
+    //
+    let startTime = new Date();  // Measure the execution time of startup and initiate.
     for (var i = 0; i < numShards; i++) {
-        if (otherParams.rs || otherParams["rs" + i] || startShardsAsRS) {
+        if (shardsAsReplSets) {
             var setName = testName + "-rs" + i;
 
             var rsDefaults = {
@@ -1223,11 +1388,13 @@ var ShardingTest = function(params) {
                     // If the test doesn't depend on specific shard binVersions, create a mixed
                     // version
                     // shard cluster that randomly assigns shard binVersions, half "latest" and half
-                    // "last-stable".
+                    // "last-lts".
+                    // TODO SERVER-50389: Support last-continuous binary version with
+                    // shardMixedBinVersions.
                     if (!otherParams.shardOptions.binVersion) {
                         Random.setRandomSeed();
                         otherParams.shardOptions.binVersion =
-                            MongoRunner.versionIterator(["latest", "last-stable"], true);
+                            MongoRunner.versionIterator(["latest", "last-lts"], true);
                     }
                 }
 
@@ -1262,39 +1429,30 @@ var ShardingTest = function(params) {
             var rs = new ReplSetTest({
                 name: setName,
                 nodes: numReplicas,
+                host: hostName,
                 useHostName: otherParams.useHostname,
                 useBridge: otherParams.useBridge,
                 bridgeOptions: otherParams.bridgeOptions,
-                keyFile: keyFile,
+                keyFile: this.keyFile,
                 protocolVersion: protocolVersion,
                 waitForKeys: false,
-                settings: rsSettings
+                settings: rsSettings,
+                seedRandomNumberGenerator: !randomSeedAlreadySet,
             });
 
+            print("ShardingTest starting replica set for shard: " + setName);
+
+            // Start up the replica set but don't wait for it to complete. This allows the startup
+            // of each shard to proceed in parallel.
             this._rs[i] =
-                {setName: setName, test: rs, nodes: rs.startSet(rsDefaults), url: rs.getURL()};
-
-            // ReplSetTest.initiate() requires all nodes to be to be authorized to run
-            // replSetGetStatus.
-            // TODO(SERVER-14017): Remove this in favor of using initiate() everywhere.
-            rs.initiateWithAnyNodeAsPrimary();
-
-            this["rs" + i] = rs;
-            this._rsObjects[i] = rs;
-
-            _alldbpaths.push(null);
-            this._connections.push(null);
-
-            if (otherParams.useBridge) {
-                unbridgedConnections.push(null);
-            }
+                {setName: setName, test: rs, nodes: rs.startSetAsync(rsDefaults), url: rs.getURL()};
         } else {
             var options = {
                 useHostname: otherParams.useHostname,
                 pathOpts: Object.merge(pathOpts, {shard: i}),
                 dbpath: "$testName$shard",
                 shardsvr: '',
-                keyFile: keyFile
+                keyFile: this.keyFile
             };
 
             options.setParameter = options.setParameter || {};
@@ -1307,11 +1465,13 @@ var ShardingTest = function(params) {
                 }
                 // If the test doesn't depend on specific shard binVersions, create a mixed version
                 // shard cluster that randomly assigns shard binVersions, half "latest" and half
-                // "last-stable".
+                // "last-lts".
+                // TODO SERVER-50389: Support last-continuous binary version with
+                // shardMixedBinVersions.
                 if (!otherParams.shardOptions.binVersion) {
                     Random.setRandomSeed();
                     otherParams.shardOptions.binVersion =
-                        MongoRunner.versionIterator(["latest", "last-stable"], true);
+                        MongoRunner.versionIterator(["latest", "last-lts"], true);
                 }
             }
 
@@ -1361,41 +1521,22 @@ var ShardingTest = function(params) {
         }
     }
 
-    // Do replication on replica sets if required
-    for (var i = 0; i < numShards; i++) {
-        if (!otherParams.rs && !otherParams["rs" + i] && !startShardsAsRS) {
-            continue;
-        }
-
-        var rs = this._rs[i].test;
-        rs.getPrimary().getDB("admin").foo.save({x: 1});
-
-        if (keyFile) {
-            authutil.asCluster(rs.nodes, keyFile, function() {
-                rs.awaitReplication();
-            });
-        }
-
-        rs.awaitSecondaryNodes();
-
-        var rsConn = new Mongo(rs.getURL());
-        rsConn.name = rs.getURL();
-
-        this._connections[i] = rsConn;
-        this["shard" + i] = rsConn;
-        rsConn.rs = rs;
-    }
-
+    //
+    // Start up the config server replica set.
+    //
     this._configServers = [];
 
     // Using replica set for config servers
     var rstOptions = {
         useHostName: otherParams.useHostname,
+        host: hostName,
         useBridge: otherParams.useBridge,
         bridgeOptions: otherParams.bridgeOptions,
-        keyFile: keyFile,
+        keyFile: this.keyFile,
         waitForKeys: false,
         name: testName + "-configRS",
+        seedRandomNumberGenerator: !randomSeedAlreadySet,
+        isConfigServer: true,
     };
 
     // when using CSRS, always use wiredTiger as the storage engine
@@ -1422,20 +1563,183 @@ var ShardingTest = function(params) {
 
     rstOptions.nodes = nodeOptions;
 
-    // Start the config server's replica set
+    // Start the config server's replica set without waiting for it to complete. This allows it
+    // to proceed in parallel with the startup of each shard.
     this.configRS = new ReplSetTest(rstOptions);
-    this.configRS.startSet(startOptions);
+    this.configRS.startSetAsync(startOptions);
 
+    //
+    // Wait for each shard replica set to finish starting up.
+    //
+    if (shardsAsReplSets) {
+        for (let i = 0; i < numShards; i++) {
+            print("Waiting for shard " + this._rs[i].setName + " to finish starting up.");
+            this._rs[i].test.startSetAwait();
+        }
+    }
+
+    //
+    // Wait for the config server to finish starting up.
+    //
+    print("Waiting for the config server to finish starting up.");
+    this.configRS.startSetAwait();
     var config = this.configRS.getReplSetConfig();
     config.configsvr = true;
     config.settings = config.settings || {};
 
-    // ReplSetTest.initiate() requires all nodes to be to be authorized to run replSetGetStatus.
-    // TODO(SERVER-14017): Remove this in favor of using initiate() everywhere.
-    this.configRS.initiateWithAnyNodeAsPrimary(config);
+    print("ShardingTest startup for all nodes took " + (new Date() - startTime) + "ms with " +
+          this.configRS.nodeList().length + " config server nodes and " +
+          totalNumShardNodes(shardsAsReplSets) + " total shard nodes.");
+
+    //
+    // Initiate each shard replica set and wait for replication. Also initiate the config replica
+    // set. Whenever possible, in parallel.
+    //
+    const shardsRS = shardsAsReplSets ? this._rs.map(obj => obj.test) : [];
+    const replicaSetsToInitiate = [...shardsRS, this.configRS].map(rst => {
+        const rstConfig = rst.getReplSetConfig();
+
+        // The mongo shell cannot authenticate as the internal __system user in tests that use x509
+        // for cluster authentication. Choosing the default value for wcMajorityJournalDefault in
+        // ReplSetTest cannot be done automatically without the shell performing such
+        // authentication, so allow tests to pass the value in.
+        if (otherParams.hasOwnProperty("writeConcernMajorityJournalDefault")) {
+            rstConfig.writeConcernMajorityJournalDefault =
+                otherParams.writeConcernMajorityJournalDefault;
+        }
+
+        if (rst === this.configRS) {
+            rstConfig.configsvr = true;
+            rstConfig.writeConcernMajorityJournalDefault = true;
+        }
+
+        return {
+            rst,
+            // Arguments for creating instances of each replica set within parallel threads.
+            rstArgs: {
+                name: rst.name,
+                nodeHosts: rst.nodes.map(node => `127.0.0.1:${node.port}`),
+                nodeOptions: rst.nodeOptions,
+                // Mixed-mode SSL tests may specify a keyFile per replica set rather than one for
+                // the whole cluster.
+                keyFile: rst.keyFile ? rst.keyFile : this.keyFile,
+                host: otherParams.useHostname ? hostName : "localhost",
+                waitForKeys: false,
+            },
+            // Replica set configuration for initiating the replica set.
+            rstConfig,
+        };
+    });
+
+    const initiateReplicaSet = (rst, rstConfig) => {
+        rst.initiateWithAnyNodeAsPrimary(rstConfig);
+
+        // Do replication.
+        rst.awaitNodesAgreeOnPrimary();
+        rst.getPrimary().getDB("admin").foo.save({x: 1});
+        if (rst.keyFile) {
+            authutil.asCluster(rst.nodes, rst.keyFile, function() {
+                rst.awaitReplication();
+            });
+        }
+        rst.awaitSecondaryNodes();
+    };
+
+    const isParallelSupported = (() => {
+        if (!tryLoadParallelTester()) {
+            return false;
+        }
+
+        for (let {rst} of replicaSetsToInitiate) {
+            if (rst.startOptions && rst.startOptions.clusterAuthMode === "x509") {
+                // The mongo shell performing X.509 authentication as a cluster member requires
+                // starting a parallel shell and using the server's (not the client's) certificate.
+                // The ReplSetTest instance constructed in a Thread wouldn't have copied the path to
+                // the server's certificate. We therefore fall back to initiating the CSRS and
+                // replica set shards sequentially when X.509 authentication is being used.
+                return false;
+            }
+
+            for (let n of Object.keys(rst.nodeOptions)) {
+                const nodeOptions = rst.nodeOptions[n];
+                if (nodeOptions && nodeOptions.clusterAuthMode === "x509") {
+                    return false;
+                }
+            }
+        }
+
+        return true;
+    })();
+
+    if (isParallelSupported) {
+        const threads = [];
+        try {
+            for (let {rstArgs, rstConfig} of replicaSetsToInitiate) {
+                const thread = new Thread((rstArgs, rstConfig, initiateReplicaSet) => {
+                    try {
+                        const rst = new ReplSetTest({rstArgs});
+                        initiateReplicaSet(rst, rstConfig);
+                        return {ok: 1};
+                    } catch (e) {
+                        return {
+                            ok: 0,
+                            hosts: rstArgs.nodeHosts,
+                            name: rstArgs.name,
+                            error: e.toString(),
+                            stack: e.stack,
+                        };
+                    }
+                }, rstArgs, rstConfig, initiateReplicaSet);
+                thread.start();
+                threads.push(thread);
+            }
+        } finally {
+            // Wait for each thread to finish. Throw an error if any thread fails.
+            const returnData = threads.map(thread => {
+                thread.join();
+                return thread.returnData();
+            });
+
+            returnData.forEach(res => {
+                assert.commandWorked(res,
+                                     'Initiating shard or config servers as a replica set failed');
+            });
+        }
+    } else {
+        for (let {rst, rstConfig} of replicaSetsToInitiate) {
+            initiateReplicaSet(rst, rstConfig);
+        }
+    }
+
+    if (shardsAsReplSets) {
+        for (let i = 0; i < numShards; i++) {
+            let rs = this._rs[i].test;
+
+            this["rs" + i] = rs;
+            this._rsObjects[i] = rs;
+
+            _alldbpaths.push(null);
+            this._connections.push(null);
+
+            if (otherParams.useBridge) {
+                unbridgedConnections.push(null);
+            }
+            let rsConn = new Mongo(rs.getURL());
+            rsConn.name = rs.getURL();
+
+            this._connections[i] = rsConn;
+            this["shard" + i] = rsConn;
+            rsConn.rs = rs;
+        }
+    }
 
     // Wait for master to be elected before starting mongos
+    this.configRS.awaitNodesAgreeOnPrimary();
     var csrsPrimary = this.configRS.getPrimary();
+
+    print("ShardingTest startup and initiation for all nodes took " + (new Date() - startTime) +
+          "ms with " + this.configRS.nodeList().length + " config server nodes and " +
+          totalNumShardNodes(shardsAsReplSets) + " total shard nodes.");
 
     // If 'otherParams.mongosOptions.binVersion' is an array value, then we'll end up constructing a
     // version iterator.
@@ -1445,7 +1749,7 @@ var ShardingTest = function(params) {
             useHostname: otherParams.useHostname,
             pathOpts: Object.merge(pathOpts, {mongos: i}),
             verbose: mongosVerboseLevel,
-            keyFile: keyFile,
+            keyFile: this.keyFile,
         };
 
         if (otherParams.mongosOptions && otherParams.mongosOptions.binVersion) {
@@ -1456,23 +1760,31 @@ var ShardingTest = function(params) {
         options = Object.merge(options, otherParams.mongosOptions);
         options = Object.merge(options, otherParams["s" + i]);
 
+        // The default time for mongos quiesce mode in response to SIGTERM is 15 seconds.
+        // Reduce this to 100ms for faster shutdown.
+        options.setParameter = options.setParameter || {};
+        options.setParameter.mongosShutdownTimeoutMillisForSignaledShutdown =
+            options.setParameter.mongosShutdownTimeoutMillisForSignaledShutdown || 100;
+
         options.port = options.port || _allocatePortForMongos();
 
         mongosOptions.push(options);
     }
 
     const configRS = this.configRS;
-    if (_hasNewFeatureCompatibilityVersion() && _isMixedVersionCluster()) {
+    const clusterVersionInfo = this.getClusterVersionInfo();
+    if (_hasNewFeatureCompatibilityVersion() && clusterVersionInfo.isMixedVersion) {
+        const fcv = binVersionToFCV(clusterVersionInfo.oldestBinVersion);
         function setFeatureCompatibilityVersion() {
-            assert.commandWorked(csrsPrimary.adminCommand({setFeatureCompatibilityVersion: '4.0'}));
+            assert.commandWorked(csrsPrimary.adminCommand({setFeatureCompatibilityVersion: fcv}));
 
             // Wait for the new featureCompatibilityVersion to propagate to all nodes in the CSRS
             // to ensure that older versions of mongos can successfully connect.
             configRS.awaitReplication();
         }
 
-        if (keyFile) {
-            authutil.asCluster(this.configRS.nodes, keyFile, setFeatureCompatibilityVersion);
+        if (this.keyFile) {
+            authutil.asCluster(this.configRS.nodes, this.keyFile, setFeatureCompatibilityVersion);
         } else {
             setFeatureCompatibilityVersion();
         }
@@ -1481,7 +1793,7 @@ var ShardingTest = function(params) {
     // If chunkSize has been requested for this test, write the configuration
     if (otherParams.chunkSize) {
         function setChunkSize() {
-            assert.writeOK(csrsPrimary.getDB('config').settings.update(
+            assert.commandWorked(csrsPrimary.getDB('config').settings.update(
                 {_id: 'chunksize'},
                 {$set: {value: otherParams.chunkSize}},
                 {upsert: true, writeConcern: {w: 'majority', wtimeout: kDefaultWTimeoutMs}}));
@@ -1489,8 +1801,8 @@ var ShardingTest = function(params) {
             configRS.awaitLastOpCommitted();
         }
 
-        if (keyFile) {
-            authutil.asCluster(csrsPrimary, keyFile, setChunkSize);
+        if (this.keyFile) {
+            authutil.asCluster(csrsPrimary, this.keyFile, setChunkSize);
         } else {
             setChunkSize();
         }
@@ -1562,10 +1874,17 @@ var ShardingTest = function(params) {
 
     // If auth is enabled for the test, login the mongos connections as system in order to configure
     // the instances and then log them out again.
-    if (keyFile) {
-        authutil.asCluster(this._mongos, keyFile, _configureCluster);
+    if (this.keyFile) {
+        authutil.asCluster(this._mongos, this.keyFile, _configureCluster);
+    } else if (mongosOptions[0] && mongosOptions[0].keyFile) {
+        authutil.asCluster(this._mongos, mongosOptions[0].keyFile, _configureCluster);
     } else {
         _configureCluster();
+        // Ensure that all config server nodes are up to date with any changes made to balancer
+        // settings before adding shards to the cluster. This prevents shards, which read
+        // config.settings with readPreference 'nearest', from accidentally fetching stale values
+        // from secondaries that aren't up-to-date.
+        this.configRS.awaitLastOpCommitted();
     }
 
     try {
@@ -1606,18 +1925,72 @@ var ShardingTest = function(params) {
     // Ensure that the sessions collection exists so jstests can run things with
     // logical sessions and test them. We do this by forcing an immediate cache refresh
     // on the config server, which auto-shards the collection for the cluster.
-    var lastStableBinVersion = MongoRunner.getBinVersionFor('last-stable');
-    if ((!otherParams.configOptions) ||
-        (otherParams.configOptions && !otherParams.configOptions.binVersion) ||
-        (otherParams.configOptions && otherParams.configOptions.binVersion &&
-         MongoRunner.areBinVersionsTheSame(
-             lastStableBinVersion,
-             MongoRunner.getBinVersionFor(otherParams.configOptions.binVersion)))) {
-        this.configRS.getPrimary().getDB("admin").runCommand({refreshLogicalSessionCacheNow: 1});
-    }
+    this.configRS.getPrimary().getDB("admin").runCommand({refreshLogicalSessionCacheNow: 1});
 
+    // Flushes the routing table cache on connection 'conn'. If 'keyFileLocal' is defined,
+    // authenticates the keyfile user.
+    const flushRT = function flushRoutingTableAndHandleAuth(conn, keyFileLocal) {
+        // Invokes the actual execution of cache refresh.
+        const execFlushRT = (conn) => {
+            assert.commandWorked(conn.getDB("admin").runCommand(
+                {_flushRoutingTableCacheUpdates: "config.system.sessions"}));
+        };
+
+        const x509AuthRequired = (conn.fullOptions && conn.fullOptions.clusterAuthMode &&
+                                  conn.fullOptions.clusterAuthMode === "x509");
+
+        if (keyFileLocal) {
+            authutil.asCluster(conn, keyFileLocal, () => execFlushRT(conn));
+        } else if (x509AuthRequired) {
+            const exitCode = _runMongoProgram(
+                ...["mongo",
+                    conn.host,
+                    "--tls",
+                    "--tlsAllowInvalidHostnames",
+                    "--tlsCertificateKeyFile",
+                    conn.fullOptions.tlsCertificateKeyFile ? conn.fullOptions.tlsCertificateKeyFile
+                                                           : conn.fullOptions.sslPEMKeyFile,
+                    "--tlsCAFile",
+                    conn.fullOptions.tlsCAFile ? conn.fullOptions.tlsCAFile
+                                               : conn.fullOptions.sslCAFile,
+                    "--authenticationDatabase=$external",
+                    "--authenticationMechanism=MONGODB-X509",
+                    "--eval",
+                    `(${execFlushRT.toString()})(db.getMongo())`,
+            ]);
+            assert.eq(0, exitCode, "parallel shell for x509 auth failed");
+        } else {
+            execFlushRT(conn);
+        }
+    };
+
+    if (!otherParams.manualAddShard) {
+        for (let i = 0; i < numShards; i++) {
+            const keyFileLocal =
+                (otherParams.shards && otherParams.shards[i] && otherParams.shards[i].keyFile)
+                ? otherParams.shards[i].keyFile
+                : this.keyFile;
+
+            if (otherParams.rs || otherParams["rs" + i] || startShardsAsRS) {
+                const rs = this._rs[i].test;
+                flushRT(rs.getPrimary(), keyFileLocal);
+            } else {
+                // If specified, use the keyFile for the standalone shard.
+                flushRT(this["shard" + i], keyFileLocal);
+            }
+        }
+
+        self.waitForShardingInitialized();
+    }
 };
 
 // Stub for a hook to check that collection UUIDs are consistent across shards and the config
 // server.
 ShardingTest.prototype.checkUUIDsConsistentAcrossCluster = function() {};
+
+// Stub for a hook to check that indexes are consistent across shards.
+ShardingTest.prototype.checkIndexesConsistentAcrossCluster = function() {};
+
+ShardingTest.prototype.checkOrphansAreDeleted = function() {
+    print("Unhooked function");
+};

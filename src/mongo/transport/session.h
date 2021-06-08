@@ -31,6 +31,7 @@
 
 #include <memory>
 
+#include "mongo/config.h"
 #include "mongo/db/baton.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/rpc/message.h"
@@ -38,9 +39,16 @@
 #include "mongo/util/decorable.h"
 #include "mongo/util/future.h"
 #include "mongo/util/net/hostandport.h"
+#include "mongo/util/net/sockaddr.h"
 #include "mongo/util/time_support.h"
+#ifdef MONGO_CONFIG_SSL
+#include "mongo/util/net/ssl_types.h"
+#endif
 
 namespace mongo {
+
+class SSLManagerInterface;
+
 namespace transport {
 
 class TransportLayer;
@@ -104,16 +112,23 @@ public:
     /**
      * Source (receive) a new Message from the remote host for this Session.
      */
-    virtual StatusWith<Message> sourceMessage() = 0;
-    virtual Future<Message> asyncSourceMessage(const BatonHandle& handle = nullptr) = 0;
+    virtual StatusWith<Message> sourceMessage() noexcept = 0;
+    virtual Future<Message> asyncSourceMessage(const BatonHandle& handle = nullptr) noexcept = 0;
+
+    /**
+     * Waits for the availability of incoming data.
+     */
+    virtual Status waitForData() noexcept = 0;
+    virtual Future<void> asyncWaitForData() noexcept = 0;
 
     /**
      * Sink (send) a Message to the remote host for this Session.
      *
      * Async version will keep the buffer alive until the operation completes.
      */
-    virtual Status sinkMessage(Message message) = 0;
-    virtual Future<void> asyncSinkMessage(Message message, const BatonHandle& handle = nullptr) = 0;
+    virtual Status sinkMessage(Message message) noexcept = 0;
+    virtual Future<void> asyncSinkMessage(Message message,
+                                          const BatonHandle& handle = nullptr) noexcept = 0;
 
     /**
      * Cancel any outstanding async operations. There is no way to cancel synchronous calls.
@@ -123,13 +138,13 @@ public:
     virtual void cancelAsyncOperations(const BatonHandle& handle = nullptr) = 0;
 
     /**
-    * This should only be used to detect when the remote host has disappeared without
-    * notice. It does NOT work correctly for ensuring that operations complete or fail
-    * by some deadline.
-    *
-    * This timeout will only effect calls sourceMessage()/sinkMessage(). Async operations do not
-    * currently support timeouts.
-    */
+     * This should only be used to detect when the remote host has disappeared without
+     * notice. It does NOT work correctly for ensuring that operations complete or fail
+     * by some deadline.
+     *
+     * This timeout will only effect calls sourceMessage()/sinkMessage(). Async operations do not
+     * currently support timeouts.
+     */
     virtual void setTimeout(boost::optional<Milliseconds> timeout) = 0;
 
     /**
@@ -144,6 +159,9 @@ public:
 
     virtual const HostAndPort& remote() const = 0;
     virtual const HostAndPort& local() const = 0;
+
+    virtual const SockAddr& remoteAddr() const = 0;
+    virtual const SockAddr& localAddr() const = 0;
 
     virtual boost::optional<std::string> getSniName() const {
         return boost::none;
@@ -176,9 +194,21 @@ public:
      * of the 'mutateFunc' call. The 'kPending' tag is only for new sessions; callers should never
      * try to set it.
      */
-    void mutateTags(const stdx::function<TagMask(TagMask)>& mutateFunc);
+    void mutateTags(const std::function<TagMask(TagMask)>& mutateFunc);
 
     TagMask getTags() const;
+
+#ifdef MONGO_CONFIG_SSL
+    /**
+     * Get the configuration from the SSL manager.
+     */
+    virtual const SSLConfiguration* getSSLConfiguration() const = 0;
+
+    /**
+     * Get the SSL manager associated with this session.
+     */
+    virtual const std::shared_ptr<SSLManagerInterface> getSSLManager() const = 0;
+#endif
 
 protected:
     Session();

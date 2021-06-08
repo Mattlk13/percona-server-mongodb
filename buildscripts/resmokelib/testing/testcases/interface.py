@@ -8,8 +8,8 @@ import os.path
 import unittest
 import uuid
 
-from ... import logging
-from ...utils import registry
+from buildscripts.resmokelib import logging
+from buildscripts.resmokelib.utils import registry
 
 _TEST_CASES = {}  # type: ignore
 
@@ -21,7 +21,7 @@ def make_test_case(test_kind, *args, **kwargs):
     return _TEST_CASES[test_kind](*args, **kwargs)
 
 
-class TestCase(unittest.TestCase, metaclass=registry.make_registry_metaclass(_TEST_CASES)):  # pylint: disable=too-many-instance-attributes
+class TestCase(unittest.TestCase, metaclass=registry.make_registry_metaclass(_TEST_CASES)):  # pylint: disable=too-many-instance-attributes, invalid-metaclass
     """A test case to execute."""
 
     REGISTERED_NAME = registry.LEAVE_UNREGISTERED
@@ -54,6 +54,7 @@ class TestCase(unittest.TestCase, metaclass=registry.make_registry_metaclass(_TE
 
         self.fixture = None
         self.return_code = None
+        self.propagate_error = None
 
         self.is_configured = False
 

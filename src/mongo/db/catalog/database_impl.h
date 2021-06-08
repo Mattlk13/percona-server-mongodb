@@ -31,40 +31,19 @@
 
 #include "mongo/db/catalog/database.h"
 
-#include "mongo/platform/random.h"
-
 namespace mongo {
 
 class DatabaseImpl final : public Database {
 public:
-    explicit DatabaseImpl(StringData name, uint64_t epoch);
+    explicit DatabaseImpl(StringData name);
 
     void init(OperationContext*) const final;
-
-
-    // closes files and other cleanup see below.
-    void close(OperationContext* opCtx) const final;
 
     const std::string& name() const final {
         return _name;
     }
 
     void clearTmpCollections(OperationContext* opCtx) const final;
-
-    /**
-     * Sets a new profiling level for the database and returns the outcome.
-     *
-     * @param opCtx Operation context which to use for creating the profiling collection.
-     * @param newLevel New profiling level to use.
-     */
-    Status setProfilingLevel(OperationContext* opCtx, int newLevel) final;
-
-    int getProfilingLevel() const final {
-        return _profile.load();
-    }
-    const NamespaceString& getProfilingNS() const final {
-        return _profileName;
-    }
 
     void setDropPending(OperationContext* opCtx, bool dropPending) final;
 
@@ -87,7 +66,8 @@ public:
                           repl::OpTime dropOpTime) const final;
     Status dropCollectionEvenIfSystem(OperationContext* opCtx,
                                       NamespaceString nss,
-                                      repl::OpTime dropOpTime) const final;
+                                      repl::OpTime dropOpTime,
+                                      bool markFromMigrate = false) const final;
 
     Status dropView(OperationContext* opCtx, NamespaceString viewName) const final;
 
@@ -107,11 +87,6 @@ public:
                       const NamespaceString& viewName,
                       const CollectionOptions& options) const final;
 
-    Collection* getCollection(OperationContext* opCtx, const NamespaceString& nss) const;
-
-    Collection* getOrCreateCollection(OperationContext* opCtx,
-                                      const NamespaceString& nss) const final;
-
     Status renameCollection(OperationContext* opCtx,
                             NamespaceString fromNss,
                             NamespaceString toNss,
@@ -123,26 +98,25 @@ public:
         return _viewsName;
     }
 
-    StatusWith<NamespaceString> makeUniqueCollectionNamespace(OperationContext* opCtx,
-                                                              StringData collectionNameModel) final;
+    /**
+     * Given an input pattern `collectionNameModel`, returns a namespace string where `%` characters
+     * are replaced with random alpha-numerics.
+     *
+     * When called while holding an exclusive database lock, the collection name is guaranteed to
+     * not exist. Otherwise the caller is responsible for acquiring locks to check uniqueness.
+     *
+     * Returns a NamespaceExists error status if multiple attempts fail to generate a possible
+     * unique name.
+     */
+    StatusWith<NamespaceString> makeUniqueCollectionNamespace(
+        OperationContext* opCtx, StringData collectionNameModel) const final;
 
     void checkForIdIndexesAndDropPendingCollections(OperationContext* opCtx) const final;
 
-    CollectionCatalog::iterator begin(OperationContext* opCtx) const final {
-        return CollectionCatalog::get(opCtx).begin(_name);
-    }
-
-    CollectionCatalog::iterator end(OperationContext* opCtx) const final {
-        return CollectionCatalog::get(opCtx).end();
-    }
-
-    uint64_t epoch() const {
-        return _epoch;
-    }
-
 private:
     /**
-     * Throws if there is a reason 'ns' cannot be created as a user collection.
+     * Throws if there is a reason 'ns' cannot be created as a user collection. Namespace pattern
+     * matching checks should be added to userAllowedCreateNS().
      */
     void _checkCanCreateCollection(OperationContext* opCtx,
                                    const NamespaceString& nss,
@@ -167,22 +141,12 @@ private:
 
     const std::string _name;  // "dbname"
 
-    const uint64_t _epoch;
-
-    const NamespaceString _profileName;  // "dbname.system.profile"
-    const NamespaceString _viewsName;    // "dbname.system.views"
-
-    AtomicWord<int> _profile{0};  // 0=off
+    const NamespaceString _viewsName;  // "dbname.system.views"
 
     // If '_dropPending' is true, this Database is in the midst of a two-phase drop. No new
     // collections may be created in this Database.
     // This variable may only be read/written while the database is locked in MODE_X.
     AtomicWord<bool> _dropPending{false};
-
-    // Random number generator used to create unique collection namespaces suitable for temporary
-    // collections. Lazily created on first call to makeUniqueCollectionNamespace().
-    // This variable may only be read/written while the database is locked in MODE_X.
-    std::unique_ptr<PseudoRandom> _uniqueCollectionNamespacePseudoRandom;
 };
 
 }  // namespace mongo

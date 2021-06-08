@@ -34,17 +34,25 @@
 
 #include "mongo/db/pipeline/accumulator.h"
 
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/accumulation_statement.h"
 #include "mongo/db/pipeline/expression.h"
-#include "mongo/db/pipeline/value.h"
+#include "mongo/db/pipeline/window_function/window_function_count.h"
+#include "mongo/db/pipeline/window_function/window_function_expression.h"
+#include "mongo/db/pipeline/window_function/window_function_sum.h"
 #include "mongo/util/summation.h"
 
 namespace mongo {
 
 using boost::intrusive_ptr;
 
-REGISTER_ACCUMULATOR(sum, AccumulatorSum::create);
+REGISTER_ACCUMULATOR(sum, genericParseSingleExpressionAccumulator<AccumulatorSum>);
 REGISTER_EXPRESSION(sum, ExpressionFromAccumulator<AccumulatorSum>::parse);
+REGISTER_REMOVABLE_WINDOW_FUNCTION(sum, AccumulatorSum, WindowFunctionSum);
+REGISTER_ACCUMULATOR_WITH_MIN_VERSION(
+    count, parseCountAccumulator, ServerGlobalParams::FeatureCompatibility::Version::kVersion50);
+
+REGISTER_WINDOW_FUNCTION(count, window_function::parseCountWindowFunction);
 
 const char* AccumulatorSum::getOpName() const {
     return "$sum";
@@ -70,9 +78,11 @@ void AccumulatorSum::processInternal(const Value& input, bool merging) {
     // Upgrade to the widest type required to hold the result.
     totalType = Value::getWidestNumeric(totalType, input.getType());
     switch (input.getType()) {
-        case NumberInt:
         case NumberLong:
-            nonDecimalTotal.addLong(input.coerceToLong());
+            nonDecimalTotal.addLong(input.getLong());
+            break;
+        case NumberInt:
+            nonDecimalTotal.addInt(input.getInt());
             break;
         case NumberDouble:
             nonDecimalTotal.addDouble(input.getDouble());
@@ -85,8 +95,7 @@ void AccumulatorSum::processInternal(const Value& input, bool merging) {
     }
 }
 
-intrusive_ptr<Accumulator> AccumulatorSum::create(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+intrusive_ptr<AccumulatorState> AccumulatorSum::create(ExpressionContext* const expCtx) {
     return new AccumulatorSum(expCtx);
 }
 
@@ -120,24 +129,15 @@ Value AccumulatorSum::getValue(bool toBeMerged) {
         case NumberDouble:
             return Value(nonDecimalTotal.getDouble());
         case NumberDecimal: {
-            double sum, error;
-            std::tie(sum, error) = nonDecimalTotal.getDoubleDouble();
-            Decimal128 total;  // zero
-            if (sum != 0) {
-                total = total.add(Decimal128(sum, Decimal128::kRoundTo34Digits));
-                total = total.add(Decimal128(error, Decimal128::kRoundTo34Digits));
-            }
-            total = total.add(decimalTotal);
-            return Value(total);
+            return Value(decimalTotal.add(nonDecimalTotal.getDecimal()));
         }
         default:
             MONGO_UNREACHABLE;
     }
 }
 
-AccumulatorSum::AccumulatorSum(const boost::intrusive_ptr<ExpressionContext>& expCtx)
-    : Accumulator(expCtx) {
-    // This is a fixed size Accumulator so we never need to update this.
+AccumulatorSum::AccumulatorSum(ExpressionContext* const expCtx) : AccumulatorState(expCtx) {
+    // This is a fixed size AccumulatorState so we never need to update this.
     _memUsageBytes = sizeof(*this);
 }
 

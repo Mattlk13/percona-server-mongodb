@@ -1,8 +1,8 @@
 """The unittest.TestCase for gennylib integration tests."""
 
-from . import interface
-from ... import core
-from ... import utils
+from buildscripts.resmokelib import core
+from buildscripts.resmokelib import utils
+from buildscripts.resmokelib.testing.testcases import interface
 
 
 class GennyLibTestCase(interface.ProcessTestCase):
@@ -39,4 +39,4 @@ class GennyLibTestCase(interface.ProcessTestCase):
     def _make_process(self):
         return core.programs.generic_program(self.logger,
                                              [self.program_executable] + self.verbatim_arguments,
-                                             **self.program_options)
+                                             self.fixture.job_num, self._id, **self.program_options)

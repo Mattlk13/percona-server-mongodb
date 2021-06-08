@@ -46,10 +46,10 @@ public:
     void setUp() override {
         auto net = std::make_unique<NetworkInterfaceMock>();
         _net = net.get();
-        _tpte.emplace(std::make_unique<ThreadPoolMock>(_net, 1, ThreadPoolMock::Options{}),
-                      std::move(net));
+        _tpte = std::make_shared<ThreadPoolTaskExecutor>(
+            std::make_unique<ThreadPoolMock>(_net, 1, ThreadPoolMock::Options{}), std::move(net));
         _tpte->startup();
-        _executor.emplace(_tpte.get_ptr());
+        _executor.emplace(_tpte);
     }
 
     void tearDown() override {
@@ -112,13 +112,17 @@ public:
         return *_executor;
     }
 
+    std::shared_ptr<ThreadPoolTaskExecutor>& getUnderlying() {
+        return _tpte;
+    }
+
     NetworkInterfaceMock* getNet() {
         return _net;
     }
 
 private:
     NetworkInterfaceMock* _net;
-    boost::optional<ThreadPoolTaskExecutor> _tpte;
+    std::shared_ptr<ThreadPoolTaskExecutor> _tpte;
     boost::optional<ScopedTaskExecutor> _executor;
 };
 
@@ -251,10 +255,12 @@ TEST_F(ScopedTaskExecutorTest, scheduleLoseRaceWithShutdown) {
 
     ASSERT_FALSE(resultPf.future.isReady());
 
+    ASSERT_FALSE(getExecutor()->joinAsync().isReady());
     getExecutor()->shutdown();
     getNet()->exitNetwork();
 
     ASSERT_EQUALS(resultPf.future.getNoThrow(), ErrorCodes::ShutdownInProgress);
+    ASSERT_OK(getExecutor()->joinAsync().getNoThrow());
 }
 
 // ScheduleRemoteCommand on the underlying, but are shut down when we execute our wrapping callback
@@ -288,7 +294,7 @@ TEST_F(ScopedTaskExecutorTest, scheduleLoseRaceWithShutdownOfUnderlying) {
                 .isOK());
     });
 
-    MONGO_FAIL_POINT_PAUSE_WHILE_SET((bfp));
+    (bfp).pauseWhileSet();
 
     shutdownUnderlying();
 
@@ -313,6 +319,35 @@ TEST_F(ScopedTaskExecutorTest, DestructionShutsDown) {
     }
 
     ASSERT_EQUALS(pf.future.getNoThrow(), ErrorCodes::ShutdownInProgress);
+}
+
+TEST_F(ScopedTaskExecutorTest, SetShutdownCode) {
+    // Make an executor with the default shutdown behavior, shut it down, check the code returned
+    // when you try to use it.
+    {
+        ScopedTaskExecutor executor(getUnderlying());
+        executor->shutdown();
+
+        auto event = executor->makeEvent();
+        ASSERT_EQUALS(event.getStatus(), ErrorCodes::ShutdownInProgress);
+    }
+
+    // Now make an executor with a provided non-default shutdown code and check that we get that
+    // code instead of the default one.
+    {
+        Status stepDownStatus(ErrorCodes::InterruptedDueToReplStateChange, "node stepped down");
+        ScopedTaskExecutor executor(getUnderlying(), stepDownStatus);
+        executor->shutdown();
+
+        auto event = executor->makeEvent();
+        ASSERT_EQUALS(event.getStatus(), ErrorCodes::InterruptedDueToReplStateChange);
+    }
+}
+
+TEST_F(ScopedTaskExecutorTest, joinAllBecomesReadyOnShutdown) {
+    ASSERT_FALSE(getExecutor()->joinAsync().isReady());
+    getExecutor()->shutdown();
+    ASSERT_TRUE(getExecutor()->joinAsync().isReady());
 }
 
 }  // namespace

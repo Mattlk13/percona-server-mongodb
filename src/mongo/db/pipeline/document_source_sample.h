@@ -38,7 +38,6 @@ class DocumentSourceSample final : public DocumentSource {
 public:
     static constexpr StringData kStageName = "$sample"_sd;
 
-    GetNextResult getNext() final;
     const char* getSourceName() const final {
         return kStageName.rawData();
     }
@@ -51,10 +50,12 @@ public:
                 DiskUseRequirement::kWritesTmpData,
                 FacetRequirement::kAllowed,
                 TransactionRequirement::kAllowed,
-                LookupRequirement::kAllowed};
+                LookupRequirement::kAllowed,
+                UnionRequirement::kAllowed};
     }
 
     DepsTracker::State getDependencies(DepsTracker* deps) const final {
+        deps->needRandomGenerator = true;
         return DepsTracker::State::SEE_NEXT;
     }
 
@@ -67,8 +68,13 @@ public:
     static boost::intrusive_ptr<DocumentSource> createFromBson(
         BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& expCtx);
 
+    static boost::intrusive_ptr<DocumentSource> create(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx, long long size);
+
 private:
     explicit DocumentSourceSample(const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
+
+    GetNextResult doGetNext() final;
 
     long long _size;
 

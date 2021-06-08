@@ -38,7 +38,7 @@
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/replication_consistency_markers.h"
 #include "mongo/db/repl/replication_recovery.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 
 namespace mongo {
 
@@ -63,7 +63,7 @@ class ReplicationProcess {
     ReplicationProcess& operator=(const ReplicationProcess&) = delete;
 
 public:
-    static const int kUninitializedRollbackId = -1;
+    constexpr static int kUninitializedRollbackId = -1;
 
     // Operation Context binding.
     static ReplicationProcess* get(ServiceContext* service);
@@ -103,7 +103,7 @@ private:
     // (M)  Reads and writes guarded by _mutex.
 
     // Guards access to member variables.
-    mutable stdx::mutex _mutex;
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("ReplicationProcess::_mutex");
 
     // Used to access the storage layer.
     StorageInterface* const _storageInterface;  // (R)

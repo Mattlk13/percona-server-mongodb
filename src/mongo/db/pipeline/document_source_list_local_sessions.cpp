@@ -39,18 +39,14 @@ namespace mongo {
 
 REGISTER_DOCUMENT_SOURCE(listLocalSessions,
                          DocumentSourceListLocalSessions::LiteParsed::parse,
-                         DocumentSourceListLocalSessions::createFromBson);
+                         DocumentSourceListLocalSessions::createFromBson,
+                         LiteParsedDocumentSource::AllowedWithApiStrict::kNeverInVersion1);
 
-const char* DocumentSourceListLocalSessions::kStageName = "$listLocalSessions";
-
-DocumentSource::GetNextResult DocumentSourceListLocalSessions::getNext() {
-    pExpCtx->checkForInterrupt();
-
+DocumentSource::GetNextResult DocumentSourceListLocalSessions::doGetNext() {
     while (!_ids.empty()) {
         const auto& id = _ids.back();
+        const auto record = _cache->peekCached(id);
         _ids.pop_back();
-
-        const auto& record = _cache->peekCached(id);
         if (!record) {
             // It's possible for SessionRecords to have expired while we're walking
             continue;
@@ -75,7 +71,7 @@ boost::intrusive_ptr<DocumentSource> DocumentSourceListLocalSessions::createFrom
 
 DocumentSourceListLocalSessions::DocumentSourceListLocalSessions(
     const boost::intrusive_ptr<ExpressionContext>& pExpCtx, const ListSessionsSpec& spec)
-    : DocumentSource(pExpCtx), _spec(spec) {
+    : DocumentSource(kStageName, pExpCtx), _spec(spec) {
     const auto& opCtx = pExpCtx->opCtx;
     _cache = LogicalSessionCache::get(opCtx);
     if (_spec.getAllUsers()) {

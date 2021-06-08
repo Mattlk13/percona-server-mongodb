@@ -60,7 +60,7 @@ public:
      * "thisShardId" is the shard identity of this shard for purposes of answering questions like
      * "does this key belong to this shard"?
      */
-    CollectionMetadata(std::shared_ptr<ChunkManager> cm, const ShardId& thisShardId);
+    CollectionMetadata(ChunkManager cm, const ShardId& thisShardId);
 
     /**
      * Returns whether this metadata object represents a sharded or unsharded collection.
@@ -69,11 +69,46 @@ public:
         return bool(_cm);
     }
 
+    bool allowMigrations() const;
+
+    /**
+     * Returns the resharding key if the coordinator state is such that the recipient is tailing
+     * the donor's oplog.
+     */
+    boost::optional<ShardKeyPattern> getReshardingKeyIfShouldForwardOps() const;
+
+    /**
+     * Throws an exception if resharding fields currently exist in the collection metadata.
+     */
+    void throwIfReshardingInProgress(NamespaceString const& nss) const;
+
+    /**
+     * The caller should disallow writes when
+     *      1. The coordinator is in the mirroring state, OR
+     *      2. The coordinator is in the decision persisted state, but the UUID is still the
+     *         original UUID.
+     */
+    bool disallowWritesForResharding(const UUID& currentCollectionUUID) const;
+
     /**
      * Returns the current shard version for the collection or UNSHARDED if it is not sharded.
+     *
+     * Will throw ShardInvalidatedForTargeting if _thisShardId is marked as stale by
+     * the CollectionMetadata's current chunk manager.
      */
     ChunkVersion getShardVersion() const {
         return (isSharded() ? _cm->getVersion(_thisShardId) : ChunkVersion::UNSHARDED());
+    }
+
+    /**
+     * Returns the current shard version for the collection or UNSHARDED if it is not sharded.
+     *
+     * Will not throw an exception if _thisShardId is marked as stale by the CollectionMetadata's
+     * current chunk manager. Only use this function when logging the returned ChunkVersion. If the
+     * caller must execute logic based on the returned ChunkVersion, use getShardVersion() instead.
+     */
+    ChunkVersion getShardVersionForLogging() const {
+        return (isSharded() ? _cm->getVersionForLogging(_thisShardId) : ChunkVersion::UNSHARDED());
     }
 
     /**
@@ -91,32 +126,32 @@ public:
         return _thisShardId;
     }
 
+    const ShardKeyPattern& getShardKeyPattern() const {
+        invariant(isSharded());
+        return _cm->getShardKeyPattern();
+    }
+
     /**
      * Returns true if 'key' contains exactly the same fields as the shard key pattern.
      */
     bool isValidKey(const BSONObj& key) const {
-        invariant(isSharded());
-        return _cm->getShardKeyPattern().isShardKey(key);
+        return getShardKeyPattern().isShardKey(key);
     }
 
     const BSONObj& getKeyPattern() const {
-        invariant(isSharded());
-        return _cm->getShardKeyPattern().toBSON();
+        return getShardKeyPattern().toBSON();
     }
 
     const std::vector<std::unique_ptr<FieldRef>>& getKeyPatternFields() const {
-        invariant(isSharded());
-        return _cm->getShardKeyPattern().getKeyPatternFields();
+        return getShardKeyPattern().getKeyPatternFields();
     }
 
     BSONObj getMinKey() const {
-        invariant(isSharded());
-        return _cm->getShardKeyPattern().getKeyPattern().globalMin();
+        return getShardKeyPattern().getKeyPattern().globalMin();
     }
 
     BSONObj getMaxKey() const {
-        invariant(isSharded());
-        return _cm->getShardKeyPattern().getKeyPattern().globalMax();
+        return getShardKeyPattern().getKeyPattern().globalMax();
     }
 
     bool uuidMatches(UUID uuid) const {
@@ -135,18 +170,24 @@ public:
      */
     void toBSONBasic(BSONObjBuilder& bb) const;
 
+    BSONObj toBSON() const;
+
     /**
      * String output of the collection and shard versions.
      */
     std::string toStringBasic() const;
 
+    std::string toString() const {
+        return toStringBasic();
+    }
+
     //
     // Methods used for orphan filtering and general introspection of the chunks owned by the shard
     //
 
-    ChunkManager* getChunkManager() const {
+    const ChunkManager* getChunkManager() const {
         invariant(isSharded());
-        return _cm.get();
+        return _cm.get_ptr();
     }
 
     /**
@@ -180,6 +221,11 @@ public:
     }
 
     /**
+     * Returns true if this shard has any chunks for the collection.
+     */
+    bool currentShardHasAnyChunks() const;
+
+    /**
      * Given a key in the shard key range, get the next range which overlaps or is greater than
      * this key.
      *
@@ -210,12 +256,22 @@ public:
      */
     void toBSONChunks(BSONArrayBuilder* builder) const;
 
+    const boost::optional<TypeCollectionReshardingFields>& getReshardingFields() const {
+        invariant(isSharded());
+        return _cm->getReshardingFields();
+    }
+
+    const boost::optional<TypeCollectionTimeseriesFields>& getTimeseriesFields() const {
+        invariant(isSharded());
+        return _cm->getTimeseriesFields();
+    }
+
 private:
-    // The full routing table for the collection or nullptr if the collection is not sharded
-    std::shared_ptr<ChunkManager> _cm;
+    // The full routing table for the collection or boost::none if the collection is not sharded
+    boost::optional<ChunkManager> _cm;
 
     // The identity of this shard, for the purpose of answering "key belongs to me" queries. If the
-    // collection is not sharded (_cm is nullptr), then this value will be empty.
+    // collection is not sharded (_cm is boost::none), then this value will be empty.
     ShardId _thisShardId;
 };
 

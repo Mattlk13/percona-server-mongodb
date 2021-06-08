@@ -8,6 +8,7 @@
  *
  * @tags: [SERVER-40561]
  */
+load("jstests/concurrency/fsm_workload_helpers/assert_handle_fail_in_transaction.js");
 
 var $config = (function() {
     var data = {
@@ -29,17 +30,21 @@ var $config = (function() {
                 });
             }
             var res = bulk.execute();
-            assertAlways.writeOK(res);
+            assertAlways.commandWorked(res);
             assertAlways.eq(this.nDocumentsToInsert, res.nInserted);
         }
 
         function createIndexes(db, collName) {
             // The number of indexes created here is also stored in data.nIndexes.
             const coll = db[this.threadCollName];
-            assertAlways.commandWorked(coll.createIndex({text: 'text'}));
-            assertAlways.commandWorked(coll.createIndex({geo: '2dsphere'}));
-            assertAlways.commandWorked(coll.createIndex({integer: 1}));
-            assertAlways.commandWorked(coll.createIndex({"$**": 1}));
+            assertWorkedHandleTxnErrors(coll.createIndex({text: 'text'}),
+                                        ErrorCodes.IndexBuildAlreadyInProgress);
+            assertWorkedHandleTxnErrors(coll.createIndex({geo: '2dsphere'}),
+                                        ErrorCodes.IndexBuildAlreadyInProgress);
+            assertWorkedHandleTxnErrors(coll.createIndex({integer: 1}),
+                                        ErrorCodes.IndexBuildAlreadyInProgress);
+            assertWorkedHandleTxnErrors(coll.createIndex({"$**": 1}),
+                                        ErrorCodes.IndexBuildAlreadyInProgress);
         }
 
         function init(db, collName) {

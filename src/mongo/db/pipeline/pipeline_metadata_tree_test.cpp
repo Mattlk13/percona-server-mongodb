@@ -41,7 +41,7 @@
 #include "mongo/bson/json.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
-#include "mongo/db/pipeline/aggregation_request.h"
+#include "mongo/db/pipeline/aggregation_request_helper.h"
 #include "mongo/db/pipeline/document_source_bucket_auto.h"
 #include "mongo/db/pipeline/document_source_facet.h"
 #include "mongo/db/pipeline/document_source_graph_lookup.h"
@@ -77,17 +77,16 @@ protected:
         const auto inputBson = fromjson("{pipeline: " + jsonArray + "}");
 
         ASSERT_EQUALS(inputBson["pipeline"].type(), BSONType::Array);
-        auto rawPipeline =
-            uassertStatusOK(AggregationRequest::parsePipelineFromBSON(inputBson["pipeline"]));
+        auto rawPipeline = parsePipelineFromBSON(inputBson["pipeline"]);
         NamespaceString testNss("test", "collection");
-        AggregationRequest request(testNss, rawPipeline);
+        AggregateCommandRequest request(testNss, rawPipeline);
         getExpCtx()->ns = testNss;
 
-        return uassertStatusOK(Pipeline::parse(request.getPipeline(), getExpCtx()));
+        return Pipeline::parse(request.getPipeline(), getExpCtx());
     }
 
     template <typename T, typename... Args>
-    std::vector<T> make_vector(Args&&... args) {
+    std::vector<T> makeVector(Args&&... args) {
         std::vector<T> v;
         v.reserve(sizeof...(Args));
         (v.push_back(std::forward<Args>(args)), ...);
@@ -129,7 +128,8 @@ TEST_F(PipelineMetadataTreeTest, LinearPipelinesConstructProperTrees) {
         auto pipePtr = jsonToPipeline("[{$project: {name: 1}}]");
         return makeTree<TestThing>(
             {{NamespaceString("test.collection"), initial}}, *pipePtr, ignoreDocumentSourceAddOne);
-    }().first.get() == Stage(TestThing{23}, {}, {}));
+    }()
+               .first.get() == Stage(TestThing{23}, {}, {}));
 
     ASSERT([&]() {
         auto pipePtr = jsonToPipeline(
@@ -137,7 +137,8 @@ TEST_F(PipelineMetadataTreeTest, LinearPipelinesConstructProperTrees) {
             "{$match: {status: \"completed\"}}]");
         return makeTree<TestThing>(
             {{NamespaceString("test.collection"), initial}}, *pipePtr, ignoreDocumentSourceAddOne);
-    }().first.get() == Stage(TestThing{24}, makeUniqueStage(TestThing{23}, {}, {}), {}));
+    }()
+               .first.get() == Stage(TestThing{24}, makeUniqueStage(TestThing{23}, {}, {}), {}));
 
     ASSERT([&]() {
         auto pipePtr = jsonToPipeline(
@@ -149,7 +150,8 @@ TEST_F(PipelineMetadataTreeTest, LinearPipelinesConstructProperTrees) {
             "{$match: {status: \"completed\"}}]");
         return makeTree<TestThing>(
             {{NamespaceString("test.collection"), initial}}, *pipePtr, ignoreDocumentSourceAddOne);
-    }().first.get() ==
+    }()
+               .first.get() ==
            Stage(TestThing{28},
                  makeUniqueStage(
                      TestThing{27},
@@ -199,7 +201,7 @@ TEST_F(PipelineMetadataTreeTest, BranchingPipelinesConstructProperTrees) {
         if (typeid(source) == typeid(DocumentSourceGroup))
             return {previousThing.string + "g"};
         if (auto lookupSource = dynamic_cast<const DocumentSourceLookUp*>(&source)) {
-            if (lookupSource->wasConstructedWithPipelineSyntax())
+            if (lookupSource->hasPipeline())
                 return {previousThing.string + "l[" + extraThings.front().string + "]"};
             else
                 return {previousThing.string + "l"};
@@ -247,7 +249,8 @@ TEST_F(PipelineMetadataTreeTest, BranchingPipelinesConstructProperTrees) {
                                     {NamespaceString("test.instruments"), {"2"}}},
                                    *pipePtr,
                                    buildRepresentativeString);
-    }().first.get() ==
+    }()
+               .first.get() ==
            Stage(TestThing{"1mpxul[2m]ulu"},
                  makeUniqueStage(
                      TestThing{"1mpxul[2m]ul"},
@@ -266,7 +269,7 @@ TEST_F(PipelineMetadataTreeTest, BranchingPipelinesConstructProperTrees) {
                                                          {}),
                                          {}),
                                      {}),
-                                 make_vector<Stage<TestThing>>(Stage(TestThing{"2"}, {}, {}))),
+                                 makeVector<Stage<TestThing>>(Stage(TestThing{"2"}, {}, {}))),
                              {}),
                          {}),
                      {}),
@@ -283,12 +286,13 @@ TEST_F(PipelineMetadataTreeTest, BranchingPipelinesConstructProperTrees) {
             "{$limit: 12}]");
         return makeTree<TestThing>(
             {{NamespaceString("test.collection"), {""}}}, *pipePtr, buildRepresentativeString);
-    }().first.get() ==
+    }()
+               .first.get() ==
            Stage(TestThing{"f[tugs, tmgs, tb]"},
                  makeUniqueStage(
                      TestThing{""},
                      {},
-                     make_vector<Stage<TestThing>>(
+                     makeVector<Stage<TestThing>>(
                          Stage(TestThing{"tug"},
                                makeUniqueStage(
                                    TestThing{"tu"},
@@ -386,7 +390,7 @@ TEST_F(PipelineMetadataTreeTest, ZipWalksAPipelineAndTreeInTandemAndInOrder) {
 }
 
 TEST_F(PipelineMetadataTreeTest, MakeTreeWithEmptyPipeline) {
-    auto pipeline = uassertStatusOK(Pipeline::parse({}, getExpCtx()));
+    auto pipeline = Pipeline::parse({}, getExpCtx());
     auto result =
         makeTree<std::string>({{NamespaceString("unittests.pipeline_test"), std::string("input")}},
                               *pipeline,

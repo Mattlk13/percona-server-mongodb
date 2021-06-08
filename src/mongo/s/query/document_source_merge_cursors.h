@@ -29,6 +29,8 @@
 
 #pragma once
 
+#include <memory>
+
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/s/query/blocking_results_merger.h"
@@ -60,9 +62,7 @@ public:
      * Creates a new DocumentSourceMergeCursors from the given parameters.
      */
     static boost::intrusive_ptr<DocumentSourceMergeCursors> create(
-        executor::TaskExecutor*,
-        AsyncResultsMergerParams,
-        const boost::intrusive_ptr<ExpressionContext>&);
+        const boost::intrusive_ptr<ExpressionContext>&, AsyncResultsMergerParams);
 
     /**
      * Extracts the remote cursors and converts the execution machinery from a DocumentSource to a
@@ -89,7 +89,8 @@ public:
                                      DiskUseRequirement::kNoDiskUse,
                                      FacetRequirement::kNotAllowed,
                                      TransactionRequirement::kAllowed,
-                                     LookupRequirement::kNotAllowed);
+                                     LookupRequirement::kNotAllowed,
+                                     UnionRequirement::kNotAllowed);
 
         constraints.requiresInputDocSource = false;
         return constraints;
@@ -99,9 +100,14 @@ public:
         return boost::none;
     }
 
-    GetNextResult getNext() final;
-
     std::size_t getNumRemotes() const;
+
+    /**
+     * Returns the set of shard ids whose cursor has already been established.
+     */
+    const std::set<ShardId>& getShardIds() const {
+        return _shardsWithCursors;
+    }
 
     /**
      * Returns the high water mark sort key for the given cursor, if it exists; otherwise, returns
@@ -134,6 +140,7 @@ public:
      */
     void addNewShardCursors(std::vector<RemoteCursor>&& newCursors) {
         invariant(_blockingResultsMerger);
+        recordRemoteCursorShardIds(newCursors);
         _blockingResultsMerger->addNewShardCursors(std::move(newCursors));
     }
 
@@ -146,12 +153,12 @@ public:
     }
 
 protected:
+    GetNextResult doGetNext() final;
     void doDispose() final;
 
 private:
-    DocumentSourceMergeCursors(executor::TaskExecutor*,
+    DocumentSourceMergeCursors(const boost::intrusive_ptr<ExpressionContext>&,
                                AsyncResultsMergerParams,
-                               const boost::intrusive_ptr<ExpressionContext>&,
                                boost::optional<BSONObj> ownedParamsSpec = boost::none);
 
     /**
@@ -160,11 +167,14 @@ private:
      */
     void populateMerger();
 
+    /**
+     * Adds the shard Ids of the given remote cursors into the _shardsWithCursors set.
+     */
+    void recordRemoteCursorShardIds(const std::vector<RemoteCursor>& remoteCursors);
+
     // When we have parsed the params out of a BSONObj, the object needs to stay around while the
     // params are in use. We store them here.
     boost::optional<BSONObj> _armParamsObj;
-
-    executor::TaskExecutor* _executor;
 
     // '_blockingResultsMerger' is lazily populated. Until we need to use it, '_armParams' will be
     // populated with the parameters. Once we start using '_blockingResultsMerger', '_armParams'
@@ -185,6 +195,9 @@ private:
     // Indicates whether the cursors stored in _armParams are "owned", meaning the cursors should be
     // killed upon disposal of this DocumentSource.
     bool _ownCursors = true;
+
+    // Set containing shard ids with valid cursors.
+    std::set<ShardId> _shardsWithCursors;
 };
 
 }  // namespace mongo

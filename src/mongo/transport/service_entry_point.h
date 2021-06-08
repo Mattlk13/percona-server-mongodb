@@ -29,9 +29,12 @@
 
 #pragma once
 
+#include <limits>
+
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/dbmessage.h"
 #include "mongo/transport/session.h"
+#include "mongo/util/future.h"
 
 namespace mongo {
 
@@ -65,8 +68,8 @@ public:
     virtual Status start() = 0;
 
     /**
-    * Shuts down the service entry point.
-    */
+     * Shuts down the service entry point.
+     */
     virtual bool shutdown(Milliseconds timeout) = 0;
 
     /**
@@ -75,14 +78,29 @@ public:
     virtual void appendStats(BSONObjBuilder* bob) const = 0;
 
     /**
-    * Returns the number of sessions currently open.
-    */
+     * Returns the number of sessions currently open.
+     */
     virtual size_t numOpenSessions() const = 0;
+
+    /**
+     * Returns the maximum number of sessions that can be open.
+     */
+    virtual size_t maxOpenSessions() const {
+        return std::numeric_limits<size_t>::max();
+    }
 
     /**
      * Processes a request and fills out a DbResponse.
      */
-    virtual DbResponse handleRequest(OperationContext* opCtx, const Message& request) = 0;
+    virtual Future<DbResponse> handleRequest(OperationContext* opCtx,
+                                             const Message& request) noexcept = 0;
+
+    /**
+     * Optional handler which is invoked after a session ends.
+     *
+     * This function implies that the Session itself will soon be destructed.
+     */
+    virtual void onEndSession(const transport::SessionHandle&) {}
 
 protected:
     ServiceEntryPoint() = default;

@@ -29,38 +29,32 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/base/status_with.h"
-#include "mongo/bson/oid.h"
 #include "mongo/s/catalog/type_collection.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/time_support.h"
 
+namespace mongo {
 namespace {
-
-using namespace mongo;
 
 using unittest::assertGet;
 
 TEST(CollectionType, Empty) {
-    StatusWith<CollectionType> status = CollectionType::fromBSON(BSONObj());
-    ASSERT_FALSE(status.isOK());
+    ASSERT_THROWS(CollectionType(BSONObj()), DBException);
 }
 
 TEST(CollectionType, Basic) {
     const OID oid = OID::gen();
-    StatusWith<CollectionType> status =
-        CollectionType::fromBSON(BSON(CollectionType::fullNs("db.coll")
-                                      << CollectionType::epoch(oid)
-                                      << CollectionType::updatedAt(Date_t::fromMillisSinceEpoch(1))
-                                      << CollectionType::keyPattern(BSON("a" << 1))
-                                      << CollectionType::defaultCollation(BSON("locale"
-                                                                               << "fr_CA"))
-                                      << CollectionType::unique(true)));
-    ASSERT_TRUE(status.isOK());
+    CollectionType coll(BSON(CollectionType::kNssFieldName
+                             << "db.coll" << CollectionType::kEpochFieldName << oid
+                             << CollectionType::kUpdatedAtFieldName
+                             << Date_t::fromMillisSinceEpoch(1)
+                             << CollectionType::kKeyPatternFieldName << BSON("a" << 1)
+                             << CollectionType::kDefaultCollationFieldName
+                             << BSON("locale"
+                                     << "fr_CA")
+                             << CollectionType::kUniqueFieldName << true));
 
-    CollectionType coll = status.getValue();
-    ASSERT_TRUE(coll.validate().isOK());
-    ASSERT(coll.getNs() == NamespaceString{"db.coll"});
+    ASSERT(coll.getNss() == NamespaceString{"db.coll"});
     ASSERT_EQUALS(coll.getEpoch(), oid);
     ASSERT_EQUALS(coll.getUpdatedAt(), Date_t::fromMillisSinceEpoch(1));
     ASSERT_BSONOBJ_EQ(coll.getKeyPattern().toBSON(), BSON("a" << 1));
@@ -70,29 +64,30 @@ TEST(CollectionType, Basic) {
     ASSERT_EQUALS(coll.getUnique(), true);
     ASSERT_EQUALS(coll.getAllowBalance(), true);
     ASSERT_EQUALS(coll.getDropped(), false);
-    ASSERT_EQUALS(coll.isAssignedShardKey(), true);
 }
 
 TEST(CollectionType, AllFieldsPresent) {
     const OID oid = OID::gen();
     const auto uuid = UUID::gen();
-    StatusWith<CollectionType> status =
-        CollectionType::fromBSON(BSON(CollectionType::fullNs("db.coll")
-                                      << CollectionType::epoch(oid)
-                                      << CollectionType::updatedAt(Date_t::fromMillisSinceEpoch(1))
-                                      << CollectionType::keyPattern(BSON("a" << 1))
-                                      << CollectionType::defaultCollation(BSON("locale"
-                                                                               << "fr_CA"))
-                                      << CollectionType::unique(true)
-                                      << CollectionType::uuid()
-                                      << uuid
-                                      << "isAssignedShardKey"
-                                      << false));
-    ASSERT_TRUE(status.isOK());
+    const auto reshardingUuid = UUID::gen();
 
-    CollectionType coll = status.getValue();
-    ASSERT_TRUE(coll.validate().isOK());
-    ASSERT(coll.getNs() == NamespaceString{"db.coll"});
+    ReshardingFields reshardingFields;
+    reshardingFields.setReshardingUUID(reshardingUuid);
+
+    CollectionType coll(BSON(CollectionType::kNssFieldName
+                             << "db.coll" << CollectionType::kEpochFieldName << oid
+                             << CollectionType::kUpdatedAtFieldName
+                             << Date_t::fromMillisSinceEpoch(1)
+                             << CollectionType::kKeyPatternFieldName << BSON("a" << 1)
+                             << CollectionType::kDefaultCollationFieldName
+                             << BSON("locale"
+                                     << "fr_CA")
+                             << CollectionType::kUniqueFieldName << true
+                             << CollectionType::kUuidFieldName << uuid
+                             << CollectionType::kReshardingFieldsFieldName
+                             << reshardingFields.toBSON()));
+
+    ASSERT(coll.getNss() == NamespaceString{"db.coll"});
     ASSERT_EQUALS(coll.getEpoch(), oid);
     ASSERT_EQUALS(coll.getUpdatedAt(), Date_t::fromMillisSinceEpoch(1));
     ASSERT_BSONOBJ_EQ(coll.getKeyPattern().toBSON(), BSON("a" << 1));
@@ -102,110 +97,46 @@ TEST(CollectionType, AllFieldsPresent) {
     ASSERT_EQUALS(coll.getUnique(), true);
     ASSERT_EQUALS(coll.getAllowBalance(), true);
     ASSERT_EQUALS(coll.getDropped(), false);
-    ASSERT_TRUE(coll.getUUID());
-    ASSERT_EQUALS(*coll.getUUID(), uuid);
-    ASSERT_EQUALS(coll.isAssignedShardKey(), false);
-}
-
-TEST(CollectionType, EmptyDefaultCollationFailsToParse) {
-    const OID oid = OID::gen();
-    StatusWith<CollectionType> status =
-        CollectionType::fromBSON(BSON(CollectionType::fullNs("db.coll")
-                                      << CollectionType::epoch(oid)
-                                      << CollectionType::updatedAt(Date_t::fromMillisSinceEpoch(1))
-                                      << CollectionType::keyPattern(BSON("a" << 1))
-                                      << CollectionType::defaultCollation(BSONObj())
-                                      << CollectionType::unique(true)));
-    ASSERT_FALSE(status.isOK());
+    ASSERT_EQUALS(coll.getUuid(), uuid);
+    ASSERT(coll.getReshardingFields()->getState() == CoordinatorStateEnum::kUnused);
+    ASSERT(coll.getReshardingFields()->getReshardingUUID() == reshardingUuid);
 }
 
 TEST(CollectionType, MissingDefaultCollationParses) {
     const OID oid = OID::gen();
-    StatusWith<CollectionType> status =
-        CollectionType::fromBSON(BSON(CollectionType::fullNs("db.coll")
-                                      << CollectionType::epoch(oid)
-                                      << CollectionType::updatedAt(Date_t::fromMillisSinceEpoch(1))
-                                      << CollectionType::keyPattern(BSON("a" << 1))
-                                      << CollectionType::unique(true)));
-    ASSERT_TRUE(status.isOK());
-
-    CollectionType coll = status.getValue();
-    ASSERT_TRUE(coll.validate().isOK());
+    CollectionType coll(BSON(CollectionType::kNssFieldName
+                             << "db.coll" << CollectionType::kEpochFieldName << oid
+                             << CollectionType::kUpdatedAtFieldName
+                             << Date_t::fromMillisSinceEpoch(1)
+                             << CollectionType::kKeyPatternFieldName << BSON("a" << 1)
+                             << CollectionType::kUniqueFieldName << true));
     ASSERT_BSONOBJ_EQ(coll.getDefaultCollation(), BSONObj());
 }
 
 TEST(CollectionType, DefaultCollationSerializesCorrectly) {
     const OID oid = OID::gen();
-    StatusWith<CollectionType> status =
-        CollectionType::fromBSON(BSON(CollectionType::fullNs("db.coll")
-                                      << CollectionType::epoch(oid)
-                                      << CollectionType::updatedAt(Date_t::fromMillisSinceEpoch(1))
-                                      << CollectionType::keyPattern(BSON("a" << 1))
-                                      << CollectionType::defaultCollation(BSON("locale"
-                                                                               << "fr_CA"))
-                                      << CollectionType::unique(true)));
-    ASSERT_TRUE(status.isOK());
-
-    CollectionType coll = status.getValue();
-    ASSERT_TRUE(coll.validate().isOK());
+    CollectionType coll(BSON(CollectionType::kNssFieldName
+                             << "db.coll" << CollectionType::kEpochFieldName << oid
+                             << CollectionType::kUpdatedAtFieldName
+                             << Date_t::fromMillisSinceEpoch(1)
+                             << CollectionType::kKeyPatternFieldName << BSON("a" << 1)
+                             << CollectionType::kDefaultCollationFieldName
+                             << BSON("locale"
+                                     << "fr_CA")
+                             << CollectionType::kUniqueFieldName << true));
     BSONObj serialized = coll.toBSON();
     ASSERT_BSONOBJ_EQ(serialized["defaultCollation"].Obj(),
                       BSON("locale"
                            << "fr_CA"));
 }
 
-TEST(CollectionType, MissingDefaultCollationIsNotSerialized) {
-    const OID oid = OID::gen();
-    StatusWith<CollectionType> status =
-        CollectionType::fromBSON(BSON(CollectionType::fullNs("db.coll")
-                                      << CollectionType::epoch(oid)
-                                      << CollectionType::updatedAt(Date_t::fromMillisSinceEpoch(1))
-                                      << CollectionType::keyPattern(BSON("a" << 1))
-                                      << CollectionType::unique(true)));
-    ASSERT_TRUE(status.isOK());
-
-    CollectionType coll = status.getValue();
-    ASSERT_TRUE(coll.validate().isOK());
-    BSONObj serialized = coll.toBSON();
-    ASSERT_FALSE(serialized["defaultCollation"]);
-}
-
-TEST(CollectionType, EpochCorrectness) {
-    CollectionType coll;
-    coll.setNs(NamespaceString{"db.coll"});
-    coll.setUpdatedAt(Date_t::fromMillisSinceEpoch(1));
-    coll.setKeyPattern(KeyPattern{BSON("a" << 1)});
-    coll.setUnique(false);
-    coll.setDropped(false);
-
-    // Validation will fail because we don't have epoch set. This ensures that if we read a
-    // collection with no epoch, we will write back one with epoch.
-    ASSERT_NOT_OK(coll.validate());
-
-    // We should be allowed to set empty epoch for dropped collections
-    coll.setDropped(true);
-    coll.setEpoch(OID());
-    ASSERT_OK(coll.validate());
-
-    // We should be allowed to set normal epoch for non-dropped collections
-    coll.setDropped(false);
-    coll.setEpoch(OID::gen());
-    ASSERT_OK(coll.validate());
-}
-
 TEST(CollectionType, Pre22Format) {
-    CollectionType coll = assertGet(CollectionType::fromBSON(BSON("_id"
-                                                                  << "db.coll"
-                                                                  << "lastmod"
-                                                                  << Date_t::fromMillisSinceEpoch(1)
-                                                                  << "dropped"
-                                                                  << false
-                                                                  << "key"
-                                                                  << BSON("a" << 1)
-                                                                  << "unique"
-                                                                  << false)));
+    CollectionType coll(BSON("_id"
+                             << "db.coll"
+                             << "lastmod" << Date_t::fromMillisSinceEpoch(1) << "dropped" << false
+                             << "key" << BSON("a" << 1) << "unique" << false));
 
-    ASSERT(coll.getNs() == NamespaceString{"db.coll"});
+    ASSERT(coll.getNss() == NamespaceString{"db.coll"});
     ASSERT(!coll.getEpoch().isSet());
     ASSERT_EQUALS(coll.getUpdatedAt(), Date_t::fromMillisSinceEpoch(1));
     ASSERT_BSONOBJ_EQ(coll.getKeyPattern().toBSON(), BSON("a" << 1));
@@ -214,28 +145,25 @@ TEST(CollectionType, Pre22Format) {
     ASSERT_EQUALS(coll.getDropped(), false);
 }
 
-TEST(CollectionType, InvalidCollectionNamespace) {
-    const OID oid = OID::gen();
-    StatusWith<CollectionType> result =
-        CollectionType::fromBSON(BSON(CollectionType::fullNs("foo\\bar.coll")
-                                      << CollectionType::epoch(oid)
-                                      << CollectionType::updatedAt(Date_t::fromMillisSinceEpoch(1))
-                                      << CollectionType::keyPattern(BSON("a" << 1))
-                                      << CollectionType::unique(true)));
-    ASSERT_TRUE(result.isOK());
-    CollectionType collType = result.getValue();
-    ASSERT_FALSE(collType.validate().isOK());
+TEST(CollectionType, InvalidNamespace) {
+    ASSERT_THROWS(CollectionType(BSON(CollectionType::kNssFieldName
+                                      << "foo\\bar.coll" << CollectionType::kEpochFieldName
+                                      << OID::gen() << CollectionType::kUpdatedAtFieldName
+                                      << Date_t::fromMillisSinceEpoch(1)
+                                      << CollectionType::kKeyPatternFieldName << BSON("a" << 1)
+                                      << CollectionType::kUniqueFieldName << true)),
+                  DBException);
 }
 
-TEST(CollectionType, BadType) {
-    const OID oid = OID::gen();
-    StatusWith<CollectionType> status = CollectionType::fromBSON(
-        BSON(CollectionType::fullNs() << 1 << CollectionType::epoch(oid)
-                                      << CollectionType::updatedAt(Date_t::fromMillisSinceEpoch(1))
-                                      << CollectionType::keyPattern(BSON("a" << 1))
-                                      << CollectionType::unique(true)));
-
-    ASSERT_FALSE(status.isOK());
+TEST(CollectionType, BadNamespaceType) {
+    ASSERT_THROWS(CollectionType(BSON(CollectionType::kNssFieldName
+                                      << 1 << CollectionType::kEpochFieldName << OID::gen()
+                                      << CollectionType::kUpdatedAtFieldName
+                                      << Date_t::fromMillisSinceEpoch(1)
+                                      << CollectionType::kKeyPatternFieldName << BSON("a" << 1)
+                                      << CollectionType::kUniqueFieldName << true)),
+                  DBException);
 }
 
 }  // namespace
+}  // namespace mongo

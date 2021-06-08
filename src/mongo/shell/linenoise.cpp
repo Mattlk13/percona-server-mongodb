@@ -97,7 +97,6 @@
 
 #else /* _WIN32 */
 
-#include <cctype>
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
@@ -105,15 +104,16 @@
 #include <sys/types.h>
 #include <termios.h>
 #include <unistd.h>
-#include <wctype.h>
 
 #endif /* _WIN32 */
 
 #include "linenoise.h"
 #include "linenoise_utf8.h"
 #include "mk_wcwidth.h"
+#include <cwctype>
 #include <errno.h>
 #include <fcntl.h>
+#include <memory>
 #include <sstream>
 #include <stdio.h>
 #include <string>
@@ -126,16 +126,16 @@ using std::vector;
 
 using std::unique_ptr;
 
-using linenoise_utf8::UChar8;
-using linenoise_utf8::UChar32;
-using linenoise_utf8::copyString8to32;
 using linenoise_utf8::copyString32;
 using linenoise_utf8::copyString32to8;
+using linenoise_utf8::copyString8to32;
 using linenoise_utf8::strlen32;
 using linenoise_utf8::strncmp32;
-using linenoise_utf8::write32;
-using linenoise_utf8::Utf8String;
+using linenoise_utf8::UChar32;
+using linenoise_utf8::UChar8;
 using linenoise_utf8::Utf32String;
+using linenoise_utf8::Utf8String;
+using linenoise_utf8::write32;
 
 struct linenoiseCompletions {
     vector<Utf32String> completionStrings;
@@ -385,12 +385,12 @@ public:
     }
 
     Utf32String* yank() {
-        return (size > 0) ? &theRing[indexToSlot[index]] : 0;
+        return (size > 0) ? &theRing[indexToSlot[index]] : nullptr;
     }
 
     Utf32String* yankPop() {
         if (size == 0) {
-            return 0;
+            return nullptr;
         }
         ++index;
         if (index == size) {
@@ -467,8 +467,8 @@ static const int DELETE_KEY = 0x10E00000;
 static const int PAGE_UP_KEY = 0x11000000;
 static const int PAGE_DOWN_KEY = 0x11200000;
 
-static const char* unsupported_term[] = {"dumb", "cons25", "emacs", NULL};
-static linenoiseCompletionCallback* completionCallback = NULL;
+static const char* unsupported_term[] = {"dumb", "cons25", "emacs", nullptr};
+static linenoiseCompletionCallback* completionCallback = nullptr;
 
 #ifdef _WIN32
 static HANDLE console_in, console_out;
@@ -485,7 +485,7 @@ static int atexit_registered = 0; /* register atexit just 1 time */
 static int historyMaxLen = LINENOISE_DEFAULT_HISTORY_MAX_LEN;
 static int historyLen = 0;
 static int historyIndex = 0;
-static UChar8** history = NULL;
+static UChar8** history = nullptr;
 
 // used to emulate Windows command prompt on down-arrow after a recall
 // we use -2 as our "not set" value because we add 1 to the previous index on down-arrow,
@@ -497,7 +497,7 @@ static void linenoiseAtExit(void);
 
 static bool isUnsupportedTerm(void) {
     char* term = getenv("TERM");
-    if (term == NULL)
+    if (term == nullptr)
         return false;
     for (int j = 0; unsupported_term[j]; ++j)
         if (!strcasecmp(term, unsupported_term[j])) {
@@ -517,7 +517,7 @@ void linenoiseHistoryFree(void) {
             free(history[j]);
         historyLen = 0;
         free(history);
-        history = 0;
+        history = nullptr;
     }
 }
 
@@ -1234,7 +1234,7 @@ static UChar32 setMetaRoutine(UChar32 c) {
     return doDispatch(c, initialDispatch);
 }
 
-}  // namespace EscapeSequenceProcessing // move these out of global namespace
+}  // namespace EscapeSequenceProcessing
 
 #endif  // #ifndef _WIN32
 
@@ -1754,7 +1754,7 @@ int InputBuffer::incrementalHistorySearch(PromptBase& pi, int startChar) {
     bool keepLooping = true;
     bool useSearchedLine = true;
     bool searchAgain = false;
-    UChar32* activeHistoryLine = 0;
+    std::unique_ptr<UChar32[]> activeHistoryLine;
     while (keepLooping) {
         c = linenoiseReadChar();
         c = cleanupCtrl(c);  // convert CTRL + <char> into normal ctrl
@@ -1881,9 +1881,9 @@ int InputBuffer::incrementalHistorySearch(PromptBase& pi, int startChar) {
         // if we are staying in search mode, search now
         if (keepLooping) {
             bufferSize = historyLineLength + 1;
-            activeHistoryLine = new UChar32[bufferSize];
+            activeHistoryLine = std::make_unique<UChar32[]>(bufferSize);
             copyString8to32(
-                activeHistoryLine, history[historyIndex], bufferSize, ucharCount, errorCode);
+                activeHistoryLine.get(), history[historyIndex], bufferSize, ucharCount, errorCode);
             if (dp.searchTextLen > 0) {
                 bool found = false;
                 int historySearchIndex = historyIndex;
@@ -1914,9 +1914,8 @@ int InputBuffer::incrementalHistorySearch(PromptBase& pi, int startChar) {
                         historySearchIndex += dp.direction;
                         bufferSize =
                             strlen(reinterpret_cast<char*>(history[historySearchIndex])) + 1;
-                        delete[] activeHistoryLine;
-                        activeHistoryLine = new UChar32[bufferSize];
-                        copyString8to32(activeHistoryLine,
+                        activeHistoryLine = std::make_unique<UChar32[]>(bufferSize);
+                        copyString8to32(activeHistoryLine.get(),
                                         history[historySearchIndex],
                                         bufferSize,
                                         ucharCount,
@@ -1929,15 +1928,12 @@ int InputBuffer::incrementalHistorySearch(PromptBase& pi, int startChar) {
                     }
                 };  // while
             }
-            if (activeHistoryLine) {
-                delete[] activeHistoryLine;
-            }
             bufferSize = historyLineLength + 1;
-            activeHistoryLine = new UChar32[bufferSize];
+            activeHistoryLine = std::make_unique<UChar32[]>(bufferSize);
             copyString8to32(
-                activeHistoryLine, history[historyIndex], bufferSize, ucharCount, errorCode);
+                activeHistoryLine.get(), history[historyIndex], bufferSize, ucharCount, errorCode);
             dynamicRefresh(dp,
-                           activeHistoryLine,
+                           activeHistoryLine.get(),
                            historyLineLength,
                            historyLinePosition);  // draw user's text with our prompt
         }
@@ -1959,12 +1955,9 @@ int InputBuffer::incrementalHistorySearch(PromptBase& pi, int startChar) {
     pb.promptPreviousLen = dp.promptChars;
     if (useSearchedLine && activeHistoryLine) {
         historyRecallMostRecent = true;
-        copyString32(buf32, activeHistoryLine, buflen + 1);
+        copyString32(buf32, activeHistoryLine.get(), buflen + 1);
         len = historyLineLength;
         pos = historyLinePosition;
-    }
-    if (activeHistoryLine) {
-        delete[] activeHistoryLine;
     }
     dynamicRefresh(pb, buf32, len, pos);  // redraw the original prompt with current input
     pi.promptPreviousInputLen = len;
@@ -1974,7 +1967,7 @@ int InputBuffer::incrementalHistorySearch(PromptBase& pi, int startChar) {
 }
 
 static bool isCharacterAlphanumeric(UChar32 testChar) {
-    return iswalnum(testChar);
+    return std::iswalnum(testChar);
 }
 
 int InputBuffer::getInputLine(PromptBase& pi) {
@@ -2618,6 +2611,11 @@ void linenoisePreloadBuffer(const char* preloadText) {
     }
 }
 
+static void printLongLineWarning(const char* context) {
+    printf("WARNING: %s truncated at %d bytes.\n", context, LINENOISE_MAX_LINE - 1);
+    fflush(stdout);
+}
+
 /**
  * linenoise is a readline replacement.
  *
@@ -2639,17 +2637,20 @@ char* linenoise(const char* prompt) {
         PromptInfo pi(reinterpret_cast<const UChar8*>(prompt), getScreenColumns());
         if (isUnsupportedTerm()) {
             if (write32(1, pi.promptText.get(), pi.promptChars) == -1)
-                return 0;
+                return nullptr;
             fflush(stdout);
             if (preloadedBufferContents.empty()) {
                 unique_ptr<char[]> buf8(new char[LINENOISE_MAX_LINE]);
-                if (fgets(buf8.get(), LINENOISE_MAX_LINE, stdin) == NULL) {
-                    return NULL;
+                if (fgets(buf8.get(), LINENOISE_MAX_LINE, stdin) == nullptr) {
+                    return nullptr;
                 }
                 size_t len = strlen(buf8.get());
                 while (len && (buf8[len - 1] == '\n' || buf8[len - 1] == '\r')) {
                     --len;
                     buf8[len] = '\0';
+                }
+                if (len == LINENOISE_MAX_LINE - 1) {
+                    printLongLineWarning("input line");
                 }
                 return strdup(buf8.get());  // caller must free buffer
             } else {
@@ -2659,7 +2660,7 @@ char* linenoise(const char* prompt) {
             }
         } else {
             if (enableRawMode() == -1) {
-                return NULL;
+                return nullptr;
             }
             InputBuffer ib(buf32, charWidths, LINENOISE_MAX_LINE);
             if (!preloadedBufferContents.empty()) {
@@ -2670,7 +2671,10 @@ char* linenoise(const char* prompt) {
             disableRawMode();
             printf("\n");
             if (count == -1) {
-                return NULL;
+                return nullptr;
+            }
+            if (count == LINENOISE_MAX_LINE - 1) {
+                printLongLineWarning("input line");
             }
             size_t bufferSize = sizeof(UChar32) * ib.length() + 1;
             unique_ptr<UChar8[]> buf8(new UChar8[bufferSize]);
@@ -2679,8 +2683,8 @@ char* linenoise(const char* prompt) {
         }
     } else {  // input not from a terminal, we should work with piped input, i.e. redirected stdin
         unique_ptr<char[]> buf8(new char[LINENOISE_MAX_LINE]);
-        if (fgets(buf8.get(), LINENOISE_MAX_LINE, stdin) == NULL) {
-            return NULL;
+        if (fgets(buf8.get(), LINENOISE_MAX_LINE, stdin) == nullptr) {
+            return nullptr;
         }
 
         // if fgets() gave us the newline, remove it
@@ -2688,6 +2692,9 @@ char* linenoise(const char* prompt) {
         if (count > 0 && buf8[count - 1] == '\n') {
             --count;
             buf8[count] = '\0';
+        }
+        if (count == LINENOISE_MAX_LINE - 1) {
+            printLongLineWarning("input line");
         }
         return strdup(buf8.get());  // caller must free buffer
     }
@@ -2706,9 +2713,9 @@ int linenoiseHistoryAdd(const char* line) {
     if (historyMaxLen == 0) {
         return 0;
     }
-    if (history == NULL) {
+    if (history == nullptr) {
         history = reinterpret_cast<UChar8**>(malloc(sizeof(UChar8*) * historyMaxLen));
-        if (history == NULL) {
+        if (history == nullptr) {
             return 0;
         }
         memset(history, 0, (sizeof(char*) * historyMaxLen));
@@ -2746,7 +2753,7 @@ int linenoiseHistorySetMaxLen(int len) {
     if (history) {
         int tocopy = historyLen;
         UChar8** newHistory = reinterpret_cast<UChar8**>(malloc(sizeof(UChar8*) * len));
-        if (newHistory == NULL) {
+        if (newHistory == nullptr) {
             return 0;
         }
         if (len < tocopy) {
@@ -2784,7 +2791,7 @@ mongo::Status linenoiseHistorySave(const char* filename) {
         return linenoiseFileError(mongo::ErrorCodes::FileOpenFailed, "open()", filename, ewd);
     }
     fp = fdopen(fd, "wt");
-    if (fp == NULL) {
+    if (fp == nullptr) {
         const auto ewd = mongo::errnoWithDescription();
         // We've already failed, so no need to report any close() failure.
         (void)close(fd);
@@ -2792,7 +2799,7 @@ mongo::Status linenoiseHistorySave(const char* filename) {
     }
 #else
     fp = fopen(filename, "wt");
-    if (fp == NULL) {
+    if (fp == nullptr) {
         const auto ewd = mongo::errnoWithDescription();
         return linenoiseFileError(mongo::ErrorCodes::FileOpenFailed, "fopen()", filename, ewd);
     }
@@ -2820,7 +2827,7 @@ mongo::Status linenoiseHistorySave(const char* filename) {
 /* Load the history from the specified file. */
 mongo::Status linenoiseHistoryLoad(const char* filename) {
     FILE* fp = fopen(filename, "rt");
-    if (fp == NULL) {
+    if (fp == nullptr) {
         if (errno == ENOENT) {
             // Not having a history file isn't an error condition.
             // For example, it's always the case when the shell is run for the first time.
@@ -2830,8 +2837,9 @@ mongo::Status linenoiseHistoryLoad(const char* filename) {
         return linenoiseFileError(mongo::ErrorCodes::FileOpenFailed, "fopen()", filename, ewd);
     }
 
+    bool historyLinesTruncated = false;
     char buf[LINENOISE_MAX_LINE];
-    while (fgets(buf, LINENOISE_MAX_LINE, fp) != NULL) {
+    while (fgets(buf, LINENOISE_MAX_LINE, fp) != nullptr) {
         char* p = strchr(buf, '\r');
         if (!p) {
             p = strchr(buf, '\n');
@@ -2840,8 +2848,15 @@ mongo::Status linenoiseHistoryLoad(const char* filename) {
             *p = '\0';
         }
         if (p != buf) {
+            int count = strlen(buf);
+            if (count == LINENOISE_MAX_LINE - 1) {
+                historyLinesTruncated = true;
+            }
             linenoiseHistoryAdd(buf);
         }
+    }
+    if (historyLinesTruncated) {
+        printLongLineWarning("some history file lines were");
     }
     // fgets() returns NULL on error or EOF (with nothing read).
     // So if we aren't EOF, it must have been an error.

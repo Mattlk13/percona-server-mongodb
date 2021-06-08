@@ -27,19 +27,19 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/scripting/mozjs/session.h"
 
+#include "mongo/logv2/log.h"
 #include "mongo/scripting/mozjs/bson.h"
-#include "mongo/scripting/mozjs/end_sessions_gen.h"
 #include "mongo/scripting/mozjs/implscope.h"
 #include "mongo/scripting/mozjs/mongo.h"
+#include "mongo/scripting/mozjs/scripting_util_gen.h"
 #include "mongo/scripting/mozjs/valuereader.h"
 #include "mongo/scripting/mozjs/wrapconstrainedmethod.h"
-#include "mongo/util/log.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -122,20 +122,16 @@ void endSession(SessionHolder* holder) {
     if (holder->txnState == SessionHolder::TransactionState::kActive) {
         holder->txnState = SessionHolder::TransactionState::kAborted;
         BSONObj abortObj = BSON("abortTransaction" << 1 << "lsid" << holder->lsid << "txnNumber"
-                                                   << holder->txnNumber
-                                                   << "autocommit"
-                                                   << false);
+                                                   << holder->txnNumber << "autocommit" << false);
 
-        MONGO_COMPILER_VARIABLE_UNUSED auto ignored =
-            holder->client->runCommand("admin", abortObj, out);
+        [[maybe_unused]] auto ignored = holder->client->runCommand("admin", abortObj, out);
     }
 
     EndSessions es;
 
     es.setEndSessions({holder->lsid});
 
-    MONGO_COMPILER_VARIABLE_UNUSED auto ignored =
-        holder->client->runCommand("admin", es.toBSON(), out);
+    [[maybe_unused]] auto ignored = holder->client->runCommand("admin", es.toBSON(), out);
 
     holder->client.reset();
 }
@@ -154,7 +150,10 @@ void SessionInfo::finalize(js::FreeOp* fop, JSObject* obj) {
             auto status = exceptionToStatus();
 
             try {
-                LOG(0) << "Failed to end session " << lsid << " due to " << status;
+                LOGV2_INFO(22791,
+                           "Failed to end logical session",
+                           "lsid"_attr = lsid,
+                           "error"_attr = status);
             } catch (...) {
                 // This is here in case logging fails.
             }

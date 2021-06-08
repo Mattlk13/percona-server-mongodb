@@ -31,9 +31,10 @@
 
 #include <algorithm>
 #include <array>
+#include <boost/optional.hpp>
+#include <memory>
 
 #include "mongo/db/matcher/expression.h"
-#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
@@ -57,7 +58,7 @@ public:
         _debugAddSpace(debug, indentationLevel);
 
         BSONObjBuilder builder;
-        serialize(&builder);
+        serialize(&builder, true);
         debug << builder.obj().toString();
     }
 
@@ -80,7 +81,7 @@ public:
             [](const auto& expr1, const auto& expr2) { return expr1->equivalent(expr2.get()); });
     }
 
-    std::vector<MatchExpression*>* getChildVector() final {
+    std::vector<std::unique_ptr<MatchExpression>>* getChildVector() final {
         return nullptr;
     }
 
@@ -101,11 +102,11 @@ public:
     /**
      * Serializes each subexpression sequentially in a BSONArray.
      */
-    void serialize(BSONObjBuilder* builder) const final {
+    void serialize(BSONObjBuilder* builder, bool includePath) const final {
         BSONArrayBuilder exprArray(builder->subarrayStart(name()));
         for (const auto& expr : _expressions) {
             BSONObjBuilder exprBuilder(exprArray.subobjStart());
-            expr->serialize(&exprBuilder);
+            expr->serialize(&exprBuilder, includePath);
             exprBuilder.doneFast();
         }
         exprArray.doneFast();
@@ -123,13 +124,14 @@ public:
                            return orig ? orig->shallowClone()
                                        : std::unique_ptr<MatchExpression>(nullptr);
                        });
-        std::unique_ptr<T> clone = stdx::make_unique<T>(std::move(clonedExpressions));
+        std::unique_ptr<T> clone =
+            std::make_unique<T>(std::move(clonedExpressions), _errorAnnotation);
 
         if (getTag()) {
             clone->setTag(getTag()->clone());
         }
 
-        return std::move(clone);
+        return clone;
     }
 
 protected:
@@ -137,8 +139,10 @@ protected:
      * Takes ownership of the MatchExpressions in 'expressions'.
      */
     explicit FixedArityMatchExpression(
-        MatchType type, std::array<std::unique_ptr<MatchExpression>, nargs> expressions)
-        : MatchExpression(type), _expressions(std::move(expressions)) {}
+        MatchType type,
+        std::array<std::unique_ptr<MatchExpression>, nargs> expressions,
+        clonable_ptr<ErrorAnnotation> annotation = nullptr)
+        : MatchExpression(type, std::move(annotation)), _expressions(std::move(expressions)) {}
 
     const auto& expressions() const {
         return _expressions;

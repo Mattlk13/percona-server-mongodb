@@ -45,7 +45,9 @@ enums:
 commands:
     setFreeMonitoring:
         description: "setFreeMonitoring Command"
+        command_name: setFreeMonitoring
         namespace: ignored
+        api_version: ""
         fields:
           action:
             description: "Action to take"
@@ -53,5 +55,7 @@ commands:
 
     getFreeMonitoringStatus:
         description: "getFreeMonitoringStatus Command"
+        command_name: getFreeMonitoringStatus
         namespace: ignored
+        api_version: ""
 

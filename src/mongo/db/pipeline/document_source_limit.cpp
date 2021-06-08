@@ -31,12 +31,13 @@
 
 #include "mongo/db/pipeline/document_source_limit.h"
 
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
-#include "mongo/db/pipeline/value.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -44,17 +45,22 @@ using boost::intrusive_ptr;
 
 DocumentSourceLimit::DocumentSourceLimit(const intrusive_ptr<ExpressionContext>& pExpCtx,
                                          long long limit)
-    : DocumentSource(pExpCtx), _limit(limit) {}
+    : DocumentSource(kStageName, pExpCtx), _limit(limit) {}
 
 REGISTER_DOCUMENT_SOURCE(limit,
                          LiteParsedDocumentSourceDefault::parse,
-                         DocumentSourceLimit::createFromBson);
+                         DocumentSourceLimit::createFromBson,
+                         LiteParsedDocumentSource::AllowedWithApiStrict::kAlways);
 
 constexpr StringData DocumentSourceLimit::kStageName;
 
 Pipeline::SourceContainer::iterator DocumentSourceLimit::doOptimizeAt(
     Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container) {
     invariant(*itr == this);
+
+    if (std::next(itr) == container->end()) {
+        return container->end();
+    }
 
     auto nextLimit = dynamic_cast<DocumentSourceLimit*>((*std::next(itr)).get());
 
@@ -66,9 +72,7 @@ Pipeline::SourceContainer::iterator DocumentSourceLimit::doOptimizeAt(
     return std::next(itr);
 }
 
-DocumentSource::GetNextResult DocumentSourceLimit::getNext() {
-    pExpCtx->checkForInterrupt();
-
+DocumentSource::GetNextResult DocumentSourceLimit::doGetNext() {
     if (_nReturned >= _limit) {
         return GetNextResult::makeEOF();
     }
@@ -97,9 +101,10 @@ intrusive_ptr<DocumentSourceLimit> DocumentSourceLimit::create(
 
 intrusive_ptr<DocumentSource> DocumentSourceLimit::createFromBson(
     BSONElement elem, const intrusive_ptr<ExpressionContext>& pExpCtx) {
-    uassert(15957, "the limit must be specified as a number", elem.isNumber());
-
-    long long limit = elem.safeNumberLong();
-    return DocumentSourceLimit::create(pExpCtx, limit);
+    const auto limit = elem.parseIntegerElementToNonNegativeLong();
+    uassert(5107201,
+            str::stream() << "invalid argument to $limit stage: " << limit.getStatus().reason(),
+            limit.isOK());
+    return DocumentSourceLimit::create(pExpCtx, limit.getValue());
 }
 }  // namespace mongo

@@ -37,9 +37,11 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/s/balancer/cluster_statistics.h"
 #include "mongo/s/catalog/type_chunk.h"
+#include "mongo/s/request_types/move_chunk_request.h"
 #include "mongo/s/shard_id.h"
 
 namespace mongo {
+
 
 struct ZoneRange {
     ZoneRange(const BSONObj& a_min, const BSONObj& a_max, const std::string& _zone);
@@ -52,9 +54,16 @@ struct ZoneRange {
 };
 
 struct MigrateInfo {
-    MigrateInfo(const ShardId& a_to, const ChunkType& a_chunk);
+    enum MigrationReason { drain, zoneViolation, chunksImbalance };
+
+    MigrateInfo(const ShardId& a_to,
+                const ChunkType& a_chunk,
+                MoveChunkRequest::ForceJumbo a_forceJumbo,
+                MigrationReason a_reason);
 
     std::string getName() const;
+
+    BSONObj getMigrationTypeQuery() const;
 
     std::string toString() const;
 
@@ -64,10 +73,53 @@ struct MigrateInfo {
     BSONObj minKey;
     BSONObj maxKey;
     ChunkVersion version;
+    MoveChunkRequest::ForceJumbo forceJumbo;
+    MigrationReason reason;
 };
 
 typedef std::vector<ClusterStatistics::ShardStatistics> ShardStatisticsVector;
 typedef std::map<ShardId, std::vector<ChunkType>> ShardToChunksMap;
+
+/**
+ * Keeps track of zones for a collection.
+ */
+class ZoneInfo {
+public:
+    ZoneInfo();
+
+    /**
+     * Appends the specified range to the set of ranges tracked for this collection and checks if
+     * it overlaps with existing ranges.
+     */
+    Status addRangeToZone(const ZoneRange& range);
+
+    /**
+     * Returns all zones added so far.
+     */
+    const std::set<std::string>& allZones() const {
+        return _allZones;
+    }
+
+    /**
+     * Using the set of zones added so far, returns what zone corresponds to the specified chunk.
+     * Returns an empty string if the chunk doesn't fall into any zone.
+     */
+    std::string getZoneForChunk(const ChunkRange& chunkRange) const;
+
+    /**
+     * Returns all zone ranges defined.
+     */
+    const BSONObjIndexedMap<ZoneRange>& zoneRanges() const {
+        return _zoneRanges;
+    }
+
+private:
+    // Map of zone max key to the zone description
+    BSONObjIndexedMap<ZoneRange> _zoneRanges;
+
+    // Set of all zones defined for this collection
+    std::set<std::string> _allZones;
+};
 
 /**
  * This class constitutes a cache of the chunk distribution across the entire cluster along with the
@@ -125,14 +177,14 @@ public:
      * Returns all tag ranges defined for the collection.
      */
     const BSONObjIndexedMap<ZoneRange>& tagRanges() const {
-        return _zoneRanges;
+        return _zoneInfo.zoneRanges();
     }
 
     /**
      * Returns all tags defined for the collection.
      */
     const std::set<std::string>& tags() const {
-        return _allTags;
+        return _zoneInfo.allZones();
     }
 
     /**
@@ -154,11 +206,8 @@ private:
     // Map of what chunks are owned by each shard
     ShardToChunksMap _shardChunks;
 
-    // Map of zone max key to the zone description
-    BSONObjIndexedMap<ZoneRange> _zoneRanges;
-
-    // Set of all zones defined for this collection
-    std::set<std::string> _allTags;
+    // Info for zones.
+    ZoneInfo _zoneInfo;
 };
 
 class BalancerPolicy {
@@ -188,7 +237,8 @@ public:
      */
     static std::vector<MigrateInfo> balance(const ShardStatisticsVector& shardStats,
                                             const DistributionStatus& distribution,
-                                            std::set<ShardId>* usedShards);
+                                            std::set<ShardId>* usedShards,
+                                            bool forceJumbo);
 
     /**
      * Using the specified distribution information, returns a suggested better location for the
@@ -234,7 +284,8 @@ private:
                                    const std::string& tag,
                                    size_t idealNumberOfChunksPerShardForTag,
                                    std::vector<MigrateInfo>* migrations,
-                                   std::set<ShardId>* usedShards);
+                                   std::set<ShardId>* usedShards,
+                                   MoveChunkRequest::ForceJumbo forceJumbo);
 };
 
 }  // namespace mongo

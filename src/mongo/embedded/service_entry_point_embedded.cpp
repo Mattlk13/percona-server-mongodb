@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -38,8 +38,34 @@
 #include "mongo/db/service_entry_point_common.h"
 #include "mongo/embedded/not_implemented.h"
 #include "mongo/embedded/periodic_runner_embedded.h"
+#include "mongo/transport/service_executor.h"
 
 namespace mongo {
+
+namespace {
+
+/**
+ * Use the dedicated threading model for embedded clients. The following ensures any request
+ * initiated by the embedded service entry point will always go through the synchronous command
+ * execution path, and will never get scheduled on a borrowed thread.
+ */
+class EmbeddedClientObserver final : public ServiceContext::ClientObserver {
+    void onCreateClient(Client* client) {
+        auto seCtx = transport::ServiceExecutorContext{};
+        seCtx.setThreadingModel(transport::ServiceExecutor::ThreadingModel::kDedicated);
+        transport::ServiceExecutorContext::set(client, std::move(seCtx));
+    }
+    void onDestroyClient(Client*) {}
+    void onCreateOperationContext(OperationContext*) {}
+    void onDestroyOperationContext(OperationContext*) {}
+};
+
+ServiceContext::ConstructorActionRegisterer registerClientObserverConstructor{
+    "EmbeddedClientObserverConstructor", [](ServiceContext* service) {
+        service->registerClientObserver(std::make_unique<EmbeddedClientObserver>());
+    }};
+
+}  // namespace
 
 class ServiceEntryPointEmbedded::Hooks final : public ServiceEntryPointCommon::Hooks {
 public:
@@ -47,16 +73,17 @@ public:
         return false;
     }
 
+    void setPrepareConflictBehaviorForReadConcern(
+        OperationContext* opCtx, const CommandInvocation* invocation) const override {
+        mongo::setPrepareConflictBehaviorForReadConcern(
+            opCtx, repl::ReadConcernArgs::get(opCtx), PrepareConflictBehavior::kEnforce);
+    }
+
     void waitForReadConcern(OperationContext* opCtx,
                             const CommandInvocation* invocation,
                             const OpMsgRequest& request) const override {
-        const auto prepareConflictBehavior = invocation->canIgnorePrepareConflicts()
-            ? PrepareConflictBehavior::kIgnore
-            : PrepareConflictBehavior::kEnforce;
-        auto rcStatus = mongo::waitForReadConcern(opCtx,
-                                                  repl::ReadConcernArgs::get(opCtx),
-                                                  invocation->allowsAfterClusterTime(),
-                                                  prepareConflictBehavior);
+        auto rcStatus = mongo::waitForReadConcern(
+            opCtx, repl::ReadConcernArgs::get(opCtx), invocation->allowsAfterClusterTime());
         uassertStatusOK(rcStatus);
     }
 
@@ -92,7 +119,21 @@ public:
 
     void attachCurOpErrInfo(OperationContext*, const BSONObj&) const override {}
 
-    void handleException(const DBException& e, OperationContext* opCtx) const override {}
+    bool refreshDatabase(OperationContext* opCtx, const StaleDbRoutingVersion& se) const
+        noexcept override {
+        return false;
+    }
+
+    bool refreshCollection(OperationContext* opCtx, const StaleConfigInfo& se) const
+        noexcept override {
+        return false;
+    }
+
+    bool refreshCatalogCache(OperationContext* opCtx,
+                             const ShardCannotRefreshDueToLocksHeldInfo& refreshInfo) const
+        noexcept override {
+        return false;
+    }
 
     void advanceConfigOpTimeFromRequestMetadata(OperationContext* opCtx) const override {}
 
@@ -109,13 +150,14 @@ public:
                              BSONObjBuilder* metadataBob) const override {}
 };
 
-DbResponse ServiceEntryPointEmbedded::handleRequest(OperationContext* opCtx, const Message& m) {
+Future<DbResponse> ServiceEntryPointEmbedded::handleRequest(OperationContext* opCtx,
+                                                            const Message& m) noexcept {
     // Only one thread will pump at a time and concurrent calls to this will skip the pumping and go
     // directly to handleRequest. This means that the jobs in the periodic runner can't provide any
     // guarantees of the state (that they have run).
     checked_cast<PeriodicRunnerEmbedded*>(opCtx->getServiceContext()->getPeriodicRunner())
         ->tryPump();
-    return ServiceEntryPointCommon::handleRequest(opCtx, m, Hooks{});
+    return ServiceEntryPointCommon::handleRequest(opCtx, m, std::make_unique<Hooks>());
 }
 
 void ServiceEntryPointEmbedded::startSession(transport::SessionHandle session) {

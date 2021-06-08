@@ -17,218 +17,223 @@
  *  - A record for the third session id was created during oplog replay.
  */
 (function() {
-    "use strict";
+"use strict";
 
-    // This test drops a collection in the config database, which is not allowed under a session. It
-    // also manually simulates a session, which is not compatible with implicit sessions.
-    TestData.disableImplicitSessions = true;
+// This test drops a collection in the config database, which is not allowed under a session. It
+// also manually simulates a session, which is not compatible with implicit sessions.
+TestData.disableImplicitSessions = true;
 
-    load("jstests/libs/retryable_writes_util.js");
+// TODO (SERVER-24266): Once fast counts are tolerant to rollbacks, remove this guard.
+TestData.skipEnforceFastCountOnValidate = true;
 
-    if (!RetryableWritesUtil.storageEngineSupportsRetryableWrites(jsTest.options().storageEngine)) {
-        jsTestLog("Retryable writes are not supported, skipping test");
-        return;
-    }
+load("jstests/libs/retryable_writes_util.js");
 
-    load("jstests/replsets/rslib.js");
+if (!RetryableWritesUtil.storageEngineSupportsRetryableWrites(jsTest.options().storageEngine)) {
+    jsTestLog("Retryable writes are not supported, skipping test");
+    return;
+}
 
-    function assertSameRecordOnBothConnections(primary, secondary, lsid) {
-        let primaryRecord = primary.getDB("config").transactions.findOne({"_id.id": lsid.id});
-        let secondaryRecord = secondary.getDB("config").transactions.findOne({"_id.id": lsid.id});
+load("jstests/replsets/rslib.js");
 
-        jsTestLog("Primary record: " + tojson(primaryRecord));
-        jsTestLog("Secondary record: " + tojson(secondaryRecord));
+function assertSameRecordOnBothConnections(primary, secondary, lsid) {
+    let primaryRecord = primary.getDB("config").transactions.findOne({"_id.id": lsid.id});
+    let secondaryRecord = secondary.getDB("config").transactions.findOne({"_id.id": lsid.id});
 
-        assert.eq(bsonWoCompare(primaryRecord, secondaryRecord),
-                  0,
-                  "expected transaction records: " + tojson(primaryRecord) + " and " +
-                      tojson(secondaryRecord) + " to be the same for lsid: " + tojson(lsid));
-    }
+    jsTestLog("Primary record: " + tojson(primaryRecord));
+    jsTestLog("Secondary record: " + tojson(secondaryRecord));
 
-    function assertRecordHasTxnNumber(conn, lsid, txnNum) {
-        let recordTxnNum = conn.getDB("config").transactions.findOne({"_id.id": lsid.id}).txnNum;
-        assert.eq(recordTxnNum,
-                  txnNum,
-                  "expected node: " + conn + " to have txnNumber: " + txnNum + " for session id: " +
-                      lsid + " - instead found: " + recordTxnNum);
-    }
+    assert.eq(bsonWoCompare(primaryRecord, secondaryRecord),
+              0,
+              "expected transaction records: " + tojson(primaryRecord) + " and " +
+                  tojson(secondaryRecord) + " to be the same for lsid: " + tojson(lsid));
+}
 
-    let testName = "rollback_transaction_table";
-    let dbName = "test";
+function assertRecordHasTxnNumber(conn, lsid, txnNum) {
+    let recordTxnNum = conn.getDB("config").transactions.findOne({"_id.id": lsid.id}).txnNum;
+    assert.eq(recordTxnNum,
+              txnNum,
+              "expected node: " + conn + " to have txnNumber: " + txnNum +
+                  " for session id: " + lsid + " - instead found: " + recordTxnNum);
+}
 
-    let replTest = new ReplSetTest({
-        name: testName,
-        nodes: [
-            // Primary flops between nodes 0 and 1.
-            {},
-            {},
-            // Arbiter to sway elections.
-            {rsConfig: {arbiterOnly: true}}
-        ],
-        useBridge: true,
-    });
-    let nodes = replTest.startSet();
-    replTest.initiate();
+let testName = "rollback_transaction_table";
+let dbName = "test";
 
-    let downstream = nodes[0];
-    let upstream = nodes[1];
-    let arbiter = nodes[2];
+let replTest = new ReplSetTest({
+    name: testName,
+    nodes: [
+        // Primary flops between nodes 0 and 1.
+        {},
+        {},
+        // Arbiter to sway elections.
+        {rsConfig: {arbiterOnly: true}}
+    ],
+    useBridge: true,
+});
+let nodes = replTest.startSet();
+replTest.initiate();
 
-    jsTestLog("Making sure 'downstream node' is the primary node.");
-    assert.eq(downstream, replTest.getPrimary());
+// The default WC is majority and this test can't satisfy majority writes.
+assert.commandWorked(replTest.getPrimary().adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
+replTest.awaitReplication();
+let downstream = nodes[0];
+let upstream = nodes[1];
+let arbiter = nodes[2];
 
-    // Renaming or dropping the transactions collection shouldn't crash if command is not rolled
-    // back.
-    assert.commandWorked(downstream.getDB("config").transactions.renameCollection("foo"));
-    assert.commandWorked(downstream.getDB("config").foo.renameCollection("transactions"));
-    assert(downstream.getDB("config").transactions.drop());
-    assert.commandWorked(downstream.getDB("config").createCollection("transactions"));
+jsTestLog("Making sure 'downstream node' is the primary node.");
+assert.eq(downstream, replTest.getPrimary());
 
-    jsTestLog("Running a transaction on the 'downstream node' and waiting for it to replicate.");
-    let firstLsid = {id: UUID()};
-    let firstCmd = {
-        insert: "foo",
-        documents: [{_id: 10}, {_id: 30}],
-        ordered: false,
-        lsid: firstLsid,
-        txnNumber: NumberLong(5)
-    };
+// Renaming or dropping the transactions collection shouldn't crash if command is not rolled
+// back.
+assert.commandWorked(downstream.getDB("config").transactions.renameCollection("foo"));
+assert.commandWorked(downstream.getDB("config").foo.renameCollection("transactions"));
+assert(downstream.getDB("config").transactions.drop());
+assert.commandWorked(downstream.getDB("config").createCollection("transactions"));
 
-    assert.commandWorked(downstream.getDB(dbName).runCommand(firstCmd));
-    replTest.awaitReplication();
+jsTestLog("Running a transaction on the 'downstream node' and waiting for it to replicate.");
+let firstLsid = {id: UUID()};
+let firstCmd = {
+    insert: "foo",
+    documents: [{_id: 10}, {_id: 30}],
+    ordered: false,
+    lsid: firstLsid,
+    txnNumber: NumberLong(5)
+};
 
-    // Both data bearing nodes should have the same record for the first session id.
-    assertSameRecordOnBothConnections(downstream, upstream, firstLsid);
+assert.commandWorked(downstream.getDB(dbName).runCommand(firstCmd));
+replTest.awaitReplication();
 
-    assert.eq(downstream.getDB("config").transactions.find().itcount(), 1);
-    assertRecordHasTxnNumber(downstream, firstLsid, NumberLong(5));
+// Both data bearing nodes should have the same record for the first session id.
+assertSameRecordOnBothConnections(downstream, upstream, firstLsid);
 
-    assert.eq(upstream.getDB("config").transactions.find().itcount(), 1);
-    assertRecordHasTxnNumber(upstream, firstLsid, NumberLong(5));
+assert.eq(downstream.getDB("config").transactions.find().itcount(), 1);
+assertRecordHasTxnNumber(downstream, firstLsid, NumberLong(5));
 
-    jsTestLog(
-        "Creating a partition between 'the downstream and arbiter node' and 'the upstream node.'");
-    downstream.disconnect(upstream);
-    arbiter.disconnect(upstream);
+assert.eq(upstream.getDB("config").transactions.find().itcount(), 1);
+assertRecordHasTxnNumber(upstream, firstLsid, NumberLong(5));
 
-    jsTestLog(
-        "Running a higher transaction for the existing session on only the 'downstream node.'");
-    let higherTxnFirstCmd = {
-        insert: "foo",
-        documents: [{_id: 50}],
-        ordered: false,
-        lsid: firstLsid,
-        txnNumber: NumberLong(20)
-    };
+jsTestLog(
+    "Creating a partition between 'the downstream and arbiter node' and 'the upstream node.'");
+downstream.disconnect(upstream);
+arbiter.disconnect(upstream);
 
-    assert.commandWorked(downstream.getDB(dbName).runCommand(higherTxnFirstCmd));
+jsTestLog("Running a higher transaction for the existing session on only the 'downstream node.'");
+let higherTxnFirstCmd = {
+    insert: "foo",
+    documents: [{_id: 50}],
+    ordered: false,
+    lsid: firstLsid,
+    txnNumber: NumberLong(20)
+};
 
-    // Now the data bearing nodes should have different transaction table records for the first
-    // session id.
-    assert.eq(downstream.getDB("config").transactions.find().itcount(), 1);
-    assertRecordHasTxnNumber(downstream, firstLsid, NumberLong(20));
+assert.commandWorked(downstream.getDB(dbName).runCommand(higherTxnFirstCmd));
 
-    assert.eq(upstream.getDB("config").transactions.find().itcount(), 1);
-    assertRecordHasTxnNumber(upstream, firstLsid, NumberLong(5));
+// Now the data bearing nodes should have different transaction table records for the first
+// session id.
+assert.eq(downstream.getDB("config").transactions.find().itcount(), 1);
+assertRecordHasTxnNumber(downstream, firstLsid, NumberLong(20));
 
-    jsTestLog("Running a transaction for a second session on the 'downstream node.'");
-    let secondLsid = {id: UUID()};
-    let secondCmd = {
-        insert: "foo",
-        documents: [{_id: 100}, {_id: 200}],
-        ordered: false,
-        lsid: secondLsid,
-        txnNumber: NumberLong(100)
-    };
+assert.eq(upstream.getDB("config").transactions.find().itcount(), 1);
+assertRecordHasTxnNumber(upstream, firstLsid, NumberLong(5));
 
-    assert.commandWorked(downstream.getDB(dbName).runCommand(secondCmd));
+jsTestLog("Running a transaction for a second session on the 'downstream node.'");
+let secondLsid = {id: UUID()};
+let secondCmd = {
+    insert: "foo",
+    documents: [{_id: 100}, {_id: 200}],
+    ordered: false,
+    lsid: secondLsid,
+    txnNumber: NumberLong(100)
+};
 
-    // Only the downstream node should have two transaction table records, one for the first and
-    // second session ids.
-    assert.eq(downstream.getDB("config").transactions.find().itcount(), 2);
-    assertRecordHasTxnNumber(downstream, firstLsid, NumberLong(20));
-    assertRecordHasTxnNumber(downstream, secondLsid, NumberLong(100));
+assert.commandWorked(downstream.getDB(dbName).runCommand(secondCmd));
 
-    assert.eq(upstream.getDB("config").transactions.find().itcount(), 1);
-    assertRecordHasTxnNumber(upstream, firstLsid, NumberLong(5));
+// Only the downstream node should have two transaction table records, one for the first and
+// second session ids.
+assert.eq(downstream.getDB("config").transactions.find().itcount(), 2);
+assertRecordHasTxnNumber(downstream, firstLsid, NumberLong(20));
+assertRecordHasTxnNumber(downstream, secondLsid, NumberLong(100));
 
-    // We do not disconnect the downstream node from the arbiter node at the same time as we
-    // disconnect it from the upstream node. This prevents a race where the transaction using the
-    // second session id must finish before the downstream node steps down from being the primary.
-    jsTestLog(
-        "Disconnecting the 'downstream node' from the 'arbiter node' and reconnecting the 'upstream node' to the 'arbiter node.'");
-    downstream.disconnect(arbiter);
-    upstream.reconnect(arbiter);
+assert.eq(upstream.getDB("config").transactions.find().itcount(), 1);
+assertRecordHasTxnNumber(upstream, firstLsid, NumberLong(5));
 
-    jsTestLog("Waiting for the 'upstream node' to become the new primary.");
-    waitForState(downstream, ReplSetTest.State.SECONDARY);
-    waitForState(upstream, ReplSetTest.State.PRIMARY);
-    assert.eq(upstream, replTest.getPrimary());
+// We do not disconnect the downstream node from the arbiter node at the same time as we
+// disconnect it from the upstream node. This prevents a race where the transaction using the
+// second session id must finish before the downstream node steps down from being the primary.
+jsTestLog(
+    "Disconnecting the 'downstream node' from the 'arbiter node' and reconnecting the 'upstream node' to the 'arbiter node.'");
+downstream.disconnect(arbiter);
+upstream.reconnect(arbiter);
 
-    jsTestLog("Running a new transaction for a third session on the 'upstream node.'");
-    let thirdLsid = {id: UUID()};
-    let thirdCmd = {
-        insert: "foo",
-        documents: [{_id: 1000}, {_id: 2000}],
-        ordered: false,
-        lsid: thirdLsid,
-        txnNumber: NumberLong(1)
-    };
+jsTestLog("Waiting for the 'upstream node' to become the new primary.");
+waitForState(downstream, ReplSetTest.State.SECONDARY);
+waitForState(upstream, ReplSetTest.State.PRIMARY);
+assert.eq(upstream, replTest.getPrimary());
 
-    assert.commandWorked(upstream.getDB(dbName).runCommand(thirdCmd));
+jsTestLog("Running a new transaction for a third session on the 'upstream node.'");
+let thirdLsid = {id: UUID()};
+let thirdCmd = {
+    insert: "foo",
+    documents: [{_id: 1000}, {_id: 2000}],
+    ordered: false,
+    lsid: thirdLsid,
+    txnNumber: NumberLong(1)
+};
 
-    // Now the upstream node also has two transaction table records, but for the first and third
-    // session ids, not the first and second.
-    assert.eq(downstream.getDB("config").transactions.find().itcount(), 2);
-    assertRecordHasTxnNumber(downstream, firstLsid, NumberLong(20));
-    assertRecordHasTxnNumber(downstream, secondLsid, NumberLong(100));
+assert.commandWorked(upstream.getDB(dbName).runCommand(thirdCmd));
 
-    assert.eq(upstream.getDB("config").transactions.find().itcount(), 2);
-    assertRecordHasTxnNumber(upstream, firstLsid, NumberLong(5));
-    assertRecordHasTxnNumber(upstream, thirdLsid, NumberLong(1));
+// Now the upstream node also has two transaction table records, but for the first and third
+// session ids, not the first and second.
+assert.eq(downstream.getDB("config").transactions.find().itcount(), 2);
+assertRecordHasTxnNumber(downstream, firstLsid, NumberLong(20));
+assertRecordHasTxnNumber(downstream, secondLsid, NumberLong(100));
 
-    // Gets the rollback ID of the downstream node before rollback occurs.
-    let downstreamRBIDBefore = assert.commandWorked(downstream.adminCommand('replSetGetRBID')).rbid;
+assert.eq(upstream.getDB("config").transactions.find().itcount(), 2);
+assertRecordHasTxnNumber(upstream, firstLsid, NumberLong(5));
+assertRecordHasTxnNumber(upstream, thirdLsid, NumberLong(1));
 
-    jsTestLog("Reconnecting the 'downstream node.'");
-    downstream.reconnect(upstream);
-    downstream.reconnect(arbiter);
+// Gets the rollback ID of the downstream node before rollback occurs.
+let downstreamRBIDBefore = assert.commandWorked(downstream.adminCommand('replSetGetRBID')).rbid;
 
-    jsTestLog("Waiting for the 'downstream node' to complete rollback.");
-    replTest.awaitReplication();
-    replTest.awaitSecondaryNodes();
+jsTestLog("Reconnecting the 'downstream node.'");
+downstream.reconnect(upstream);
+downstream.reconnect(arbiter);
 
-    // Ensure that connection to the downstream node is re-established, since the connection should
-    // have gotten killed during the downstream node's transition to ROLLBACK state.
-    reconnect(downstream);
+jsTestLog("Waiting for the 'downstream node' to complete rollback.");
+replTest.awaitReplication();
+replTest.awaitSecondaryNodes();
 
-    jsTestLog(
-        "Checking the rollback ID of the downstream node to confirm that a rollback occurred.");
-    assert.neq(downstreamRBIDBefore,
-               assert.commandWorked(downstream.adminCommand('replSetGetRBID')).rbid);
+// Ensure that connection to the downstream node is re-established, since the connection should
+// have gotten killed during the downstream node's transition to ROLLBACK state.
+reconnect(downstream);
 
-    // Verify the record for the first lsid rolled back to its original value, the record for the
-    // second lsid was removed, and the record for the third lsid was created during oplog replay.
-    jsTestLog("Verifying the transaction collection rolled back properly.");
+jsTestLog("Checking the rollback ID of the downstream node to confirm that a rollback occurred.");
+assert.neq(downstreamRBIDBefore,
+           assert.commandWorked(downstream.adminCommand('replSetGetRBID')).rbid);
 
-    assertSameRecordOnBothConnections(downstream, upstream, firstLsid);
-    assertRecordHasTxnNumber(downstream, firstLsid, NumberLong(5));
-    assertRecordHasTxnNumber(upstream, firstLsid, NumberLong(5));
+// Verify the record for the first lsid rolled back to its original value, the record for the
+// second lsid was removed, and the record for the third lsid was created during oplog replay.
+jsTestLog("Verifying the transaction collection rolled back properly.");
 
-    assert.isnull(downstream.getDB("config").transactions.findOne({"_id.id": secondLsid.id}));
-    assert.isnull(upstream.getDB("config").transactions.findOne({"_id.id": secondLsid.id}));
+assertSameRecordOnBothConnections(downstream, upstream, firstLsid);
+assertRecordHasTxnNumber(downstream, firstLsid, NumberLong(5));
+assertRecordHasTxnNumber(upstream, firstLsid, NumberLong(5));
 
-    assertSameRecordOnBothConnections(downstream, upstream, thirdLsid);
-    assertRecordHasTxnNumber(downstream, thirdLsid, NumberLong(1));
-    assertRecordHasTxnNumber(upstream, thirdLsid, NumberLong(1));
+assert.isnull(downstream.getDB("config").transactions.findOne({"_id.id": secondLsid.id}));
+assert.isnull(upstream.getDB("config").transactions.findOne({"_id.id": secondLsid.id}));
 
-    assert.eq(downstream.getDB("config").transactions.find().itcount(), 2);
-    assert.eq(upstream.getDB("config").transactions.find().itcount(), 2);
+assertSameRecordOnBothConnections(downstream, upstream, thirdLsid);
+assertRecordHasTxnNumber(downstream, thirdLsid, NumberLong(1));
+assertRecordHasTxnNumber(upstream, thirdLsid, NumberLong(1));
 
-    // Confirm the nodes are consistent.
-    replTest.checkOplogs();
-    replTest.checkReplicatedDataHashes(testName);
-    replTest.checkCollectionCounts();
+assert.eq(downstream.getDB("config").transactions.find().itcount(), 2);
+assert.eq(upstream.getDB("config").transactions.find().itcount(), 2);
 
-    replTest.stopSet();
+// Confirm the nodes are consistent.
+replTest.checkOplogs();
+replTest.checkReplicatedDataHashes(testName);
+replTest.checkCollectionCounts();
+
+replTest.stopSet();
 }());

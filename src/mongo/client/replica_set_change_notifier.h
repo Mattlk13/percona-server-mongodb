@@ -35,9 +35,10 @@
 
 #include "mongo/client/connection_string.h"
 #include "mongo/executor/task_executor.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/util/functional.h"
+#include "mongo/util/hierarchical_acquisition.h"
 
 namespace mongo {
 
@@ -48,7 +49,6 @@ class ReplicaSetChangeNotifier {
 public:
     using Key = std::string;
     class Listener;
-    using ListenerHandle = std::unique_ptr<Listener, unique_function<void(Listener*)>>;
     struct State;
 
 public:
@@ -61,22 +61,24 @@ public:
     /**
      *  Notify every listener that there is a new ReplicaSet and initialize the State
      */
-    void onFoundSet(const std::string& replicaSet);
+    void onFoundSet(const std::string& replicaSet) noexcept;
 
     /**
      * Notify every listener that a scan completed without finding a primary and update
      */
-    void onPossibleSet(ConnectionString connectionString);
+    void onPossibleSet(ConnectionString connectionString) noexcept;
 
     /**
      * Notify every listener that a scan completed and found a new primary or config
      */
-    void onConfirmedSet(ConnectionString connectionString, HostAndPort primary);
+    void onConfirmedSet(ConnectionString connectionString,
+                        HostAndPort primary,
+                        std::set<HostAndPort> passives) noexcept;
 
     /**
      * Notify every listener that a ReplicaSet is no longer in use and drop the State
      */
-    void onDroppedSet(const std::string& replicaSet);
+    void onDroppedSet(const std::string& replicaSet) noexcept;
 
     /**
      * Create a listener of a given type and bind it to this notifier
@@ -85,23 +87,17 @@ public:
               typename... Args,
               typename = std::enable_if_t<std::is_constructible_v<DerivedT, Args...>>>
     auto makeListener(Args&&... args) {
-        auto deleter = [this](auto listener) {
-            _removeListener(listener);
-            delete listener;
-        };
-        auto ptr = new DerivedT(std::forward<Args>(args)...);
-
+        auto ptr = std::make_shared<DerivedT>(std::forward<Args>(args)...);
         _addListener(ptr);
-
-        return ListenerHandle(ptr, std::move(deleter));
+        return ptr;
     }
 
 private:
-    void _addListener(Listener* listener);
-    void _removeListener(Listener* listener);
+    void _addListener(std::shared_ptr<Listener> listener);
 
-    stdx::mutex _mutex;
-    std::vector<Listener*> _listeners;
+    Mutex _mutex =
+        MONGO_MAKE_LATCH(HierarchicalAcquisitionLevel(0), "ReplicaSetChangeNotifier::_mutex");
+    std::vector<std::weak_ptr<Listener>> _listeners;
     stdx::unordered_map<Key, State> _replicaSetStates;
 };
 
@@ -138,22 +134,22 @@ public:
     /**
      * React to a new ReplicaSet that will soon be scanned
      */
-    virtual void onFoundSet(const Key& key) = 0;
+    virtual void onFoundSet(const Key& key) noexcept = 0;
 
     /**
      * React to a finished scan that found no primary
      */
-    virtual void onPossibleSet(const State& data) = 0;
+    virtual void onPossibleSet(const State& data) noexcept = 0;
 
     /**
      * React to a finished scan that found a primary
      */
-    virtual void onConfirmedSet(const State& data) = 0;
+    virtual void onConfirmedSet(const State& data) noexcept = 0;
 
     /**
      * React to a ReplicaSet being dropped from use
      */
-    virtual void onDroppedSet(const Key& key) = 0;
+    virtual void onDroppedSet(const Key& key) noexcept = 0;
 
     /**
      * Get the State as of the last signal function invoked on the Notifier
@@ -164,11 +160,10 @@ private:
     Notifier* _notifier = nullptr;
 };
 
-using ReplicaSetChangeListenerHandle = ReplicaSetChangeNotifier::ListenerHandle;
-
 struct ReplicaSetChangeNotifier::State {
     ConnectionString connStr;
     HostAndPort primary;
+    std::set<HostAndPort> passives;
 
     int64_t generation = 0;
 };

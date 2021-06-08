@@ -27,12 +27,15 @@
  *    it in the license file.
  */
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
+
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/client.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/service_context.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 namespace repl {
@@ -66,7 +69,7 @@ void ReplicationCoordinator::set(ServiceContext* service,
 }
 
 bool ReplicationCoordinator::isOplogDisabledFor(OperationContext* opCtx,
-                                                const NamespaceString& nss) {
+                                                const NamespaceString& nss) const {
     if (getReplicationMode() == ReplicationCoordinator::modeNone) {
         return true;
     }
@@ -75,7 +78,17 @@ bool ReplicationCoordinator::isOplogDisabledFor(OperationContext* opCtx,
         return true;
     }
 
-    if (nss.db() == "local") {
+    if (ReplicationCoordinator::isOplogDisabledForNS(nss)) {
+        return true;
+    }
+
+    fassert(28626, opCtx->recoveryUnit());
+
+    return false;
+}
+
+bool ReplicationCoordinator::isOplogDisabledForNS(const NamespaceString& nss) {
+    if (nss.isLocal()) {
         return true;
     }
 
@@ -86,8 +99,6 @@ bool ReplicationCoordinator::isOplogDisabledFor(OperationContext* opCtx,
     if (nss.isDropPendingNamespace()) {
         return true;
     }
-
-    fassert(28626, opCtx->recoveryUnit());
 
     return false;
 }

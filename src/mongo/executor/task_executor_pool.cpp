@@ -33,8 +33,6 @@
 
 #include <algorithm>
 
-#include "mongo/executor/connection_pool_stats.h"
-#include "mongo/executor/task_executor.h"
 #include "mongo/executor/task_executor_pool_parameters_gen.h"
 #include "mongo/util/processinfo.h"
 
@@ -48,10 +46,10 @@ size_t TaskExecutorPool::getSuggestedPoolSize() {
     }
 
     ProcessInfo p;
-    unsigned numCores = p.getNumCores();
+    auto numCores = p.getNumAvailableCores();
 
     // Never suggest a number outside the range [4, 64].
-    return std::max(4U, std::min(64U, numCores));
+    return std::max<size_t>(4U, std::min<size_t>(64U, numCores));
 }
 
 void TaskExecutorPool::startup() {
@@ -73,8 +71,8 @@ void TaskExecutorPool::shutdownAndJoin() {
     }
 }
 
-void TaskExecutorPool::addExecutors(std::vector<std::unique_ptr<TaskExecutor>> executors,
-                                    std::unique_ptr<TaskExecutor> fixedExecutor) {
+void TaskExecutorPool::addExecutors(std::vector<std::shared_ptr<TaskExecutor>> executors,
+                                    std::shared_ptr<TaskExecutor> fixedExecutor) {
     invariant(_executors.empty());
     invariant(fixedExecutor);
     invariant(!_fixedExecutor);
@@ -83,15 +81,15 @@ void TaskExecutorPool::addExecutors(std::vector<std::unique_ptr<TaskExecutor>> e
     _executors = std::move(executors);
 }
 
-TaskExecutor* TaskExecutorPool::getArbitraryExecutor() {
+const std::shared_ptr<TaskExecutor>& TaskExecutorPool::getArbitraryExecutor() {
     invariant(!_executors.empty());
     uint64_t idx = (_counter.fetchAndAdd(1) % _executors.size());
-    return _executors[idx].get();
+    return _executors[idx];
 }
 
-TaskExecutor* TaskExecutorPool::getFixedExecutor() {
+const std::shared_ptr<TaskExecutor>& TaskExecutorPool::getFixedExecutor() {
     invariant(_fixedExecutor);
-    return _fixedExecutor.get();
+    return _fixedExecutor;
 }
 
 void TaskExecutorPool::appendConnectionStats(ConnectionPoolStats* stats) const {

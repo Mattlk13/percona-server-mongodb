@@ -31,13 +31,13 @@
 
 #include "mongo/db/bson/dotted_path_support.h"
 
-#include <cctype>
 #include <string>
 
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/util/ctype.h"
 
 namespace mongo {
 namespace dotted_path_support {
@@ -52,13 +52,14 @@ void _extractAllElementsAlongPath(const BSONObj& obj,
                                   StringData path,
                                   BSONElementColl& elements,
                                   bool expandArrayOnTrailingField,
-                                  size_t depth,
-                                  std::set<size_t>* arrayComponents) {
+                                  BSONDepthIndex depth,
+                                  MultikeyComponents* arrayComponents) {
     BSONElement e = obj.getField(path);
 
     if (e.eoo()) {
         size_t idx = path.find('.');
         if (idx != std::string::npos) {
+            invariant(depth != std::numeric_limits<BSONDepthIndex>::max());
             StringData left = path.substr(0, idx);
             StringData next = path.substr(idx + 1, path.size());
 
@@ -73,9 +74,9 @@ void _extractAllElementsAlongPath(const BSONObj& obj,
                                              arrayComponents);
             } else if (e.type() == Array) {
                 bool allDigits = false;
-                if (next.size() > 0 && std::isdigit(next[0])) {
+                if (next.size() > 0 && ctype::isDigit(next[0])) {
                     unsigned temp = 1;
-                    while (temp < next.size() && std::isdigit(next[temp]))
+                    while (temp < next.size() && ctype::isDigit(next[temp]))
                         temp++;
                     allDigits = temp == next.size() || next[temp] == '.';
                 }
@@ -165,8 +166,8 @@ void extractAllElementsAlongPath(const BSONObj& obj,
                                  StringData path,
                                  BSONElementSet& elements,
                                  bool expandArrayOnTrailingField,
-                                 std::set<size_t>* arrayComponents) {
-    const size_t initialDepth = 0;
+                                 MultikeyComponents* arrayComponents) {
+    const BSONDepthIndex initialDepth = 0;
     _extractAllElementsAlongPath(
         obj, path, elements, expandArrayOnTrailingField, initialDepth, arrayComponents);
 }
@@ -175,8 +176,8 @@ void extractAllElementsAlongPath(const BSONObj& obj,
                                  StringData path,
                                  BSONElementMultiSet& elements,
                                  bool expandArrayOnTrailingField,
-                                 std::set<size_t>* arrayComponents) {
-    const size_t initialDepth = 0;
+                                 MultikeyComponents* arrayComponents) {
+    const BSONDepthIndex initialDepth = 0;
     _extractAllElementsAlongPath(
         obj, path, elements, expandArrayOnTrailingField, initialDepth, arrayComponents);
 }

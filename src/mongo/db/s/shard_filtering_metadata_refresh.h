@@ -30,8 +30,9 @@
 #pragma once
 
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/s/collection_metadata.h"
 #include "mongo/s/chunk_version.h"
-#include "mongo/s/database_version_gen.h"
+#include "mongo/s/database_version.h"
 
 namespace mongo {
 
@@ -56,8 +57,27 @@ class OperationContext;
  */
 Status onShardVersionMismatchNoExcept(OperationContext* opCtx,
                                       const NamespaceString& nss,
-                                      ChunkVersion shardVersionReceived,
-                                      bool forceRefreshFromThisThread = false) noexcept;
+                                      boost::optional<ChunkVersion> shardVersionReceived) noexcept;
+
+void onShardVersionMismatch(OperationContext* opCtx,
+                            const NamespaceString& nss,
+                            boost::optional<ChunkVersion> shardVersionReceived);
+
+/**
+ * Starts the RecoverRefreshThread to set the current metadata on the CSR. This function will also
+ * recover any ongoing migrations if runRecover is true.
+ */
+SharedSemiFuture<void> recoverRefreshShardVersion(ServiceContext* serviceContext,
+                                                  const NamespaceString nss,
+                                                  bool runRecover);
+
+/**
+ * Unconditionally get the shard's filtering metadata from the config server on the calling thread.
+ * Returns the metadata if the nss is sharded, otherwise default unsharded metadata.
+ *
+ * NOTE: Does network I/O, so it must not be called with a lock
+ */
+CollectionMetadata forceGetCurrentMetadata(OperationContext* opCtx, const NamespaceString& nss);
 
 /**
  * Unconditionally causes the shard's filtering metadata to be refreshed from the config server and
@@ -67,8 +87,7 @@ Status onShardVersionMismatchNoExcept(OperationContext* opCtx,
  * called with a lock
  */
 ChunkVersion forceShardFilteringMetadataRefresh(OperationContext* opCtx,
-                                                const NamespaceString& nss,
-                                                bool forceRefreshFromThisThread = false);
+                                                const NamespaceString& nss);
 
 /**
  * Should be called when any client request on this shard generates a StaleDbVersion exception.
@@ -83,5 +102,28 @@ Status onDbVersionMismatchNoExcept(
     const boost::optional<DatabaseVersion>& serverDbVersion) noexcept;
 
 void forceDatabaseRefresh(OperationContext* opCtx, const StringData dbName);
+
+/**
+ * RAII-style class that enters the migration critical section and refresh the filtering
+ * metadata for the specified collection. The critical section is released when this object
+ * goes out of scope.
+ */
+class ScopedShardVersionCriticalSection {
+    ScopedShardVersionCriticalSection(const ScopedShardVersionCriticalSection&) = delete;
+    ScopedShardVersionCriticalSection& operator=(const ScopedShardVersionCriticalSection&) = delete;
+
+public:
+    ScopedShardVersionCriticalSection(OperationContext* opCtx, NamespaceString nss, BSONObj reason);
+    ~ScopedShardVersionCriticalSection();
+
+    void enterCommitPhase();
+
+private:
+    void _cleanup();
+
+    OperationContext* const _opCtx;
+    const NamespaceString _nss;
+    const BSONObj _reason;
+};
 
 }  // namespace mongo

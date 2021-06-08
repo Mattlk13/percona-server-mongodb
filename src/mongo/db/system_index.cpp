@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -41,20 +41,14 @@
 #include "mongo/db/catalog/commit_quorum_options.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/catalog/index_key_validate.h"
-#include "mongo/db/catalog/multi_index_block.h"
-#include "mongo/db/client.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
-#include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/op_observer.h"
-#include "mongo/db/repl_index_build_state.h"
 #include "mongo/db/storage/storage_options.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/future.h"
-#include "mongo/util/log.h"
 
 using namespace std::chrono_literals;
 
@@ -73,20 +67,16 @@ const NamespaceString sessionCollectionNamespace("config.system.sessions");
 
 MONGO_INITIALIZER(AuthIndexKeyPatterns)(InitializerContext*) {
     v1SystemUsersKeyPattern = BSON("user" << 1 << "userSource" << 1);
-    v3SystemUsersKeyPattern = BSON(
-        AuthorizationManager::USER_NAME_FIELD_NAME << 1 << AuthorizationManager::USER_DB_FIELD_NAME
-                                                   << 1);
-    v3SystemRolesKeyPattern = BSON(
-        AuthorizationManager::ROLE_NAME_FIELD_NAME << 1 << AuthorizationManager::ROLE_DB_FIELD_NAME
-                                                   << 1);
+    v3SystemUsersKeyPattern = BSON(AuthorizationManager::USER_NAME_FIELD_NAME
+                                   << 1 << AuthorizationManager::USER_DB_FIELD_NAME << 1);
+    v3SystemRolesKeyPattern = BSON(AuthorizationManager::ROLE_NAME_FIELD_NAME
+                                   << 1 << AuthorizationManager::ROLE_DB_FIELD_NAME << 1);
     v3SystemUsersIndexName =
         std::string(str::stream() << AuthorizationManager::USER_NAME_FIELD_NAME << "_1_"
-                                  << AuthorizationManager::USER_DB_FIELD_NAME
-                                  << "_1");
+                                  << AuthorizationManager::USER_DB_FIELD_NAME << "_1");
     v3SystemRolesIndexName =
         std::string(str::stream() << AuthorizationManager::ROLE_NAME_FIELD_NAME << "_1_"
-                                  << AuthorizationManager::ROLE_DB_FIELD_NAME
-                                  << "_1");
+                                  << AuthorizationManager::ROLE_DB_FIELD_NAME << "_1");
 
     v3SystemUsersIndexSpec.addKeys(v3SystemUsersKeyPattern);
     v3SystemUsersIndexSpec.unique();
@@ -95,18 +85,15 @@ MONGO_INITIALIZER(AuthIndexKeyPatterns)(InitializerContext*) {
     v3SystemRolesIndexSpec.addKeys(v3SystemRolesKeyPattern);
     v3SystemRolesIndexSpec.unique();
     v3SystemRolesIndexSpec.name(v3SystemRolesIndexName);
-
-    return Status::OK();
 }
 
-SharedSemiFuture<ReplIndexBuildState::IndexCatalogStats> generateSystemIndexForExistingCollection(
-    OperationContext* opCtx,
-    UUID collectionUUID,
-    const NamespaceString& ns,
-    const IndexSpec& spec) {
+void generateSystemIndexForExistingCollection(OperationContext* opCtx,
+                                              UUID collectionUUID,
+                                              const NamespaceString& ns,
+                                              const IndexSpec& spec) {
     // Do not try to generate any system indexes on a secondary.
     auto replCoord = repl::ReplicationCoordinator::get(opCtx);
-    uassert(ErrorCodes::NotMaster,
+    uassert(ErrorCodes::NotWritablePrimary,
             "Not primary while creating authorization index",
             replCoord->getReplicationMode() != repl::ReplicationCoordinator::modeReplSet ||
                 replCoord->canAcceptWritesForDatabase(opCtx, ns.db()));
@@ -114,26 +101,27 @@ SharedSemiFuture<ReplIndexBuildState::IndexCatalogStats> generateSystemIndexForE
     invariant(!opCtx->lockState()->inAWriteUnitOfWork());
 
     try {
-        auto indexSpecStatus = index_key_validate::validateIndexSpec(
-            opCtx, spec.toBSON(), ns, serverGlobalParams.featureCompatibility);
+        auto indexSpecStatus = index_key_validate::validateIndexSpec(opCtx, spec.toBSON());
         BSONObj indexSpec = fassert(40452, indexSpecStatus);
 
-        log() << "No authorization index detected on " << ns
-              << " collection. Attempting to recover by creating an index with spec: " << indexSpec;
+        LOGV2(22488,
+              "No authorization index detected on {namespace} collection. Attempting to recover by "
+              "creating an index with spec: {indexSpec}",
+              "No authorization index detected. Attempting to recover by "
+              "creating an index",
+              logAttrs(ns),
+              "indexSpec"_attr = indexSpec);
 
-        UUID buildUUID = UUID::gen();
-        IndexBuildsCoordinator* indexBuildsCoord = IndexBuildsCoordinator::get(opCtx);
-        IndexBuildsCoordinator::IndexBuildOptions indexBuildOptions = {CommitQuorumOptions(1)};
-        auto indexBuildFuture =
-            uassertStatusOK(indexBuildsCoord->startIndexBuild(opCtx,
-                                                              collectionUUID,
-                                                              {indexSpec},
-                                                              buildUUID,
-                                                              IndexBuildProtocol::kSinglePhase,
-                                                              indexBuildOptions));
-        return indexBuildFuture;
+        auto indexConstraints = IndexBuildsManager::IndexConstraints::kEnforce;
+        auto fromMigrate = false;
+        IndexBuildsCoordinator::get(opCtx)->createIndex(
+            opCtx, collectionUUID, indexSpec, indexConstraints, fromMigrate);
     } catch (const DBException& e) {
-        severe() << "Failed to regenerate index for " << ns << ". Exception: " << e.what();
+        LOGV2_FATAL_CONTINUE(22490,
+                             "Failed to regenerate index for {namespace}. Exception: {error}",
+                             "Failed to regenerate index",
+                             logAttrs(ns),
+                             "error"_attr = e.what());
         throw;
     }
 }
@@ -143,26 +131,20 @@ SharedSemiFuture<ReplIndexBuildState::IndexCatalogStats> generateSystemIndexForE
 Status verifySystemIndexes(OperationContext* opCtx) {
     // Do not try and generate any system indexes in read only mode.
     if (storageGlobalParams.readOnly) {
-        warning() << "Running in queryable backup mode. Unable to create authorization indexes";
+        LOGV2_WARNING(22489,
+                      "Running in queryable backup mode. Unable to create authorization indexes");
         return Status::OK();
     }
 
     const NamespaceString& systemUsers = AuthorizationManager::usersCollectionNamespace;
     const NamespaceString& systemRoles = AuthorizationManager::rolesCollectionNamespace;
 
-    boost::optional<SharedSemiFuture<ReplIndexBuildState::IndexCatalogStats>> systemUsersFuture;
-    boost::optional<SharedSemiFuture<ReplIndexBuildState::IndexCatalogStats>> systemRolesFuture;
-
-    // Create indexes for collections on the admin db
+    // Create indexes for the admin.system.users collection.
     {
-        AutoGetDb autoDb(opCtx, systemUsers.db(), MODE_X);
-        if (!autoDb.getDb()) {
-            return Status::OK();
-        }
+        AutoGetCollection collection(opCtx, systemUsers, MODE_X);
 
-        Collection* collection = autoDb.getDb()->getCollection(opCtx, systemUsers);
         if (collection) {
-            IndexCatalog* indexCatalog = collection->getIndexCatalog();
+            const IndexCatalog* indexCatalog = collection->getIndexCatalog();
             invariant(indexCatalog);
 
             // Make sure the old unique index from v2.4 on system.users doesn't exist.
@@ -177,30 +159,34 @@ Status verifySystemIndexes(OperationContext* opCtx) {
                               "running authSchemaUpgrade on a 2.6 server.");
             }
 
-            // Ensure that system indexes exist for the user collection
+            // Ensure that system indexes exist for the user collection.
             indexCatalog->findIndexesByKeyPattern(opCtx, v3SystemUsersKeyPattern, false, &indexes);
             if (indexes.empty()) {
                 try {
-                    systemUsersFuture = generateSystemIndexForExistingCollection(
-                        opCtx, collection->uuid().get(), systemUsers, v3SystemUsersIndexSpec);
+                    generateSystemIndexForExistingCollection(
+                        opCtx, collection->uuid(), systemUsers, v3SystemUsersIndexSpec);
                 } catch (...) {
                     return exceptionToStatus();
                 }
             }
         }
+    }
+
+    // Create indexes for the admin.system.roles collection.
+    {
+        AutoGetCollection collection(opCtx, systemRoles, MODE_X);
 
         // Ensure that system indexes exist for the roles collection, if it exists.
-        collection = autoDb.getDb()->getCollection(opCtx, systemRoles);
         if (collection) {
-            IndexCatalog* indexCatalog = collection->getIndexCatalog();
+            const IndexCatalog* indexCatalog = collection->getIndexCatalog();
             invariant(indexCatalog);
 
             std::vector<const IndexDescriptor*> indexes;
             indexCatalog->findIndexesByKeyPattern(opCtx, v3SystemRolesKeyPattern, false, &indexes);
             if (indexes.empty()) {
                 try {
-                    systemRolesFuture = generateSystemIndexForExistingCollection(
-                        opCtx, collection->uuid().get(), systemRoles, v3SystemRolesIndexSpec);
+                    generateSystemIndexForExistingCollection(
+                        opCtx, collection->uuid(), systemRoles, v3SystemRolesIndexSpec);
                 } catch (...) {
                     return exceptionToStatus();
                 }
@@ -208,55 +194,31 @@ Status verifySystemIndexes(OperationContext* opCtx) {
         }
     }
 
-    Status systemUsersStatus = Status::OK();
-    Status systemRolesStatus = Status::OK();
-
-    if (systemUsersFuture) {
-        systemUsersStatus = systemUsersFuture->waitNoThrow(opCtx);
-    }
-
-    if (systemRolesFuture) {
-        systemRolesStatus = systemRolesFuture->waitNoThrow(opCtx);
-    }
-
-    if (!systemUsersStatus.isOK()) {
-        return systemUsersStatus;
-    }
-
-    if (!systemRolesStatus.isOK()) {
-        return systemRolesStatus;
-    }
-
     return Status::OK();
 }
 
-void createSystemIndexes(OperationContext* opCtx, Collection* collection) {
+void createSystemIndexes(OperationContext* opCtx, CollectionWriter& collection) {
     invariant(collection);
     const NamespaceString& ns = collection->ns();
     BSONObj indexSpec;
     if (ns == AuthorizationManager::usersCollectionNamespace) {
-        indexSpec =
-            fassert(40455,
-                    index_key_validate::validateIndexSpec(opCtx,
-                                                          v3SystemUsersIndexSpec.toBSON(),
-                                                          ns,
-                                                          serverGlobalParams.featureCompatibility));
+        indexSpec = fassert(
+            40455, index_key_validate::validateIndexSpec(opCtx, v3SystemUsersIndexSpec.toBSON()));
 
     } else if (ns == AuthorizationManager::rolesCollectionNamespace) {
-        indexSpec =
-            fassert(40457,
-                    index_key_validate::validateIndexSpec(opCtx,
-                                                          v3SystemRolesIndexSpec.toBSON(),
-                                                          ns,
-                                                          serverGlobalParams.featureCompatibility));
+        indexSpec = fassert(
+            40457, index_key_validate::validateIndexSpec(opCtx, v3SystemRolesIndexSpec.toBSON()));
     }
     if (!indexSpec.isEmpty()) {
-        opCtx->getServiceContext()->getOpObserver()->onCreateIndex(
-            opCtx, ns, *(collection->uuid()), indexSpec, false /* fromMigrate */);
-        // Note that the opObserver is called prior to creating the index.  This ensures the index
-        // write gets the same storage timestamp as the oplog entry.
-        fassert(40456,
-                collection->getIndexCatalog()->createIndexOnEmptyCollection(opCtx, indexSpec));
+        auto fromMigrate = false;
+        try {
+            IndexBuildsCoordinator::get(opCtx)->createIndexesOnEmptyCollection(
+                opCtx, collection, {indexSpec}, fromMigrate);
+        } catch (WriteConflictException&) {
+            throw;
+        } catch (DBException& ex) {
+            fassertFailedWithStatus(40456, ex.toStatus());
+        }
     }
 }
 

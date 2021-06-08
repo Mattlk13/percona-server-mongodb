@@ -74,7 +74,7 @@ StatusWith<BSONObj> storePossibleCursor(OperationContext* opCtx,
                                         const HostAndPort& server,
                                         const BSONObj& cmdResult,
                                         const NamespaceString& requestedNss,
-                                        executor::TaskExecutor* executor,
+                                        std::shared_ptr<executor::TaskExecutor> executor,
                                         ClusterCursorManager* cursorManager,
                                         PrivilegeVector privileges,
                                         TailableModeEnum tailableMode) {
@@ -99,7 +99,10 @@ StatusWith<BSONObj> storePossibleCursor(OperationContext* opCtx,
         return cmdResult;
     }
 
-    ClusterClientCursorParams params(incomingCursorResponse.getValue().getNSS());
+    ClusterClientCursorParams params(incomingCursorResponse.getValue().getNSS(),
+                                     APIParameters::get(opCtx),
+                                     boost::none,
+                                     ReadConcernArgs::get(opCtx));
     params.remotes.emplace_back();
     auto& remoteCursor = params.remotes.back();
     remoteCursor.setShardId(shardId.toString());
@@ -117,8 +120,8 @@ StatusWith<BSONObj> storePossibleCursor(OperationContext* opCtx,
         params.isAutoCommit = false;
     }
 
-    auto ccc = ClusterClientCursorImpl::make(opCtx, executor, std::move(params));
-
+    auto ccc = ClusterClientCursorImpl::make(opCtx, std::move(executor), std::move(params));
+    ccc->incNBatches();
     // We don't expect to use this cursor until a subsequent getMore, so detach from the current
     // OperationContext until then.
     ccc->detachFromOperationContext();
@@ -136,8 +139,10 @@ StatusWith<BSONObj> storePossibleCursor(OperationContext* opCtx,
 
     CurOp::get(opCtx)->debug().cursorid = clusterCursorId.getValue();
 
-    CursorResponse outgoingCursorResponse(
-        requestedNss, clusterCursorId.getValue(), incomingCursorResponse.getValue().getBatch());
+    CursorResponse outgoingCursorResponse(requestedNss,
+                                          clusterCursorId.getValue(),
+                                          incomingCursorResponse.getValue().getBatch(),
+                                          incomingCursorResponse.getValue().getAtClusterTime());
     return outgoingCursorResponse.toBSON(CursorResponse::ResponseType::InitialResponse);
 }
 

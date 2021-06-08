@@ -40,18 +40,14 @@ Copyright (C) 2019-present Percona and/or its affiliates. All rights reserved.
 
 namespace mongo {
 MONGO_GENERAL_STARTUP_OPTIONS_REGISTER(PerconaDecryptOptions)(InitializerContext* context) {
-    return addPerconaDecryptOptions(&moe::startupOptions);
+    uassertStatusOK(addPerconaDecryptOptions(&moe::startupOptions));
 }
 
 MONGO_STARTUP_OPTIONS_VALIDATE(PerconaDecryptOptions)(InitializerContext* context) {
     if (!handlePreValidationPerconaDecryptOptions(moe::startupOptionsParsed)) {
         quickExit(EXIT_SUCCESS);
     }
-    Status ret = moe::startupOptionsParsed.validate();
-    if (!ret.isOK()) {
-        return ret;
-    }
-    return Status::OK();
+    uassertStatusOK(moe::startupOptionsParsed.validate());
 }
 
 MONGO_STARTUP_OPTIONS_STORE(PerconaDecryptOptions)(InitializerContext* context) {
@@ -61,7 +57,5 @@ MONGO_STARTUP_OPTIONS_STORE(PerconaDecryptOptions)(InitializerContext* context) 
         std::cerr << "try '" << context->args()[0] << " --help' for more information" << std::endl;
         quickExit(EXIT_BADOPTIONS);
     }
-
-    return Status::OK();
 }
 }

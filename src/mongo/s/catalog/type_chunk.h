@@ -33,11 +33,13 @@
 #include <string>
 
 #include "mongo/bson/bsonobj.h"
+#include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/s/catalog/type_chunk_base_gen.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/shard_id.h"
 #include "mongo/s/shard_key_pattern.h"
+#include "mongo/stdx/type_traits.h"
 
 namespace mongo {
 
@@ -52,12 +54,22 @@ class StatusWith;
  */
 class ChunkRange {
 public:
+    static constexpr char kMinKey[] = "min";
+    static constexpr char kMaxKey[] = "max";
+
     ChunkRange(BSONObj minKey, BSONObj maxKey);
 
     /**
      * Parses a chunk range using the format { min: <min bound>, max: <max bound> }.
      */
     static StatusWith<ChunkRange> fromBSON(const BSONObj& obj);
+
+    /**
+     * A throwing version of 'fromBSON'.
+     */
+    static ChunkRange fromBSONThrowing(const BSONObj& obj) {
+        return uassertStatusOK(fromBSON(obj));
+    }
 
     const BSONObj& getMin() const {
         return _minKey;
@@ -79,6 +91,8 @@ public:
      */
     void append(BSONObjBuilder* builder) const;
 
+    BSONObj toBSON() const;
+
     std::string toString() const;
 
     /**
@@ -99,12 +113,24 @@ public:
     boost::optional<ChunkRange> overlapWith(ChunkRange const& other) const;
 
     /**
+     * Returns true if there is any overlap between the two ranges.
+     */
+    bool overlaps(const ChunkRange& other) const;
+
+    /**
      * Returns a range that includes *this and other. If the ranges do not overlap, it includes
      * all the space between, as well.
      */
     ChunkRange unionWith(ChunkRange const& other) const;
 
 private:
+    /** Does not enforce the non-empty range invariant. */
+    ChunkRange() = default;
+
+    friend ChunkRange idlPreparsedValue(stdx::type_identity<ChunkRange>) {
+        return {};
+    }
+
     BSONObj _minKey;
     BSONObj _maxKey;
 };
@@ -174,26 +200,39 @@ public:
     static const std::string ShardNSPrefix;
 
     // Field names and types in the chunks collections.
-    static const BSONField<std::string> name;
+    static const BSONField<OID> name;
     static const BSONField<BSONObj> minShardID;
     static const BSONField<std::string> ns;
+    static const BSONField<UUID> collectionUUID;
     static const BSONField<BSONObj> min;
     static const BSONField<BSONObj> max;
     static const BSONField<std::string> shard;
     static const BSONField<bool> jumbo;
     static const BSONField<Date_t> lastmod;
     static const BSONField<OID> epoch;
+    static const BSONField<Timestamp> timestamp;
     static const BSONField<BSONObj> history;
 
     ChunkType();
     ChunkType(NamespaceString nss, ChunkRange range, ChunkVersion version, ShardId shardId);
+    ChunkType(NamespaceString nss,
+              CollectionUUID collectionUUID,
+              ChunkRange range,
+              ChunkVersion version,
+              ShardId shardId);
+    ChunkType(CollectionUUID collectionUUID,
+              ChunkRange range,
+              ChunkVersion version,
+              ShardId shardId);
 
     /**
      * Constructs a new ChunkType object from BSON that has the config server's config.chunks
      * collection format.
      *
-     * Also does validation of the contents.
+     * Also does validation of the contents. Note that 'parseFromConfigBSONCommand' does not return
+     * ErrorCodes::NoSuchKey if the '_id' field is missing while 'fromConfigBSON' does.
      */
+    static StatusWith<ChunkType> parseFromConfigBSONCommand(const BSONObj& source);
     static StatusWith<ChunkType> fromConfigBSON(const BSONObj& source);
 
     /**
@@ -208,7 +247,9 @@ public:
      *
      * Also does validation of the contents.
      */
-    static StatusWith<ChunkType> fromShardBSON(const BSONObj& source, const OID& epoch);
+    static StatusWith<ChunkType> fromShardBSON(const BSONObj& source,
+                                               const OID& epoch,
+                                               const boost::optional<Timestamp>& timestamp);
 
     /**
      * Returns the BSON representation of the entry for a shard server's config.chunks.<epoch>
@@ -216,15 +257,23 @@ public:
      */
     BSONObj toShardBSON() const;
 
-    std::string getName() const;
+    const OID& getName() const;
+    void setName(const OID& id);
 
     /**
      * Getters and setters.
      */
     const NamespaceString& getNS() const {
+        invariant(_nss);
         return _nss.get();
     }
     void setNS(const NamespaceString& nss);
+
+    const CollectionUUID& getCollectionUUID() const {
+        invariant(_collectionUUID);
+        return *_collectionUUID;
+    }
+    void setCollectionUUID(const CollectionUUID& uuid);
 
     const BSONObj& getMin() const {
         return _min.get();
@@ -271,11 +320,6 @@ public:
     void addHistoryToBSON(BSONObjBuilder& builder) const;
 
     /**
-     * Generates chunk id based on the namespace name and the lower bound of the chunk.
-     */
-    static std::string genID(const NamespaceString& nss, const BSONObj& min);
-
-    /**
      * Returns OK if all the mandatory fields have been set. Otherwise returns NoSuchKey and
      * information about the first field that is missing.
      */
@@ -289,8 +333,12 @@ public:
 private:
     // Convention: (M)andatory, (O)ptional, (S)pecial; (C)onfig, (S)hard.
 
+    // (M)(C)     auto-generated object id
+    boost::optional<OID> _id;
     // (O)(C)     collection this chunk is in
     boost::optional<NamespaceString> _nss;
+    // (O)(C)     uuid of the collection in the CollectionCatalog
+    boost::optional<CollectionUUID> _collectionUUID;
     // (M)(C)(S)  first key of the range, inclusive
     boost::optional<BSONObj> _min;
     // (M)(C)(S)  last key of the range, non-inclusive

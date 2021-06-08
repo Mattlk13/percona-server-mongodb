@@ -36,6 +36,7 @@
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/transactions_stats_gen.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/util/concurrency/with_lock.h"
 
 namespace mongo {
@@ -87,10 +88,15 @@ public:
     void incrementCurrentPrepared();
     void decrementCurrentPrepared();
 
+    void updateLastTransaction(size_t operationCount,
+                               size_t oplogOperationBytes,
+                               BSONObj writeConcern);
+
     /**
      * Appends the accumulated stats to a transactions stats object.
+     * Include the 'lastCommittedTransactions' field if 'includeLastCommitted' is true.
      */
-    void updateStats(TransactionsStats* stats);
+    void updateStats(TransactionsStats* stats, bool includeLastCommitted);
 
 private:
     // The number of multi-document transactions currently active.
@@ -122,6 +128,11 @@ private:
 
     // The current number of transactions in the prepared state.
     AtomicWord<unsigned long long> _currentPrepared{0};
+
+    // Protects member variables below.
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("ServerTransactionsMetrics::_mutex");
+
+    boost::optional<LastCommittedTransaction> _lastCommittedTransaction;
 };
 
 }  // namespace mongo

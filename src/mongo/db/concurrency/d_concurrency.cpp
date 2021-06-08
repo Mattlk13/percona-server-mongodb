@@ -27,22 +27,23 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/concurrency/d_concurrency.h"
 
+#include <memory>
 #include <string>
 #include <vector>
 
+#include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/concurrency/flow_control_ticketholder.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/service_context.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/logv2/log.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
 #include "mongo/util/stacktrace.h"
 #include "mongo/util/str.h"
 
@@ -76,7 +77,7 @@ public:
     }
 
     static std::string nameForId(ResourceId resourceId) {
-        stdx::lock_guard<stdx::mutex> lk(resourceIdFactory->labelsMutex);
+        stdx::lock_guard<Latch> lk(resourceIdFactory->labelsMutex);
         return resourceIdFactory->labels.at(resourceId.getHashId());
     }
 
@@ -92,7 +93,7 @@ public:
 
 private:
     ResourceId _newResourceIdForMutex(std::string resourceLabel) {
-        stdx::lock_guard<stdx::mutex> lk(labelsMutex);
+        stdx::lock_guard<Latch> lk(labelsMutex);
         invariant(nextId == labels.size());
         labels.push_back(std::move(resourceLabel));
 
@@ -103,7 +104,7 @@ private:
 
     std::uint64_t nextId = 0;
     std::vector<std::string> labels;
-    stdx::mutex labelsMutex;
+    Mutex labelsMutex = MONGO_MAKE_LATCH("ResourceIdFactory::labelsMutex");
 };
 
 ResourceIdFactory* ResourceIdFactory::resourceIdFactory;
@@ -139,40 +140,19 @@ bool Lock::ResourceMutex::isAtLeastReadLocked(Locker* locker) {
 Lock::GlobalLock::GlobalLock(OperationContext* opCtx,
                              LockMode lockMode,
                              Date_t deadline,
-                             InterruptBehavior behavior)
-    : GlobalLock(opCtx, lockMode, deadline, behavior, EnqueueOnly()) {
-    waitForLockUntil(deadline);
-}
-
-Lock::GlobalLock::GlobalLock(OperationContext* opCtx,
-                             LockMode lockMode,
-                             Date_t deadline,
                              InterruptBehavior behavior,
-                             EnqueueOnly enqueueOnly)
+                             bool skipRSTLLock)
     : _opCtx(opCtx),
       _result(LOCK_INVALID),
       _pbwm(opCtx->lockState(), resourceIdParallelBatchWriterMode),
       _interruptBehavior(behavior),
+      _skipRSTLLock(skipRSTLLock),
       _isOutermostLock(!opCtx->lockState()->isLocked()) {
-    _enqueue(lockMode, deadline);
-}
-
-Lock::GlobalLock::GlobalLock(GlobalLock&& otherLock)
-    : _opCtx(otherLock._opCtx),
-      _result(otherLock._result),
-      _pbwm(std::move(otherLock._pbwm)),
-      _interruptBehavior(otherLock._interruptBehavior),
-      _isOutermostLock(otherLock._isOutermostLock) {
-    // Mark as moved so the destructor doesn't invalidate the newly-constructed lock.
-    otherLock._result = LOCK_INVALID;
-}
-
-void Lock::GlobalLock::_enqueue(LockMode lockMode, Date_t deadline) {
     _opCtx->lockState()->getFlowControlTicket(_opCtx, lockMode);
 
     try {
         if (_opCtx->lockState()->shouldConflictWithSecondaryBatchApplication()) {
-            _pbwm.lock(MODE_IS);
+            _pbwm.lock(opCtx, MODE_IS, deadline);
         }
         auto unlockPBWM = makeGuard([this] {
             if (_opCtx->lockState()->shouldConflictWithSecondaryBatchApplication()) {
@@ -180,43 +160,47 @@ void Lock::GlobalLock::_enqueue(LockMode lockMode, Date_t deadline) {
             }
         });
 
-        _opCtx->lockState()->lock(
-            _opCtx, resourceIdReplicationStateTransitionLock, MODE_IX, deadline);
-
-        auto unlockRSTL = makeGuard(
-            [this] { _opCtx->lockState()->unlock(resourceIdReplicationStateTransitionLock); });
-
         _result = LOCK_INVALID;
-        _result = _opCtx->lockState()->lockGlobalBegin(_opCtx, lockMode, deadline);
+        if (skipRSTLLock) {
+            _takeGlobalLockOnly(lockMode, deadline);
+        } else {
+            _takeGlobalAndRSTLLocks(lockMode, deadline);
+        }
+        _result = LOCK_OK;
 
-        unlockRSTL.dismiss();
         unlockPBWM.dismiss();
     } catch (const ExceptionForCat<ErrorCategory::Interruption>&) {
         // The kLeaveUnlocked behavior suppresses this exception.
         if (_interruptBehavior == InterruptBehavior::kThrow)
             throw;
     }
+    auto acquiredLockMode = _opCtx->lockState()->getLockMode(resourceIdGlobal);
+    _opCtx->lockState()->setGlobalLockTakenInMode(acquiredLockMode);
 }
 
-void Lock::GlobalLock::waitForLockUntil(Date_t deadline) {
-    try {
-        if (_result == LOCK_WAITING) {
-            _result = LOCK_INVALID;
-            _opCtx->lockState()->lockGlobalComplete(_opCtx, deadline);
-            _result = LOCK_OK;
-        }
-    } catch (const ExceptionForCat<ErrorCategory::Interruption>&) {
-        _opCtx->lockState()->unlock(resourceIdReplicationStateTransitionLock);
-        if (_opCtx->lockState()->shouldConflictWithSecondaryBatchApplication()) {
-            _pbwm.unlock();
-        }
-        // The kLeaveUnlocked behavior suppresses this exception.
-        if (_interruptBehavior == InterruptBehavior::kThrow)
-            throw;
-    }
+void Lock::GlobalLock::_takeGlobalLockOnly(LockMode lockMode, Date_t deadline) {
+    _opCtx->lockState()->lockGlobal(_opCtx, lockMode, deadline);
+}
 
-    auto lockMode = _opCtx->lockState()->getLockMode(resourceIdGlobal);
-    _opCtx->lockState()->setGlobalLockTakenInMode(lockMode);
+void Lock::GlobalLock::_takeGlobalAndRSTLLocks(LockMode lockMode, Date_t deadline) {
+    _opCtx->lockState()->lock(_opCtx, resourceIdReplicationStateTransitionLock, MODE_IX, deadline);
+    auto unlockRSTL = makeGuard(
+        [this] { _opCtx->lockState()->unlock(resourceIdReplicationStateTransitionLock); });
+
+    _opCtx->lockState()->lockGlobal(_opCtx, lockMode, deadline);
+
+    unlockRSTL.dismiss();
+}
+
+Lock::GlobalLock::GlobalLock(GlobalLock&& otherLock)
+    : _opCtx(otherLock._opCtx),
+      _result(otherLock._result),
+      _pbwm(std::move(otherLock._pbwm)),
+      _interruptBehavior(otherLock._interruptBehavior),
+      _skipRSTLLock(otherLock._skipRSTLLock),
+      _isOutermostLock(otherLock._isOutermostLock) {
+    // Mark as moved so the destructor doesn't invalidate the newly-constructed lock.
+    otherLock._result = LOCK_INVALID;
 }
 
 void Lock::GlobalLock::_unlock() {
@@ -232,12 +216,6 @@ Lock::DBLock::DBLock(OperationContext* opCtx, StringData db, LockMode mode, Date
       _globalLock(
           opCtx, isSharedLockMode(_mode) ? MODE_IS : MODE_IX, deadline, InterruptBehavior::kThrow) {
     massert(28539, "need a valid database name", !db.empty() && nsIsDbOnly(db));
-
-    // The check for the admin db is to ensure direct writes to auth collections
-    // are serialized (see SERVER-16092).
-    if ((_id == resourceIdAdminDB) && !isSharedLockMode(_mode)) {
-        _mode = MODE_X;
-    }
 
     _opCtx->lockState()->lock(_opCtx, _id, _mode, deadline);
     _result = LOCK_OK;
@@ -277,20 +255,50 @@ void Lock::DBLock::relockWithMode(LockMode newMode) {
     _result = LOCK_OK;
 }
 
-
 Lock::CollectionLock::CollectionLock(OperationContext* opCtx,
-                                     const NamespaceString& nss,
+                                     const NamespaceStringOrUUID& nssOrUUID,
                                      LockMode mode,
                                      Date_t deadline)
-    : _id(RESOURCE_COLLECTION, nss.ns()), _opCtx(opCtx) {
-    invariant(nss.coll().size(), str::stream() << "expected non-empty collection name:" << nss);
-    dassert(opCtx->lockState()->isDbLockedForMode(nss.db(),
-                                                  isSharedLockMode(mode) ? MODE_IS : MODE_IX));
-    LockMode actualLockMode = mode;
-    if (!supportsDocLocking()) {
-        actualLockMode = isSharedLockMode(mode) ? MODE_S : MODE_X;
+    : _opCtx(opCtx) {
+    if (nssOrUUID.nss()) {
+        auto& nss = *nssOrUUID.nss();
+        _id = {RESOURCE_COLLECTION, nss.ns()};
+
+        invariant(nss.coll().size(), str::stream() << "expected non-empty collection name:" << nss);
+        dassert(_opCtx->lockState()->isDbLockedForMode(nss.db(),
+                                                       isSharedLockMode(mode) ? MODE_IS : MODE_IX));
+
+        _opCtx->lockState()->lock(_opCtx, _id, mode, deadline);
+        return;
     }
-    _opCtx->lockState()->lock(_opCtx, _id, actualLockMode, deadline);
+
+    // 'nsOrUUID' must be a UUID and dbName.
+
+    auto nss = CollectionCatalog::get(opCtx)->resolveNamespaceStringOrUUID(opCtx, nssOrUUID);
+
+    // The UUID cannot move between databases so this one dassert is sufficient.
+    dassert(_opCtx->lockState()->isDbLockedForMode(nss.db(),
+                                                   isSharedLockMode(mode) ? MODE_IS : MODE_IX));
+
+    // We cannot be sure that the namespace we lock matches the UUID given because we resolve the
+    // namespace from the UUID without the safety of a lock. Therefore, we will continue to re-lock
+    // until the namespace we resolve from the UUID before and after taking the lock is the same.
+    bool locked = false;
+    NamespaceString prevResolvedNss;
+    do {
+        if (locked) {
+            _opCtx->lockState()->unlock(_id);
+        }
+
+        _id = ResourceId(RESOURCE_COLLECTION, nss.ns());
+        _opCtx->lockState()->lock(_opCtx, _id, mode, deadline);
+        locked = true;
+
+        // We looked up UUID without a collection lock so it's possible that the
+        // collection name changed now. Look it up again.
+        prevResolvedNss = nss;
+        nss = CollectionCatalog::get(opCtx)->resolveNamespaceStringOrUUID(opCtx, nssOrUUID);
+    } while (nss != prevResolvedNss);
 }
 
 Lock::CollectionLock::CollectionLock(CollectionLock&& otherLock)
@@ -307,9 +315,9 @@ Lock::ParallelBatchWriterMode::ParallelBatchWriterMode(Locker* lockState)
     : _pbwm(lockState, resourceIdParallelBatchWriterMode, MODE_X),
       _shouldNotConflictBlock(lockState) {}
 
-void Lock::ResourceLock::lock(LockMode mode) {
+void Lock::ResourceLock::lock(OperationContext* opCtx, LockMode mode, Date_t deadline) {
     invariant(_result == LOCK_INVALID);
-    _locker->lock(_rid, mode);
+    _locker->lock(opCtx, _rid, mode, deadline);
     _result = LOCK_OK;
 }
 

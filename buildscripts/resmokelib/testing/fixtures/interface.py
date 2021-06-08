@@ -2,39 +2,68 @@
 
 import os.path
 import time
+from enum import Enum
+from collections import namedtuple
+from typing import List
 
 import pymongo
 import pymongo.errors
 
-from ... import config
-from ... import errors
-from ... import logging
-from ... import utils
-from ...utils import registry
+import buildscripts.resmokelib.multiversionconstants as multiversion
+import buildscripts.resmokelib.utils.registry as registry
+from buildscripts.resmokelib.testing.fixtures.fixturelib import FixtureLib
 
 _FIXTURES = {}  # type: ignore
 
+# Represents the version of the API presented by interface.py,
+# registry.py, and fixturelib.py. Increment this when making
+# possibly-breaking changes to them.
+FIXTURE_API_VERSION = 0.1
 
-def make_fixture(class_name, *args, **kwargs):
+
+class TeardownMode(Enum):
+    """
+    Enumeration representing different ways a fixture can be torn down.
+
+    Each constant has the value of a Linux signal, even though the signal won't be used on Windows.
+    This class is used because the 'signal' package on Windows has different values.
+    """
+
+    TERMINATE = 15
+    KILL = 9
+    ABORT = 6
+
+
+def make_fixture(class_name, logger, job_num, *args, **kwargs):
     """Provide factory function for creating Fixture instances."""
+
+    fixturelib = FixtureLib()
 
     if class_name not in _FIXTURES:
         raise ValueError("Unknown fixture class '%s'" % class_name)
-    return _FIXTURES[class_name](*args, **kwargs)
+    return _FIXTURES[class_name](logger, job_num, fixturelib, *args, **kwargs)
 
 
-class Fixture(object, metaclass=registry.make_registry_metaclass(_FIXTURES)):
+class Fixture(object, metaclass=registry.make_registry_metaclass(_FIXTURES)):  # pylint: disable=invalid-metaclass
     """Base class for all fixtures."""
 
     # We explicitly set the 'REGISTERED_NAME' attribute so that PyLint realizes that the attribute
     # is defined for all subclasses of Fixture.
     REGISTERED_NAME = "Fixture"
 
-    def __init__(self, logger, job_num, dbpath_prefix=None):
+    _LAST_LTS_FCV = multiversion.LAST_LTS_FCV
+    _LATEST_FCV = multiversion.LATEST_FCV
+    _LAST_LTS_BIN_VERSION = multiversion.LAST_LTS_BIN_VERSION
+
+    AWAIT_READY_TIMEOUT_SECS = 300
+
+    def __init__(self, logger, job_num, fixturelib, dbpath_prefix=None):
         """Initialize the fixture with a logger instance."""
 
-        if not isinstance(logger, logging.Logger):
-            raise TypeError("logger must be a Logger instance")
+        self.fixturelib = fixturelib
+        self.config = self.fixturelib.get_config()
+
+        self.fixturelib.assert_logger(logger)
 
         if not isinstance(job_num, int):
             raise TypeError("job_num must be an integer")
@@ -44,9 +73,14 @@ class Fixture(object, metaclass=registry.make_registry_metaclass(_FIXTURES)):
         self.logger = logger
         self.job_num = job_num
 
-        dbpath_prefix = utils.default_if_none(config.DBPATH_PREFIX, dbpath_prefix)
-        dbpath_prefix = utils.default_if_none(dbpath_prefix, config.DEFAULT_DBPATH_PREFIX)
+        dbpath_prefix = self.fixturelib.default_if_none(self.config.DBPATH_PREFIX, dbpath_prefix)
+        dbpath_prefix = self.fixturelib.default_if_none(dbpath_prefix,
+                                                        self.config.DEFAULT_DBPATH_PREFIX)
         self._dbpath_prefix = os.path.join(dbpath_prefix, "job{}".format(self.job_num))
+
+    def pids(self):
+        """Return any pids owned by this fixture."""
+        raise NotImplementedError("pids must be implemented by Fixture subclasses %s" % self)
 
     def setup(self):
         """Create the fixture."""
@@ -56,7 +90,7 @@ class Fixture(object, metaclass=registry.make_registry_metaclass(_FIXTURES)):
         """Block until the fixture can be used for testing."""
         pass
 
-    def teardown(self, finished=False):  # noqa
+    def teardown(self, finished=False, mode=None):  # noqa
         """Destroy the fixture.
 
         The fixture's logging handlers are closed if 'finished' is true,
@@ -67,15 +101,15 @@ class Fixture(object, metaclass=registry.make_registry_metaclass(_FIXTURES)):
         """
 
         try:
-            self._do_teardown()
+            self._do_teardown(mode=mode)
         finally:
             if finished:
                 for handler in self.logger.handlers:
                     # We ignore the cancellation token returned by close_later() since we always
                     # want the logs to eventually get flushed.
-                    logging.flush.close_later(handler)
+                    self.fixturelib.close_loggers(handler)
 
-    def _do_teardown(self):  # noqa
+    def _do_teardown(self, mode=None):  # noqa
         """Destroy the fixture.
 
         This method must be implemented by subclasses.
@@ -88,6 +122,10 @@ class Fixture(object, metaclass=registry.make_registry_metaclass(_FIXTURES)):
     def is_running(self):  # pylint: disable=no-self-use
         """Return true if the fixture is still operating and more tests and can be run."""
         return True
+
+    def get_node_info(self):  # pylint: disable=no-self-use
+        """Return a list of NodeInfo objects."""
+        return []
 
     def get_dbpath_prefix(self):
         """Return dbpath prefix."""
@@ -138,6 +176,7 @@ class ReplFixture(Fixture):
     REGISTERED_NAME = registry.LEAVE_UNREGISTERED  # type: ignore
 
     AWAIT_REPL_TIMEOUT_MINS = 5
+    AWAIT_REPL_TIMEOUT_FOREVER_MINS = 24 * 60
 
     def get_primary(self):
         """Return the primary of a replica set."""
@@ -172,15 +211,15 @@ class ReplFixture(Fixture):
                     message = "Failed to connect to {} within {} minutes".format(
                         self.get_driver_connection_url(), ReplFixture.AWAIT_REPL_TIMEOUT_MINS)
                     self.logger.error(message)
-                    raise errors.ServerFailure(message)
+                    raise self.fixturelib.ServerFailure(message)
             except pymongo.errors.WTimeoutError:
                 message = "Replication of write operation timed out."
                 self.logger.error(message)
-                raise errors.ServerFailure(message)
+                raise self.fixturelib.ServerFailure(message)
             except pymongo.errors.PyMongoError as err:
                 message = "Write operation on {} failed: {}".format(
                     self.get_driver_connection_url(), err)
-                raise errors.ServerFailure(message)
+                raise self.fixturelib.ServerFailure(message)
 
 
 class NoOpFixture(Fixture):
@@ -191,6 +230,10 @@ class NoOpFixture(Fixture):
     """
 
     REGISTERED_NAME = "NoOpFixture"
+
+    def pids(self):
+        """:return: any pids owned by this fixture (none for NopFixture)."""
+        return []
 
     def mongo_client(self, read_preference=None, timeout_millis=None):
         """Return the mongo_client connection."""
@@ -229,7 +272,7 @@ class FixtureTeardownHandler(object):
         """
         return self._message
 
-    def teardown(self, fixture, name):  # noqa: D406,D407,D411,D413
+    def teardown(self, fixture, name, mode=None):  # noqa: D406,D407,D411,D413
         """Tear down the given fixture and log errors instead of raising a ServerFailure exception.
 
         Args:
@@ -240,10 +283,10 @@ class FixtureTeardownHandler(object):
         """
         try:
             self._logger.info("Stopping %s...", name)
-            fixture.teardown()
+            fixture.teardown(mode=mode)
             self._logger.info("Successfully stopped %s.", name)
             return True
-        except errors.ServerFailure as err:
+        except fixture.fixturelib.ServerFailure as err:
             msg = "Error while stopping {}: {}".format(name, err)
             self._logger.warning(msg)
             self._add_error_message(msg)
@@ -255,3 +298,64 @@ class FixtureTeardownHandler(object):
             self._message = message
         else:
             self._message = "{} - {}".format(self._message, message)
+
+
+def create_fixture_table(fixture):
+    """Get fixture node info, make it a pretty table. Return it or None if fixture is invalid target."""
+    info: List[NodeInfo] = fixture.get_node_info()
+    if not info:
+        return None
+
+    columns = {}
+    longest = {}
+    for key in NodeInfo._fields:
+        longest[key] = len(key)
+        columns[key] = []
+        for node in info:
+            value = str(getattr(node, key))
+            columns[key].append(value)
+            longest[key] = max(longest[key], len(value))
+
+    def horizontal_separator():
+        row = ""
+        for key in columns:
+            row += "+" + "-" * (longest[key])
+        row += "+"
+        return row
+
+    def title_row():
+        row = ""
+        for key in columns:
+            row += "|" + key + " " * (longest[key] - len(key))
+        row += "|"
+        return row
+
+    def data_row(i):
+        row = ""
+        for key in columns:
+            row += "|" + columns[key][i] + " " * (longest[key] - len(columns[key][i]))
+        row += "|"
+        return row
+
+    table = ""
+    table += horizontal_separator() + "\n"
+    table += title_row() + "\n"
+    table += horizontal_separator() + "\n"
+    for i in range(len(info)):
+        table += data_row(i) + "\n"
+    table += horizontal_separator()
+
+    return "Fixture status:\n" + table
+
+
+def authenticate(client, auth_options=None):
+    """Authenticate client for the 'authenticationDatabase' and return the client."""
+    if auth_options is not None:
+        auth_db = client[auth_options["authenticationDatabase"]]
+        auth_db.authenticate(auth_options["username"], password=auth_options["password"],
+                             mechanism=auth_options["authenticationMechanism"])
+    return client
+
+
+# Represents a row in a node info table.
+NodeInfo = namedtuple('NodeInfo', ['full_name', 'name', 'port', 'pid'])

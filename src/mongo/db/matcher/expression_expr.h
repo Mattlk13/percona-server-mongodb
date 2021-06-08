@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include <boost/optional.hpp>
 #include <vector>
 
 #include "mongo/db/matcher/expression.h"
@@ -36,6 +37,7 @@
 #include "mongo/db/matcher/rewrite_expr.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/expression_walker.h"
 
 namespace mongo {
 
@@ -45,16 +47,25 @@ namespace mongo {
  */
 class ExprMatchExpression final : public MatchExpression {
 public:
-    ExprMatchExpression(BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& expCtx);
+    ExprMatchExpression(BSONElement elem,
+                        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                        clonable_ptr<ErrorAnnotation> annotation = nullptr);
 
     ExprMatchExpression(boost::intrusive_ptr<Expression> expr,
-                        const boost::intrusive_ptr<ExpressionContext>& expCtx);
+                        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                        clonable_ptr<ErrorAnnotation> annotation = nullptr);
 
     bool matchesSingleElement(const BSONElement& e, MatchDetails* details = nullptr) const final {
         MONGO_UNREACHABLE;
     }
 
     bool matches(const MatchableDocument* doc, MatchDetails* details = nullptr) const final;
+
+    /**
+     * Evaluates the aggregation expression of this match expression on document 'doc' and returns
+     * the result.
+     */
+    Value evaluateExpression(const MatchableDocument* doc) const;
 
     std::unique_ptr<MatchExpression> shallowClone() const final;
 
@@ -63,7 +74,7 @@ public:
         debug << "$expr " << _expression->serialize(false).toString();
     }
 
-    void serialize(BSONObjBuilder* out) const final;
+    void serialize(BSONObjBuilder* out, bool includePath) const final;
 
     bool equivalent(const MatchExpression* other) const final;
 
@@ -79,8 +90,35 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    std::vector<MatchExpression*>* getChildVector() final {
+    std::vector<std::unique_ptr<MatchExpression>>* getChildVector() final {
         return nullptr;
+    }
+
+    boost::intrusive_ptr<ExpressionContext> getExpressionContext() const {
+        return _expCtx;
+    }
+
+    boost::intrusive_ptr<Expression> getExpression() const {
+        return _expression;
+    }
+
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    /**
+     * Finds an applicable rename from 'renameList' (if one exists) and applies it to the
+     * expression. Each pair in 'renameList' specifies a path prefix that should be renamed (as the
+     * first element) and the path components that should replace the renamed prefix (as the second
+     * element).
+     */
+    void applyRename(const StringMap<std::string>& renameList) {
+        SubstituteFieldPathWalker substituteWalker(renameList);
+        expression_walker::walk(&substituteWalker, _expression.get());
     }
 
 private:

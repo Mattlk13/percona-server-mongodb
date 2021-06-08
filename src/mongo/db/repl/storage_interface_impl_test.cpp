@@ -34,11 +34,11 @@
 #include <memory>
 
 #include "mongo/bson/bsonmisc.h"
-#include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/catalog/index_catalog.h"
+#include "mongo/db/catalog/validate_results.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
@@ -48,15 +48,16 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/oplog.h"
+#include "mongo/db/repl/oplog_applier_impl_test_fixture.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/repl/storage_interface_impl.h"
-#include "mongo/db/repl/sync_tail_test_fixture.h"
 #include "mongo/db/service_context_d_test_fixture.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/db/storage/durable_catalog.h"
 #include "mongo/stdx/thread.h"
+#include "mongo/transport/transport_layer_mock.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/str.h"
 
 namespace {
@@ -67,14 +68,10 @@ using namespace mongo::repl;
 const auto kIndexVersion = IndexDescriptor::IndexVersion::kV2;
 
 BSONObj makeIdIndexSpec(const NamespaceString& nss) {
-    return BSON("ns" << nss.toString() << "name"
-                     << "_id_"
-                     << "key"
-                     << BSON("_id" << 1)
-                     << "unique"
-                     << true
-                     << "v"
-                     << static_cast<int>(kIndexVersion));
+    return BSON("name"
+                << "_id_"
+                << "key" << BSON("_id" << 1) << "unique" << true << "v"
+                << static_cast<int>(kIndexVersion));
 }
 
 /**
@@ -134,13 +131,12 @@ void createCollection(OperationContext* opCtx,
  */
 int _createIndexOnEmptyCollection(OperationContext* opCtx, NamespaceString nss, BSONObj indexSpec) {
     Lock::DBLock dbLock(opCtx, nss.db(), MODE_X);
-    AutoGetCollection autoColl(opCtx, nss, MODE_X);
-    auto coll = autoColl.getCollection();
-
-    auto indexCatalog = coll->getIndexCatalog();
-    ASSERT(indexCatalog);
+    AutoGetCollection coll(opCtx, nss, MODE_X);
 
     WriteUnitOfWork wunit(opCtx);
+    auto indexCatalog = coll.getWritableCollection()->getIndexCatalog();
+    ASSERT(indexCatalog);
+
     ASSERT_OK(indexCatalog->createIndexOnEmptyCollection(opCtx, indexSpec).getStatus());
     wunit.commit();
 
@@ -160,10 +156,12 @@ TimestampedBSONObj makeOplogEntry(OpTime opTime) {
 /**
  * Counts the number of keys in an index using an IndexAccessMethod::validate call.
  */
-int64_t getIndexKeyCount(OperationContext* opCtx, IndexCatalog* cat, const IndexDescriptor* desc) {
+int64_t getIndexKeyCount(OperationContext* opCtx,
+                         const IndexCatalog* cat,
+                         const IndexDescriptor* desc) {
     auto idx = cat->getEntry(desc)->accessMethod();
     int64_t numKeys;
-    ValidateResults fullRes;
+    IndexValidateResults fullRes;
     idx->validate(opCtx, &numKeys, &fullRes);
     return numKeys;
 }
@@ -202,7 +200,7 @@ private:
         ServiceContextMongoDTest::setUp();
         _createOpCtx();
         auto service = getServiceContext();
-        auto replCoord = stdx::make_unique<ReplicationCoordinatorMock>(service);
+        auto replCoord = std::make_unique<ReplicationCoordinatorMock>(service);
         _replicationCoordinatorMock = replCoord.get();
         ReplicationCoordinator::set(service, std::move(replCoord));
     }
@@ -217,8 +215,8 @@ private:
     void _createOpCtx() {
         _opCtx = cc().makeOperationContext();
         // We are not replicating nor validating these writes.
-        _uwb = stdx::make_unique<UnreplicatedWritesBlock>(_opCtx.get());
-        _ddv = stdx::make_unique<DisableDocumentValidation>(_opCtx.get());
+        _uwb = std::make_unique<UnreplicatedWritesBlock>(_opCtx.get());
+        _ddv = std::make_unique<DisableDocumentValidation>(_opCtx.get());
     }
 
     ServiceContext::UniqueOperationContext _opCtx;
@@ -299,8 +297,7 @@ void _assertRollbackIDDocument(OperationContext* opCtx, int id) {
         opCtx,
         NamespaceString(StorageInterfaceImpl::kDefaultRollbackIdNamespace),
         {BSON("_id" << StorageInterfaceImpl::kRollbackIdDocumentId
-                    << StorageInterfaceImpl::kRollbackIdFieldName
-                    << id)});
+                    << StorageInterfaceImpl::kRollbackIdFieldName << id)});
 }
 
 TEST_F(StorageInterfaceImplTest, RollbackIdInitializesIncrementsAndReadsProperly) {
@@ -380,8 +377,7 @@ TEST_F(StorageInterfaceImplTest, GetRollbackIDReturnsBadStatusIfRollbackIDIsNotI
 
     std::vector<TimestampedBSONObj> badDoc = {
         TimestampedBSONObj{BSON("_id" << StorageInterfaceImpl::kRollbackIdDocumentId
-                                      << StorageInterfaceImpl::kRollbackIdFieldName
-                                      << "bad id"),
+                                      << StorageInterfaceImpl::kRollbackIdFieldName << "bad id"),
                            Timestamp::min()}};
     ASSERT_OK(storage.insertDocuments(opCtx, nss, transformInserts(badDoc)));
     ASSERT_EQUALS(ErrorCodes::TypeMismatch, storage.getRollbackID(opCtx).getStatus());
@@ -389,7 +385,7 @@ TEST_F(StorageInterfaceImplTest, GetRollbackIDReturnsBadStatusIfRollbackIDIsNotI
 
 TEST_F(StorageInterfaceImplTest, SnapshotSupported) {
     auto opCtx = getOperationContext();
-    Status status = opCtx->recoveryUnit()->obtainMajorityCommittedSnapshot();
+    Status status = opCtx->recoveryUnit()->majorityCommittedSnapshotAvailable();
     ASSERT(status.isOK());
 }
 
@@ -578,8 +574,7 @@ TEST_F(StorageInterfaceImplTest, CreateCollectionWithIDIndexCommits) {
     ASSERT_OK(loader->insertDocuments(docs.begin(), docs.end()));
     ASSERT_OK(loader->commit());
 
-    AutoGetCollectionForReadCommand autoColl(opCtx, nss);
-    auto coll = autoColl.getCollection();
+    AutoGetCollectionForReadCommand coll(opCtx, nss);
     ASSERT(coll);
     ASSERT_EQ(coll->getRecordStore()->numRecords(opCtx), 2LL);
     auto collIdxCat = coll->getIndexCatalog();
@@ -592,7 +587,7 @@ void _testDestroyUncommitedCollectionBulkLoader(
     OperationContext* opCtx,
     const NamespaceString& nss,
     std::vector<BSONObj> secondaryIndexes,
-    stdx::function<void(std::unique_ptr<CollectionBulkLoader> loader)> destroyLoaderFn) {
+    std::function<void(std::unique_ptr<CollectionBulkLoader> loader)> destroyLoaderFn) {
     StorageInterfaceImpl storage;
     CollectionOptions opts = generateOptionsWithUuid();
     auto loaderStatus =
@@ -606,8 +601,7 @@ void _testDestroyUncommitedCollectionBulkLoader(
     // Collection and ID index should not exist after 'loader' is destroyed.
     destroyLoaderFn(std::move(loader));
 
-    AutoGetCollectionForReadCommand autoColl(opCtx, nss);
-    auto coll = autoColl.getCollection();
+    AutoGetCollectionForReadCommand coll(opCtx, nss);
 
     // Bulk loader is used to create indexes. The collection is not dropped when the bulk loader is
     // destroyed.
@@ -624,9 +618,7 @@ TEST_F(StorageInterfaceImplTest, DestroyingUncommittedCollectionBulkLoaderDropsI
     auto opCtx = getOperationContext();
     auto nss = makeNamespace(_agent);
     std::vector<BSONObj> indexes = {BSON("v" << 1 << "key" << BSON("x" << 1) << "name"
-                                             << "x_1"
-                                             << "ns"
-                                             << nss.ns())};
+                                             << "x_1")};
     auto destroyLoaderFn = [](std::unique_ptr<CollectionBulkLoader> loader) {
         // Destroy 'loader' by letting it go out of scope.
     };
@@ -649,9 +641,7 @@ TEST_F(StorageInterfaceImplTest,
     auto opCtx = getOperationContext();
     auto nss = makeNamespace(_agent);
     std::vector<BSONObj> indexes = {BSON("v" << 1 << "key" << BSON("x" << 1) << "name"
-                                             << "x_1"
-                                             << "ns"
-                                             << nss.ns())};
+                                             << "x_1")};
     auto destroyLoaderFn = [](std::unique_ptr<CollectionBulkLoader> loader) {
         // Destroy 'loader' in a new thread that does not have a Client.
         stdx::thread([&loader]() { loader.reset(); }).join();
@@ -803,7 +793,9 @@ TEST_F(StorageInterfaceImplTest, RenameCollectionWithStayTempFalseMakesItNotTemp
 
     AutoGetCollectionForReadCommand autoColl2(opCtx, toNss);
     ASSERT_TRUE(autoColl2.getCollection());
-    ASSERT_FALSE(autoColl2.getCollection()->getCatalogEntry()->getCollectionOptions(opCtx).temp);
+    ASSERT_FALSE(DurableCatalog::get(opCtx)
+                     ->getCollectionOptions(opCtx, autoColl2.getCollection()->getCatalogId())
+                     .temp);
 }
 
 TEST_F(StorageInterfaceImplTest, RenameCollectionWithStayTempTrueMakesItTemp) {
@@ -822,7 +814,9 @@ TEST_F(StorageInterfaceImplTest, RenameCollectionWithStayTempTrueMakesItTemp) {
 
     AutoGetCollectionForReadCommand autoColl2(opCtx, toNss);
     ASSERT_TRUE(autoColl2.getCollection());
-    ASSERT_TRUE(autoColl2.getCollection()->getCatalogEntry()->getCollectionOptions(opCtx).temp);
+    ASSERT_TRUE(DurableCatalog::get(opCtx)
+                    ->getCollectionOptions(opCtx, autoColl2.getCollection()->getCatalogId())
+                    .temp);
 }
 
 TEST_F(StorageInterfaceImplTest, RenameCollectionFailsBetweenDatabases) {
@@ -914,10 +908,7 @@ TEST_F(StorageInterfaceImplTest, FindDocumentsReturnsIndexOptionsConflictIfIndex
     auto nss = makeNamespace(_agent);
     std::vector<BSONObj> indexes = {BSON("v" << 1 << "key" << BSON("x" << 1) << "name"
                                              << "x_1"
-                                             << "ns"
-                                             << nss.ns()
-                                             << "partialFilterExpression"
-                                             << BSON("y" << 1))};
+                                             << "partialFilterExpression" << BSON("y" << 1))};
     auto loader = unittest::assertGet(storage.createCollectionForBulkLoading(
         nss, generateOptionsWithUuid(), makeIdIndexSpec(nss), indexes));
     std::vector<BSONObj> docs = {BSON("_id" << 1), BSON("_id" << 1), BSON("_id" << 2)};
@@ -975,8 +966,8 @@ void _assertDocumentsEqual(const StatusWith<std::vector<BSONObj>>& statusWithDoc
                            const std::vector<BSONObj>& expectedDocs) {
     const auto actualDocs = unittest::assertGet(statusWithDocs);
     auto iter = actualDocs.cbegin();
-    std::string msg = str::stream() << "expected: " << _toString(expectedDocs)
-                                    << "; actual: " << _toString(actualDocs);
+    std::string msg = str::stream()
+        << "expected: " << _toString(expectedDocs) << "; actual: " << _toString(actualDocs);
     for (const auto& doc : expectedDocs) {
         ASSERT_TRUE(iter != actualDocs.cend()) << msg;
         ASSERT_BSONOBJ_EQ(doc, *(iter++));
@@ -2158,7 +2149,7 @@ TEST_F(StorageInterfaceImplTest,
     // Checks that we can update collections with namespaces not considered "legal client system"
     // namespaces.
     NamespaceString nss("local.system.rollback.docs");
-    ASSERT_FALSE(nss.isLegalClientSystemNS());
+    ASSERT_FALSE(nss.isLegalClientSystemNS(serverGlobalParams.featureCompatibility));
 
     auto opCtx = getOperationContext();
     auto options = generateOptionsWithUuid();
@@ -2264,9 +2255,7 @@ TEST_F(StorageInterfaceImplTest, DeleteByFilterReturnsNamespaceNotFoundWhenDatab
     ASSERT_EQUALS(ErrorCodes::NamespaceNotFound, status);
     ASSERT_EQUALS(std::string(str::stream()
                               << "Database [nosuchdb] not found. Unable to delete documents in "
-                              << nss.ns()
-                              << " using filter "
-                              << filter),
+                              << nss.ns() << " using filter " << filter),
                   status.reason());
 }
 
@@ -2283,16 +2272,23 @@ TEST_F(StorageInterfaceImplTest, DeleteByFilterReturnsBadValueWhenFilterContains
 }
 
 TEST_F(StorageInterfaceImplTest, DeleteByFilterReturnsIllegalOperationOnCappedCollection) {
-    auto opCtx = getOperationContext();
+    // User operations are not allowed to delete from capped collections.
+    transport::TransportLayerMock transportLayerMock;
+    auto userClient = getOperationContext()->getServiceContext()->makeClient(
+        "user", transportLayerMock.createSession());
+    AlternativeClientRegion acr(userClient);
+    const auto opCtx = cc().makeOperationContext();
+    ASSERT(cc().isFromUserConnection());
+
     StorageInterfaceImpl storage;
     auto nss = makeNamespace(_agent);
     CollectionOptions options = generateOptionsWithUuid();
     options.capped = true;
     options.cappedSize = 1024 * 1024;
-    ASSERT_OK(storage.createCollection(opCtx, nss, options));
+    ASSERT_OK(storage.createCollection(opCtx.get(), nss, options));
 
     auto filter = BSON("x" << 1);
-    auto status = storage.deleteByFilter(opCtx, nss, filter);
+    auto status = storage.deleteByFilter(opCtx.get(), nss, filter);
     ASSERT_EQUALS(ErrorCodes::IllegalOperation, status);
     ASSERT_STRING_CONTAINS(status.reason(),
                            str::stream() << "cannot remove from a capped collection: " << nss.ns());
@@ -2362,9 +2358,7 @@ TEST_F(StorageInterfaceImplTest, DeleteByFilterReturnsNamespaceNotFoundWhenColle
     ASSERT_EQUALS(std::string(
                       str::stream()
                       << "Collection [mydb.wrongColl] not found. Unable to delete documents in "
-                      << wrongColl.ns()
-                      << " using filter "
-                      << filter),
+                      << wrongColl.ns() << " using filter " << filter),
                   status.reason());
 }
 
@@ -2455,7 +2449,7 @@ TEST_F(StorageInterfaceImplTest, DeleteByFilterRemovesDocumentsInIllegalClientSy
     // Checks that we can remove documents from collections with namespaces not considered "legal
     // client system" namespaces.
     NamespaceString nss("local.system.rollback.docs");
-    ASSERT_FALSE(nss.isLegalClientSystemNS());
+    ASSERT_FALSE(nss.isLegalClientSystemNS(serverGlobalParams.featureCompatibility));
 
     auto opCtx = getOperationContext();
     StorageInterfaceImpl storage;
@@ -2484,8 +2478,7 @@ TEST_F(StorageInterfaceImplTest,
     CollectionOptions options = generateOptionsWithUuid();
     options.collation = BSON("locale"
                              << "en_US"
-                             << "strength"
-                             << 2);
+                             << "strength" << 2);
     ASSERT_OK(storage.createCollection(opCtx, nss, options));
 
     auto doc1 = BSON("_id" << 1 << "x"
@@ -2622,7 +2615,7 @@ TEST_F(StorageInterfaceImplTest, SetIndexIsMultikeyReturnsNamespaceNotFoundForMi
     StorageInterfaceImpl storage;
     auto nss = makeNamespace(_agent);
     ASSERT_EQUALS(ErrorCodes::NamespaceNotFound,
-                  storage.setIndexIsMultikey(opCtx, nss, "foo", {}, Timestamp(3, 3)));
+                  storage.setIndexIsMultikey(opCtx, nss, "foo", {}, {}, Timestamp(3, 3)));
 }
 
 TEST_F(StorageInterfaceImplTest, SetIndexIsMultikeyReturnsNamespaceNotFoundForMissingCollection) {
@@ -2632,7 +2625,7 @@ TEST_F(StorageInterfaceImplTest, SetIndexIsMultikeyReturnsNamespaceNotFoundForMi
     NamespaceString wrongColl(nss.db(), "wrongColl"_sd);
     ASSERT_OK(storage.createCollection(opCtx, nss, CollectionOptions()));
     ASSERT_EQUALS(ErrorCodes::NamespaceNotFound,
-                  storage.setIndexIsMultikey(opCtx, wrongColl, "foo", {}, Timestamp(3, 3)));
+                  storage.setIndexIsMultikey(opCtx, wrongColl, "foo", {}, {}, Timestamp(3, 3)));
 }
 
 TEST_F(StorageInterfaceImplTest, SetIndexIsMultikeyReturnsIndexNotFoundForMissingIndex) {
@@ -2641,7 +2634,7 @@ TEST_F(StorageInterfaceImplTest, SetIndexIsMultikeyReturnsIndexNotFoundForMissin
     auto nss = makeNamespace(_agent);
     ASSERT_OK(storage.createCollection(opCtx, nss, CollectionOptions()));
     ASSERT_EQUALS(ErrorCodes::IndexNotFound,
-                  storage.setIndexIsMultikey(opCtx, nss, "foo", {}, Timestamp(3, 3)));
+                  storage.setIndexIsMultikey(opCtx, nss, "foo", {}, {}, Timestamp(3, 3)));
 }
 
 TEST_F(StorageInterfaceImplTest, SetIndexIsMultikeyReturnsInvalidOptionsForNullTimestamp) {
@@ -2650,7 +2643,7 @@ TEST_F(StorageInterfaceImplTest, SetIndexIsMultikeyReturnsInvalidOptionsForNullT
     auto nss = makeNamespace(_agent);
     ASSERT_OK(storage.createCollection(opCtx, nss, CollectionOptions()));
     ASSERT_EQUALS(ErrorCodes::InvalidOptions,
-                  storage.setIndexIsMultikey(opCtx, nss, "foo", {}, Timestamp()));
+                  storage.setIndexIsMultikey(opCtx, nss, "foo", {}, {}, Timestamp()));
 }
 
 TEST_F(StorageInterfaceImplTest, SetIndexIsMultikeySucceeds) {
@@ -2660,19 +2653,18 @@ TEST_F(StorageInterfaceImplTest, SetIndexIsMultikeySucceeds) {
     ASSERT_OK(storage.createCollection(opCtx, nss, CollectionOptions()));
 
     auto indexName = "a_b_1";
-    auto indexSpec =
-        BSON("name" << indexName << "ns" << nss.ns() << "key" << BSON("a.b" << 1) << "v"
-                    << static_cast<int>(kIndexVersion));
+    auto indexSpec = BSON("name" << indexName << "key" << BSON("a.b" << 1) << "v"
+                                 << static_cast<int>(kIndexVersion));
     ASSERT_EQUALS(_createIndexOnEmptyCollection(opCtx, nss, indexSpec), 2);
 
     MultikeyPaths paths = {{1}};
-    ASSERT_OK(storage.setIndexIsMultikey(opCtx, nss, indexName, paths, Timestamp(3, 3)));
+    ASSERT_OK(storage.setIndexIsMultikey(opCtx, nss, indexName, {}, paths, Timestamp(3, 3)));
     AutoGetCollectionForReadCommand autoColl(opCtx, nss);
     ASSERT_TRUE(autoColl.getCollection());
     auto indexCatalog = autoColl.getCollection()->getIndexCatalog();
-    ASSERT(indexCatalog->isMultikey(opCtx, indexCatalog->findIndexByName(opCtx, indexName)));
-    ASSERT(paths ==
-           indexCatalog->getMultikeyPaths(opCtx, indexCatalog->findIndexByName(opCtx, indexName)));
+    auto entry = indexCatalog->findIndexByName(opCtx, indexName)->getEntry();
+    ASSERT(entry->isMultikey());
+    ASSERT(paths == entry->getMultikeyPaths(opCtx));
 }
 
 }  // namespace

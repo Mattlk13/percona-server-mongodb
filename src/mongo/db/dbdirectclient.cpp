@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -43,13 +43,12 @@
 #include "mongo/db/wire_version.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/transport/service_entry_point.h"
-#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
 
-using std::unique_ptr;
 using std::string;
+using std::unique_ptr;
 
 namespace {
 
@@ -79,6 +78,10 @@ DBDirectClient::DBDirectClient(OperationContext* opCtx) : _opCtx(opCtx) {
     _setServerRPCProtocols(rpc::supports::kAll);
 }
 
+void DBDirectClient::_auth(const BSONObj& params) {
+    uasserted(2625701, "DBDirectClient should not authenticate");
+}
+
 bool DBDirectClient::isFailed() const {
     return false;
 }
@@ -97,12 +100,12 @@ std::string DBDirectClient::getServerAddress() const {
 
 // Returned version should match the incoming connections restrictions.
 int DBDirectClient::getMinWireVersion() {
-    return WireSpec::instance().incomingExternalClient.minWireVersion;
+    return WireSpec::instance().get()->incomingExternalClient.minWireVersion;
 }
 
 // Returned version should match the incoming connections restrictions.
 int DBDirectClient::getMaxWireVersion() {
-    return WireSpec::instance().incomingExternalClient.maxWireVersion;
+    return WireSpec::instance().get()->incomingExternalClient.maxWireVersion;
 }
 
 bool DBDirectClient::isReplicaSetMember() const {
@@ -111,7 +114,7 @@ bool DBDirectClient::isReplicaSetMember() const {
 }
 
 ConnectionString::ConnectionType DBDirectClient::type() const {
-    return ConnectionString::MASTER;
+    return ConnectionString::ConnectionType::kStandalone;
 }
 
 double DBDirectClient::getSoTimeout() const {
@@ -120,10 +123,6 @@ double DBDirectClient::getSoTimeout() const {
 
 bool DBDirectClient::lazySupported() const {
     return false;
-}
-
-void DBDirectClient::setOpCtx(OperationContext* opCtx) {
-    _opCtx = opCtx;
 }
 
 QueryOptions DBDirectClient::_lookupAvailableOptions() {
@@ -144,7 +143,8 @@ DbResponse loopbackBuildResponse(OperationContext* const opCtx,
 
     toSend.header().setId(nextMessageId());
     toSend.header().setResponseToMsgId(0);
-    return opCtx->getServiceContext()->getServiceEntryPoint()->handleRequest(opCtx, toSend);
+    IgnoreAPIParametersBlock ignoreApiParametersBlock(opCtx);
+    return opCtx->getServiceContext()->getServiceEntryPoint()->handleRequest(opCtx, toSend).get();
 }
 }  // namespace
 
@@ -167,20 +167,33 @@ unique_ptr<DBClientCursor> DBDirectClient::query(const NamespaceStringOrUUID& ns
                                                  int nToSkip,
                                                  const BSONObj* fieldsToReturn,
                                                  int queryOptions,
-                                                 int batchSize) {
+                                                 int batchSize,
+                                                 boost::optional<BSONObj> readConcernObj) {
+    invariant(!readConcernObj, "passing readConcern to DBDirectClient functions is not supported");
     return DBClientBase::query(
         nsOrUuid, query, nToReturn, nToSkip, fieldsToReturn, queryOptions, batchSize);
 }
 
-unsigned long long DBDirectClient::count(
-    const string& ns, const BSONObj& query, int options, int limit, int skip) {
-    DirectClientScope directClientScope(_opCtx);
-    BSONObj cmdObj = _countCmd(ns, query, options, limit, skip);
+write_ops::FindAndModifyCommandReply DBDirectClient::findAndModify(
+    const write_ops::FindAndModifyCommandRequest& findAndModify) {
+    auto response = runCommand(findAndModify.serialize({}));
+    return FindAndModifyOp::parseResponse(response->getCommandReply());
+}
 
-    NamespaceString nsString(ns);
+long long DBDirectClient::count(const NamespaceStringOrUUID nsOrUuid,
+                                const BSONObj& query,
+                                int options,
+                                int limit,
+                                int skip,
+                                boost::optional<BSONObj> readConcernObj) {
+    invariant(!readConcernObj, "passing readConcern to DBDirectClient functions is not supported");
+    DirectClientScope directClientScope(_opCtx);
+    BSONObj cmdObj = _countCmd(nsOrUuid, query, options, limit, skip, boost::none);
+
+    auto dbName = (nsOrUuid.uuid() ? nsOrUuid.dbname() : (*nsOrUuid.nss()).db().toString());
 
     auto result = CommandHelpers::runCommandDirectly(
-        _opCtx, OpMsgRequest::fromDBAndBody(nsString.db(), std::move(cmdObj)));
+        _opCtx, OpMsgRequest::fromDBAndBody(dbName, std::move(cmdObj)));
 
     uassertStatusOK(getStatusFromCommandResult(result));
     return static_cast<unsigned long long>(result["n"].numberLong());

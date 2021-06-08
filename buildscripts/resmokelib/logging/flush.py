@@ -4,9 +4,10 @@ These instances are used to send logs to buildlogger.
 """
 
 import logging
-import sched
 import threading
 import time
+
+from buildscripts.resmokelib.utils import scheduler
 
 _FLUSH_THREAD_LOCK = threading.Lock()
 _FLUSH_THREAD = None
@@ -32,8 +33,12 @@ def stop_thread():
             raise ValueError("FlushThread hasn't been started")
 
     _FLUSH_THREAD.signal_shutdown()
-    _FLUSH_THREAD.await_shutdown()
-    _FLUSH_THREAD.join()
+    # Wait for 5min instead of _FLUSH_THREAD.await_shutdown() because we can
+    # sometimes wait indefinitely for a response, causing a task timeout.
+    _FLUSH_THREAD.join(5 * 60)
+
+    success = not _FLUSH_THREAD.is_alive()
+    return success
 
 
 def flush_after(handler, delay):
@@ -93,7 +98,7 @@ class _FlushThread(threading.Thread):
             self.__schedule_updated.wait(secs)
             self.__schedule_updated.clear()
 
-        self.__scheduler = sched.scheduler(time.time, interruptible_sleep)
+        self.__scheduler = scheduler.Scheduler(time.monotonic, interruptible_sleep)
         self.__schedule_updated = threading.Event()
         self.__should_stop = threading.Event()
         self.__terminated = threading.Event()

@@ -36,12 +36,13 @@
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/json.h"
+#include "mongo/db/exec/document_value/document_value_test_util.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
 #include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/document_source_mock.h"
 #include "mongo/db/pipeline/document_source_project.h"
-#include "mongo/db/pipeline/document_value_test_util.h"
-#include "mongo/db/pipeline/value.h"
+#include "mongo/db/pipeline/semantic_analysis.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -50,9 +51,9 @@ using boost::intrusive_ptr;
 using std::vector;
 
 //
-// DocumentSourceProject delegates much of its responsibilities to the ParsedAggregationProjection.
-// Most of the functional tests are testing ParsedAggregationProjection directly. These are meant as
-// simpler integration tests.
+// DocumentSourceProject delegates much of its responsibilities to the ProjectionExecutor. Most of
+// the functional tests are testing ProjectionExecutor directly. These are meant as simpler
+// integration tests.
 //
 
 // This provides access to getExpCtx(), but we'll use a different name for this test suite.
@@ -60,9 +61,9 @@ using ProjectStageTest = AggregationContextFixture;
 using UnsetTest = AggregationContextFixture;
 
 TEST_F(ProjectStageTest, InclusionProjectionShouldRemoveUnspecifiedFields) {
-    auto project =
-        DocumentSourceProject::create(BSON("a" << true << "c" << BSON("d" << true)), getExpCtx());
-    auto source = DocumentSourceMock::createForTest("{_id: 0, a: 1, b: 1, c: {d: 1}}");
+    auto project = DocumentSourceProject::create(
+        BSON("a" << true << "c" << BSON("d" << true)), getExpCtx(), "$project"_sd);
+    auto source = DocumentSourceMock::createForTest("{_id: 0, a: 1, b: 1, c: {d: 1}}", getExpCtx());
     project->setSource(source.get());
     // The first result exists and is as expected.
     auto next = project->getNext();
@@ -77,7 +78,9 @@ TEST_F(ProjectStageTest, InclusionProjectionShouldRemoveUnspecifiedFields) {
 
 TEST_F(ProjectStageTest, ShouldOptimizeInnerExpressions) {
     auto project = DocumentSourceProject::create(
-        BSON("a" << BSON("$and" << BSON_ARRAY(BSON("$const" << true)))), getExpCtx());
+        BSON("a" << BSON("$and" << BSON_ARRAY(BSON("$const" << true)))),
+        getExpCtx(),
+        "$project"_sd);
     project->optimize();
     // The $and should have been replaced with its only argument.
     vector<Value> serializedArray;
@@ -99,8 +102,8 @@ TEST_F(ProjectStageTest, ShouldErrorOnNonObjectSpec) {
  * projection.
  */
 TEST_F(ProjectStageTest, InclusionShouldBeAbleToProcessMultipleDocuments) {
-    auto project = DocumentSourceProject::create(BSON("a" << true), getExpCtx());
-    auto source = DocumentSourceMock::createForTest({"{a: 1, b: 2}", "{a: 3, b: 4}"});
+    auto project = DocumentSourceProject::create(BSON("a" << true), getExpCtx(), "$project"_sd);
+    auto source = DocumentSourceMock::createForTest({"{a: 1, b: 2}", "{a: 3, b: 4}"}, getExpCtx());
     project->setSource(source.get());
     auto next = project->getNext();
     ASSERT(next.isAdvanced());
@@ -122,8 +125,8 @@ TEST_F(ProjectStageTest, InclusionShouldBeAbleToProcessMultipleDocuments) {
  * projection.
  */
 TEST_F(ProjectStageTest, ExclusionShouldBeAbleToProcessMultipleDocuments) {
-    auto project = DocumentSourceProject::create(BSON("a" << false), getExpCtx());
-    auto source = DocumentSourceMock::createForTest({"{a: 1, b: 2}", "{a: 3, b: 4}"});
+    auto project = DocumentSourceProject::create(BSON("a" << false), getExpCtx(), "$project"_sd);
+    auto source = DocumentSourceMock::createForTest({"{a: 1, b: 2}", "{a: 3, b: 4}"}, getExpCtx());
     project->setSource(source.get());
     auto next = project->getNext();
     ASSERT(next.isAdvanced());
@@ -141,14 +144,15 @@ TEST_F(ProjectStageTest, ExclusionShouldBeAbleToProcessMultipleDocuments) {
 }
 
 TEST_F(ProjectStageTest, ShouldPropagatePauses) {
-    auto project = DocumentSourceProject::create(BSON("a" << false), getExpCtx());
+    auto project = DocumentSourceProject::create(BSON("a" << false), getExpCtx(), "$project"_sd);
     auto source =
         DocumentSourceMock::createForTest({Document(),
                                            DocumentSource::GetNextResult::makePauseExecution(),
                                            Document(),
                                            DocumentSource::GetNextResult::makePauseExecution(),
                                            Document(),
-                                           DocumentSource::GetNextResult::makePauseExecution()});
+                                           DocumentSource::GetNextResult::makePauseExecution()},
+                                          getExpCtx());
     project->setSource(source.get());
 
     ASSERT_TRUE(project->getNext().isAdvanced());
@@ -166,8 +170,9 @@ TEST_F(ProjectStageTest, ShouldPropagatePauses) {
 TEST_F(ProjectStageTest, InclusionShouldAddDependenciesOfIncludedAndComputedFields) {
     auto project = DocumentSourceProject::create(
         fromjson("{a: true, x: '$b', y: {$and: ['$c','$d']}, z: {$meta: 'textScore'}}"),
-        getExpCtx());
-    DepsTracker dependencies(DepsTracker::MetadataAvailable::kTextScore);
+        getExpCtx(),
+        "$project"_sd);
+    DepsTracker dependencies(DepsTracker::kAllMetadata & ~DepsTracker::kOnlyTextScore);
     ASSERT_EQUALS(DepsTracker::State::EXHAUSTIVE_FIELDS, project->getDependencies(&dependencies));
     ASSERT_EQUALS(5U, dependencies.fields.size());
 
@@ -184,24 +189,26 @@ TEST_F(ProjectStageTest, InclusionShouldAddDependenciesOfIncludedAndComputedFiel
     ASSERT_EQUALS(1U, dependencies.fields.count("c"));
     ASSERT_EQUALS(1U, dependencies.fields.count("d"));
     ASSERT_EQUALS(false, dependencies.needWholeDocument);
-    ASSERT_EQUALS(true, dependencies.getNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE));
+    ASSERT_EQUALS(true, dependencies.getNeedsMetadata(DocumentMetadataFields::kTextScore));
 }
 
 TEST_F(ProjectStageTest, ExclusionShouldNotAddDependencies) {
-    auto project = DocumentSourceProject::create(fromjson("{a: false, 'b.c': false}"), getExpCtx());
+    auto project = DocumentSourceProject::create(
+        fromjson("{a: false, 'b.c': false}"), getExpCtx(), "$project"_sd);
 
     DepsTracker dependencies;
     ASSERT_EQUALS(DepsTracker::State::SEE_NEXT, project->getDependencies(&dependencies));
 
     ASSERT_EQUALS(0U, dependencies.fields.size());
     ASSERT_EQUALS(false, dependencies.needWholeDocument);
-    ASSERT_EQUALS(false, dependencies.getNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE));
+    ASSERT_EQUALS(false, dependencies.getNeedsMetadata(DocumentMetadataFields::kTextScore));
 }
 
 TEST_F(ProjectStageTest, InclusionProjectionReportsIncludedPathsFromGetModifiedPaths) {
     auto project = DocumentSourceProject::create(
         fromjson("{a: true, 'b.c': {d: true}, e: {f: {g: true}}, h: {i: {$literal: true}}}"),
-        getExpCtx());
+        getExpCtx(),
+        "$project"_sd);
 
     auto modifiedPaths = project->getModifiedPaths();
     ASSERT(modifiedPaths.type == DocumentSource::GetModPathsReturn::Type::kAllExcept);
@@ -215,7 +222,8 @@ TEST_F(ProjectStageTest, InclusionProjectionReportsIncludedPathsFromGetModifiedP
 TEST_F(ProjectStageTest, InclusionProjectionReportsIncludedPathsButExcludesId) {
     auto project = DocumentSourceProject::create(
         fromjson("{_id: false, 'b.c': {d: true}, e: {f: {g: true}}, h: {i: {$literal: true}}}"),
-        getExpCtx());
+        getExpCtx(),
+        "$project"_sd);
 
     auto modifiedPaths = project->getModifiedPaths();
     ASSERT(modifiedPaths.type == DocumentSource::GetModPathsReturn::Type::kAllExcept);
@@ -226,7 +234,7 @@ TEST_F(ProjectStageTest, InclusionProjectionReportsIncludedPathsButExcludesId) {
 
 TEST_F(ProjectStageTest, ExclusionProjectionReportsExcludedPathsAsModifiedPaths) {
     auto project = DocumentSourceProject::create(
-        fromjson("{a: false, 'b.c': {d: false}, e: {f: {g: false}}}"), getExpCtx());
+        fromjson("{a: false, 'b.c': {d: false}, e: {f: {g: false}}}"), getExpCtx(), "$project"_sd);
 
     auto modifiedPaths = project->getModifiedPaths();
     ASSERT(modifiedPaths.type == DocumentSource::GetModPathsReturn::Type::kFiniteSet);
@@ -238,7 +246,9 @@ TEST_F(ProjectStageTest, ExclusionProjectionReportsExcludedPathsAsModifiedPaths)
 
 TEST_F(ProjectStageTest, ExclusionProjectionReportsExcludedPathsWithIdExclusion) {
     auto project = DocumentSourceProject::create(
-        fromjson("{_id: false, 'b.c': {d: false}, e: {f: {g: false}}}"), getExpCtx());
+        fromjson("{_id: false, 'b.c': {d: false}, e: {f: {g: false}}}"),
+        getExpCtx(),
+        "$project"_sd);
 
     auto modifiedPaths = project->getModifiedPaths();
     ASSERT(modifiedPaths.type == DocumentSource::GetModPathsReturn::Type::kFiniteSet);
@@ -250,8 +260,10 @@ TEST_F(ProjectStageTest, ExclusionProjectionReportsExcludedPathsWithIdExclusion)
 
 TEST_F(ProjectStageTest, CanUseRemoveSystemVariableToConditionallyExcludeProjectedField) {
     auto project = DocumentSourceProject::create(
-        fromjson("{a: 1, b: {$cond: [{$eq: ['$b', 4]}, '$$REMOVE', '$b']}}"), getExpCtx());
-    auto source = DocumentSourceMock::createForTest({"{a: 2, b: 2}", "{a: 3, b: 4}"});
+        fromjson("{a: 1, b: {$cond: [{$eq: ['$b', 4]}, '$$REMOVE', '$b']}}"),
+        getExpCtx(),
+        "$project"_sd);
+    auto source = DocumentSourceMock::createForTest({"{a: 2, b: 2}", "{a: 3, b: 4}"}, getExpCtx());
     project->setSource(source.get());
     auto next = project->getNext();
     ASSERT(next.isAdvanced());
@@ -264,6 +276,31 @@ TEST_F(ProjectStageTest, CanUseRemoveSystemVariableToConditionallyExcludeProject
     ASSERT_DOCUMENT_EQ(next.releaseDocument(), expected);
 
     ASSERT(project->getNext().isEOF());
+}
+
+TEST_F(ProjectStageTest, ProjectionCorrectlyReportsRenamesForwards) {
+    auto project =
+        DocumentSourceProject::create(fromjson("{'renamedB' : '$b'}"), getExpCtx(), "$project"_sd);
+    auto renames =
+        semantic_analysis::renamedPaths({"b"}, *project, semantic_analysis::Direction::kForward);
+    // renamedPaths should return a mapping of old name->new name for each path in interestingPaths
+    // if the paths are all unmodified (but possibly renamed). Because path b is preserved, but
+    // renamed (to renamedB) we expect a renamedPaths to return a mapping from b->renamedB.
+    auto single_rename = renames->extract("b");
+    ASSERT_FALSE(single_rename.empty());
+    ASSERT_EQUALS(single_rename.mapped(), "renamedB");
+    ASSERT_TRUE(renames->empty());
+}
+
+TEST_F(ProjectStageTest, ProjectionCorrectlyReportsRenamesBackwards) {
+    auto project =
+        DocumentSourceProject::create(fromjson("{'renamedB' : '$b'}"), getExpCtx(), "$project"_sd);
+    auto renames = semantic_analysis::renamedPaths(
+        {"renamedB"}, *project, semantic_analysis::Direction::kBackward);
+    auto single_rename = renames->extract("renamedB");
+    ASSERT_FALSE(single_rename.empty());
+    ASSERT_EQUALS(single_rename.mapped(), "b");
+    ASSERT_TRUE(renames->empty());
 }
 
 /**
@@ -282,8 +319,10 @@ BSONObj makeProjectForNestedDocument(size_t depth) {
 
 TEST_F(ProjectStageTest, CanAddNestedDocumentExactlyAtDepthLimit) {
     auto project = DocumentSourceProject::create(
-        makeProjectForNestedDocument(BSONDepth::getMaxAllowableDepth()), getExpCtx());
-    auto mock = DocumentSourceMock::createForTest(Document{{"_id", 1}});
+        makeProjectForNestedDocument(BSONDepth::getMaxAllowableDepth()),
+        getExpCtx(),
+        "$project"_sd);
+    auto mock = DocumentSourceMock::createForTest(Document{{"_id", 1}}, getExpCtx());
     project->setSource(mock.get());
 
     auto next = project->getNext();
@@ -291,14 +330,15 @@ TEST_F(ProjectStageTest, CanAddNestedDocumentExactlyAtDepthLimit) {
 }
 
 TEST_F(ProjectStageTest, CannotAddNestedDocumentExceedingDepthLimit) {
-    ASSERT_THROWS_CODE(
-        DocumentSourceProject::create(
-            makeProjectForNestedDocument(BSONDepth::getMaxAllowableDepth() + 1), getExpCtx()),
-        AssertionException,
-        ErrorCodes::Overflow);
+    ASSERT_THROWS_CODE(DocumentSourceProject::create(
+                           makeProjectForNestedDocument(BSONDepth::getMaxAllowableDepth() + 1),
+                           getExpCtx(),
+                           "$project"_sd),
+                       AssertionException,
+                       ErrorCodes::Overflow);
 }
 
-TEST_F(UnsetTest, AcceptsValidUnsetSpec) {
+TEST_F(UnsetTest, AcceptsValidUnsetSpecWithArray) {
     auto spec = BSON("$unset" << BSON_ARRAY("a"
                                             << "b"
                                             << "c.d"));
@@ -307,9 +347,16 @@ TEST_F(UnsetTest, AcceptsValidUnsetSpec) {
     ASSERT(stage);
 }
 
-TEST_F(UnsetTest, RejectsUnsetSpecWhichIsNotAnArray) {
+TEST_F(UnsetTest, AcceptsValidUnsetSpecWithSingleString) {
     auto spec = BSON("$unset"
-                     << "foo");
+                     << "a");
+    auto specElement = spec.firstElement();
+    auto stage = DocumentSourceProject::createFromBson(specElement, getExpCtx());
+    ASSERT(stage);
+}
+
+TEST_F(UnsetTest, RejectsUnsetSpecWhichIsNotAnArrayOrString) {
+    auto spec = BSON("$unset" << 1);
     auto specElement = spec.firstElement();
     ASSERT_THROWS_CODE(
         DocumentSourceProject::createFromBson(specElement, getExpCtx()), AssertionException, 31002);
@@ -332,7 +379,7 @@ TEST_F(UnsetTest, RejectsUnsetSpecWithArrayContainingAnyNonStringValue) {
 TEST_F(UnsetTest, UnsetSingleField) {
     auto updateDoc = BSON("$unset" << BSON_ARRAY("a"));
     auto unsetStage = DocumentSourceProject::createFromBson(updateDoc.firstElement(), getExpCtx());
-    auto source = DocumentSourceMock::createForTest({"{a: 10, b: 20}"});
+    auto source = DocumentSourceMock::createForTest({"{a: 10, b: 20}"}, getExpCtx());
     unsetStage->setSource(source.get());
     auto next = unsetStage->getNext();
     ASSERT(next.isAdvanced());
@@ -347,7 +394,8 @@ TEST_F(UnsetTest, UnsetMultipleFields) {
                                                  << "b.c"
                                                  << "d.e"));
     auto unsetStage = DocumentSourceProject::createFromBson(updateDoc.firstElement(), getExpCtx());
-    auto source = DocumentSourceMock::createForTest({"{a: 10, b: {c: 20}, d: [{e: 30, f: 40}]}"});
+    auto source = DocumentSourceMock::createForTest({"{a: 10, b: {c: 20}, d: [{e: 30, f: 40}]}"},
+                                                    getExpCtx());
     unsetStage->setSource(source.get());
     auto next = unsetStage->getNext();
     ASSERT(next.isAdvanced());
@@ -360,7 +408,7 @@ TEST_F(UnsetTest, UnsetMultipleFields) {
 TEST_F(UnsetTest, UnsetShouldBeAbleToProcessMultipleDocuments) {
     auto updateDoc = BSON("$unset" << BSON_ARRAY("a"));
     auto unsetStage = DocumentSourceProject::createFromBson(updateDoc.firstElement(), getExpCtx());
-    auto source = DocumentSourceMock::createForTest({"{a: 1, b: 2}", "{a: 3, b: 4}"});
+    auto source = DocumentSourceMock::createForTest({"{a: 1, b: 2}", "{a: 3, b: 4}"}, getExpCtx());
     unsetStage->setSource(source.get());
     auto next = unsetStage->getNext();
     ASSERT(next.isAdvanced());
@@ -382,7 +430,7 @@ TEST_F(UnsetTest, UnsetSerializesToProject) {
     vector<Value> serializedArray;
     unsetStage->serializeToArray(serializedArray);
     auto serializedUnsetStage = serializedArray[0].getDocument().toBson();
-    ASSERT_BSONOBJ_EQ(serializedUnsetStage, fromjson("{$project: {b: {c: false}}}"));
+    ASSERT_BSONOBJ_EQ(serializedUnsetStage, fromjson("{$project: {b: {c: false}, _id: true}}"));
     auto projectStage =
         DocumentSourceProject::createFromBson(serializedUnsetStage.firstElement(), getExpCtx());
     projectStage->serializeToArray(serializedArray);
@@ -400,7 +448,7 @@ TEST_F(UnsetTest, UnsetShouldNotAddDependencies) {
 
     ASSERT_EQUALS(0U, dependencies.fields.size());
     ASSERT_EQUALS(false, dependencies.needWholeDocument);
-    ASSERT_EQUALS(false, dependencies.getNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE));
+    ASSERT_EQUALS(false, dependencies.getNeedsMetadata(DocumentMetadataFields::kTextScore));
 }
 
 TEST_F(UnsetTest, UnsetReportsExcludedPathsAsModifiedPaths) {

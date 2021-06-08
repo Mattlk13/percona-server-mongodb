@@ -30,20 +30,23 @@
 #pragma once
 
 #include <boost/optional.hpp>
+#include <functional>
 #include <string>
 
 #include "mongo/executor/task_executor.h"
-#include "mongo/stdx/functional.h"
 #include "mongo/transport/baton.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/functional.h"
 #include "mongo/util/future.h"
 
 namespace mongo {
 namespace executor {
 
-MONGO_FAIL_POINT_DECLARE(networkInterfaceDiscardCommandsBeforeAcquireConn);
-MONGO_FAIL_POINT_DECLARE(networkInterfaceDiscardCommandsAfterAcquireConn);
+extern FailPoint networkInterfaceSendRequestsToTargetHostsInAlphabeticalOrder;
+extern FailPoint networkInterfaceDiscardCommandsBeforeAcquireConn;
+extern FailPoint networkInterfaceHangCommandsAfterAcquireConn;
+extern FailPoint networkInterfaceCommandsFailedWithErrorCode;
+extern FailPoint networkInterfaceShouldNotKillPendingRequests;
 
 /**
  * Interface to networking for use by TaskExecutor implementations.
@@ -54,7 +57,12 @@ class NetworkInterface {
 
 public:
     using Response = RemoteCommandResponse;
-    using RemoteCommandCompletionFn = unique_function<void(const TaskExecutor::ResponseStatus&)>;
+    using RemoteCommandCompletionFn =
+        unique_function<void(const TaskExecutor::ResponseOnAnyStatus&)>;
+    using RemoteCommandOnReplyFn = unique_function<void(const TaskExecutor::ResponseOnAnyStatus&)>;
+
+    // Indicates that there is no expiration time by when a request needs to complete
+    static constexpr Date_t kNoExpirationDate{Date_t::max()};
 
     virtual ~NetworkInterface();
 
@@ -120,14 +128,16 @@ public:
     virtual std::string getHostName() = 0;
 
     struct Counters {
+        uint64_t sent = 0;
         uint64_t canceled = 0;
         uint64_t timedOut = 0;
         uint64_t failed = 0;
+        uint64_t failedRemotely = 0;
         uint64_t succeeded = 0;
     };
     /*
      * Returns a copy of the operation counters (see struct Counters above). This method should
-     * only be used in tests, and will invariant if getTestCommands() returns false.
+     * only be used in tests, and will invariant if testing diagnostics are not enabled.
      */
     virtual Counters getCounters() const = 0;
 
@@ -144,19 +154,24 @@ public:
      * function will not run.
      */
     virtual Status startCommand(const TaskExecutor::CallbackHandle& cbHandle,
-                                RemoteCommandRequest& request,
+                                RemoteCommandRequestOnAny& request,
                                 RemoteCommandCompletionFn&& onFinish,
                                 const BatonHandle& baton = nullptr) = 0;
+    virtual Status startExhaustCommand(const TaskExecutor::CallbackHandle& cbHandle,
+                                       RemoteCommandRequestOnAny& request,
+                                       RemoteCommandOnReplyFn&& onReply,
+                                       const BatonHandle& baton = nullptr) = 0;
 
-    Future<TaskExecutor::ResponseStatus> startCommand(const TaskExecutor::CallbackHandle& cbHandle,
-                                                      RemoteCommandRequest& request,
-                                                      const BatonHandle& baton = nullptr) {
-        auto pf = makePromiseFuture<TaskExecutor::ResponseStatus>();
+    Future<TaskExecutor::ResponseOnAnyStatus> startCommand(
+        const TaskExecutor::CallbackHandle& cbHandle,
+        RemoteCommandRequestOnAny& request,
+        const BatonHandle& baton = nullptr) {
+        auto pf = makePromiseFuture<TaskExecutor::ResponseOnAnyStatus>();
 
         auto status = startCommand(
             cbHandle,
             request,
-            [p = std::move(pf.promise)](const TaskExecutor::ResponseStatus& rs) mutable {
+            [p = std::move(pf.promise)](const TaskExecutor::ResponseOnAnyStatus& rs) mutable {
                 p.emplaceValue(rs);
             },
             baton);
@@ -168,8 +183,11 @@ public:
     }
 
     /**
-     * Requests cancelation of the network activity associated with "cbHandle" if it has not yet
+     * Requests cancellation of the network activity associated with "cbHandle" if it has not yet
      * completed.
+     *
+     * Note that the work involved in onFinish may run locally as a result of invoking this
+     * function. Do not hold locks while calling cancelCommand(...).
      */
     virtual void cancelCommand(const TaskExecutor::CallbackHandle& cbHandle,
                                const BatonHandle& baton = nullptr) = 0;
@@ -217,6 +235,16 @@ public:
      * Drops all connections to the given host in the connection pool.
      */
     virtual void dropConnections(const HostAndPort& hostAndPort) = 0;
+
+    /**
+     * Acquire a connection and subsequently release it.
+     * If status is not OK, the connection will be dropped,
+     * otherwise the connection will be returned to the pool.
+     */
+    virtual void testEgress(const HostAndPort& hostAndPort,
+                            transport::ConnectSSLMode sslMode,
+                            Milliseconds timeout,
+                            Status status) = 0;
 
 protected:
     NetworkInterface();

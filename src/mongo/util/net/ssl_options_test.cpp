@@ -36,7 +36,6 @@
 #include <boost/range/size.hpp>
 #include <ostream>
 
-#include "mongo/base/global_initializer.h"
 #include "mongo/base/init.h"
 #include "mongo/base/initializer.h"
 #include "mongo/db/server_options_base.h"
@@ -54,27 +53,18 @@ namespace moe = mongo::optionenvironment;
 namespace mongo {
 namespace {
 
-MONGO_INITIALIZER(ServerLogRedirection)(InitializerContext*) {
-    // ssl_options_server.cpp has an initializer which depends on logging.
-    // We can stub that dependency out for unit testing purposes.
-    return Status::OK();
-}
+// ssl_options_server.cpp has an initializer which depends on logging.
+// We can stub that dependency out for unit testing purposes.
+MONGO_INITIALIZER(ServerLogRedirection)(InitializerContext*) {}
 
 Status executeInitializer(const std::string& name) try {
-    const auto* node =
-        getGlobalInitializer().getInitializerDependencyGraph().getInitializerNode(name);
-    if (!node) {
-        return {ErrorCodes::BadValue, str::stream() << "Unknown initializer: '" << name << "'"};
-    }
-
-    const auto& fn = node->getInitializerFunction();
-    if (!fn) {
-        return {ErrorCodes::InternalError,
-                str::stream() << "Initializer node '" << name << "' has no associated function."};
-    }
-
-    // The initializers we call don't actually need a context currently.
-    return fn(nullptr);
+    InitializerFunction fn = getGlobalInitializer().getInitializerFunctionForTesting(name);
+    uassert(ErrorCodes::InternalError,
+            str::stream() << "Initializer node '" << name << "' has no associated function.",
+            fn);
+    InitializerContext initContext({});
+    fn(&initContext);
+    return Status::OK();
 } catch (const DBException& ex) {
     return ex.toStatus();
 }
@@ -169,10 +159,9 @@ TEST(SetupOptions, tlsModeDisabled) {
     argv.push_back("binaryname");
     argv.push_back("--tlsMode");
     argv.push_back("disabled");
-    std::map<std::string, std::string> env_map;
 
     OptionsParserTester parser;
-    ASSERT_OK(parser.run(moe::startupOptions, argv, env_map, &moe::startupOptionsParsed));
+    ASSERT_OK(parser.run(moe::startupOptions, argv, &moe::startupOptionsParsed));
     ASSERT_OK(storeSSLServerOptions());
     ASSERT_EQ(::mongo::sslGlobalParams.sslMode.load(), ::mongo::sslGlobalParams.SSLMode_disabled);
 }
@@ -188,10 +177,9 @@ TEST(SetupOptions, sslModeDisabled) {
     argv.push_back("binaryname");
     argv.push_back("--sslMode");
     argv.push_back("disabled");
-    std::map<std::string, std::string> env_map;
 
     OptionsParserTester parser;
-    ASSERT_OK(parser.run(moe::startupOptions, argv, env_map, &moe::startupOptionsParsed));
+    ASSERT_OK(parser.run(moe::startupOptions, argv, &moe::startupOptionsParsed));
     ASSERT_OK(storeSSLServerOptions());
     ASSERT_EQ(::mongo::sslGlobalParams.sslMode.load(), ::mongo::sslGlobalParams.SSLMode_disabled);
 }
@@ -232,10 +220,9 @@ TEST(SetupOptions, tlsModeRequired) {
     argv.push_back("TLS1_1");
     argv.push_back("--tlsLogVersions");
     argv.push_back("TLS1_2");
-    std::map<std::string, std::string> env_map;
 
     OptionsParserTester parser;
-    ASSERT_OK(parser.run(moe::startupOptions, argv, env_map, &moe::startupOptionsParsed));
+    ASSERT_OK(parser.run(moe::startupOptions, argv, &moe::startupOptionsParsed));
     ASSERT_OK(storeSSLServerOptions());
 
     ASSERT_EQ(::mongo::sslGlobalParams.sslMode.load(), ::mongo::sslGlobalParams.SSLMode_requireSSL);
@@ -299,10 +286,9 @@ TEST(SetupOptions, sslModeRequired) {
     argv.push_back("TLS1_1");
     argv.push_back("--tlsLogVersions");
     argv.push_back("TLS1_0");
-    std::map<std::string, std::string> env_map;
 
     OptionsParserTester parser;
-    ASSERT_OK(parser.run(moe::startupOptions, argv, env_map, &moe::startupOptionsParsed));
+    ASSERT_OK(parser.run(moe::startupOptions, argv, &moe::startupOptionsParsed));
     ASSERT_OK(storeSSLServerOptions());
 
     ASSERT_EQ(::mongo::sslGlobalParams.sslMode.load(), ::mongo::sslGlobalParams.SSLMode_requireSSL);
@@ -346,10 +332,9 @@ TEST(SetupOptions, tlsModeRequiredCertificateSelector) {
     argv.push_back("subject=Subject 1");
     argv.push_back("--tlsClusterCertificateSelector");
     argv.push_back("subject=Subject 2");
-    std::map<std::string, std::string> env_map;
 
     OptionsParserTester parser;
-    ASSERT_OK(parser.run(moe::startupOptions, argv, env_map, &moe::startupOptionsParsed));
+    ASSERT_OK(parser.run(moe::startupOptions, argv, &moe::startupOptionsParsed));
     ASSERT_OK(storeSSLServerOptions());
 
     ASSERT_EQ(::mongo::sslGlobalParams.sslMode.load(), ::mongo::sslGlobalParams.SSLMode_requireSSL);
@@ -372,10 +357,9 @@ TEST(SetupOptions, sslModeRequiredCertificateSelector) {
     argv.push_back("subject=Subject 1");
     argv.push_back("--sslClusterCertificateSelector");
     argv.push_back("subject=Subject 2");
-    std::map<std::string, std::string> env_map;
 
     OptionsParserTester parser;
-    ASSERT_OK(parser.run(moe::startupOptions, argv, env_map, &moe::startupOptionsParsed));
+    ASSERT_OK(parser.run(moe::startupOptions, argv, &moe::startupOptionsParsed));
     ASSERT_OK(storeSSLServerOptions());
 
     ASSERT_EQ(::mongo::sslGlobalParams.sslMode.load(), ::mongo::sslGlobalParams.SSLMode_requireSSL);
@@ -395,9 +379,8 @@ TEST(SetupOptions, disableNonSSLConnectionLoggingFalse) {
     argv.push_back("binaryname");
     argv.push_back("--setParameter");
     argv.push_back("disableNonSSLConnectionLogging=false");
-    std::map<std::string, std::string> env_map;
 
-    ASSERT_OK(parser.run(options, argv, env_map, &environment));
+    ASSERT_OK(parser.run(options, argv, &environment));
     ASSERT_OK(mongo::storeServerOptions(environment));
 
     ASSERT_EQ(::mongo::sslGlobalParams.disableNonSSLConnectionLogging, false);
@@ -415,9 +398,8 @@ TEST(SetupOptions, disableNonTLSConnectionLoggingFalse) {
     argv.push_back("binaryname");
     argv.push_back("--setParameter");
     argv.push_back("disableNonTLSConnectionLogging=false");
-    std::map<std::string, std::string> env_map;
 
-    ASSERT_OK(parser.run(options, argv, env_map, &environment));
+    ASSERT_OK(parser.run(options, argv, &environment));
     Status storeRet = mongo::storeServerOptions(environment);
 
     ASSERT_EQ(::mongo::sslGlobalParams.disableNonSSLConnectionLogging, false);
@@ -435,9 +417,8 @@ TEST(SetupOptions, disableNonSSLConnectionLoggingTrue) {
     argv.push_back("binaryname");
     argv.push_back("--setParameter");
     argv.push_back("disableNonSSLConnectionLogging=true");
-    std::map<std::string, std::string> env_map;
 
-    ASSERT_OK(parser.run(options, argv, env_map, &environment));
+    ASSERT_OK(parser.run(options, argv, &environment));
     Status storeRet = mongo::storeServerOptions(environment);
 
     ASSERT_EQ(::mongo::sslGlobalParams.disableNonSSLConnectionLogging, true);
@@ -455,9 +436,8 @@ TEST(SetupOptions, disableNonTLSConnectionLoggingTrue) {
     argv.push_back("binaryname");
     argv.push_back("--setParameter");
     argv.push_back("disableNonTLSConnectionLogging=true");
-    std::map<std::string, std::string> env_map;
 
-    ASSERT_OK(parser.run(options, argv, env_map, &environment));
+    ASSERT_OK(parser.run(options, argv, &environment));
     Status storeRet = mongo::storeServerOptions(environment);
 
     ASSERT_EQ(::mongo::sslGlobalParams.disableNonSSLConnectionLogging, true);
@@ -476,9 +456,8 @@ TEST(SetupOptions, disableNonTLSConnectionLoggingInvalid) {
     argv.push_back("disableNonTLSConnectionLogging=false");
     argv.push_back("--setParameter");
     argv.push_back("disableNonSSLConnectionLogging=false");
-    std::map<std::string, std::string> env_map;
 
-    ASSERT_OK(parser.run(options, argv, env_map, &environment));
+    ASSERT_OK(parser.run(options, argv, &environment));
     ASSERT_NOT_OK(mongo::storeServerOptions(environment));
 }
 

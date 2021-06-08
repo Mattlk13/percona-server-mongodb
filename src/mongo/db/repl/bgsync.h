@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include <functional>
 #include <memory>
 
 #include "mongo/base/status_with.h"
@@ -41,9 +42,9 @@
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/rollback_impl.h"
 #include "mongo/db/repl/sync_source_resolver.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/net/hostandport.h"
 
@@ -116,6 +117,11 @@ public:
      */
     bool inShutdown() const;
 
+    /**
+     * Returns true if we have discovered that no sync source's oplog overlaps with ours.
+     */
+    bool tooStale() const;
+
     // starts the sync target notifying thread
     void notifierThread();
 
@@ -159,8 +165,8 @@ private:
      *
      * requiredRBID is reset to empty after the first call.
      */
-    Status _enqueueDocuments(Fetcher::Documents::const_iterator begin,
-                             Fetcher::Documents::const_iterator end,
+    Status _enqueueDocuments(OplogFetcher::Documents::const_iterator begin,
+                             OplogFetcher::Documents::const_iterator end,
                              const OplogFetcher::DocumentsInfo& info);
 
     /**
@@ -200,7 +206,12 @@ private:
     // restart syncing
     void start(OperationContext* opCtx);
 
+    // Set the state and notify the condition variable.
+    void setState(WithLock, ProducerState newState);
+
     OpTime _readLastAppliedOpTime(OperationContext* opCtx);
+
+    long long _getRetrySleepMS();
 
     // This OplogApplier applies oplog entries fetched from the sync source.
     OplogApplier* const _oplogApplier;
@@ -215,34 +226,37 @@ private:
     ReplicationProcess* _replicationProcess;
 
     /**
-      * All member variables are labeled with one of the following codes indicating the
-      * synchronization rules for accessing them:
-      *
-      * (PR) Completely private to BackgroundSync. Can be read or written to from within the main
-      *      BackgroundSync thread without synchronization. Shouldn't be accessed outside of this
-      *      thread.
-      *
-      * (S)  Self-synchronizing; access in any way from any context.
-      *
-      * (M)  Reads and writes guarded by _mutex
-      *
+     * All member variables are labeled with one of the following codes indicating the
+     * synchronization rules for accessing them:
+     *
+     * (PR) Completely private to BackgroundSync. Can be read or written to from within the main
+     *      BackgroundSync thread without synchronization. Shouldn't be accessed outside of this
+     *      thread.
+     *
+     * (S)  Self-synchronizing; access in any way from any context.
+     *
+     * (M)  Reads and writes guarded by _mutex
+     *
      */
 
     // Protects member data of BackgroundSync.
     // Never hold the BackgroundSync mutex when trying to acquire the ReplicationCoordinator mutex.
-    mutable stdx::mutex _mutex;  // (S)
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("BackgroundSync::_mutex");  // (S)
 
     OpTime _lastOpTimeFetched;  // (M)
 
     // Thread running producerThread().
     std::unique_ptr<stdx::thread> _producerThread;  // (M)
 
+    // Condition variable to notify of _state and _inShutdown changes.
+    stdx::condition_variable _stateCv;  // (S)
+
     // Set to true if shutdown() has been called.
     bool _inShutdown = false;  // (M)
 
     // Flag that marks whether a node's oplog has no common point with any
     // potential sync sources.
-    bool _tooStale = false;  // (PR)
+    AtomicWord<bool> _tooStale{false};  // (S)
 
     ProducerState _state = ProducerState::Starting;  // (M)
 

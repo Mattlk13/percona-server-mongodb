@@ -34,6 +34,7 @@
 #include <ostream>
 
 #include "mongo/base/parse_number.h"
+#include "mongo/db/server_options.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -65,17 +66,72 @@ const NamespaceString NamespaceString::kSessionTransactionsTableNamespace(
 const NamespaceString NamespaceString::kTransactionCoordinatorsNamespace(
     NamespaceString::kConfigDb, "transaction_coordinators");
 
+const NamespaceString NamespaceString::kMigrationCoordinatorsNamespace(NamespaceString::kConfigDb,
+                                                                       "migrationCoordinators");
+
+const NamespaceString NamespaceString::kTenantMigrationDonorsNamespace(NamespaceString::kConfigDb,
+                                                                       "tenantMigrationDonors");
+
+const NamespaceString NamespaceString::kTenantMigrationRecipientsNamespace(
+    NamespaceString::kConfigDb, "tenantMigrationRecipients");
+
+const NamespaceString NamespaceString::kTenantMigrationOplogView(
+    NamespaceString::kLocalDb, "system.tenantMigration.oplogView");
+
 const NamespaceString NamespaceString::kShardConfigCollectionsNamespace(NamespaceString::kConfigDb,
                                                                         "cache.collections");
 const NamespaceString NamespaceString::kShardConfigDatabasesNamespace(NamespaceString::kConfigDb,
                                                                       "cache.databases");
-const NamespaceString NamespaceString::kSystemKeysNamespace(NamespaceString::kAdminDb,
-                                                            "system.keys");
+const NamespaceString NamespaceString::kKeysCollectionNamespace(NamespaceString::kAdminDb,
+                                                                "system.keys");
+const NamespaceString NamespaceString::kExternalKeysCollectionNamespace(NamespaceString::kConfigDb,
+                                                                        "external_validation_keys");
 const NamespaceString NamespaceString::kRsOplogNamespace(NamespaceString::kLocalDb, "oplog.rs");
 const NamespaceString NamespaceString::kSystemReplSetNamespace(NamespaceString::kLocalDb,
                                                                "system.replset");
 const NamespaceString NamespaceString::kIndexBuildEntryNamespace(NamespaceString::kConfigDb,
                                                                  "system.indexBuilds");
+const NamespaceString NamespaceString::kRangeDeletionNamespace(NamespaceString::kConfigDb,
+                                                               "rangeDeletions");
+const NamespaceString NamespaceString::kRangeDeletionForRenameNamespace(NamespaceString::kConfigDb,
+                                                                        "rangeDeletionsForRename");
+const NamespaceString NamespaceString::kConfigReshardingOperationsNamespace(
+    NamespaceString::kConfigDb, "reshardingOperations");
+
+const NamespaceString NamespaceString::kDonorReshardingOperationsNamespace(
+    NamespaceString::kConfigDb, "localReshardingOperations.donor");
+
+const NamespaceString NamespaceString::kRecipientReshardingOperationsNamespace(
+    NamespaceString::kConfigDb, "localReshardingOperations.recipient");
+
+const NamespaceString NamespaceString::kShardingDDLCoordinatorsNamespace(
+    NamespaceString::kConfigDb, "system.sharding_ddl_coordinators");
+
+const NamespaceString NamespaceString::kShardingRenameParticipantsNamespace(
+    NamespaceString::kConfigDb, "localRenameParticipants");
+
+const NamespaceString NamespaceString::kConfigSettingsNamespace(NamespaceString::kConfigDb,
+                                                                "settings");
+const NamespaceString NamespaceString::kVectorClockNamespace(NamespaceString::kConfigDb,
+                                                             "vectorClock");
+
+const NamespaceString NamespaceString::kReshardingApplierProgressNamespace(
+    NamespaceString::kConfigDb, "localReshardingOperations.recipient.progress_applier");
+
+const NamespaceString NamespaceString::kReshardingTxnClonerProgressNamespace(
+    NamespaceString::kConfigDb, "localReshardingOperations.recipient.progress_txn_cloner");
+
+const NamespaceString NamespaceString::kReshardingOplogView(
+    NamespaceString::kLocalDb, "system.resharding.slimOplogForGraphLookup");
+
+const NamespaceString NamespaceString::kCollectionCriticalSectionsNamespace(
+    NamespaceString::kConfigDb, "collection_critical_sections");
+
+const NamespaceString NamespaceString::kForceOplogBatchBoundaryNamespace(
+    NamespaceString::kConfigDb, "system.forceOplogBatchBoundary");
+
+const NamespaceString NamespaceString::kConfigImagesNamespace(NamespaceString::kConfigDb,
+                                                              "image_collection");
 
 bool NamespaceString::isListCollectionsCursorNS() const {
     return coll() == listCollectionsCursorCol;
@@ -85,37 +141,65 @@ bool NamespaceString::isCollectionlessAggregateNS() const {
     return coll() == collectionlessAggregateCursorCol;
 }
 
-bool NamespaceString::isLegalClientSystemNS() const {
-    if (db() == "admin") {
-        if (ns() == "admin.system.roles")
+bool NamespaceString::isLegalClientSystemNS(
+    const ServerGlobalParams::FeatureCompatibility& currentFCV) const {
+    if (db() == kAdminDb) {
+        if (coll() == "system.roles")
             return true;
-        if (ns() == kServerConfigurationNamespace.ns())
+        if (coll() == kServerConfigurationNamespace.coll())
             return true;
-        if (ns() == kSystemKeysNamespace.ns())
+        if (coll() == kKeysCollectionNamespace.coll())
             return true;
-        if (ns() == "admin.system.new_users")
+        if (coll() == "system.backup_users")
             return true;
-        if (ns() == "admin.system.backup_users")
+    } else if (db() == kConfigDb) {
+        if (coll() == "system.sessions")
             return true;
-    } else if (db() == "config") {
-        if (ns() == "config.system.sessions")
+        if (coll() == kIndexBuildEntryNamespace.coll())
             return true;
-        if (ns() == kIndexBuildEntryNamespace.ns())
+        if (coll().find(".system.resharding.") != std::string::npos)
+            return true;
+        if (coll() == kShardingDDLCoordinatorsNamespace.coll())
+            return true;
+    } else if (db() == kLocalDb) {
+        if (coll() == kSystemReplSetNamespace.coll())
+            return true;
+        if (coll() == "system.healthlog")
             return true;
     }
-
-    if (ns() == "local.system.replset")
-        return true;
 
     if (coll() == "system.users")
         return true;
     if (coll() == "system.js")
         return true;
-
     if (coll() == kSystemDotViewsCollectionName)
         return true;
+    if (currentFCV.isGreaterThanOrEqualTo(
+            ServerGlobalParams::FeatureCompatibility::Version::kVersion47) &&
+        // While this FCV check is being added in 4.9, the namespace was allowed in 4.7 binaries
+        // without an FCV check.
+        isTemporaryReshardingCollection()) {
+        return true;
+    }
+    if (isTimeseriesBucketsCollection()) {
+        return true;
+    }
 
     return false;
+}
+
+/**
+ * Oplog entries on 'system.views' should also be processed one at a time. View catalog immediately
+ * reflects changes for each oplog entry so we can see inconsistent view catalog if multiple oplog
+ * entries on 'system.views' are being applied out of the original order.
+ *
+ * Process updates to 'admin.system.version' individually as well so the secondary's FCV when
+ * processing each operation matches the primary's when committing that operation.
+ */
+bool NamespaceString::mustBeAppliedInOwnOplogBatch() const {
+    return isSystemDotViews() || isServerConfigurationCollection() || isPrivilegeCollection() ||
+        _ns == kDonorReshardingOperationsNamespace.ns() ||
+        _ns == kForceOplogBatchBoundaryNamespace.ns();
 }
 
 NamespaceString NamespaceString::makeListCollectionsNSS(StringData dbName) {
@@ -137,6 +221,14 @@ std::string NamespaceString::getSisterNS(StringData local) const {
     return db().toString() + "." + local.toString();
 }
 
+void NamespaceString::serializeCollectionName(BSONObjBuilder* builder, StringData fieldName) const {
+    if (isCollectionlessAggregateNS()) {
+        builder->append(fieldName, 1);
+    } else {
+        builder->append(fieldName, coll());
+    }
+}
+
 bool NamespaceString::isDropPendingNamespace() const {
     return coll().startsWith(dropPendingNSPrefix);
 }
@@ -146,7 +238,7 @@ NamespaceString NamespaceString::makeDropPendingNamespace(const repl::OpTime& op
     ss << db() << "." << dropPendingNSPrefix;
     ss << opTime.getSecs() << "i" << opTime.getTimestamp().getInc() << "t" << opTime.getTerm();
     ss << "." << coll();
-    return NamespaceString(ss.stringData().substr(0, MaxNsCollectionLen));
+    return NamespaceString(ss.stringData());
 }
 
 StatusWith<repl::OpTime> NamespaceString::getDropPendingNamespaceOpTime() const {
@@ -175,51 +267,76 @@ StatusWith<repl::OpTime> NamespaceString::getDropPendingNamespaceOpTime() const 
     }
 
     long long seconds;
-    auto status = parseNumberFromString(opTimeStr.substr(0, incrementSeparatorIndex), &seconds);
+    auto status = NumberParser{}(opTimeStr.substr(0, incrementSeparatorIndex), &seconds);
     if (!status.isOK()) {
         return status.withContext(
             str::stream() << "Invalid timestamp seconds in drop-pending namespace: " << _ns);
     }
 
     unsigned int increment;
-    status =
-        parseNumberFromString(opTimeStr.substr(incrementSeparatorIndex + 1,
-                                               termSeparatorIndex - (incrementSeparatorIndex + 1)),
-                              &increment);
+    status = NumberParser{}(opTimeStr.substr(incrementSeparatorIndex + 1,
+                                             termSeparatorIndex - (incrementSeparatorIndex + 1)),
+                            &increment);
     if (!status.isOK()) {
         return status.withContext(
             str::stream() << "Invalid timestamp increment in drop-pending namespace: " << _ns);
     }
 
     long long term;
-    status = mongo::parseNumberFromString(opTimeStr.substr(termSeparatorIndex + 1), &term);
+    status = mongo::NumberParser{}(opTimeStr.substr(termSeparatorIndex + 1), &term);
     if (!status.isOK()) {
-        return status.withContext(str::stream() << "Invalid term in drop-pending namespace: "
-                                                << _ns);
+        return status.withContext(str::stream()
+                                  << "Invalid term in drop-pending namespace: " << _ns);
     }
 
     return repl::OpTime(Timestamp(Seconds(seconds), increment), term);
 }
 
-Status NamespaceString::checkLengthForRename(
-    const std::string::size_type longestIndexNameLength) const {
-    auto longestAllowed =
-        std::min(std::string::size_type(NamespaceString::MaxNsCollectionLen),
-                 std::string::size_type(NamespaceString::MaxNsLen - 2U /*strlen(".$")*/ -
-                                        longestIndexNameLength));
-    if (size() > longestAllowed) {
-        StringBuilder sb;
-        sb << "collection name length of " << size() << " exceeds maximum length of "
-           << longestAllowed << ", allowing for index names";
-        return Status(ErrorCodes::InvalidLength, sb.str());
-    }
-    return Status::OK();
+bool NamespaceString::isNamespaceAlwaysUnsharded() const {
+    // Local and admin never have sharded collections
+    if (db() == NamespaceString::kLocalDb || db() == NamespaceString::kAdminDb)
+        return true;
+
+    // Config can only have the system.sessions as sharded
+    if (db() == NamespaceString::kConfigDb)
+        return *this != NamespaceString::kLogicalSessionsNamespace;
+
+    if (isSystemDotProfile())
+        return true;
+
+    if (isSystemDotViews())
+        return true;
+
+    return false;
 }
 
-NamespaceString NamespaceString::makeIndexNamespace(StringData indexName) const {
-    StringBuilder ss;
-    ss << coll() << ".$" << indexName;
-    return NamespaceString(db(), ss.stringData());
+bool NamespaceString::isConfigDotCacheDotChunks() const {
+    return db() == "config" && coll().startsWith("cache.chunks.");
+}
+
+bool NamespaceString::isReshardingLocalOplogBufferCollection() const {
+    return db() == "config" && coll().startsWith(kReshardingLocalOplogBufferPrefix);
+}
+
+bool NamespaceString::isReshardingConflictStashCollection() const {
+    return db() == "config" && coll().startsWith(kReshardingConflictStashPrefix);
+}
+
+bool NamespaceString::isTemporaryReshardingCollection() const {
+    return coll().startsWith(kTemporaryReshardingCollectionPrefix);
+}
+
+bool NamespaceString::isTimeseriesBucketsCollection() const {
+    return coll().startsWith(kTimeseriesBucketsCollectionPrefix);
+}
+
+NamespaceString NamespaceString::makeTimeseriesBucketsNamespace() const {
+    return {db(), kTimeseriesBucketsCollectionPrefix.toString() + coll()};
+}
+
+NamespaceString NamespaceString::getTimeseriesViewNamespace() const {
+    invariant(isTimeseriesBucketsCollection());
+    return {db(), coll().substr(kTimeseriesBucketsCollectionPrefix.size())};
 }
 
 bool NamespaceString::isReplicated() const {
@@ -246,6 +363,23 @@ std::string NamespaceStringOrUUID::toString() const {
         return _nss->toString();
     else
         return _uuid->toString();
+}
+
+void NamespaceStringOrUUID::serialize(BSONObjBuilder* builder, StringData fieldName) const {
+    invariant(_uuid || _nss);
+    if (_preferNssForSerialization) {
+        if (_nss) {
+            builder->append(fieldName, _nss->coll());
+        } else {
+            _uuid->appendToBuilder(builder, fieldName);
+        }
+    } else {
+        if (_uuid) {
+            _uuid->appendToBuilder(builder, fieldName);
+        } else {
+            builder->append(fieldName, _nss->coll());
+        }
+    }
 }
 
 std::ostream& operator<<(std::ostream& stream, const NamespaceString& nss) {

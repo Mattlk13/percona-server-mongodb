@@ -30,7 +30,7 @@
 #pragma once
 
 #include "mongo/db/catalog/index_catalog_entry.h"
-#include "mongo/db/ops/delete_request.h"
+#include "mongo/db/ops/delete_request_gen.h"
 #include "mongo/db/ops/parsed_delete.h"
 #include "mongo/db/ops/parsed_update.h"
 #include "mongo/db/ops/update_request.h"
@@ -46,7 +46,19 @@
 namespace mongo {
 
 class Collection;
+class CollectionPtr;
 class CountRequest;
+
+/**
+ * Make an ExpressionContext to be used for non-aggregate commands. The result of this can be passed
+ * into any of the getExecutor* functions.
+ *
+ * Note that the getExecutor* functions may change the collation on the returned ExpressionContext
+ * if the collection has a default collation and no collation was specifically requested
+ * ('requestCollation' is empty).
+ */
+boost::intrusive_ptr<ExpressionContext> makeExpressionContextForGetExecutor(
+    OperationContext* opCtx, const BSONObj& requestCollation, const NamespaceString& nss);
 
 /**
  * Filter indexes retrieved from index catalog by
@@ -62,7 +74,7 @@ void filterAllowedIndexEntries(const AllowedIndicesFilter& allowedIndicesFilter,
  * 'collection'.  Exposed for testing.
  */
 void fillOutPlannerParams(OperationContext* opCtx,
-                          Collection* collection,
+                          const CollectionPtr& collection,
                           CanonicalQuery* canonicalQuery,
                           QueryPlannerParams* plannerParams);
 
@@ -91,18 +103,11 @@ IndexEntry indexEntryFromIndexCatalogEntry(OperationContext* opCtx,
                                            const CanonicalQuery* canonicalQuery = nullptr);
 
 /**
- * Converts the catalog metadata for an index into a CoreIndexInfo, which is a format that is meant
- * to be used to update the plan cache. This function has no side effects and is safe to call in
- * all contexts.
- */
-CoreIndexInfo indexInfoFromIndexCatalogEntry(const IndexCatalogEntry& ice);
-
-/**
  * Determines whether or not to wait for oplog visibility for a query. This is only used for
  * collection scans on the oplog.
  */
 bool shouldWaitForOplogVisibility(OperationContext* opCtx,
-                                  const Collection* collection,
+                                  const CollectionPtr& collection,
                                   bool tailable);
 
 /**
@@ -115,15 +120,15 @@ bool shouldWaitForOplogVisibility(OperationContext* opCtx,
  */
 StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutor(
     OperationContext* opCtx,
-    Collection* collection,
+    const CollectionPtr* collection,
     std::unique_ptr<CanonicalQuery> canonicalQuery,
-    PlanExecutor::YieldPolicy yieldPolicy,
+    PlanYieldPolicy::YieldPolicy yieldPolicy,
     size_t plannerOptions = 0);
 
 /**
  * Get a plan executor for a .find() operation. The executor will have a 'YIELD_AUTO' yield policy
- * unless a false value for 'permitYield' or a snapshot read concern (according to the
- * OperationContext) forces it to have a 'NO_INTERRUPT' yield policy.
+ * unless a false value for 'permitYield' or being part of a multi-document transaction forces it to
+ * have a 'NO_INTERRUPT' yield policy.
  *
  * If the query is valid and an executor could be created, returns a StatusWith with the
  * PlanExecutor.
@@ -132,7 +137,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutor(
  */
 StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorFind(
     OperationContext* opCtx,
-    Collection* collection,
+    const CollectionPtr* collection,
     std::unique_ptr<CanonicalQuery> canonicalQuery,
     bool permitYield = false,
     size_t plannerOptions = QueryPlannerParams::DEFAULT);
@@ -142,7 +147,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorFind
  */
 StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorLegacyFind(
     OperationContext* opCtx,
-    Collection* collection,
+    const CollectionPtr* collection,
     std::unique_ptr<CanonicalQuery> canonicalQuery);
 
 /**
@@ -171,9 +176,9 @@ bool turnIxscanIntoDistinctIxscan(QuerySolution* soln,
  * A $group stage on a single field behaves similarly to a distinct command. If it has no
  * accumulators or only $first accumulators, the $group command only needs to visit one document for
  * each distinct value of the grouped-by (_id) field to compute its result. When there is a sort
- * order specified in parsedDistinct->getQuery()->getQueryRequest.getSort(), the DISTINCT_SCAN will
- * follow that sort order, ensuring that it chooses the correct document from each group to compute
- * any $first accumulators.
+ * order specified in parsedDistinct->getQuery()->getFindCommandRequest().getSort(), DISTINCT_SCAN
+ * will follow that sort order, ensuring that it chooses the correct document from each group to
+ * compute any $first accumulators.
  *
  * Specify the QueryPlannerParams::STRICT_DISTINCT_ONLY flag in the 'params' argument to ensure that
  * any resulting plan _guarantees_ it will return exactly one document per value of the distinct
@@ -199,10 +204,7 @@ bool turnIxscanIntoDistinctIxscan(QuerySolution* soln,
  * distinct.
  */
 StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorDistinct(
-    OperationContext* opCtx,
-    Collection* collection,
-    size_t plannerOptions,
-    ParsedDistinct* parsedDistinct);
+    const CollectionPtr* collection, size_t plannerOptions, ParsedDistinct* parsedDistinct);
 
 /*
  * Get a PlanExecutor for a query executing as part of a count command.
@@ -212,9 +214,9 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorDist
  * executing a count.
  */
 StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorCount(
-    OperationContext* opCtx,
-    Collection* collection,
-    const CountCommand& request,
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    const CollectionPtr* collection,
+    const CountCommandRequest& request,
     bool explain,
     const NamespaceString& nss);
 
@@ -224,6 +226,9 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorCoun
  * locks, and must not release these locks until after the returned PlanExecutor is deleted.
  *
  * 'opDebug' Optional argument. When not null, will be used to record operation statistics.
+ *
+ * If the delete operation is executed in explain mode, the 'verbosity' parameter should be
+ * set to the requested verbosity level, or boost::none otherwise.
  *
  * The returned PlanExecutor will used the YieldPolicy returned by parsedDelete->yieldPolicy().
  *
@@ -235,7 +240,10 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorCoun
  * If the query cannot be executed, returns a Status indicating why.
  */
 StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorDelete(
-    OperationContext* opCtx, OpDebug* opDebug, Collection* collection, ParsedDelete* parsedDelete);
+    OpDebug* opDebug,
+    const CollectionPtr* collection,
+    ParsedDelete* parsedDelete,
+    boost::optional<ExplainOptions::Verbosity> verbosity);
 
 /**
  * Get a PlanExecutor for an update operation. 'parsedUpdate' describes the query predicate
@@ -244,6 +252,9 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorDele
  * PlanExecutor is deleted.
  *
  * 'opDebug' Optional argument. When not null, will be used to record operation statistics.
+ *
+ * If the delete operation is executed in explain mode, the 'verbosity' parameter should be
+ * set to the requested verbosity level, or boost::none otherwise.
  *
  * The returned PlanExecutor will used the YieldPolicy returned by parsedUpdate->yieldPolicy().
  *
@@ -255,5 +266,8 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorDele
  * If the query cannot be executed, returns a Status indicating why.
  */
 StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorUpdate(
-    OperationContext* opCtx, OpDebug* opDebug, Collection* collection, ParsedUpdate* parsedUpdate);
+    OpDebug* opDebug,
+    const CollectionPtr* collection,
+    ParsedUpdate* parsedUpdate,
+    boost::optional<ExplainOptions::Verbosity> verbosity);
 }  // namespace mongo

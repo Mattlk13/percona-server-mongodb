@@ -32,9 +32,8 @@
 #include <string>
 #include <vector>
 
-#include "mongo/db/catalog/collection_catalog_entry.h"
+#include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/index/multikey_paths.h"
-#include "mongo/db/storage/kv/kv_prefix.h"
 
 namespace mongo {
 
@@ -42,39 +41,20 @@ namespace mongo {
  * This is a helper class for any storage engine that wants to store catalog information
  * as BSON. It is totally optional to use this.
  */
-class BSONCollectionCatalogEntry : public CollectionCatalogEntry {
+class BSONCollectionCatalogEntry {
 public:
     static const StringData kIndexBuildScanning;
     static const StringData kIndexBuildDraining;
 
-    BSONCollectionCatalogEntry(StringData ns);
+    /**
+     * Incremented when breaking changes are made to the index build procedure so that other servers
+     * know whether or not to resume or discard unfinished index builds.
+     */
+    static constexpr int kIndexBuildVersion = 1;
+
+    BSONCollectionCatalogEntry() = default;
 
     virtual ~BSONCollectionCatalogEntry() {}
-
-    virtual CollectionOptions getCollectionOptions(OperationContext* opCtx) const;
-
-    virtual int getTotalIndexCount(OperationContext* opCtx) const;
-
-    virtual int getCompletedIndexCount(OperationContext* opCtx) const;
-
-    virtual BSONObj getIndexSpec(OperationContext* opCtx, StringData idxName) const;
-
-    virtual void getAllIndexes(OperationContext* opCtx, std::vector<std::string>* names) const;
-
-    virtual void getReadyIndexes(OperationContext* opCtx, std::vector<std::string>* names) const;
-
-    virtual void getAllUniqueIndexes(OperationContext* opCtx,
-                                     std::vector<std::string>* names) const;
-
-    virtual bool isIndexMultikey(OperationContext* opCtx,
-                                 StringData indexName,
-                                 MultikeyPaths* multikeyPaths) const;
-
-    virtual bool isIndexReady(OperationContext* opCtx, StringData indexName) const;
-
-    virtual bool isIndexPresent(OperationContext* opCtx, StringData indexName) const;
-
-    virtual KVPrefix getIndexPrefix(OperationContext* opCtx, StringData indexName) const;
 
     // ------ for implementors
 
@@ -83,6 +63,8 @@ public:
 
         void updateTTLSetting(long long newExpireSeconds);
 
+        void updateHiddenSetting(bool hidden);
+
         std::string name() const {
             return spec["name"].String();
         }
@@ -90,15 +72,10 @@ public:
         BSONObj spec;
         bool ready = false;
         bool multikey = false;
-        KVPrefix prefix = KVPrefix::kNotPrefixed;
         bool isBackgroundSecondaryBuild = false;
 
-        long versionOfBuild = kIndexBuildVersion;
-        // If true, a two-phase index build is in progress, false otherwise.
-        bool runTwoPhaseBuild = false;
-        boost::optional<std::string> buildPhase;
-        boost::optional<std::string> constraintViolationsIdent;
-        boost::optional<std::string> sideWritesIdent;
+        // If initialized, a two-phase index build is in progress.
+        boost::optional<UUID> buildUUID;
 
         // If non-empty, 'multikeyPaths' is a vector with size equal to the number of elements in
         // the index key pattern. Each element in the vector is an ordered set of positions
@@ -119,17 +96,9 @@ public:
          */
         bool eraseIndex(StringData name);
 
-        void rename(StringData toNS);
-
-        KVPrefix getMaxPrefix() const;
-
         std::string ns;
         CollectionOptions options;
         std::vector<IndexMetaData> indexes;
-        KVPrefix prefix = KVPrefix::kNotPrefixed;
     };
-
-protected:
-    virtual MetaData _getMetaData(OperationContext* opCtx) const = 0;
 };
-}
+}  // namespace mongo

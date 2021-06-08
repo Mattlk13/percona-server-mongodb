@@ -48,31 +48,29 @@ void ExpressionParams::parseTwoDParams(const BSONObj& infoObj, TwoDIndexingParam
     while (i.more()) {
         BSONElement e = i.next();
         if (e.type() == String && IndexNames::GEO_2D == e.valuestr()) {
-            uassert(16800, "can't have 2 geo fields", out->geo.size() == 0);
-            uassert(16801, "2d has to be first in index", out->other.size() == 0);
+            uassert(16800, "can't have 2 geo fields", out->geo.empty());
+            uassert(16801, "2d has to be first in index", out->other.empty());
             out->geo = e.fieldName();
         } else {
             int order = 1;
             if (e.isNumber()) {
                 order = static_cast<int>(e.Number());
             }
-            out->other.push_back(std::make_pair(e.fieldName(), order));
+            out->other.emplace_back(e.fieldName(), order);
         }
     }
 
     uassert(16802, "no geo field specified", out->geo.size());
 
-    GeoHashConverter::Parameters hashParams;
-    Status paramStatus = GeoHashConverter::parseParameters(infoObj, &hashParams);
-    uassertStatusOK(paramStatus);
-
-    out->geoHashConverter.reset(new GeoHashConverter(hashParams));
+    auto result = GeoHashConverter::createFromDoc(infoObj);
+    uassertStatusOK(result.getStatus());
+    out->geoHashConverter.reset(result.getValue().release());
 }
 
 void ExpressionParams::parseHashParams(const BSONObj& infoObj,
                                        HashSeed* seedOut,
                                        int* versionOut,
-                                       std::string* fieldOut) {
+                                       BSONObj* keyPattern) {
     // Default _seed to DEFAULT_HASH_SEED if "seed" is not included in the index spec
     // or if the value of "seed" is not a number
 
@@ -91,10 +89,21 @@ void ExpressionParams::parseHashParams(const BSONObj& infoObj,
     // the value of "hashversion" is not a number
     *versionOut = infoObj["hashVersion"].numberInt();
 
-    // Get the hashfield name
-    BSONElement firstElt = infoObj.getObjectField("key").firstElement();
-    massert(16765, "error: no hashed index field", firstElt.str().compare(IndexNames::HASHED) == 0);
-    *fieldOut = firstElt.fieldName();
+    // Extract and validate the index key pattern
+    int numHashFields = 0;
+    *keyPattern = infoObj.getObjectField("key");
+    for (auto&& indexField : *keyPattern) {
+        // The 'indexField' can either be ascending (1), descending (-1), or HASHED. Any other field
+        // types should have failed validation while parsing.
+        invariant(indexField.isNumber() || (indexField.valueStringData() == IndexNames::HASHED));
+        numHashFields += (indexField.isNumber()) ? 0 : 1;
+    }
+    // We shouldn't be here if there are no hashed fields in the index.
+    invariant(numHashFields > 0);
+    uassert(31303,
+            str::stream() << "A maximum of one index field is allowed to be hashed but found "
+                          << numHashFields << " for 'key' " << *keyPattern,
+            numHashFields == 1);
 }
 
 void ExpressionParams::parseHaystackParams(const BSONObj& infoObj,
@@ -193,14 +202,8 @@ void ExpressionParams::initialize2dsphereParams(const BSONObj& infoObj,
 
     massert(17395,
             stream() << "unsupported geo index version { " << kIndexVersionFieldName << " : "
-                     << out->indexVersion
-                     << " }, only support versions: ["
-                     << S2_INDEX_VERSION_1
-                     << ","
-                     << S2_INDEX_VERSION_2
-                     << ","
-                     << S2_INDEX_VERSION_3
-                     << "]",
+                     << out->indexVersion << " }, only support versions: [" << S2_INDEX_VERSION_1
+                     << "," << S2_INDEX_VERSION_2 << "," << S2_INDEX_VERSION_3 << "]",
             out->indexVersion == S2_INDEX_VERSION_3 || out->indexVersion == S2_INDEX_VERSION_2 ||
                 out->indexVersion == S2_INDEX_VERSION_1);
 }

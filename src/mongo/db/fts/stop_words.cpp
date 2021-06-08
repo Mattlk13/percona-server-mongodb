@@ -44,7 +44,7 @@ void loadStopWordMap(StringMap<std::set<std::string>>* m);
 namespace {
 StringMap<std::shared_ptr<StopWords>> StopWordsMap;
 StopWords empty;
-}
+}  // namespace
 
 
 StopWords::StopWords() {}
@@ -68,7 +68,6 @@ MONGO_INITIALIZER(StopWords)(InitializerContext* context) {
     for (StringMap<std::set<std::string>>::const_iterator i = raw.begin(); i != raw.end(); ++i) {
         StopWordsMap[i->first].reset(new StopWords(i->second));
     }
-    return Status::OK();
 }
-}
-}
+}  // namespace fts
+}  // namespace mongo

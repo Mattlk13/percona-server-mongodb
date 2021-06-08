@@ -1,8 +1,5 @@
 """The unittest.TestCase for JSON Schema tests."""
 
-from buildscripts.resmokelib import config
-from buildscripts.resmokelib import core
-from buildscripts.resmokelib import utils
 from buildscripts.resmokelib.testing.testcases import jsrunnerfile
 
 
@@ -26,3 +23,4 @@ class JSONSchemaTestCase(jsrunnerfile.JSRunnerFileTestCase):
 
     def _populate_test_data(self, test_data):
         test_data["jsonSchemaTestFile"] = self.json_filename
+        test_data["peerPids"] = self.fixture.pids()

@@ -26,7 +26,7 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplicationRollback
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplicationRollback
 
 #include "mongo/platform/basic.h"
 
@@ -45,22 +45,21 @@
 #include "mongo/db/repl/oplog_interface_mock.h"
 #include "mongo/db/repl/rollback_impl.h"
 #include "mongo/db/repl/rollback_test_fixture.h"
-#include "mongo/db/s/shard_identity_rollback_notifier.h"
+#include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/type_shard_identity.h"
 #include "mongo/db/service_context.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/catalog/type_config_version.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/transport/session.h"
 #include "mongo/transport/transport_layer_mock.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
 #include "mongo/util/uuid.h"
 
+namespace mongo {
+namespace repl {
 namespace {
-
-using namespace mongo;
-using namespace mongo::repl;
 
 NamespaceString kOplogNSS("local.oplog.rs");
 NamespaceString nss("test.coll");
@@ -69,37 +68,21 @@ std::string kGenericUUIDStr = "b4c66a44-c1ca-4d86-8d25-12e82fa2de5b";
 BSONObj makeInsertOplogEntry(long long time, BSONObj obj, StringData ns, UUID uuid) {
     return BSON("ts" << Timestamp(time, time) << "t" << time << "op"
                      << "i"
-                     << "o"
-                     << obj
-                     << "ns"
-                     << ns
-                     << "ui"
-                     << uuid);
+                     << "o" << obj << "ns" << ns << "ui" << uuid << "wall" << Date_t());
 }
 
 BSONObj makeUpdateOplogEntry(
     long long time, BSONObj query, BSONObj update, StringData ns, UUID uuid) {
     return BSON("ts" << Timestamp(time, time) << "t" << time << "op"
                      << "u"
-                     << "ns"
-                     << ns
-                     << "ui"
-                     << uuid
-                     << "o2"
-                     << query
-                     << "o"
-                     << BSON("$set" << update));
+                     << "ns" << ns << "ui" << uuid << "o2" << query << "o" << BSON("$set" << update)
+                     << "wall" << Date_t());
 }
 
 BSONObj makeDeleteOplogEntry(long long time, BSONObj id, StringData ns, UUID uuid) {
     return BSON("ts" << Timestamp(time, time) << "t" << time << "op"
                      << "d"
-                     << "ns"
-                     << ns
-                     << "ui"
-                     << uuid
-                     << "o"
-                     << id);
+                     << "ns" << ns << "ui" << uuid << "o" << id << "wall" << Date_t());
 }
 
 class RollbackImplForTest final : public RollbackImpl {
@@ -129,10 +112,15 @@ protected:
                                         UUID uuid,
                                         NamespaceString nss,
                                         const SimpleBSONObjUnorderedSet& idSet) final {
-        log() << "Simulating writing a rollback file for namespace " << nss.ns() << " with uuid "
-              << uuid;
+        LOGV2(21647,
+              "Simulating writing a rollback file for namespace {nss_ns} with uuid {uuid}",
+              "nss_ns"_attr = nss.ns(),
+              "uuid"_attr = uuid);
         for (auto&& id : idSet) {
-            log() << "Looking up " << id.jsonString();
+            LOGV2(21648,
+                  "Looking up {id_jsonString_JsonStringFormat_LegacyStrict}",
+                  "id_jsonString_JsonStringFormat_LegacyStrict"_attr =
+                      id.jsonString(JsonStringFormat::LegacyStrict));
             auto document = _findDocumentById(opCtx, uuid, nss, id.firstElement());
             if (document) {
                 _uuidToObjsMap[uuid].push_back(*document);
@@ -176,6 +164,8 @@ protected:
         // Create a new collection in the storage interface.
         CollectionOptions options;
         options.uuid = uuid;
+        OperationShardingState::ScopedAllowImplicitCollectionCreate_UNSAFE unsafeCreateCollection(
+            opCtx);
         ASSERT_OK(_storageInterface->createCollection(opCtx, nss, options));
 
         // Initialize a mock collection.
@@ -258,45 +248,47 @@ protected:
     std::unique_ptr<RollbackImplForTest> _rollback;
 
     bool _transitionedToRollback = false;
-    stdx::function<void()> _onTransitionToRollbackFn = [this]() { _transitionedToRollback = true; };
+    std::function<void()> _onTransitionToRollbackFn = [this]() { _transitionedToRollback = true; };
 
     bool _recoveredToStableTimestamp = false;
     Timestamp _stableTimestamp;
-    stdx::function<void(Timestamp)> _onRecoverToStableTimestampFn =
+    std::function<void(Timestamp)> _onRecoverToStableTimestampFn =
         [this](Timestamp stableTimestamp) {
             _recoveredToStableTimestamp = true;
             _stableTimestamp = stableTimestamp;
         };
 
     bool _recoveredFromOplog = false;
-    stdx::function<void()> _onRecoverFromOplogFn = [this]() { _recoveredFromOplog = true; };
+    std::function<void()> _onRecoverFromOplogFn = [this]() { _recoveredFromOplog = true; };
 
     bool _incrementedRollbackID = false;
-    stdx::function<void()> _onRollbackIDIncrementedFn = [this]() { _incrementedRollbackID = true; };
+    std::function<void()> _onRollbackIDIncrementedFn = [this]() { _incrementedRollbackID = true; };
 
     bool _reconstructedPreparedTransactions = false;
-    stdx::function<void()> _onPreparedTransactionsReconstructedFn = [this]() {
+    std::function<void()> _onPreparedTransactionsReconstructedFn = [this]() {
         _reconstructedPreparedTransactions = true;
     };
 
     Timestamp _commonPointFound;
-    stdx::function<void(Timestamp commonPoint)> _onCommonPointFoundFn =
+    std::function<void(Timestamp commonPoint)> _onCommonPointFoundFn =
         [this](Timestamp commonPoint) { _commonPointFound = commonPoint; };
 
     Timestamp _truncatePoint;
-    stdx::function<void(Timestamp truncatePoint)> _onSetOplogTruncateAfterPointFn =
+    std::function<void(Timestamp truncatePoint)> _onSetOplogTruncateAfterPointFn =
         [this](Timestamp truncatePoint) { _truncatePoint = truncatePoint; };
 
     bool _triggeredOpObserver = false;
-    stdx::function<void(const OpObserver::RollbackObserverInfo& rbInfo)> _onRollbackOpObserverFn =
+    std::function<void(const OpObserver::RollbackObserverInfo& rbInfo)> _onRollbackOpObserverFn =
         [this](const OpObserver::RollbackObserverInfo& rbInfo) { _triggeredOpObserver = true; };
 
-    stdx::function<void(UUID, NamespaceString)> _onRollbackFileWrittenForNamespaceFn =
+    std::function<void(UUID, NamespaceString)> _onRollbackFileWrittenForNamespaceFn =
         [this](UUID, NamespaceString) {};
 
     std::unique_ptr<Listener> _listener;
 
     UUID kGenericUUID = unittest::assertGet(UUID::parse(kGenericUUIDStr));
+
+    const long kOneDayInMillis = 60 * 60 * 24 * 1000;
 
 private:
     long _counter = 100;
@@ -305,15 +297,15 @@ private:
 void RollbackImplTest::setUp() {
     RollbackTest::setUp();
 
-    _localOplog = stdx::make_unique<OplogInterfaceLocal>(_opCtx.get());
-    _remoteOplog = stdx::make_unique<OplogInterfaceMock>();
-    _listener = stdx::make_unique<Listener>(this);
-    _rollback = stdx::make_unique<RollbackImplForTest>(_localOplog.get(),
-                                                       _remoteOplog.get(),
-                                                       _storageInterface,
-                                                       _replicationProcess.get(),
-                                                       _coordinator,
-                                                       _listener.get());
+    _localOplog = std::make_unique<OplogInterfaceLocal>(_opCtx.get());
+    _remoteOplog = std::make_unique<OplogInterfaceMock>();
+    _listener = std::make_unique<Listener>(this);
+    _rollback = std::make_unique<RollbackImplForTest>(_localOplog.get(),
+                                                      _remoteOplog.get(),
+                                                      _storageInterface,
+                                                      _replicationProcess.get(),
+                                                      _coordinator,
+                                                      _listener.get());
 
     createOplog(_opCtx.get());
     serverGlobalParams.clusterRole = ClusterRole::None;
@@ -378,12 +370,8 @@ BSONObj makeOp(OpTime time) {
     auto kGenericUUID = unittest::assertGet(UUID::parse(kGenericUUIDStr));
     return BSON("ts" << time.getTimestamp() << "t" << time.getTerm() << "op"
                      << "n"
-                     << "o"
-                     << BSONObj()
-                     << "ns"
-                     << nss.ns()
-                     << "ui"
-                     << kGenericUUID);
+                     << "o" << BSONObj() << "ns" << nss.ns() << "ui" << kGenericUUID << "wall"
+                     << Date_t());
 }
 
 BSONObj makeOp(int count) {
@@ -398,13 +386,9 @@ auto makeOpWithWallClockTime(long count, long wallClockMillis) {
     auto kGenericUUID = unittest::assertGet(UUID::parse(kGenericUUIDStr));
     return BSON("ts" << Timestamp(count, count) << "t" << (long long)count << "op"
                      << "n"
-                     << "o"
-                     << BSONObj()
-                     << "ns"
+                     << "o" << BSONObj() << "ns"
                      << "top"
-                     << "ui"
-                     << kGenericUUID
-                     << "wall"
+                     << "ui" << kGenericUUID << "wall"
                      << Date_t::fromMillisSinceEpoch(wallClockMillis));
 };
 
@@ -423,6 +407,60 @@ OplogInterfaceMock::Operation makeOpAndRecordId(OpTime time) {
 
 OplogInterfaceMock::Operation makeOpAndRecordId(int count) {
     return makeOpAndRecordId(makeOp(count));
+}
+
+/**
+ * Helper to create a noop entry that represents a migrated retryable write or transaction oplog
+ * entry.
+ */
+BSONObj makeMigratedNoop(OpTime opTime,
+                         boost::optional<BSONObj> o2,
+                         LogicalSessionId lsid,
+                         int txnNum,
+                         OpTime prevOpTime,
+                         boost::optional<int> stmtId,
+                         int wallClockMillis,
+                         bool isRetryableWrite) {
+    repl::MutableOplogEntry op;
+    op.setOpType(repl::OpTypeEnum::kNoop);
+    op.setNss(nss);
+    op.setObject(BSONObj());
+    op.setOpTime(opTime);
+    if (isRetryableWrite) {
+        op.setFromMigrate(true);
+    }
+    op.setObject2(o2);
+    if (stmtId) {
+        op.setStatementIds({*stmtId});
+    }
+    OperationSessionInfo sessionInfo;
+    sessionInfo.setSessionId(lsid);
+    sessionInfo.setTxnNumber(txnNum);
+    op.setOperationSessionInfo(sessionInfo);
+    op.setPrevWriteOpTimeInTransaction(prevOpTime);
+    op.setWallClockTime(Date_t::fromMillisSinceEpoch(wallClockMillis));
+    return op.toBSON();
+}
+
+/**
+ * Helper to create a transaction command oplog entry.
+ */
+BSONObj makeTransactionOplogEntry(OpTime opTime,
+                                  LogicalSessionId lsid,
+                                  int txnNum,
+                                  OpTime prevOpTime) {
+    repl::MutableOplogEntry op;
+    op.setOpType(repl::OpTypeEnum::kCommand);
+    op.setNss(nss);
+    op.setObject(BSON("applyOps" << BSONArray()));
+    op.setOpTime(opTime);
+    OperationSessionInfo sessionInfo;
+    sessionInfo.setSessionId(lsid);
+    sessionInfo.setTxnNumber(txnNum);
+    op.setOperationSessionInfo(sessionInfo);
+    op.setPrevWriteOpTimeInTransaction(prevOpTime);
+    op.setWallClockTime(Date_t());
+    return op.toBSON();
 }
 
 /**
@@ -486,11 +524,31 @@ TEST_F(RollbackImplTest, RollbackReturnsNoMatchingDocumentWhenNoCommonPoint) {
 }
 
 TEST_F(RollbackImplTest, RollbackSucceedsIfRollbackPeriodIsWithinTimeLimit) {
-
-    // The default limit is 1 day, so we make the difference be just under a day.
     auto commonPoint = makeOpAndRecordId(makeOpWithWallClockTime(1, 5 * 1000));
-    auto topOfOplog = makeOpAndRecordId(makeOpWithWallClockTime(2, 60 * 60 * 24 * 1000));
+    // We use the difference of wall clock times between the top of the oplog and the first op after
+    // the common point to calculate the rollback time limit.
+    auto firstOpAfterCommonPoint =
+        makeOpAndRecordId(makeOpWithWallClockTime(2, 2 * kOneDayInMillis));
+    // The default limit is 1 day, so we make the difference be just under a day.
+    auto topOfOplog = makeOpAndRecordId(makeOpWithWallClockTime(3, kOneDayInMillis));
+    _remoteOplog->setOperations({commonPoint});
+    ASSERT_OK(_insertOplogEntry(commonPoint.first));
+    ASSERT_OK(_insertOplogEntry(firstOpAfterCommonPoint.first));
+    ASSERT_OK(_insertOplogEntry(topOfOplog.first));
 
+    _storageInterface->setStableTimestamp(nullptr, Timestamp(1, 1));
+
+    // Run rollback.
+    ASSERT_OK(_rollback->runRollback(_opCtx.get()));
+}
+
+TEST_F(RollbackImplTest, RollbackSucceedsIfTopOfOplogIsFirstOpAfterCommonPoint) {
+
+    auto commonPoint = makeOpAndRecordId(makeOpWithWallClockTime(1, 5 * 1000));
+    // The default limit is 1 day, so we make the difference be 2 days. The rollback should still
+    // succeed since we calculate the difference of wall clock times between the top of the oplog
+    // and the first op after the common point which are both the same operation in this case.
+    auto topOfOplog = makeOpAndRecordId(makeOpWithWallClockTime(3, 2 * kOneDayInMillis));
     _remoteOplog->setOperations({commonPoint});
     ASSERT_OK(_insertOplogEntry(commonPoint.first));
     ASSERT_OK(_insertOplogEntry(topOfOplog.first));
@@ -525,7 +583,11 @@ TEST_F(RollbackImplTest, RollbackKillsNecessaryOperations) {
 
     // Run rollback in a separate thread so the locking threads can check for interrupt.
     Status status(ErrorCodes::InternalError, "Not set");
-    stdx::thread rollbackThread([&] { status = _rollback->runRollback(_opCtx.get()); });
+    stdx::thread rollbackThread([&] {
+        ThreadClient tc(getGlobalServiceContext());
+        auto opCtx = tc.get()->makeOperationContext();
+        status = _rollback->runRollback(opCtx.get());
+    });
 
     while (!(writeOpCtx->isKillPending() && readOpCtx->isKillPending())) {
         // Do nothing.
@@ -533,12 +595,12 @@ TEST_F(RollbackImplTest, RollbackKillsNecessaryOperations) {
     }
 
     // We assume that an interrupted opCtx would release its locks.
-    unittest::log() << "Both opCtx's marked for kill";
+    LOGV2(21649, "Both opCtx's marked for kill");
     ASSERT_EQ(ErrorCodes::InterruptedDueToReplStateChange, writeOpCtx->checkForInterruptNoAssert());
     globalWrite = boost::none;
     ASSERT_EQ(ErrorCodes::InterruptedDueToReplStateChange, readOpCtx->checkForInterruptNoAssert());
     globalRead = boost::none;
-    unittest::log() << "Both opCtx's were interrupted";
+    LOGV2(21650, "Both opCtx's were interrupted");
 
     rollbackThread.join();
     ASSERT_OK(status);
@@ -546,12 +608,16 @@ TEST_F(RollbackImplTest, RollbackKillsNecessaryOperations) {
 
 TEST_F(RollbackImplTest, RollbackFailsIfRollbackPeriodIsTooLong) {
 
-    // The default limit is 1 day, so we make the difference be 2 days.
     auto commonPoint = makeOpAndRecordId(makeOpWithWallClockTime(1, 5 * 1000));
-    auto topOfOplog = makeOpAndRecordId(makeOpWithWallClockTime(2, 2 * 60 * 60 * 24 * 1000));
+    auto opAfterCommonPoint = makeOpAndRecordId(makeOpWithWallClockTime(2, 5 * 1000));
+    // We calculate the roll back time limit by comparing the difference between the top of the
+    // oplog and the first oplog entry after the commit point. The default limit is 1 day, so we
+    // make the difference be 2 days.
+    auto topOfOplog = makeOpAndRecordId(makeOpWithWallClockTime(3, 2 * 60 * 60 * 24 * 1000));
 
     _remoteOplog->setOperations({commonPoint});
     ASSERT_OK(_insertOplogEntry(commonPoint.first));
+    ASSERT_OK(_insertOplogEntry(opAfterCommonPoint.first));
     ASSERT_OK(_insertOplogEntry(topOfOplog.first));
 
     _storageInterface->setStableTimestamp(nullptr, Timestamp(1, 1));
@@ -574,7 +640,7 @@ TEST_F(RollbackImplTest, RollbackPersistsDocumentAfterCommonPointToOplogTruncate
     auto coll = _initializeCollection(_opCtx.get(), UUID::gen(), nss);
 
     ASSERT_OK(_rollback->runRollback(_opCtx.get()));
-    ASSERT_EQUALS(_truncatePoint, Timestamp(3, 3));
+    ASSERT_EQUALS(_truncatePoint, Timestamp(2, 2));
 }
 
 TEST_F(RollbackImplTest, RollbackImplResetsOptimesFromOplogAfterRollback) {
@@ -656,9 +722,9 @@ TEST_F(RollbackImplTest, RollbackCallsRecoverToStableTimestamp) {
     ASSERT_EQUALS(stableTimestamp, _stableTimestamp);
 }
 
-DEATH_TEST_F(RollbackImplTest,
-             RollbackFassertsIfRecoverToStableTimestampFails,
-             "Fatal assertion 31049") {
+DEATH_TEST_REGEX_F(RollbackImplTest,
+                   RollbackFassertsIfRecoverToStableTimestampFails,
+                   "Fatal assertion.*4584700") {
     auto op = makeOpAndRecordId(1);
     _remoteOplog->setOperations({op});
     ASSERT_OK(_insertOplogEntry(op.first));
@@ -765,7 +831,7 @@ TEST_F(RollbackImplTest,
 
 DEATH_TEST_F(RollbackImplTest,
              RollbackUassertsAreFatalBetweenAbortingAndReconstructingPreparedTransactions,
-             "Caught exception during critical section in rollback") {
+             "UnknownError: error for test") {
     auto op = makeOpAndRecordId(1);
     _remoteOplog->setOperations({op});
     ASSERT_OK(_insertOplogEntry(op.first));
@@ -778,7 +844,6 @@ DEATH_TEST_F(RollbackImplTest,
     // Called before aborting prepared transactions.
     _onRollbackIDIncrementedFn = [this]() { _incrementedRollbackID = true; };
 
-    // Called during the critical section.
     _onRecoverToStableTimestampFn = [this](Timestamp stableTimestamp) {
         _recoveredToStableTimestamp = true;
         uasserted(ErrorCodes::UnknownError, "error for test");
@@ -826,7 +891,7 @@ TEST_F(RollbackImplTest,
     // Run rollback.
     auto status = _rollback->runRollback(_opCtx.get());
 
-    ASSERT_EQUALS(ErrorCodes::ShutdownInProgress, _rollback->runRollback(_opCtx.get()));
+    ASSERT_EQUALS(ErrorCodes::ShutdownInProgress, status.code());
     ASSERT(_recoveredToStableTimestamp);
     ASSERT(_recoveredFromOplog);
     ASSERT_FALSE(_triggeredOpObserver);
@@ -838,7 +903,7 @@ TEST_F(RollbackImplTest,
     truncateAfterPoint =
         _replicationProcess->getConsistencyMarkers()->getOplogTruncateAfterPoint(_opCtx.get());
     ASSERT_EQUALS(Timestamp(), truncateAfterPoint);
-    ASSERT_EQUALS(_truncatePoint, Timestamp(2, 2));
+    ASSERT_EQUALS(_truncatePoint, Timestamp(1, 1));
     ASSERT_EQ(_storageInterface->getFinalCollectionCount(uuid), 1);
 }
 
@@ -862,13 +927,12 @@ TEST_F(RollbackImplTest, RollbackSucceedsAndTruncatesOplog) {
         _replicationProcess->getConsistencyMarkers()->getOplogTruncateAfterPoint(_opCtx.get());
     ASSERT_EQUALS(Timestamp(), truncateAfterPoint);
     _assertDocsInOplog(_opCtx.get(), {1});
-    ASSERT_EQUALS(_truncatePoint, Timestamp(2, 2));
+    ASSERT_EQUALS(_truncatePoint, Timestamp(1, 1));
 }
 
-DEATH_TEST_F(RollbackImplTest,
-             RollbackTriggersFatalAssertionOnFailingToTransitionFromRollbackToSecondary,
-             "Failed to transition into SECONDARY; expected to be in state ROLLBACK; found self in "
-             "ROLLBACK") {
+DEATH_TEST_REGEX_F(RollbackImplTest,
+                   RollbackTriggersFatalAssertionOnFailingToTransitionFromRollbackToSecondary,
+                   "Failed to perform replica set state transition") {
     _coordinator->failSettingFollowerMode(MemberState::RS_SECONDARY, ErrorCodes::IllegalOperation);
 
     auto op = makeOpAndRecordId(1);
@@ -878,7 +942,7 @@ DEATH_TEST_F(RollbackImplTest,
     _storageInterface->setStableTimestamp(nullptr, Timestamp(1, 1));
 
     auto status = _rollback->runRollback(_opCtx.get());
-    unittest::log() << "Mongod did not crash. Status: " << status;
+    LOGV2(21651, "Mongod did not crash. Status: {status}", "status"_attr = status);
     MONGO_UNREACHABLE;
 }
 
@@ -931,12 +995,8 @@ TEST_F(RollbackImplTest, RollbackDoesNotWriteRollbackFilesIfNoInsertsOrUpdatesAf
     const auto coll = _initializeCollection(_opCtx.get(), uuid, nss);
     const auto oplogEntry = BSON("ts" << Timestamp(3, 3) << "t" << 3LL << "op"
                                       << "c"
-                                      << "o"
-                                      << BSON("create" << nss.coll())
-                                      << "ns"
-                                      << nss.ns()
-                                      << "ui"
-                                      << uuid);
+                                      << "wall" << Date_t() << "o" << BSON("create" << nss.coll())
+                                      << "ns" << nss.ns() << "ui" << uuid);
     ASSERT_OK(_insertOplogEntry(oplogEntry));
 
     ASSERT_OK(_rollback->runRollback(_opCtx.get()));
@@ -1142,7 +1202,8 @@ TEST_F(RollbackImplTest, RollbackProperlySavesFilesWhenInsertsAndDropOfCollectio
     const auto nss = NamespaceString("db.people").makeDropPendingNamespace(dropOpTime);
     const auto uuid = UUID::gen();
     const auto coll = _initializeCollection(_opCtx.get(), uuid, nss);
-    DropPendingCollectionReaper::get(_opCtx.get())->addDropPendingNamespace(dropOpTime, nss);
+    DropPendingCollectionReaper::get(_opCtx.get())
+        ->addDropPendingNamespace(_opCtx.get(), dropOpTime, nss);
 
     // Insert documents into the collection. We'll write them out even though the collection is
     // later dropped.
@@ -1157,12 +1218,8 @@ TEST_F(RollbackImplTest, RollbackProperlySavesFilesWhenInsertsAndDropOfCollectio
     const auto oplogEntry =
         BSON("ts" << dropOpTime.getTimestamp() << "t" << dropOpTime.getTerm() << "op"
                   << "c"
-                  << "o"
-                  << BSON("drop" << nss.coll())
-                  << "ns"
-                  << nss.ns()
-                  << "ui"
-                  << uuid);
+                  << "wall" << Date_t() << "o" << BSON("drop" << nss.coll()) << "ns" << nss.ns()
+                  << "ui" << uuid);
     ASSERT_OK(_insertOplogEntry(oplogEntry));
 
     ASSERT_OK(_rollback->runRollback(_opCtx.get()));
@@ -1189,12 +1246,8 @@ TEST_F(RollbackImplTest, RollbackProperlySavesFilesWhenCreateCollAndInsertsAreRo
     const auto coll = _initializeCollection(_opCtx.get(), uuid, nss);
     const auto oplogEntry = BSON("ts" << Timestamp(3, 3) << "t" << 3LL << "op"
                                       << "c"
-                                      << "o"
-                                      << BSON("create" << nss.coll())
-                                      << "ns"
-                                      << nss.ns()
-                                      << "ui"
-                                      << uuid);
+                                      << "wall" << Date_t() << "o" << BSON("create" << nss.coll())
+                                      << "ns" << nss.ns() << "ui" << uuid);
     ASSERT_OK(_insertOplogEntry(oplogEntry));
 
     // Insert documents into the collection.
@@ -1244,7 +1297,7 @@ DEATH_TEST_F(RollbackImplTest,
     }
 
     auto status = _rollback->runRollback(_opCtx.get());
-    unittest::log() << "mongod did not crash when expected; status: " << status;
+    LOGV2(21652, "mongod did not crash when expected; status: {status}", "status"_attr = status);
 }
 
 DEATH_TEST_F(RollbackImplTest,
@@ -1258,7 +1311,7 @@ DEATH_TEST_F(RollbackImplTest,
     _storageInterface->setStableTimestamp(nullptr, Timestamp(1, 1));
 
     auto status = _rollback->runRollback(_opCtx.get());
-    unittest::log() << "mongod did not crash when expected; status: " << status;
+    LOGV2(21653, "mongod did not crash when expected; status: {status}", "status"_attr = status);
 }
 
 TEST_F(RollbackImplTest, RollbackSetsMultipleCollectionCounts) {
@@ -1428,24 +1481,31 @@ RollbackImplTest::_setUpUnpreparedTransactionForCountTest(UUID collId) {
     // set to true.
     auto insertOp2 = _insertDocAndReturnOplogEntry(BSON("_id" << 2), collId, nss, 2);
     auto partialApplyOpsOpTime = unittest::assertGet(OpTime::parseFromOplogEntry(insertOp2.first));
-    auto partialApplyOpsObj =
-        BSON("applyOps" << BSON_ARRAY(insertOp2.first) << "partialTxn" << true);
-    OplogEntry partialApplyOpsOplogEntry(partialApplyOpsOpTime,      // opTime
-                                         1LL,                        // hash
-                                         OpTypeEnum::kCommand,       // opType
-                                         adminCmdNss,                // nss
-                                         boost::none,                // uuid
-                                         boost::none,                // fromMigrate
-                                         OplogEntry::kOplogVersion,  // version
-                                         partialApplyOpsObj,         // oField
-                                         boost::none,                // o2Field
-                                         sessionInfo,                // sessionInfo
-                                         boost::none,                // isUpsert
-                                         boost::none,                // wallClockTime
-                                         boost::none,                // statementId
-                                         OpTime(),                   // prevWriteOpTimeInTransaction
-                                         boost::none,                // preImageOpTime
-                                         boost::none);               // postImageOpTime
+
+    // applyOps oplog entries cannot have an inner "ts", "t" or "wall" field.
+    auto insertOp2Obj = insertOp2.first.removeField("ts");
+    insertOp2Obj = insertOp2Obj.removeField("t");
+    insertOp2Obj = insertOp2Obj.removeField("wall");
+
+    auto partialApplyOpsObj = BSON("applyOps" << BSON_ARRAY(insertOp2Obj) << "partialTxn" << true);
+    DurableOplogEntry partialApplyOpsOplogEntry(partialApplyOpsOpTime,      // opTime
+                                                1LL,                        // hash
+                                                OpTypeEnum::kCommand,       // opType
+                                                adminCmdNss,                // nss
+                                                boost::none,                // uuid
+                                                boost::none,                // fromMigrate
+                                                OplogEntry::kOplogVersion,  // version
+                                                partialApplyOpsObj,         // oField
+                                                boost::none,                // o2Field
+                                                sessionInfo,                // sessionInfo
+                                                boost::none,                // isUpsert
+                                                Date_t(),                   // wallClockTime
+                                                {},                         // statementIds
+                                                OpTime(),      // prevWriteOpTimeInTransaction
+                                                boost::none,   // preImageOpTime
+                                                boost::none,   // postImageOpTime
+                                                boost::none,   // ShardId of resharding recipient
+                                                boost::none);  // _id
     ASSERT_OK(_insertOplogEntry(partialApplyOpsOplogEntry.toBSON()));
     ops.push_back(std::make_pair(partialApplyOpsOplogEntry.toBSON(), insertOp2.second));
 
@@ -1454,23 +1514,32 @@ RollbackImplTest::_setUpUnpreparedTransactionForCountTest(UUID collId) {
     // chain of applyOps oplog entries for this transaction.
     auto insertOp3 = _insertDocAndReturnOplogEntry(BSON("_id" << 3), collId, nss, 3);
     auto commitApplyOpsOpTime = unittest::assertGet(OpTime::parseFromOplogEntry(insertOp3.first));
-    auto commitApplyOpsObj = BSON("applyOps" << BSON_ARRAY(insertOp3.first) << "count" << 1);
-    OplogEntry commitApplyOpsOplogEntry(commitApplyOpsOpTime,       // opTime
-                                        1LL,                        // hash
-                                        OpTypeEnum::kCommand,       // opType
-                                        adminCmdNss,                // nss
-                                        boost::none,                // uuid
-                                        boost::none,                // fromMigrate
-                                        OplogEntry::kOplogVersion,  // version
-                                        commitApplyOpsObj,          // oField
-                                        boost::none,                // o2Field
-                                        sessionInfo,                // sessionInfo
-                                        boost::none,                // isUpsert
-                                        boost::none,                // wallClockTime
-                                        boost::none,                // statementId
-                                        partialApplyOpsOpTime,      // prevWriteOpTimeInTransaction
-                                        boost::none,                // preImageOpTime
-                                        boost::none);               // postImageOpTime
+
+    // applyOps oplog entries cannot have an inner "ts", "t" or "wall" field.
+    auto insertOp3Obj = insertOp3.first.removeField("ts");
+    insertOp3Obj = insertOp3Obj.removeField("t");
+    insertOp3Obj = insertOp3Obj.removeField("wall");
+
+    auto commitApplyOpsObj = BSON("applyOps" << BSON_ARRAY(insertOp3Obj) << "count" << 1);
+    DurableOplogEntry commitApplyOpsOplogEntry(
+        commitApplyOpsOpTime,       // opTime
+        1LL,                        // hash
+        OpTypeEnum::kCommand,       // opType
+        adminCmdNss,                // nss
+        boost::none,                // uuid
+        boost::none,                // fromMigrate
+        OplogEntry::kOplogVersion,  // version
+        commitApplyOpsObj,          // oField
+        boost::none,                // o2Field
+        sessionInfo,                // sessionInfo
+        boost::none,                // isUpsert
+        Date_t(),                   // wallClockTime
+        {},                         // statementIds
+        partialApplyOpsOpTime,      // prevWriteOpTimeInTransaction
+        boost::none,                // preImageOpTime
+        boost::none,                // postImageOpTime
+        boost::none,                // ShardId of resharding recipient
+        boost::none);               // _id
     ASSERT_OK(_insertOplogEntry(commitApplyOpsOplogEntry.toBSON()));
     ops.push_back(std::make_pair(commitApplyOpsOplogEntry.toBSON(), insertOp3.second));
 
@@ -1507,6 +1576,282 @@ TEST_F(RollbackImplTest, RollbackFixesCountForUnpreparedTransactionApplyOpsChain
     ASSERT_OK(_rollback->runRollback(_opCtx.get()));
 
     ASSERT_EQ(_storageInterface->getFinalCollectionCount(collId), 1);
+}
+
+TEST_F(RollbackImplTest, RollbackRestoresTxnTableEntryToBeConsistentWithStableTimestamp) {
+    const auto collUuid = UUID::gen();
+    const auto nss = NamespaceString::kSessionTransactionsTableNamespace;
+    _initializeCollection(_opCtx.get(), collUuid, nss);
+    LogicalSessionFromClient fromClient{};
+    fromClient.setId(UUID::gen());
+    LogicalSessionId lsid = makeLogicalSessionId(fromClient, _opCtx.get());
+    LogicalSessionFromClient fromClient2{};
+    fromClient2.setId(UUID::gen());
+    LogicalSessionId lsid2 = makeLogicalSessionId(fromClient2, _opCtx.get());
+    LogicalSessionFromClient fromClient3{};
+    fromClient3.setId(UUID::gen());
+    LogicalSessionId lsid3 = makeLogicalSessionId(fromClient3, _opCtx.get());
+
+    auto commonOpTime = OpTime(Timestamp(4, 4), 4);
+    auto commonPoint = makeOpAndRecordId(commonOpTime);
+    _remoteOplog->setOperations({commonPoint});
+    _storageInterface->setStableTimestamp(nullptr, commonOpTime.getTimestamp());
+
+    auto insertObj1 = BSON("_id" << 1);
+    auto insertObj2 = BSON("_id" << 2);
+    const auto txnNumOne = 1LL;
+    // Create retryable write oplog entry before 'stableTimestamp'.
+    auto opBeforeStableTs = makeInsertOplogEntry(1, insertObj1, nss.ns(), collUuid);
+    const auto prevOpTime = OpTime(opBeforeStableTs["ts"].timestamp(), 1);
+    BSONObjBuilder opBeforeStableTsBuilder(opBeforeStableTs);
+    opBeforeStableTsBuilder.append("lsid", lsid.toBSON());
+    opBeforeStableTsBuilder.append("txnNumber", txnNumOne);
+    opBeforeStableTsBuilder.append("prevOpTime", OpTime().toBSON());
+    opBeforeStableTsBuilder.append("stmtId", 1);
+    BSONObj oplogEntryBeforeStableTs = opBeforeStableTsBuilder.done();
+
+    const auto txnNumTwo = 2LL;
+    // Create no-op retryable write entry before 'stableTimestamp'.
+    auto noopPrevOpTime = OpTime(Timestamp(2, 2), 2);
+    auto noopEntryBeforeStableTs = makeMigratedNoop(noopPrevOpTime,
+                                                    oplogEntryBeforeStableTs,
+                                                    lsid2,
+                                                    txnNumTwo,
+                                                    OpTime(),
+                                                    1 /* stmtId */,
+                                                    2 /* wallClockMillis */,
+                                                    true /* isRetryableWrite */);
+
+    // Create transactions entry after 'stableTimestamp'. Transactions entries are of 'command' op
+    // type.
+    auto txnOpTime = OpTime(Timestamp(3, 3), 3);
+    auto txnEntryBeforeStableTs = makeTransactionOplogEntry(txnOpTime, lsid3, 3, OpTime());
+
+    // Create retryable write oplog entry after 'stableTimestamp'.
+    auto firstOpAfterStableTs = makeInsertOplogEntry(5, insertObj2, nss.ns(), collUuid);
+    BSONObjBuilder opAfterStableTsBuilder(firstOpAfterStableTs);
+    opAfterStableTsBuilder.append("lsid", lsid.toBSON());
+    opAfterStableTsBuilder.append("txnNumber", txnNumOne);
+    // 'prevOpTime' points to 'oplogEntryBeforeStableTs'.
+    opAfterStableTsBuilder.append("prevOpTime", prevOpTime.toBSON());
+    opAfterStableTsBuilder.append("stmtId", 2);
+    BSONObj firstOplogEntryAfterStableTs = opAfterStableTsBuilder.done();
+
+    // Create no-op retryable write entry after 'stableTimestamp'.
+    auto noopEntryAfterStableTs = makeMigratedNoop(OpTime(Timestamp(6, 6), 6),
+                                                   firstOplogEntryAfterStableTs,
+                                                   lsid2,
+                                                   txnNumTwo,
+                                                   noopPrevOpTime,
+                                                   2 /* stmtId */,
+                                                   5 /* wallClockMillis */,
+                                                   true /* isRetryableWrite */);
+
+    // Create transactions entry after 'stableTimestamp'. Transactions entries are of 'command' op
+    // type.
+    auto txnEntryAfterStableTs =
+        makeTransactionOplogEntry(OpTime(Timestamp(7, 7), 7), lsid3, 3, txnOpTime);
+
+    ASSERT_OK(_insertOplogEntry(oplogEntryBeforeStableTs));
+    ASSERT_OK(_insertOplogEntry(noopEntryBeforeStableTs));
+    ASSERT_OK(_insertOplogEntry(txnEntryBeforeStableTs));
+    ASSERT_OK(_insertOplogEntry(commonPoint.first));
+    ASSERT_OK(_insertOplogEntry(firstOplogEntryAfterStableTs));
+    ASSERT_OK(_insertOplogEntry(noopEntryAfterStableTs));
+    ASSERT_OK(_insertOplogEntry(txnEntryAfterStableTs));
+
+    auto status = _storageInterface->findSingleton(_opCtx.get(), nss);
+    // The 'config.transactions' table is currently empty.
+    ASSERT_NOT_OK(status);
+
+    // Doing a rollback should upsert two entries into the 'config.transactions' table.
+    ASSERT_OK(_rollback->runRollback(_opCtx.get()));
+    auto swDoc = _storageInterface->findById(
+        _opCtx.get(), nss, firstOplogEntryAfterStableTs.getField("lsid"));
+    ASSERT_OK(swDoc);
+    auto sessionsEntryBson = swDoc.getValue();
+    // New sessions entry should match the session information retrieved from the retryable writes
+    // oplog entry from before the 'stableTimestamp'.
+    ASSERT_EQUALS(sessionsEntryBson["txnNum"].numberInt(),
+                  oplogEntryBeforeStableTs["txnNumber"].numberInt());
+    ASSERT_EQUALS(sessionsEntryBson["lastWriteOpTime"].timestamp(),
+                  oplogEntryBeforeStableTs["prevOpTime"].timestamp());
+    ASSERT_EQUALS(sessionsEntryBson["lastWriteDate"].date(),
+                  oplogEntryBeforeStableTs["wall"].date());
+
+    swDoc =
+        _storageInterface->findById(_opCtx.get(), nss, noopEntryBeforeStableTs.getField("lsid"));
+    ASSERT_OK(swDoc);
+    sessionsEntryBson = swDoc.getValue();
+    // New sessions entry should match the session information retrieved from the noop retryable
+    // writes oplog entry from before the 'stableTimestamp'.
+    ASSERT_EQUALS(sessionsEntryBson["txnNum"].numberInt(),
+                  noopEntryBeforeStableTs["txnNumber"].numberInt());
+    ASSERT_EQUALS(sessionsEntryBson["lastWriteOpTime"].timestamp(),
+                  noopEntryBeforeStableTs["prevOpTime"].timestamp());
+    ASSERT_EQUALS(sessionsEntryBson["lastWriteDate"].date(),
+                  noopEntryBeforeStableTs["wall"].date());
+
+    // 'lsid3' does not get restored because it is not a retryable writes entry.
+    status = _storageInterface->findById(_opCtx.get(), nss, txnEntryAfterStableTs.getField("lsid"));
+    ASSERT_NOT_OK(status);
+}
+
+TEST_F(
+    RollbackImplTest,
+    RollbackRestoresTxnTableEntryToBeConsistentWithStableTimestampWithMissingPrevWriteOplogEntry) {
+    const auto collUuid = UUID::gen();
+    const auto nss = NamespaceString::kSessionTransactionsTableNamespace;
+    _initializeCollection(_opCtx.get(), collUuid, nss);
+    LogicalSessionFromClient fromClient{};
+    fromClient.setId(UUID::gen());
+    LogicalSessionId lsid = makeLogicalSessionId(fromClient, _opCtx.get());
+    LogicalSessionFromClient fromClient2{};
+    fromClient2.setId(UUID::gen());
+    LogicalSessionId lsid2 = makeLogicalSessionId(fromClient2, _opCtx.get());
+
+    auto commonOpTime = OpTime(Timestamp(2, 2), 1);
+    auto commonPoint = makeOpAndRecordId(OpTime(Timestamp(2, 2), 1));
+    _remoteOplog->setOperations({commonPoint});
+    _storageInterface->setStableTimestamp(nullptr, commonOpTime.getTimestamp());
+
+    // Create oplog entry after 'stableTimestamp'.
+    auto insertObj = BSON("_id" << 1);
+    auto firstOpAfterStableTs = makeInsertOplogEntry(3, insertObj, nss.ns(), collUuid);
+    BSONObjBuilder builder(firstOpAfterStableTs);
+    builder.append("lsid", lsid.toBSON());
+    builder.append("txnNumber", 2LL);
+    // 'prevOpTime' points to an opTime not found in the oplog. This can happen in practice
+    // due to the 'OplogCapMaintainerThread' truncating entries from before the 'stableTimestamp'.
+    builder.append("prevOpTime", OpTime(Timestamp(1, 0), 1).toBSON());
+    builder.append("stmtId", 2);
+    BSONObj firstOplogEntryAfterStableTs = builder.done();
+
+    // Create no-op entry after 'stableTimestamp'.
+    // 'prevOpTime' point sto an opTime not found in the oplog.
+    auto noopEntryAfterStableTs = makeMigratedNoop(OpTime(Timestamp(5, 5), 5),
+                                                   firstOplogEntryAfterStableTs,
+                                                   lsid2,
+                                                   3 /* txnNum */,
+                                                   OpTime(Timestamp(2, 1), 1),
+                                                   2 /* stmtId */,
+                                                   5 /* wallClockMillis */,
+                                                   true /*isRetryableWrite */);
+
+    ASSERT_OK(_insertOplogEntry(commonPoint.first));
+    ASSERT_OK(_insertOplogEntry(firstOplogEntryAfterStableTs));
+    ASSERT_OK(_insertOplogEntry(noopEntryAfterStableTs));
+
+    auto status = _storageInterface->findSingleton(_opCtx.get(), nss);
+    // The 'config.transactions' table is currently empty.
+    ASSERT_NOT_OK(status);
+
+    // Doing a rollback should upsert two entries into the 'config.transactions' table.
+    ASSERT_OK(_rollback->runRollback(_opCtx.get()));
+    auto swDoc = _storageInterface->findById(
+        _opCtx.get(), nss, firstOplogEntryAfterStableTs.getField("lsid"));
+    ASSERT_OK(swDoc);
+    auto sessionsEntryBson = swDoc.getValue();
+    // New sessions entry should match the session information retrieved from the retryable writes
+    // oplog entry from after the 'stableTimestamp'.
+    ASSERT_EQUALS(sessionsEntryBson["txnNum"].numberInt(),
+                  firstOplogEntryAfterStableTs["txnNumber"].numberInt());
+    ASSERT_EQUALS(sessionsEntryBson["lastWriteOpTime"].timestamp(),
+                  firstOplogEntryAfterStableTs["prevOpTime"].timestamp());
+    ASSERT_EQUALS(sessionsEntryBson["lastWriteDate"].date(),
+                  firstOplogEntryAfterStableTs["wall"].date());
+
+    swDoc = _storageInterface->findById(_opCtx.get(), nss, noopEntryAfterStableTs.getField("lsid"));
+    ASSERT_OK(swDoc);
+    sessionsEntryBson = swDoc.getValue();
+    // New sessions entry should match the session information retrieved from the retryable writes
+    // no-op oplog entry from after the 'stableTimestamp'.
+    ASSERT_EQUALS(sessionsEntryBson["txnNum"].numberInt(),
+                  noopEntryAfterStableTs["txnNumber"].numberInt());
+    ASSERT_EQUALS(sessionsEntryBson["lastWriteOpTime"].timestamp(),
+                  noopEntryAfterStableTs["prevOpTime"].timestamp());
+    ASSERT_EQUALS(sessionsEntryBson["lastWriteDate"].date(), noopEntryAfterStableTs["wall"].date());
+}
+
+TEST_F(RollbackImplTest, RollbackDoesNotRestoreTxnsTableWhenNoRetryableWritesEntriesAfterStableTs) {
+    const auto collUuid = UUID::gen();
+    const auto nss = NamespaceString::kSessionTransactionsTableNamespace;
+    _initializeCollection(_opCtx.get(), collUuid, nss);
+    LogicalSessionFromClient fromClient{};
+    fromClient.setId(UUID::gen());
+    LogicalSessionId lsid = makeLogicalSessionId(fromClient, _opCtx.get());
+    LogicalSessionFromClient fromClient2{};
+    fromClient2.setId(UUID::gen());
+    LogicalSessionId lsid2 = makeLogicalSessionId(fromClient2, _opCtx.get());
+
+    auto commonOpTime = OpTime(Timestamp(4, 4), 4);
+    auto commonPoint = makeOpAndRecordId(commonOpTime);
+    _remoteOplog->setOperations({commonPoint});
+    _storageInterface->setStableTimestamp(nullptr, commonOpTime.getTimestamp());
+
+    auto insertObj1 = BSON("_id" << 1);
+    auto insertObj2 = BSON("_id" << 2);
+    const auto txnNumOne = 1LL;
+    // Create oplog entry before 'stableTimestamp'.
+    auto opBeforeStableTs = makeInsertOplogEntry(1, insertObj1, nss.ns(), collUuid);
+    BSONObjBuilder opBeforeStableTsBuilder(opBeforeStableTs);
+    opBeforeStableTsBuilder.append("lsid", lsid.toBSON());
+    opBeforeStableTsBuilder.append("txnNumber", txnNumOne);
+    opBeforeStableTsBuilder.append("prevOpTime", OpTime().toBSON());
+    opBeforeStableTsBuilder.append("stmtId", 1);
+    BSONObj oplogEntryBeforeStableTs = opBeforeStableTsBuilder.done();
+
+    const auto txnNumTwo = 2LL;
+    // Create no-op entry before 'stableTimestamp'.
+    auto noopEntryBeforeStableTs = makeMigratedNoop(OpTime(Timestamp(2, 2), 2),
+                                                    oplogEntryBeforeStableTs,
+                                                    lsid2,
+                                                    txnNumTwo,
+                                                    OpTime(),
+                                                    1 /* stmtId*/,
+                                                    2 /* wallClockMillis */,
+                                                    true /* isRetryableWrite */);
+
+    // Create migrated no-op transactions entry before 'stableTimestamp'.
+    auto txnOpTime = OpTime(Timestamp(3, 3), 3);
+    auto txnEntryBeforeStableTs = makeMigratedNoop(txnOpTime,
+                                                   BSONObj(),
+                                                   lsid,
+                                                   txnNumTwo,
+                                                   OpTime(),
+                                                   boost::none /* stmtId */,
+                                                   4 /* wallClockMillis */,
+                                                   false /* isRetryableWrite */);
+
+    // Create regular non-retryable write oplog entry after 'stableTimestamp'.
+    auto insertEntry = makeInsertOplogEntry(7, BSON("_id" << 3), nss.ns(), collUuid);
+
+    // Create migrated no-op transactions entry after 'stableTimestamp'.
+    auto txnEntryAfterStableTs = makeMigratedNoop(txnOpTime,
+                                                  BSONObj(),
+                                                  lsid,
+                                                  txnNumTwo,
+                                                  txnOpTime,
+                                                  boost::none /* stmtId */,
+                                                  10 /* wallClockMillis */,
+                                                  false /* isRetryableWrite */);
+
+    ASSERT_OK(_insertOplogEntry(oplogEntryBeforeStableTs));
+    ASSERT_OK(_insertOplogEntry(noopEntryBeforeStableTs));
+    ASSERT_OK(_insertOplogEntry(txnEntryBeforeStableTs));
+    ASSERT_OK(_insertOplogEntry(commonPoint.first));
+    ASSERT_OK(_insertOplogEntry(insertEntry));
+    ASSERT_OK(_insertOplogEntry(txnEntryAfterStableTs));
+
+    auto status = _storageInterface->findSingleton(_opCtx.get(), nss);
+    // The 'config.transactions' table is currently empty.
+    ASSERT_NOT_OK(status);
+
+    // Doing a rollback should not restore any entries into the 'config.transactions' table.
+    ASSERT_OK(_rollback->runRollback(_opCtx.get()));
+    status = _storageInterface->findSingleton(_opCtx.get(), nss);
+    // No upserts were made to the 'config.transactions' table.
+    ASSERT_NOT_OK(status);
 }
 
 /**
@@ -1548,6 +1893,7 @@ public:
         collId.appendToBuilder(&bob, "ui");
         bob.append("ns", nss.ns());
         bob.append("o", doc);
+        bob.append("wall", Date_t());
         bob.append("lsid",
                    BSON("id" << sessionId << "uid"
                              << BSONBinData(std::string(32, 'x').data(), 32, BinDataGeneral)));
@@ -1558,16 +1904,15 @@ public:
     void assertRollbackInfoContainsObjectForUUID(UUID uuid, BSONObj bson) {
         const auto& uuidToIdMap = _rbInfo.rollbackDeletedIdsMap;
         auto search = uuidToIdMap.find(uuid);
-        ASSERT(search != uuidToIdMap.end()) << "map is unexpectedly missing an entry for uuid "
-                                            << uuid.toString() << " containing object "
-                                            << bson.jsonString();
+        ASSERT(search != uuidToIdMap.end())
+            << "map is unexpectedly missing an entry for uuid " << uuid.toString()
+            << " containing object " << bson.jsonString(JsonStringFormat::LegacyStrict);
         const auto& idObjSet = search->second;
         const auto iter = idObjSet.find(bson);
         ASSERT(iter != idObjSet.end()) << "_id object set is unexpectedly missing object "
-                                       << bson.jsonString() << " in namespace with uuid "
-                                       << uuid.toString();
+                                       << bson.jsonString(JsonStringFormat::LegacyStrict)
+                                       << " in namespace with uuid " << uuid.toString();
     }
-
 
 protected:
     OpObserver::RollbackObserverInfo _rbInfo;
@@ -1649,12 +1994,12 @@ TEST_F(RollbackImplObserverInfoTest, NamespacesForOpsExtractsNamespaceOfDropColl
 
 TEST_F(RollbackImplObserverInfoTest, NamespacesForOpsExtractsNamespaceOfCreateIndexOplogEntry) {
     auto nss = NamespaceString("test", "coll");
-    auto indexObj = BSON("createIndexes" << nss.coll() << "ns" << nss.toString() << "v"
-                                         << static_cast<int>(IndexDescriptor::IndexVersion::kV2)
-                                         << "key"
-                                         << "x"
-                                         << "name"
-                                         << "x_1");
+    auto indexObj =
+        BSON("createIndexes" << nss.coll() << "v"
+                             << static_cast<int>(IndexDescriptor::IndexVersion::kV2) << "key"
+                             << "x"
+                             << "name"
+                             << "x_1");
     auto cmdOp =
         makeCommandOp(Timestamp(2, 2), UUID::gen(), nss.getCommandNS().toString(), indexObj, 2);
 
@@ -1717,19 +2062,11 @@ TEST_F(RollbackImplObserverInfoTest, NamespacesForOpsExtractsNamespacesOfCollMod
 }
 
 TEST_F(RollbackImplObserverInfoTest, NamespacesForOpsFailsOnUnsupportedOplogEntry) {
-    // 'convertToCapped' is not supported in rollback.
-    auto convertToCappedOp =
-        makeCommandOp(Timestamp(2, 2), boost::none, "test.$cmd", BSON("convertToCapped" << 1), 2);
-
-    auto status =
-        _rollback->_namespacesForOp_forTest(OplogEntry(convertToCappedOp.first)).getStatus();
-    ASSERT_EQUALS(ErrorCodes::UnrecoverableRollbackError, status);
-
     // 'emptycapped' is not supported in rollback.
     auto emptycappedOp =
         makeCommandOp(Timestamp(2, 2), boost::none, "test.$cmd", BSON("emptycapped" << 1), 2);
 
-    status = _rollback->_namespacesForOp_forTest(OplogEntry(emptycappedOp.first)).getStatus();
+    auto status = _rollback->_namespacesForOp_forTest(OplogEntry(emptycappedOp.first)).getStatus();
     ASSERT_EQUALS(ErrorCodes::UnrecoverableRollbackError, status);
 }
 
@@ -1751,7 +2088,9 @@ DEATH_TEST_F(RollbackImplObserverInfoTest,
         Timestamp(2, 2), boost::none, "admin.$cmd", BSON("applyOps" << subops.arr()), 2);
 
     auto status = _rollback->_namespacesForOp_forTest(OplogEntry(applyOpsCmdOp.first));
-    unittest::log() << "Mongod did not crash. Status: " << status.getStatus();
+    LOGV2(21654,
+          "Mongod did not crash. Status: {status_getStatus}",
+          "status_getStatus"_attr = status.getStatus());
     MONGO_UNREACHABLE;
 }
 
@@ -1759,28 +2098,22 @@ TEST_F(RollbackImplObserverInfoTest, RollbackRecordsNamespacesOfApplyOpsOplogEnt
 
     // Add a few different sub-ops from different namespaces to make sure they all get recorded.
     auto createNss = NamespaceString("test", "createColl");
-    auto createOp = makeCommandOp(Timestamp(2, 2),
-                                  UUID::gen(),
-                                  createNss.getCommandNS().toString(),
-                                  BSON("create" << createNss.coll()),
-                                  2);
+    auto createOp = makeCommandOpForApplyOps(
+        UUID::gen(), createNss.getCommandNS().toString(), BSON("create" << createNss.coll()), 2);
 
     auto dropNss = NamespaceString("test", "dropColl");
     auto dropUuid = UUID::gen();
-    auto dropOp = makeCommandOp(Timestamp(2, 2),
-                                dropUuid,
-                                dropNss.getCommandNS().toString(),
-                                BSON("drop" << dropNss.coll()),
-                                2);
+    auto dropOp = makeCommandOpForApplyOps(
+        dropUuid, dropNss.getCommandNS().toString(), BSON("drop" << dropNss.coll()), 2);
     _initializeCollection(_opCtx.get(), dropUuid, dropNss);
 
     auto collModNss = NamespaceString("test", "collModColl");
-    auto collModOp = makeCommandOp(Timestamp(2, 2),
-                                   UUID::gen(),
-                                   collModNss.getCommandNS().ns(),
-                                   BSON("collMod" << collModNss.coll() << "validationLevel"
-                                                  << "off"),
-                                   2);
+    auto collModOp =
+        makeCommandOpForApplyOps(UUID::gen(),
+                                 collModNss.getCommandNS().ns(),
+                                 BSON("collMod" << collModNss.coll() << "validationLevel"
+                                                << "off"),
+                                 2);
 
     // Create the applyOps command object.
     BSONArrayBuilder subops;
@@ -1846,9 +2179,7 @@ TEST_F(RollbackImplObserverInfoTest, RollbackRecordsMultipleNamespacesOfOplogEnt
     ASSERT(expectedNamespaces == _rbInfo.rollbackNamespaces);
 }
 
-DEATH_TEST_F(RollbackImplObserverInfoTest,
-             RollbackFailsOnUnknownOplogEntryCommandType,
-             "Unknown oplog entry command type") {
+TEST_F(RollbackImplObserverInfoTest, RollbackFailsOnUnknownOplogEntryCommandType) {
     // Create a command of an unknown type.
     auto unknownCmdOp =
         makeCommandOp(Timestamp(2, 2), boost::none, "admin.$cmd", BSON("unknownCommand" << 1), 2);
@@ -1858,9 +2189,10 @@ DEATH_TEST_F(RollbackImplObserverInfoTest,
     ASSERT_OK(_insertOplogEntry(commonOp.first));
     ASSERT_OK(_insertOplogEntry(unknownCmdOp.first));
 
-    auto status = _rollback->runRollback(_opCtx.get());
-    unittest::log() << "Mongod did not crash. Status: " << status;
-    MONGO_UNREACHABLE;
+    const StringData err(
+        "Unknown oplog entry command type: unknownCommand Object field: { unknownCommand: 1 }");
+    ASSERT_THROWS_CODE_AND_WHAT(
+        _rollback->runRollback(_opCtx.get()), DBException, ErrorCodes::BadValue, err);
 }
 
 TEST_F(RollbackImplObserverInfoTest, RollbackRecordsSessionIdFromOplogEntry) {
@@ -1885,24 +2217,6 @@ TEST_F(RollbackImplObserverInfoTest,
     const auto insertOp = _insertDocAndReturnOplogEntry(BSON("_id" << 1), uuid, nss, 2);
     ASSERT_OK(rollbackOps({insertOp}));
     ASSERT(_rbInfo.rollbackSessionIds.empty());
-}
-
-TEST_F(RollbackImplObserverInfoTest, RollbackRecordsSessionIdFromApplyOpsSubOp) {
-    const auto collId = UUID::gen();
-    const auto coll = _initializeCollection(_opCtx.get(), collId, nss);
-    auto sessionId = UUID::gen();
-    auto sessionOpObj = makeSessionOp(collId, nss, sessionId, 1L);
-
-    // Create the applyOps command object.
-    BSONArrayBuilder subops;
-    subops.append(sessionOpObj);
-    auto applyOpsCmdOp = makeCommandOp(
-        Timestamp(2, 2), boost::none, "admin.$cmd", BSON("applyOps" << subops.arr()), 2);
-
-    // Run the rollback and make sure the correct session id was recorded.
-    ASSERT_OK(rollbackOps({applyOpsCmdOp}));
-    std::set<UUID> expectedSessionIds = {sessionId};
-    ASSERT(expectedSessionIds == _rbInfo.rollbackSessionIds);
 }
 
 TEST_F(RollbackImplObserverInfoTest, RollbackRecordsShardIdentityRollback) {
@@ -2086,4 +2400,7 @@ TEST_F(RollbackImplObserverInfoTest, RollbackRecordsMultipleUpdateOpsForSameName
     assertRollbackInfoContainsObjectForUUID(uuid, obj1);
     assertRollbackInfoContainsObjectForUUID(uuid, obj2);
 }
+
 }  // namespace
+}  // namespace repl
+}  // namespace mongo

@@ -29,11 +29,11 @@
 
 #pragma once
 
+#include <functional>
 #include <string>
 
 #include "mongo/db/repl/oplog_interface_remote.h"
 #include "mongo/db/repl/rollback_source.h"
-#include "mongo/stdx/functional.h"
 #include "mongo/util/net/hostandport.h"
 
 namespace mongo {
@@ -51,7 +51,7 @@ public:
     /**
      * Type of function to return a connection to the sync source.
      */
-    using GetConnectionFn = stdx::function<DBClientBase*()>;
+    using GetConnectionFn = std::function<DBClientBase*()>;
 
     RollbackSourceImpl(GetConnectionFn getConnection,
                        const HostAndPort& source,
@@ -71,9 +71,6 @@ public:
     std::pair<BSONObj, NamespaceString> findOneByUUID(const std::string& db,
                                                       UUID uuid,
                                                       const BSONObj& filter) const override;
-
-    void copyCollectionFromRemote(OperationContext* opCtx,
-                                  const NamespaceString& nss) const override;
 
     StatusWith<BSONObj> getCollectionInfoByUUID(const std::string& db,
                                                 const UUID& uuid) const override;

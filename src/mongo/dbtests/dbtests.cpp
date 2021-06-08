@@ -35,15 +35,18 @@
 
 #include "mongo/dbtests/dbtests.h"
 
+#include <memory>
+
 #include "mongo/base/init.h"
 #include "mongo/base/initializer.h"
+#include "mongo/base/status.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/catalog/multi_index_block.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/test_commands_enabled.h"
+#include "mongo/db/cursor_manager.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index/index_descriptor.h"
-#include "mongo/db/logical_clock.h"
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
@@ -53,12 +56,11 @@
 #include "mongo/db/wire_version.h"
 #include "mongo/dbtests/framework.h"
 #include "mongo/scripting/engine.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/transport/transport_layer_manager.h"
 #include "mongo/util/clock_source_mock.h"
 #include "mongo/util/quick_exit.h"
 #include "mongo/util/signal_handlers_synchronous.h"
-#include "mongo/util/startup_test.h"
+#include "mongo/util/testing_proctor.h"
 #include "mongo/util/text.h"
 
 namespace mongo {
@@ -67,26 +69,28 @@ namespace {
 const auto kIndexVersion = IndexDescriptor::IndexVersion::kV2;
 }  // namespace
 
-void initWireSpec() {
-    WireSpec& spec = WireSpec::instance();
-
-    // Accept from internal clients of the same version, as in upgrade featureCompatibilityVersion.
-    spec.incomingInternalClient.minWireVersion = LATEST_WIRE_VERSION;
-    spec.incomingInternalClient.maxWireVersion = LATEST_WIRE_VERSION;
+MONGO_INITIALIZER_WITH_PREREQUISITES(WireSpec, ("EndStartupOptionHandling"))(InitializerContext*) {
+    WireSpec::Specification spec;
 
     // Accept from any version external client.
     spec.incomingExternalClient.minWireVersion = RELEASE_2_4_AND_BEFORE;
     spec.incomingExternalClient.maxWireVersion = LATEST_WIRE_VERSION;
 
+    // Accept from internal clients of the same version, as in upgrade
+    // featureCompatibilityVersion.
+    spec.incomingInternalClient.minWireVersion = LATEST_WIRE_VERSION;
+    spec.incomingInternalClient.maxWireVersion = LATEST_WIRE_VERSION;
+
     // Connect to servers of the same version, as in upgrade featureCompatibilityVersion.
     spec.outgoing.minWireVersion = LATEST_WIRE_VERSION;
     spec.outgoing.maxWireVersion = LATEST_WIRE_VERSION;
+
+    WireSpec::instance().initialize(std::move(spec));
 }
 
 Status createIndex(OperationContext* opCtx, StringData ns, const BSONObj& keys, bool unique) {
     BSONObjBuilder specBuilder;
     specBuilder.append("name", DBClientBase::genIndexName(keys));
-    specBuilder.append("ns", ns);
     specBuilder.append("key", keys);
     specBuilder.append("v", static_cast<int>(kIndexVersion));
     if (unique) {
@@ -96,17 +100,35 @@ Status createIndex(OperationContext* opCtx, StringData ns, const BSONObj& keys, 
 }
 
 Status createIndexFromSpec(OperationContext* opCtx, StringData ns, const BSONObj& spec) {
-    AutoGetOrCreateDb autoDb(opCtx, nsToDatabaseSubstring(ns), MODE_X);
+    AutoGetDb autoDb(opCtx, nsToDatabaseSubstring(ns), MODE_X);
     Collection* coll;
     {
         WriteUnitOfWork wunit(opCtx);
-        coll = autoDb.getDb()->getOrCreateCollection(opCtx, NamespaceString(ns));
+        coll = CollectionCatalog::get(opCtx)->lookupCollectionByNamespaceForMetadataWrite(
+            opCtx, CollectionCatalog::LifetimeMode::kInplace, NamespaceString(ns));
+        if (!coll) {
+            auto db = autoDb.ensureDbExists();
+            invariant(db);
+            coll = db->createCollection(opCtx, NamespaceString(ns));
+        }
         invariant(coll);
         wunit.commit();
     }
     MultiIndexBlock indexer;
-    ON_BLOCK_EXIT([&] { indexer.cleanUpAfterBuild(opCtx, coll); });
-    Status status = indexer.init(opCtx, coll, spec, MultiIndexBlock::kNoopOnInitFn).getStatus();
+    CollectionWriter collection(coll);
+    auto abortOnExit = makeGuard(
+        [&] { indexer.abortIndexBuild(opCtx, collection, MultiIndexBlock::kNoopOnCleanUpFn); });
+    Status status = indexer
+                        .init(opCtx,
+                              collection,
+                              spec,
+                              [opCtx](const std::vector<BSONObj>& specs) -> Status {
+                                  if (opCtx->recoveryUnit()->getCommitTimestamp().isNull()) {
+                                      return opCtx->recoveryUnit()->setTimestamp(Timestamp(1, 1));
+                                  }
+                                  return Status::OK();
+                              })
+                        .getStatus();
     if (status == ErrorCodes::IndexAlreadyExists) {
         return Status::OK();
     }
@@ -117,62 +139,57 @@ Status createIndexFromSpec(OperationContext* opCtx, StringData ns, const BSONObj
     if (!status.isOK()) {
         return status;
     }
-    status = indexer.checkConstraints(opCtx);
+    status = indexer.retrySkippedRecords(opCtx, coll);
+    if (!status.isOK()) {
+        return status;
+    }
+    status = indexer.checkConstraints(opCtx, coll);
     if (!status.isOK()) {
         return status;
     }
     WriteUnitOfWork wunit(opCtx);
     ASSERT_OK(indexer.commit(
         opCtx, coll, MultiIndexBlock::kNoopOnCreateEachFn, MultiIndexBlock::kNoopOnCommitFn));
+    ASSERT_OK(opCtx->recoveryUnit()->setTimestamp(Timestamp(1, 1)));
     wunit.commit();
+    abortOnExit.dismiss();
     return Status::OK();
 }
 
 WriteContextForTests::WriteContextForTests(OperationContext* opCtx, StringData ns)
     : _opCtx(opCtx), _nss(ns) {
     // Lock the database and collection
-    _autoCreateDb.emplace(opCtx, _nss.db(), MODE_IX);
+    _autoDb.emplace(opCtx, _nss.db(), MODE_IX);
     _collLock.emplace(opCtx, _nss, MODE_IX);
 
     const bool doShardVersionCheck = false;
 
     _clientContext.emplace(opCtx, _nss.ns(), doShardVersionCheck);
-    invariant(_autoCreateDb->getDb() == _clientContext->db());
+    auto db = _autoDb->ensureDbExists();
+    invariant(db, _nss.ns());
+    invariant(db == _clientContext->db());
 
     // If the collection exists, there is no need to lock into stronger mode
     if (getCollection())
         return;
 
-    // If the database was just created, it is already locked in MODE_X so we can skip the relocking
-    // code below
-    if (_autoCreateDb->justCreated()) {
-        dassert(opCtx->lockState()->isDbLockedForMode(_nss.db(), MODE_X));
-        return;
-    }
-
-    // If the collection doesn't exists, put the context in a state where the database is locked in
-    // MODE_X so that the collection can be created
-    _clientContext.reset();
-    _collLock.reset();
-    _autoCreateDb.reset();
-    _autoCreateDb.emplace(opCtx, _nss.db(), MODE_X);
-
-    _clientContext.emplace(opCtx, _nss.ns(), _autoCreateDb->getDb());
-    invariant(_autoCreateDb->getDb() == _clientContext->db());
+    invariant(db == _clientContext->db());
+    _collLock.emplace(opCtx, _nss, MODE_X);
 }
 
 }  // namespace dbtests
 }  // namespace mongo
 
 
-int dbtestsMain(int argc, char** argv, char** envp) {
+int dbtestsMain(int argc, char** argv) {
     ::mongo::setTestCommandsEnabled(true);
+    ::mongo::TestingProctor::instance().setEnabled(true);
     ::mongo::setupSynchronousSignalHandlers();
-    mongo::dbtests::initWireSpec();
 
-    mongo::runGlobalInitializersOrDie(argc, argv, envp);
-    serverGlobalParams.featureCompatibility.setVersion(
-        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42);
+    mongo::runGlobalInitializersOrDie(std::vector<std::string>(argv, argv + argc));
+    // (Generic FCV reference): This FCV reference should exist across LTS binary versions.
+    serverGlobalParams.mutableFeatureCompatibility.setVersion(
+        ServerGlobalParams::FeatureCompatibility::kLatest);
     repl::ReplSettings replSettings;
     replSettings.setOplogSizeBytes(10 * 1024 * 1024);
     setGlobalServiceContext(ServiceContext::make());
@@ -180,10 +197,7 @@ int dbtestsMain(int argc, char** argv, char** envp) {
     const auto service = getGlobalServiceContext();
     service->setServiceEntryPoint(std::make_unique<ServiceEntryPointMongod>(service));
 
-    auto logicalClock = stdx::make_unique<LogicalClock>(service);
-    LogicalClock::set(service, std::move(logicalClock));
-
-    auto fastClock = stdx::make_unique<ClockSourceMock>();
+    auto fastClock = std::make_unique<ClockSourceMock>();
     // Timestamps are split into two 32-bit integers, seconds and "increments". Currently (but
     // maybe not for eternity), a Timestamp with a value of `0` seconds is always considered
     // "null" by `Timestamp::isNull`, regardless of its increment value. Ticking the
@@ -192,9 +206,10 @@ int dbtestsMain(int argc, char** argv, char** envp) {
     fastClock->advance(Seconds(1));
     service->setFastClockSource(std::move(fastClock));
 
-    auto preciseClock = stdx::make_unique<ClockSourceMock>();
+    auto preciseClock = std::make_unique<ClockSourceMock>();
     // See above.
     preciseClock->advance(Seconds(1));
+    CursorManager::get(service)->setPreciseClockSource(preciseClock.get());
     service->setPreciseClockSource(std::move(preciseClock));
 
     service->setTransportLayer(
@@ -208,13 +223,12 @@ int dbtestsMain(int argc, char** argv, char** envp) {
         ->setFollowerMode(repl::MemberState::RS_PRIMARY)
         .ignore();
 
-    auto storageMock = stdx::make_unique<repl::StorageInterfaceMock>();
+    auto storageMock = std::make_unique<repl::StorageInterfaceMock>();
     repl::DropPendingCollectionReaper::set(
-        service, stdx::make_unique<repl::DropPendingCollectionReaper>(storageMock.get()));
+        service, std::make_unique<repl::DropPendingCollectionReaper>(storageMock.get()));
 
     AuthorizationManager::get(service)->setAuthEnabled(false);
     ScriptEngine::setup();
-    StartupTest::runTests();
     return mongo::dbtests::runDbTests(argc, argv);
 }
 
@@ -224,14 +238,11 @@ int dbtestsMain(int argc, char** argv, char** envp) {
 // WindowsCommandLine object converts these wide character strings to a UTF-8 coded equivalent
 // and makes them available through the argv() and envp() members.  This enables dbtestsMain()
 // to process UTF-8 encoded arguments and environment variables without regard to platform.
-int wmain(int argc, wchar_t* argvW[], wchar_t* envpW[]) {
-    WindowsCommandLine wcl(argc, argvW, envpW);
-    int exitCode = dbtestsMain(argc, wcl.argv(), wcl.envp());
-    quickExit(exitCode);
+int wmain(int argc, wchar_t* argvW[]) {
+    quickExit(dbtestsMain(argc, WindowsCommandLine(argc, argvW).argv()));
 }
 #else
-int main(int argc, char* argv[], char** envp) {
-    int exitCode = dbtestsMain(argc, argv, envp);
-    quickExit(exitCode);
+int main(int argc, char* argv[]) {
+    quickExit(dbtestsMain(argc, argv));
 }
 #endif

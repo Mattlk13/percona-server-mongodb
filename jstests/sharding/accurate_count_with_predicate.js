@@ -7,37 +7,40 @@
  * twice.
  */
 (function() {
-    "use strict";
+"use strict";
 
-    const st = new ShardingTest({shards: 2});
-    const shard0Coll = st.shard0.getCollection("test.slowcount");
-    const num = 10;
-    const middle = num / 2;
+// Deliberately inserts orphans outside of migration.
+TestData.skipCheckOrphans = true;
 
-    function getNthDocument(n) {
-        return {_id: n, one: 1, x: n};
-    }
+const st = new ShardingTest({shards: 2});
+const shard0Coll = st.shard0.getCollection("test.slowcount");
+const num = 10;
+const middle = num / 2;
 
-    // Shard the collection. Shard 0 will get keys from [0, middle) and shard 1 will get everything
-    // from [middle, num).
-    assert.commandWorked(st.s.getDB("admin").runCommand({enableSharding: "test"}));
-    st.ensurePrimaryShard("test", st.shard0.name);
-    st.shardColl(shard0Coll.getName(), {x: 1}, {x: middle}, {x: middle + 1}, "test", true);
+function getNthDocument(n) {
+    return {_id: n, one: 1, x: n};
+}
 
-    // Insert some docs.
-    for (let i = 0; i < num; i++) {
-        assert.writeOK(st.getDB("test").slowcount.insert(getNthDocument(i)));
-    }
+// Shard the collection. Shard 0 will get keys from [0, middle) and shard 1 will get everything
+// from [middle, num).
+assert.commandWorked(st.s.getDB("admin").runCommand({enableSharding: "test"}));
+st.ensurePrimaryShard("test", st.shard0.name);
+st.shardColl(shard0Coll.getName(), {x: 1}, {x: middle}, {x: middle + 1}, "test", true);
 
-    // Insert some orphan documents to shard 0. These are just documents outside the range
-    // which shard 0 owns.
-    for (let i = middle + 1; i < middle + 3; i++) {
-        assert.writeOK(shard0Coll.insert(getNthDocument(i)));
-    }
+// Insert some docs.
+for (let i = 0; i < num; i++) {
+    assert.commandWorked(st.getDB("test").slowcount.insert(getNthDocument(i)));
+}
 
-    // Run a count on the whole collection. The orphaned documents on shard 0 shouldn't be double
-    // counted.
-    assert.eq(st.getDB("test").slowcount.count({one: 1}), num);
+// Insert some orphan documents to shard 0. These are just documents outside the range
+// which shard 0 owns.
+for (let i = middle + 1; i < middle + 3; i++) {
+    assert.commandWorked(shard0Coll.insert(getNthDocument(i)));
+}
 
-    st.stop();
+// Run a count on the whole collection. The orphaned documents on shard 0 shouldn't be double
+// counted.
+assert.eq(st.getDB("test").slowcount.count({one: 1}), num);
+
+st.stop();
 })();

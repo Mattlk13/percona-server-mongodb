@@ -29,6 +29,8 @@
 
 #pragma once
 
+#include <boost/optional.hpp>
+
 #include "mongo/base/string_data.h"
 #include "mongo/db/matcher/expression.h"
 
@@ -42,8 +44,11 @@ class InternalSchemaNumPropertiesMatchExpression : public MatchExpression {
 public:
     InternalSchemaNumPropertiesMatchExpression(MatchType type,
                                                long long numProperties,
-                                               std::string name)
-        : MatchExpression(type), _numProperties(numProperties), _name(name) {}
+                                               std::string name,
+                                               clonable_ptr<ErrorAnnotation> annotation = nullptr)
+        : MatchExpression(type, std::move(annotation)),
+          _numProperties(numProperties),
+          _name(name) {}
 
     virtual ~InternalSchemaNumPropertiesMatchExpression() {}
 
@@ -55,13 +60,13 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    std::vector<MatchExpression*>* getChildVector() final {
+    std::vector<std::unique_ptr<MatchExpression>>* getChildVector() final {
         return nullptr;
     }
 
     void debugString(StringBuilder& debug, int indentationLevel) const final;
 
-    void serialize(BSONObjBuilder* out) const final;
+    void serialize(BSONObjBuilder* out, bool includePath) const final;
 
     bool equivalent(const MatchExpression* other) const final;
 

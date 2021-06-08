@@ -37,21 +37,25 @@
 #include "mongo/db/query/index_tag.h"
 #include "mongo/db/query/lru_key_value.h"
 #include "mongo/db/query/plan_cache_indexability.h"
+#include "mongo/db/query/plan_ranking_decision.h"
 #include "mongo/db/query/query_planner_params.h"
 #include "mongo/platform/atomic_word.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
+#include "mongo/util/container_size_helper.h"
 
 namespace mongo {
-
 /**
  * Represents the "key" used in the PlanCache mapping from query shape -> query plan.
  */
 class PlanCacheKey {
 public:
-    PlanCacheKey(CanonicalQuery::QueryShapeString shapeString, std::string indexabilityString) {
+    PlanCacheKey(CanonicalQuery::QueryShapeString shapeString,
+                 std::string indexabilityString,
+                 bool forceClassicQueryEngine) {
         _lengthOfStablePart = shapeString.size();
         _key = std::move(shapeString);
         _key += indexabilityString;
+        _key += forceClassicQueryEngine ? "t" : "f";
     }
 
     CanonicalQuery::QueryShapeString getStableKey() const {
@@ -60,6 +64,15 @@ public:
 
     StringData getStableKeyStringData() const {
         return StringData(_key.c_str(), _lengthOfStablePart);
+    }
+
+    /**
+     * Return the 'indexability discriminators', that is, the plan cache key component after the
+     * stable key, but before the boolean indicating whether we are using the classic engine.
+     */
+    StringData getIndexabilityDiscriminators() const {
+        return StringData(_key.c_str() + _lengthOfStablePart,
+                          _key.size() - _lengthOfStablePart - 1);
     }
 
     /**
@@ -86,10 +99,11 @@ public:
     }
 
 private:
-    // Key is broken into two parts:
-    // <stable key> | <indexability discriminators>
-    // Combined, the two parts make up the plan cache key. We store them in one std::string so that
-    // we can easily/cheaply extract the stable key.
+    // Key is broken into three parts:
+    // <stable key> | <indexability discriminators> | <forceClassicQueryEngine boolean>
+    // This third part can be removed once the classic query engine reaches EOL.
+    // Combined, the three parts make up the plan cache key. We store them in one std::string so
+    // that we can easily/cheaply extract the stable key.
     std::string _key;
 
     // How long the "stable key" is.
@@ -106,9 +120,7 @@ public:
     }
 };
 
-
-struct PlanRankingDecision;
-struct QuerySolution;
+class QuerySolution;
 struct QuerySolutionNode;
 
 /**
@@ -139,6 +151,15 @@ struct PlanCacheIndexTree {
      * or satisfy the first field in the index.
      */
     struct OrPushdown {
+        uint64_t estimateObjectSizeInBytes() const {
+            return  // Add size of each element in 'route' vector.
+                container_size_helper::estimateObjectSizeInBytes(route) +
+                // Subtract static size of 'identifier' since it is already included in
+                // 'sizeof(*this)'.
+                (indexEntryId.estimateObjectSizeInBytes() - sizeof(indexEntryId)) +
+                // Add size of the object.
+                sizeof(*this);
+        }
         IndexEntry::Identifier indexEntryId;
         size_t position;
         bool canCombineBounds;
@@ -170,6 +191,22 @@ struct PlanCacheIndexTree {
      */
     std::string toString(int indents = 0) const;
 
+    uint64_t estimateObjectSizeInBytes() const {
+        return  // Recursively add size of each element in 'children' vector.
+            container_size_helper::estimateObjectSizeInBytes(
+                children,
+                [](const auto& child) { return child->estimateObjectSizeInBytes(); },
+                true) +
+            // Add size of each element in 'orPushdowns' vector.
+            container_size_helper::estimateObjectSizeInBytes(
+                orPushdowns,
+                [](const auto& orPushdown) { return orPushdown.estimateObjectSizeInBytes(); },
+                false) +
+            // Add size of 'entry' if present.
+            (entry ? entry->estimateObjectSizeInBytes() : 0) +
+            // Add size of the object.
+            sizeof(*this);
+    }
     // Children owned here.
     std::vector<PlanCacheIndexTree*> children;
 
@@ -199,11 +236,14 @@ struct SolutionCacheData {
           wholeIXSolnDir(1),
           indexFilterApplied(false) {}
 
-    // Make a deep copy.
-    SolutionCacheData* clone() const;
+    std::unique_ptr<SolutionCacheData> clone() const;
 
     // For debugging.
     std::string toString() const;
+
+    uint64_t estimateObjectSizeInBytes() const {
+        return (tree ? tree->estimateObjectSizeInBytes() : 0) + sizeof(*this);
+    }
 
     // Owned here. If 'wholeIXSoln' is false, then 'tree'
     // can be used to tag an isomorphic match expression. If 'wholeIXSoln'
@@ -245,29 +285,14 @@ private:
     CachedSolution& operator=(const CachedSolution&) = delete;
 
 public:
-    CachedSolution(const PlanCacheKey& key, const PlanCacheEntry& entry);
-    ~CachedSolution();
+    CachedSolution(const PlanCacheEntry& entry);
 
-    // Owned here.
-    std::vector<SolutionCacheData*> plannerData;
-
-    // Key used to provide feedback on the entry.
-    PlanCacheKey key;
-
-    // For debugging.
-    std::string toString() const;
-
-    // We are extracting just enough information from the canonical
-    // query. We could clone the canonical query but the following
-    // items are all that is displayed to the user.
-    BSONObj query;
-    BSONObj sort;
-    BSONObj projection;
-    BSONObj collation;
+    // Information that can be used by the QueryPlanner to reconstitute the complete execution plan.
+    std::unique_ptr<SolutionCacheData> plannerData;
 
     // The number of work cycles taken to decide on a winning plan when the plan was first
     // cached.
-    size_t decisionWorks;
+    const size_t decisionWorks;
 };
 
 /**
@@ -275,68 +300,96 @@ public:
  * Also used by the plan cache commands to display plan cache state.
  */
 class PlanCacheEntry {
-private:
-    PlanCacheEntry(const PlanCacheEntry&) = delete;
-    PlanCacheEntry& operator=(const PlanCacheEntry&) = delete;
-
 public:
+    /**
+     * A description of the query from which a 'PlanCacheEntry' was created.
+     */
+    struct CreatedFromQuery {
+        /**
+         * Returns an estimate of the size of this object, including the memory allocated elsewhere
+         * that it owns, in bytes.
+         */
+        uint64_t estimateObjectSizeInBytes() const;
+
+        std::string debugString() const;
+
+        BSONObj filter;
+        BSONObj sort;
+        BSONObj projection;
+        BSONObj collation;
+    };
+
+    /**
+     * Per-plan cache entry information that is used strictly as debug information (e.g. is intended
+     * for display by the $planCacheStats aggregation source). In order to save memory, this
+     * information is sometimes discarded instead of kept in the plan cache entry. Therefore, this
+     * information may not be used for any purpose outside displaying debug info, such as recovering
+     * a plan from the cache or determining whether or not the cache entry is active.
+     */
+    struct DebugInfo {
+        DebugInfo(CreatedFromQuery createdFromQuery,
+                  std::unique_ptr<const plan_ranker::PlanRankingDecision> decision);
+
+        /**
+         * 'DebugInfo' is copy-constructible, copy-assignable, move-constructible, and
+         * move-assignable.
+         */
+        DebugInfo(const DebugInfo&);
+        DebugInfo& operator=(const DebugInfo&);
+        DebugInfo(DebugInfo&&) = default;
+        DebugInfo& operator=(DebugInfo&&) = default;
+
+        ~DebugInfo() = default;
+
+        /**
+         * Returns an estimate of the size of this object, including the memory allocated elsewhere
+         * that it owns, in bytes.
+         */
+        uint64_t estimateObjectSizeInBytes() const;
+
+        CreatedFromQuery createdFromQuery;
+
+        // Information that went into picking the winning plan and also why the other plans lost.
+        // Never nullptr.
+        std::unique_ptr<const plan_ranker::PlanRankingDecision> decision;
+    };
+
     /**
      * Create a new PlanCacheEntry.
      * Grabs any planner-specific data required from the solutions.
-     * Takes ownership of the PlanRankingDecision that placed the plan in the cache.
      */
-    PlanCacheEntry(const std::vector<QuerySolution*>& solutions,
-                   PlanRankingDecision* why,
-                   uint32_t queryHash,
-                   uint32_t planCacheKey);
+    static std::unique_ptr<PlanCacheEntry> create(
+        const std::vector<QuerySolution*>& solutions,
+        std::unique_ptr<const plan_ranker::PlanRankingDecision> decision,
+        const CanonicalQuery& query,
+        uint32_t queryHash,
+        uint32_t planCacheKey,
+        Date_t timeOfCreation,
+        bool isActive,
+        size_t works);
 
     ~PlanCacheEntry();
 
     /**
      * Make a deep copy.
      */
-    PlanCacheEntry* clone() const;
+    std::unique_ptr<PlanCacheEntry> clone() const;
 
-    // For debugging.
-    std::string toString() const;
+    std::string debugString() const;
 
-    //
-    // Planner data
-    //
+    // Data provided to the planner to allow it to recreate the solution this entry represents. In
+    // order to return it from the cache for consumption by the 'QueryPlanner', a deep copy is made
+    // and returned inside 'CachedSolution'.
+    const std::unique_ptr<const SolutionCacheData> plannerData;
 
-    // Data provided to the planner to allow it to recreate the solutions this entry
-    // represents. Each SolutionCacheData is fully owned here, so in order to return
-    // it from the cache a deep copy is made and returned inside CachedSolution.
-    std::vector<SolutionCacheData*> plannerData;
-
-    // TODO: Do we really want to just hold a copy of the CanonicalQuery?  For now we just
-    // extract the data we need.
-    //
-    // Used by the plan cache commands to display an example query
-    // of the appropriate shape.
-    BSONObj query;
-    BSONObj sort;
-    BSONObj projection;
-    BSONObj collation;
-    Date_t timeOfCreation;
+    const Date_t timeOfCreation;
 
     // Hash of the PlanCacheKey. Intended as an identifier for the query shape in logs and other
     // diagnostic output.
-    uint32_t queryHash;
+    const uint32_t queryHash;
 
     // Hash of the "stable" PlanCacheKey, which is the same regardless of what indexes are around.
-    uint32_t planCacheKey;
-
-    //
-    // Performance stats
-    //
-
-    // Information that went into picking the winning plan and also why
-    // the other plans lost.
-    std::unique_ptr<PlanRankingDecision> decision;
-
-    // Scores from uses of this cache entry.
-    std::vector<double> feedback;
+    const uint32_t planCacheKey;
 
     // Whether or not the cache entry is active. Inactive cache entries should not be used for
     // planning.
@@ -347,6 +400,42 @@ public:
     // trigger a replan. Running a query of the same shape while this cache entry is inactive may
     // cause this value to be increased.
     size_t works = 0;
+
+    // Optional debug info containing detailed statistics. Includes a description of the query which
+    // resulted in this plan cache's creation as well as runtime stats from the multi-planner trial
+    // period that resulted in this cache entry.
+    //
+    // Once the estimated cumulative size of the mongod's plan caches exceeds a threshold, this
+    // debug info is omitted from new plan cache entries.
+    const boost::optional<DebugInfo> debugInfo;
+
+    // An estimate of the size in bytes of this plan cache entry. This is the "deep size",
+    // calculated by recursively incorporating the size of owned objects, the objects that they in
+    // turn own, and so on.
+    const uint64_t estimatedEntrySizeBytes;
+
+    /**
+     * Tracks the approximate cumulative size of the plan cache entries across all the collections.
+     */
+    inline static Counter64 planCacheTotalSizeEstimateBytes;
+
+private:
+    /**
+     * All arguments constructor.
+     */
+    PlanCacheEntry(std::unique_ptr<const SolutionCacheData> plannerData,
+                   Date_t timeOfCreation,
+                   uint32_t queryHash,
+                   uint32_t planCacheKey,
+                   bool isActive,
+                   size_t works,
+                   boost::optional<DebugInfo> debugInfo);
+
+    // Ensure that PlanCacheEntry is non-copyable.
+    PlanCacheEntry(const PlanCacheEntry&) = delete;
+    PlanCacheEntry& operator=(const PlanCacheEntry&) = delete;
+
+    uint64_t _estimateObjectSizeInBytes() const;
 };
 
 /**
@@ -401,8 +490,6 @@ public:
 
     PlanCache(size_t size);
 
-    PlanCache(const std::string& ns);
-
     ~PlanCache();
 
     /**
@@ -421,7 +508,7 @@ public:
      */
     Status set(const CanonicalQuery& query,
                const std::vector<QuerySolution*>& solns,
-               std::unique_ptr<PlanRankingDecision> why,
+               std::unique_ptr<plan_ranker::PlanRankingDecision> why,
                Date_t now,
                boost::optional<double> worksGrowthCoefficient = boost::none);
 
@@ -456,21 +543,6 @@ public:
      */
     std::unique_ptr<CachedSolution> getCacheEntryIfActive(const PlanCacheKey& key) const;
 
-
-    /**
-     * When the CachedPlanStage runs a plan out of the cache, we want to record data about the
-     * plan's performance. The CachedPlanStage calls feedback(...) after executing the cached
-     * plan for a trial period in order to do this. Currently, the only feedback metric recorded is
-     * the score associated with the cached plan trial period.
-     *
-     * If the entry corresponding to 'cq' isn't in the cache anymore, the feedback is ignored
-     * and an error Status is returned.
-     *
-     * If the entry corresponding to 'cq' still exists, 'feedback' is added to the run
-     * statistics about the plan.  Status::OK() is returned.
-     */
-    Status feedback(const CanonicalQuery& cq, double score);
-
     /**
      * Remove the entry corresponding to 'ck' from the cache.  Returns Status::OK() if the plan
      * was present and removed and an error status otherwise.
@@ -494,8 +566,7 @@ public:
     PlanCacheKey computeKey(const CanonicalQuery&) const;
 
     /**
-     * Returns a copy of a cache entry.
-     * Used by planCacheListPlans to display plan details.
+     * Returns a copy of a cache entry, looked up by CanonicalQuery.
      *
      * If there is no entry in the cache for the 'query', returns an error Status.
      */
@@ -529,10 +600,6 @@ public:
         const std::function<BSONObj(const PlanCacheEntry&)>& serializationFunc,
         const std::function<bool(const BSONObj&)>& filterFunc) const;
 
-    void setNs(NamespaceString ns) {
-        _ns = ns.toString();
-    }
-
 private:
     struct NewEntryState {
         bool shouldBeCreated = false;
@@ -549,10 +616,7 @@ private:
     LRUKeyValue<PlanCacheKey, PlanCacheEntry, PlanCacheKeyHasher> _cache;
 
     // Protects _cache.
-    mutable stdx::mutex _cacheMutex;
-
-    // Full namespace of collection.
-    std::string _ns;
+    mutable Mutex _cacheMutex = MONGO_MAKE_LATCH("PlanCache::_cacheMutex");
 
     // Holds computed information about the collection's indexes.  Used for generating plan
     // cache keys.
@@ -561,5 +625,4 @@ private:
     // are allowed.
     PlanCacheIndexabilityState _indexabilityState;
 };
-
 }  // namespace mongo

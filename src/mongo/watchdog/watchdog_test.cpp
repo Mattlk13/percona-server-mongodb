@@ -27,22 +27,23 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/watchdog/watchdog.h"
 
+#include <memory>
+
 #include "mongo/db/client.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_context_test_fixture.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/logv2/log.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/temp_dir.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/clock_source.h"
 #include "mongo/util/clock_source_mock.h"
-#include "mongo/util/log.h"
 #include "mongo/util/tick_source_mock.h"
 
 namespace mongo {
@@ -53,7 +54,7 @@ public:
 
     void run(OperationContext* opCtx) final {
         {
-            stdx::lock_guard<stdx::mutex> lock(_mutex);
+            stdx::lock_guard<Latch> lock(_mutex);
             ++_counter;
         }
 
@@ -69,7 +70,7 @@ public:
     void waitForCount() {
         invariant(_wait != 0);
 
-        stdx::unique_lock<stdx::mutex> lock(_mutex);
+        stdx::unique_lock<Latch> lock(_mutex);
         while (_counter < _wait) {
             _condvar.wait(lock);
         }
@@ -79,7 +80,7 @@ public:
 
     std::uint32_t getCounter() {
         {
-            stdx::lock_guard<stdx::mutex> lock(_mutex);
+            stdx::lock_guard<Latch> lock(_mutex);
             return _counter;
         }
     }
@@ -87,7 +88,7 @@ public:
 private:
     std::uint32_t _counter{0};
 
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH("TestPeriodicThread::_mutex");
     stdx::condition_variable _condvar;
     std::uint32_t _wait{0};
 };
@@ -197,7 +198,7 @@ class TestCounterCheck : public WatchdogCheck {
 public:
     void run(OperationContext* opCtx) final {
         {
-            stdx::lock_guard<stdx::mutex> lock(_mutex);
+            stdx::lock_guard<Latch> lock(_mutex);
             ++_counter;
         }
 
@@ -210,14 +211,21 @@ public:
         return "test";
     }
 
-    void setSignalOnCount(int c) {
+// Ignore data races in this function when running with TSAN, races are acceptable here
+#if defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+    __attribute__((no_sanitize("thread")))
+#endif
+#endif
+    void
+    setSignalOnCount(int c) {
         _wait = c;
     }
 
     void waitForCount() {
         invariant(_wait != 0);
 
-        stdx::unique_lock<stdx::mutex> lock(_mutex);
+        stdx::unique_lock<Latch> lock(_mutex);
         while (_counter < _wait) {
             _condvar.wait(lock);
         }
@@ -225,7 +233,7 @@ public:
 
     std::uint32_t getCounter() {
         {
-            stdx::lock_guard<stdx::mutex> lock(_mutex);
+            stdx::lock_guard<Latch> lock(_mutex);
             return _counter;
         }
     }
@@ -233,7 +241,7 @@ public:
 private:
     std::uint32_t _counter{0};
 
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH("TestCounterCheck::_mutex");
     stdx::condition_variable _condvar;
     std::uint32_t _wait{0};
 };
@@ -242,7 +250,7 @@ class WatchdogCheckThreadTest : public ServiceContextTest {};
 
 // Positive: Make sure check thread runs at least N times and stops correctly
 TEST_F(WatchdogCheckThreadTest, Basic) {
-    auto counterCheck = stdx::make_unique<TestCounterCheck>();
+    auto counterCheck = std::make_unique<TestCounterCheck>();
     auto counterCheckPtr = counterCheck.get();
 
     std::vector<std::unique_ptr<WatchdogCheck>> checks;
@@ -273,14 +281,14 @@ TEST_F(WatchdogCheckThreadTest, Basic) {
 class ManualResetEvent {
 public:
     void set() {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        stdx::lock_guard<Latch> lock(_mutex);
 
         _set = true;
         _condvar.notify_one();
     }
 
     void wait() {
-        stdx::unique_lock<stdx::mutex> lock(_mutex);
+        stdx::unique_lock<Latch> lock(_mutex);
 
         _condvar.wait(lock, [this]() { return _set; });
     }
@@ -288,7 +296,7 @@ public:
 private:
     bool _set{false};
 
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH("ManualResetEvent::_mutex");
     stdx::condition_variable _condvar;
 };
 
@@ -299,11 +307,11 @@ class WatchdogMonitorThreadTest : public ServiceContextTest {};
 TEST_F(WatchdogMonitorThreadTest, Basic) {
     ManualResetEvent deathEvent;
     WatchdogDeathCallback deathCallback = [&deathEvent]() {
-        log() << "Death signalled";
+        LOGV2(23431, "Death signalled");
         deathEvent.set();
     };
 
-    auto counterCheck = stdx::make_unique<TestCounterCheck>();
+    auto counterCheck = std::make_unique<TestCounterCheck>();
 
     std::vector<std::unique_ptr<WatchdogCheck>> checks;
     checks.push_back(std::move(counterCheck));
@@ -344,11 +352,11 @@ private:
 TEST_F(WatchdogMonitorThreadTest, SleepyHungCheck) {
     ManualResetEvent deathEvent;
     WatchdogDeathCallback deathCallback = [&deathEvent]() {
-        log() << "Death signalled";
+        LOGV2(23432, "Death signalled");
         deathEvent.set();
     };
 
-    auto sleepyCheck = stdx::make_unique<SleepyCheck>();
+    auto sleepyCheck = std::make_unique<SleepyCheck>();
 
     std::vector<std::unique_ptr<WatchdogCheck>> checks;
     checks.push_back(std::move(sleepyCheck));
@@ -363,9 +371,6 @@ TEST_F(WatchdogMonitorThreadTest, SleepyHungCheck) {
 
     deathEvent.wait();
 
-    // Make sure we actually did some checks
-    ASSERT_GTE(checkThread.getGeneration(), 2);
-
     monitorThread.shutdown();
 
     checkThread.shutdown();
@@ -377,11 +382,11 @@ class WatchdogMonitorTest : public ServiceContextTest {};
 TEST_F(WatchdogMonitorTest, SleepyHungCheck) {
     ManualResetEvent deathEvent;
     WatchdogDeathCallback deathCallback = [&deathEvent]() {
-        log() << "Death signalled";
+        LOGV2(23433, "Death signalled");
         deathEvent.set();
     };
 
-    auto sleepyCheck = stdx::make_unique<SleepyCheck>();
+    auto sleepyCheck = std::make_unique<SleepyCheck>();
 
     std::vector<std::unique_ptr<WatchdogCheck>> checks;
     checks.push_back(std::move(sleepyCheck));
@@ -396,8 +401,8 @@ TEST_F(WatchdogMonitorTest, SleepyHungCheck) {
 }
 
 // Positive: Make sure watchdog monitor terminates the process if a check is unresponsive
-DEATH_TEST(WatchdogMonitorTest, Death, "") {
-    auto sleepyCheck = stdx::make_unique<SleepyCheck>();
+DEATH_TEST_F(WatchdogMonitorTest, Death, "") {
+    auto sleepyCheck = std::make_unique<SleepyCheck>();
 
     std::vector<std::unique_ptr<WatchdogCheck>> checks;
     checks.push_back(std::move(sleepyCheck));
@@ -407,18 +412,19 @@ DEATH_TEST(WatchdogMonitorTest, Death, "") {
 
     monitor.start();
 
-    sleepmillis(1000);
+    // In TSAN builds, we need to wait enough time for death to be triggered
+    sleepsecs(100);
 }
 
 // Positive: Make sure the monitor can be paused and resumed, and it does not trigger death
 TEST_F(WatchdogMonitorTest, PauseAndResume) {
 
     WatchdogDeathCallback deathCallback = []() {
-        log() << "Death signalled, it should not have been";
+        LOGV2(23434, "Death signalled, it should not have been");
         invariant(false);
     };
 
-    auto counterCheck = stdx::make_unique<TestCounterCheck>();
+    auto counterCheck = std::make_unique<TestCounterCheck>();
     auto counterCheckPtr = counterCheck.get();
 
     std::vector<std::unique_ptr<WatchdogCheck>> checks;

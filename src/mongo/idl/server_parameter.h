@@ -110,6 +110,12 @@ public:
 
     virtual void append(OperationContext* opCtx, BSONObjBuilder& b, const std::string& name) = 0;
 
+    virtual void appendSupportingRoundtrip(OperationContext* opCtx,
+                                           BSONObjBuilder& b,
+                                           const std::string& name) {
+        append(opCtx, b, name);
+    }
+
     virtual Status set(const BSONElement& newValueElement) = 0;
 
     virtual Status setFromString(const std::string& str) = 0;
@@ -121,6 +127,10 @@ public:
     void setTestOnly() {
         _testOnly = true;
     }
+
+protected:
+    // Helper for translating setParameter values from BSON to string.
+    StatusWith<std::string> coerceToString(const BSONElement&, bool redact);
 
 private:
     std::string _name;
@@ -134,6 +144,7 @@ public:
     using Map = ServerParameter::Map;
 
     void add(ServerParameter* sp);
+    void remove(const std::string& name);
 
     const Map& getMap() const {
         return _map;
@@ -168,6 +179,7 @@ public:
     Status setFromString(const std::string& str) final;
 
 private:
+    std::once_flag _warnOnce;
     ServerParameter* _sp;
 };
 

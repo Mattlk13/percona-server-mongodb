@@ -15,6 +15,7 @@
  */
 
 load('jstests/concurrency/fsm_workload_helpers/server_types.js');  // for isEphemeral
+load("jstests/concurrency/fsm_workload_helpers/assert_handle_fail_in_transaction.js");
 
 var $config = (function() {
     var data = {
@@ -30,20 +31,23 @@ var $config = (function() {
                 bulk.insert({a: Random.randInt(10), b: Random.randInt(10), c: Random.randInt(10)});
             }
             var res = bulk.execute();
-            assertAlways.writeOK(res);
+            assertAlways.commandWorked(res);
             assertAlways.eq(this.nDocumentsToInsert, res.nInserted);
         }
 
         function createIndexes(db, collName) {
             // The number of indexes created here is also stored in data.nIndexes
-            var aResult = db[collName].ensureIndex({a: 1});
-            assertAlways.commandWorked(aResult);
+            var aResult = db[collName].createIndex({a: 1});
 
-            var bResult = db[collName].ensureIndex({b: 1});
-            assertAlways.commandWorked(bResult);
+            assertWorkedHandleTxnErrors(aResult, ErrorCodes.IndexBuildAlreadyInProgress);
 
-            var cResult = db[collName].ensureIndex({c: 1});
-            assertAlways.commandWorked(cResult);
+            var bResult = db[collName].createIndex({b: 1});
+
+            assertWorkedHandleTxnErrors(bResult, ErrorCodes.IndexBuildAlreadyInProgress);
+
+            var cResult = db[collName].createIndex({c: 1});
+
+            assertWorkedHandleTxnErrors(cResult, ErrorCodes.IndexBuildAlreadyInProgress);
         }
 
         // This method is independent of collectionSetup to allow it to be overridden in
@@ -88,7 +92,7 @@ var $config = (function() {
     };
 
     return {
-        threadCount: 15,
+        threadCount: 3,
         iterations: 10,
         states: states,
         transitions: transitions,

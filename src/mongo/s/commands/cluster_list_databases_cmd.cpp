@@ -40,144 +40,133 @@
 #include "mongo/db/commands/list_databases_gen.h"
 #include "mongo/s/client/shard.h"
 #include "mongo/s/client/shard_registry.h"
+#include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/commands/strategy.h"
 #include "mongo/s/grid.h"
 
 namespace mongo {
 namespace {
 
-class ListDatabasesCmd : public BasicCommand {
+class ListDatabasesCmd final : public ListDatabasesCmdVersion1Gen<ListDatabasesCmd> {
 public:
-    ListDatabasesCmd() : BasicCommand("listDatabases", "listdatabases") {}
-
-    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const final {
         return AllowedOnSecondary::kAlways;
     }
 
-    bool adminOnly() const override {
-        return true;
-    }
-
-
-    bool supportsWriteConcern(const BSONObj& cmd) const override {
+    bool maintenanceOk() const final {
         return false;
     }
 
-    std::string help() const override {
-        return "list databases in a cluster";
+    bool adminOnly() const final {
+        return true;
     }
 
-    /* listDatabases is always authorized,
-     * however the results returned will be redacted
-     * based on read privileges if auth is enabled
-     * and the current user does not have listDatabases permisison.
-     */
-    Status checkAuthForCommand(Client* client,
-                               const std::string& dbname,
-                               const BSONObj& cmdObj) const override {
-        return Status::OK();
-    }
+    class Invocation final : public InvocationBaseGen {
+    public:
+        using InvocationBaseGen::InvocationBaseGen;
 
-
-    bool run(OperationContext* opCtx,
-             const std::string& dbname_unused,
-             const BSONObj& cmdObj,
-             BSONObjBuilder& result) override {
-        CommandHelpers::handleMarkKillOnClientDisconnect(opCtx);
-
-        IDLParserErrorContext ctx("listDatabases");
-        auto cmd = ListDatabasesCommand::parse(ctx, cmdObj);
-        auto* as = AuthorizationSession::get(opCtx->getClient());
-
-        // { nameOnly: bool } - Default false.
-        const bool nameOnly = cmd.getNameOnly();
-
-        // { authorizedDatabases: bool } - Dynamic default based on perms.
-        const bool authorizedDatabases = ([as](const boost::optional<bool>& authDB) {
-            const bool mayListAllDatabases = as->isAuthorizedForActionsOnResource(
-                ResourcePattern::forClusterResource(), ActionType::listDatabases);
-            if (authDB) {
-                uassert(ErrorCodes::Unauthorized,
-                        "Insufficient permissions to list all databases",
-                        authDB.get() || mayListAllDatabases);
-                return authDB.get();
-            }
-
-            // By default, list all databases if we can, otherwise
-            // only those we're allowed to find on.
-            return !mayListAllDatabases;
-        })(cmd.getAuthorizedDatabases());
-
-        auto const shardRegistry = Grid::get(opCtx)->shardRegistry();
-
-        std::map<std::string, long long> sizes;
-        std::map<std::string, std::unique_ptr<BSONObjBuilder>> dbShardInfo;
-
-        std::vector<ShardId> shardIds;
-        shardRegistry->getAllShardIdsNoReload(&shardIds);
-        shardIds.emplace_back(ShardRegistry::kConfigServerShardId);
-
-        // { filter: matchExpression }.
-        auto filteredCmd = CommandHelpers::filterCommandRequestForPassthrough(cmdObj);
-
-        for (const ShardId& shardId : shardIds) {
-            const auto shardStatus = shardRegistry->getShard(opCtx, shardId);
-            if (!shardStatus.isOK()) {
-                continue;
-            }
-            const auto s = shardStatus.getValue();
-
-            auto response = uassertStatusOK(
-                s->runCommandWithFixedRetryAttempts(opCtx,
-                                                    ReadPreferenceSetting::get(opCtx),
-                                                    "admin",
-                                                    filteredCmd,
-                                                    Shard::RetryPolicy::kIdempotent));
-            uassertStatusOK(response.commandStatus);
-            BSONObj x = std::move(response.response);
-
-            BSONObjIterator j(x["databases"].Obj());
-            while (j.more()) {
-                BSONObj dbObj = j.next().Obj();
-
-                const auto name = dbObj["name"].String();
-
-                // If this is the admin db, only collect its stats from the config servers.
-                if (name == "admin" && !s->isConfig()) {
-                    continue;
-                }
-
-                // We don't collect config server info for dbs other than "admin" and "config".
-                if (s->isConfig() && name != "config" && name != "admin") {
-                    continue;
-                }
-
-                const long long size = dbObj["sizeOnDisk"].numberLong();
-
-                long long& sizeSumForDbAcrossShards = sizes[name];
-                if (size == 1) {
-                    if (sizeSumForDbAcrossShards <= 1) {
-                        sizeSumForDbAcrossShards = 1;
-                    }
-                } else {
-                    sizeSumForDbAcrossShards += size;
-                }
-
-                auto& bb = dbShardInfo[name];
-                if (!bb) {
-                    bb.reset(new BSONObjBuilder());
-                }
-
-                bb->appendNumber(s->getId().toString(), size);
-            }
+        bool supportsWriteConcern() const final {
+            return false;
         }
 
-        // Now that we have aggregated results for all the shards, convert to a response,
-        // and compute total sizes.
-        long long totalSize = 0;
+        void doCheckAuthorization(OperationContext*) const final {}
 
-        {
-            BSONArrayBuilder dbListBuilder(result.subarrayStart("databases"));
+        NamespaceString ns() const final {
+            return NamespaceString(request().getDbName(), "");
+        }
+
+        ListDatabasesReply typedRun(OperationContext* opCtx) final {
+            CommandHelpers::handleMarkKillOnClientDisconnect(opCtx);
+            auto* as = AuthorizationSession::get(opCtx->getClient());
+            auto cmd = request();
+
+            // { nameOnly: bool } - Default false.
+            const bool nameOnly = cmd.getNameOnly();
+
+            // { authorizedDatabases: bool } - Dynamic default based on perms.
+            const bool authorizedDatabases = ([as](const boost::optional<bool>& authDB) {
+                const bool mayListAllDatabases = as->isAuthorizedForActionsOnResource(
+                    ResourcePattern::forClusterResource(), ActionType::listDatabases);
+                if (authDB) {
+                    uassert(ErrorCodes::Unauthorized,
+                            "Insufficient permissions to list all databases",
+                            authDB.get() || mayListAllDatabases);
+                    return authDB.get();
+                }
+
+                // By default, list all databases if we can, otherwise
+                // only those we're allowed to find on.
+                return !mayListAllDatabases;
+            })(cmd.getAuthorizedDatabases());
+
+            auto const shardRegistry = Grid::get(opCtx)->shardRegistry();
+
+            std::map<std::string, long long> sizes;
+            std::map<std::string, std::unique_ptr<BSONObjBuilder>> dbShardInfo;
+
+            auto shardIds = shardRegistry->getAllShardIdsNoReload();
+            shardIds.emplace_back(ShardId::kConfigServerId);
+
+            // { filter: matchExpression }.
+            auto filteredCmd = applyReadWriteConcern(
+                opCtx, this, CommandHelpers::filterCommandRequestForPassthrough(cmd.toBSON({})));
+
+            for (const ShardId& shardId : shardIds) {
+                const auto shardStatus = shardRegistry->getShard(opCtx, shardId);
+                if (!shardStatus.isOK()) {
+                    continue;
+                }
+                const auto s = shardStatus.getValue();
+
+                auto response = uassertStatusOK(
+                    s->runCommandWithFixedRetryAttempts(opCtx,
+                                                        ReadPreferenceSetting::get(opCtx),
+                                                        "admin",
+                                                        filteredCmd,
+                                                        Shard::RetryPolicy::kIdempotent));
+                uassertStatusOK(response.commandStatus);
+                BSONObj x = std::move(response.response);
+
+                BSONObjIterator j(x["databases"].Obj());
+                while (j.more()) {
+                    BSONObj dbObj = j.next().Obj();
+
+                    const auto name = dbObj["name"].String();
+
+                    // If this is the admin db, only collect its stats from the config servers.
+                    if (name == "admin" && !s->isConfig()) {
+                        continue;
+                    }
+
+                    // We don't collect config server info for dbs other than "admin" and "config".
+                    if (s->isConfig() && name != "config" && name != "admin") {
+                        continue;
+                    }
+
+                    const long long size = dbObj["sizeOnDisk"].numberLong();
+
+                    long long& sizeSumForDbAcrossShards = sizes[name];
+                    if (size == 1) {
+                        if (sizeSumForDbAcrossShards <= 1) {
+                            sizeSumForDbAcrossShards = 1;
+                        }
+                    } else {
+                        sizeSumForDbAcrossShards += size;
+                    }
+
+                    auto& bb = dbShardInfo[name];
+                    if (!bb) {
+                        bb.reset(new BSONObjBuilder());
+                    }
+
+                    bb->append(s->getId().toString(), size);
+                }
+            }
+
+            // Now that we have aggregated results for all the shards, convert to a response,
+            // and compute total sizes.
+            long long totalSize = 0;
+            std::vector<ListDatabasesReplyItem> items;
             for (const auto& sizeEntry : sizes) {
                 const auto& name = sizeEntry.first;
                 const long long size = sizeEntry.second;
@@ -191,12 +180,11 @@ public:
                     continue;
                 }
 
-                BSONObjBuilder temp;
-                temp.append("name", name);
+                ListDatabasesReplyItem item(name);
                 if (!nameOnly) {
-                    temp.appendNumber("sizeOnDisk", size);
-                    temp.appendBool("empty", size == 1);
-                    temp.append("shards", dbShardInfo[name]->obj());
+                    item.setSizeOnDisk(size);
+                    item.setEmpty(size == 1);
+                    item.setShards(dbShardInfo[name]->obj());
 
                     uassert(ErrorCodes::BadValue,
                             str::stream() << "Found negative 'sizeOnDisk' in: " << name,
@@ -205,18 +193,18 @@ public:
                     totalSize += size;
                 }
 
-                dbListBuilder.append(temp.obj());
+                items.push_back(std::move(item));
             }
+
+            ListDatabasesReply reply(items);
+            if (!nameOnly) {
+                reply.setTotalSize(totalSize);
+                reply.setTotalSizeMb(totalSize / (1024 * 1024));
+            }
+
+            return reply;
         }
-
-        if (!nameOnly) {
-            result.appendNumber("totalSize", totalSize);
-            result.appendNumber("totalSizeMb", totalSize / (1024 * 1024));
-        }
-
-        return true;
-    }
-
+    };
 } listDatabasesCmd;
 
 }  // namespace

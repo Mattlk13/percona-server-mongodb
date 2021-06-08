@@ -39,7 +39,6 @@
 #include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/json.h"
 #include "mongo/db/server_options.h"
-#include "mongo/db/storage/mobile/mobile_options.h"
 #include "mongo/embedded/mongo_embedded/mongo_embedded_test_gen.h"
 #include "mongo/rpc/message.h"
 #include "mongo/rpc/op_msg.h"
@@ -52,6 +51,7 @@
 #include "mongo/util/quick_exit.h"
 #include "mongo/util/shared_buffer.h"
 #include "mongo/util/signal_handlers_synchronous.h"
+#include "mongo/util/text.h"
 
 namespace moe = mongo::optionenvironment;
 
@@ -59,7 +59,14 @@ mongo_embedded_v1_lib* global_lib_handle;
 
 namespace {
 
-std::unique_ptr<mongo::unittest::TempDir> globalTempDir;
+
+auto& getGlobalTempDir() {
+    static std::unique_ptr<mongo::unittest::TempDir> globalTempDir;
+    if (!globalTempDir) {
+        globalTempDir = std::make_unique<mongo::unittest::TempDir>("embedded_mongo");
+    }
+    return globalTempDir;
+}
 
 struct StatusDestructor {
     void operator()(mongo_embedded_v1_status* const p) const noexcept {
@@ -97,20 +104,10 @@ using MongoDBCAPIClientPtr = std::unique_ptr<mongo_embedded_v1_client, ClientDes
 class MongodbCAPITest : public mongo::unittest::Test {
 protected:
     void setUp() {
-        status = mongo_embedded_v1_status_create();
-        ASSERT(status != nullptr);
-
-        if (!globalTempDir) {
-            globalTempDir = std::make_unique<mongo::unittest::TempDir>("embedded_mongo");
-        }
-
         mongo_embedded_v1_init_params params;
         params.log_flags = MONGO_EMBEDDED_V1_LOG_STDOUT;
         params.log_callback = nullptr;
         params.log_user_data = nullptr;
-
-        // Set a parameter that lives in mobileGlobalOptions to verify it can be set using YAML.
-        uint32_t vacuumCheckIntervalMinutes = 1;
 
         YAML::Emitter yaml;
         yaml << YAML::BeginMap;
@@ -118,31 +115,34 @@ protected:
         yaml << YAML::Key << "storage";
         yaml << YAML::Value << YAML::BeginMap;
         yaml << YAML::Key << "dbPath";
-        yaml << YAML::Value << globalTempDir->path();
-        yaml << YAML::Key << "mobile" << YAML::BeginMap;
-        yaml << YAML::Key << "vacuumCheckIntervalMinutes" << YAML::Value
-             << vacuumCheckIntervalMinutes;
-        yaml << YAML::EndMap;  // mobile
+        yaml << YAML::Value << getGlobalTempDir()->path();
         yaml << YAML::EndMap;  // storage
 
         yaml << YAML::EndMap;
 
         params.yaml_config = yaml.c_str();
 
+        auto* status = mongo_embedded_v1_status_create();
+        ASSERT(status);
+
         lib = mongo_embedded_v1_lib_init(&params, status);
         ASSERT(lib != nullptr) << mongo_embedded_v1_status_get_explanation(status);
 
         db = mongo_embedded_v1_instance_create(lib, yaml.c_str(), status);
         ASSERT(db != nullptr) << mongo_embedded_v1_status_get_explanation(status);
-        ASSERT(mongo::embedded::mobileGlobalOptions.vacuumCheckIntervalMinutes ==
-               vacuumCheckIntervalMinutes);
+
+        mongo_embedded_v1_status_destroy(status);
     }
 
     void tearDown() {
+        auto* status = mongo_embedded_v1_status_create();
+        ASSERT(status);
+
         ASSERT_EQUALS(mongo_embedded_v1_instance_destroy(db, status), MONGO_EMBEDDED_V1_SUCCESS)
             << mongo_embedded_v1_status_get_explanation(status);
         ASSERT_EQUALS(mongo_embedded_v1_lib_fini(lib, status), MONGO_EMBEDDED_V1_SUCCESS)
             << mongo_embedded_v1_status_get_explanation(status);
+
         mongo_embedded_v1_status_destroy(status);
     }
 
@@ -151,8 +151,13 @@ protected:
     }
 
     MongoDBCAPIClientPtr createClient() const {
+        auto* status = mongo_embedded_v1_status_create();
+        ASSERT(status);
+
         MongoDBCAPIClientPtr client(mongo_embedded_v1_client_create(db, status));
         ASSERT(client.get() != nullptr) << mongo_embedded_v1_status_get_explanation(status);
+
+        mongo_embedded_v1_status_destroy(status);
         return client;
     }
 
@@ -170,10 +175,15 @@ protected:
         void* output;
         size_t outputSize;
 
+        auto* status = mongo_embedded_v1_status_create();
+        ASSERT(status);
+
         // call the wire protocol
         int err = mongo_embedded_v1_client_invoke(
             client.get(), inputMessage.buf(), inputMessage.size(), &output, &outputSize, status);
         ASSERT_EQUALS(err, MONGO_EMBEDDED_V1_SUCCESS);
+
+        mongo_embedded_v1_status_destroy(status);
 
         // convert the shared buffer to a mongo::message and ensure that it is valid
         auto outputMessage = messageFromBuffer(output, outputSize);
@@ -182,7 +192,7 @@ protected:
 
         // convert the message into an OpMessage to examine its BSON
         auto outputOpMsg = mongo::OpMsg::parseOwned(outputMessage);
-        ASSERT(outputOpMsg.body.valid(mongo::BSONVersion::kLatest));
+        ASSERT(outputOpMsg.body.valid());
         return outputOpMsg.body;
     }
 
@@ -190,7 +200,6 @@ protected:
 protected:
     mongo_embedded_v1_lib* lib;
     mongo_embedded_v1_instance* db;
-    mongo_embedded_v1_status* status;
 };
 
 TEST_F(MongodbCAPITest, CreateAndDestroyDB) {
@@ -238,7 +247,7 @@ TEST_F(MongodbCAPITest, CreateIndex) {
     mongo::BSONObj inputObj = mongo::fromjson(
         R"raw_delimiter({
             createIndexes: 'items',
-            indexes: 
+            indexes:
             [
                 {
                     key: {
@@ -265,7 +274,7 @@ TEST_F(MongodbCAPITest, CreateBackgroundIndex) {
     mongo::BSONObj inputObj = mongo::fromjson(
         R"raw_delimiter({
             createIndexes: 'items',
-            indexes: 
+            indexes:
             [
                 {
                     key: {
@@ -291,7 +300,7 @@ TEST_F(MongodbCAPITest, CreateTTLIndex) {
     mongo::BSONObj inputObj = mongo::fromjson(
         R"raw_delimiter({
             createIndexes: 'items',
-            indexes: 
+            indexes:
             [
                 {
                     key: {
@@ -308,27 +317,6 @@ TEST_F(MongodbCAPITest, CreateTTLIndex) {
     ASSERT(output.hasField("ok")) << output;
     ASSERT(output.getField("ok").numberDouble() != 1.0) << output;
 }
-
-TEST_F(MongodbCAPITest, TrimMemory) {
-    // create the client object
-    auto client = createClient();
-
-    // craft the isMaster message
-    mongo::BSONObj inputObj = mongo::fromjson("{trimMemory: 'aggressive'}");
-    auto inputOpMsg = mongo::OpMsgRequest::fromDBAndBody("admin", inputObj);
-    performRpc(client, inputOpMsg);
-}
-
-TEST_F(MongodbCAPITest, BatteryLevel) {
-    // create the client object
-    auto client = createClient();
-
-    // craft the isMaster message
-    mongo::BSONObj inputObj = mongo::fromjson("{setBatteryLevel: 'low'}");
-    auto inputOpMsg = mongo::OpMsgRequest::fromDBAndBody("admin", inputObj);
-    performRpc(client, inputOpMsg);
-}
-
 
 TEST_F(MongodbCAPITest, InsertDocument) {
     auto client = createClient();
@@ -415,7 +403,7 @@ TEST_F(MongodbCAPITest, ReadDB) {
     auto outputBSON = performRpc(client, findMsg);
 
 
-    ASSERT(outputBSON.valid(mongo::BSONVersion::kLatest));
+    ASSERT(outputBSON.valid());
     ASSERT(outputBSON.hasField("cursor"));
     ASSERT(outputBSON.getField("cursor").embeddedObject().hasField("firstBatch"));
     mongo::BSONObj arrObj =
@@ -440,7 +428,7 @@ TEST_F(MongodbCAPITest, InsertAndRead) {
         "{insert: 'collection_name', documents: [{firstName: 'Mongo', lastName: 'DB', age: 10}]}");
     auto insertOpMsg = mongo::OpMsgRequest::fromDBAndBody("db_name", insertObj);
     auto outputBSON1 = performRpc(client, insertOpMsg);
-    ASSERT(outputBSON1.valid(mongo::BSONVersion::kLatest));
+    ASSERT(outputBSON1.valid());
     ASSERT(outputBSON1.hasField("n"));
     ASSERT(outputBSON1.getIntField("n") == 1);
     ASSERT(outputBSON1.hasField("ok"));
@@ -449,7 +437,7 @@ TEST_F(MongodbCAPITest, InsertAndRead) {
     mongo::BSONObj findObj = mongo::fromjson("{find: 'collection_name', limit: 1}");
     auto findMsg = mongo::OpMsgRequest::fromDBAndBody("db_name", findObj);
     auto outputBSON2 = performRpc(client, findMsg);
-    ASSERT(outputBSON2.valid(mongo::BSONVersion::kLatest));
+    ASSERT(outputBSON2.valid());
     ASSERT(outputBSON2.hasField("cursor"));
     ASSERT(outputBSON2.getField("cursor").embeddedObject().hasField("firstBatch"));
     mongo::BSONObj arrObj =
@@ -475,7 +463,7 @@ TEST_F(MongodbCAPITest, InsertAndReadDifferentClients) {
         "{insert: 'collection_name', documents: [{firstName: 'Mongo', lastName: 'DB', age: 10}]}");
     auto insertOpMsg = mongo::OpMsgRequest::fromDBAndBody("db_name", insertObj);
     auto outputBSON1 = performRpc(client1, insertOpMsg);
-    ASSERT(outputBSON1.valid(mongo::BSONVersion::kLatest));
+    ASSERT(outputBSON1.valid());
     ASSERT(outputBSON1.hasField("n"));
     ASSERT(outputBSON1.getIntField("n") == 1);
     ASSERT(outputBSON1.hasField("ok"));
@@ -484,7 +472,7 @@ TEST_F(MongodbCAPITest, InsertAndReadDifferentClients) {
     mongo::BSONObj findObj = mongo::fromjson("{find: 'collection_name', limit: 1}");
     auto findMsg = mongo::OpMsgRequest::fromDBAndBody("db_name", findObj);
     auto outputBSON2 = performRpc(client2, findMsg);
-    ASSERT(outputBSON2.valid(mongo::BSONVersion::kLatest));
+    ASSERT(outputBSON2.valid());
     ASSERT(outputBSON2.hasField("cursor"));
     ASSERT(outputBSON2.getField("cursor").embeddedObject().hasField("firstBatch"));
     mongo::BSONObj arrObj =
@@ -509,7 +497,7 @@ TEST_F(MongodbCAPITest, InsertAndDelete) {
         "age: 10}]}");
     auto insertOpMsg = mongo::OpMsgRequest::fromDBAndBody("db_name", insertObj);
     auto outputBSON1 = performRpc(client, insertOpMsg);
-    ASSERT(outputBSON1.valid(mongo::BSONVersion::kLatest));
+    ASSERT(outputBSON1.valid());
     ASSERT(outputBSON1.hasField("n"));
     ASSERT(outputBSON1.getIntField("n") == 1);
     ASSERT(outputBSON1.hasField("ok"));
@@ -522,7 +510,7 @@ TEST_F(MongodbCAPITest, InsertAndDelete) {
         "1}]}");
     auto deleteOpMsg = mongo::OpMsgRequest::fromDBAndBody("db_name", deleteObj);
     auto outputBSON2 = performRpc(client, deleteOpMsg);
-    ASSERT(outputBSON2.valid(mongo::BSONVersion::kLatest));
+    ASSERT(outputBSON2.valid());
     ASSERT(outputBSON2.hasField("n"));
     ASSERT(outputBSON2.getIntField("n") == 1);
     ASSERT(outputBSON2.hasField("ok"));
@@ -538,7 +526,7 @@ TEST_F(MongodbCAPITest, InsertAndUpdate) {
         "age: 10}]}");
     auto insertOpMsg = mongo::OpMsgRequest::fromDBAndBody("db_name", insertObj);
     auto outputBSON1 = performRpc(client, insertOpMsg);
-    ASSERT(outputBSON1.valid(mongo::BSONVersion::kLatest));
+    ASSERT(outputBSON1.valid());
     ASSERT(outputBSON1.hasField("n"));
     ASSERT(outputBSON1.getIntField("n") == 1);
     ASSERT(outputBSON1.hasField("ok"));
@@ -551,7 +539,7 @@ TEST_F(MongodbCAPITest, InsertAndUpdate) {
         "{age: 5}}}]}");
     auto updateOpMsg = mongo::OpMsgRequest::fromDBAndBody("db_name", updateObj);
     auto outputBSON2 = performRpc(client, updateOpMsg);
-    ASSERT(outputBSON2.valid(mongo::BSONVersion::kLatest));
+    ASSERT(outputBSON2.valid());
     ASSERT(outputBSON2.hasField("ok"));
     ASSERT(outputBSON2.getField("ok").numberDouble() == 1.0);
     ASSERT(outputBSON2.hasField("nModified"));
@@ -561,72 +549,69 @@ TEST_F(MongodbCAPITest, InsertAndUpdate) {
 TEST_F(MongodbCAPITest, RunListCommands) {
     auto client = createClient();
 
-    std::vector<std::string> whitelist = {
-        "_hashBSONElement",
-        "auditGetOptions",
-        "logApplicationMessage",
-        "aggregate",
-        "buildInfo",
-        "collMod",
-        "collStats",
-        "configureFailPoint",
-        "count",
-        "create",
-        "createIndexes",
-        "currentOp",
-        "dataSize",
-        "dbStats",
-        "delete",
-        "distinct",
-        "drop",
-        "dropDatabase",
-        "dropIndexes",
-        "echo",
-        "endSessions",
-        "explain",
-        "find",
-        "findAndModify",
-        "getLastError",
-        "getMore",
-        "getParameter",
-        "httpClientRequest",
-        "insert",
-        "isMaster",
-        "killCursors",
-        "killOp",
-        "killSessions",
-        "killAllSessions",
-        "killAllSessionsByPattern",
-        "listCollections",
-        "listCommands",
-        "listDatabases",
-        "listIndexes",
-        "lockInfo",
-        "ping",
-        "planCacheClear",
-        "planCacheClearFilters",
-        "planCacheListFilters",
-        "planCacheListPlans",
-        "planCacheListQueryShapes",
-        "planCacheSetFilter",
-        "reIndex",
-        "refreshLogicalSessionCacheNow",
-        "refreshSessions",
-        "renameCollection",
-        "repairCursor",
-        "repairDatabase",
-        "resetError",
-        "serverStatus",
-        "setBatteryLevel",
-        "setParameter",
-        "sleep",
-        "startSession",
-        "trimMemory",
-        "twoPhaseCreateIndexes",
-        "update",
-        "validate",
-    };
-    std::sort(whitelist.begin(), whitelist.end());
+    std::vector<std::string> allowlist = {"_hashBSONElement",
+                                          "_killOperations",
+                                          "auditGetOptions",
+                                          "logApplicationMessage",
+                                          "aggregate",
+                                          "buildInfo",
+                                          "collMod",
+                                          "collStats",
+                                          "configureFailPoint",
+                                          "count",
+                                          "create",
+                                          "createIndexes",
+                                          "currentOp",
+                                          "dataSize",
+                                          "dbStats",
+                                          "delete",
+                                          "distinct",
+                                          "drop",
+                                          "dropDatabase",
+                                          "dropIndexes",
+                                          "echo",
+                                          "endSessions",
+                                          "explain",
+                                          "find",
+                                          "findAndModify",
+                                          "getLastError",
+                                          "getMore",
+                                          "getParameter",
+                                          "httpClientRequest",
+                                          "insert",
+                                          "isMaster",
+                                          "killCursors",
+                                          "killOp",
+                                          "killSessions",
+                                          "killAllSessions",
+                                          "killAllSessionsByPattern",
+                                          "listCollections",
+                                          "listCommands",
+                                          "listDatabases",
+                                          "listIndexes",
+                                          "lockInfo",
+                                          "logMessage",
+                                          "ping",
+                                          "planCacheClear",
+                                          "planCacheClearFilters",
+                                          "planCacheListFilters",
+                                          "planCacheSetFilter",
+                                          "reIndex",
+                                          "refreshLogicalSessionCacheNow",
+                                          "refreshSessions",
+                                          "renameCollection",
+                                          "repairDatabase",
+                                          "serverStatus",
+                                          "setParameter",
+                                          "sleep",
+                                          "startSession",
+                                          "update",
+                                          "validate",
+                                          "validateDBMetadata",
+                                          "waitForFailPoint",
+                                          "whatsmysni"};
+
+    std::sort(allowlist.begin(), allowlist.end());
 
     mongo::BSONObj listCommandsObj = mongo::fromjson("{ listCommands: 1 }");
     auto listCommandsOpMsg = mongo::OpMsgRequest::fromDBAndBody("db_name", listCommandsObj);
@@ -640,15 +625,15 @@ TEST_F(MongodbCAPITest, RunListCommands) {
 
     std::vector<std::string> missing;
     std::vector<std::string> unsupported;
-    std::set_difference(whitelist.begin(),
-                        whitelist.end(),
+    std::set_difference(allowlist.begin(),
+                        allowlist.end(),
                         commands.begin(),
                         commands.end(),
                         std::back_inserter(missing));
     std::set_difference(commands.begin(),
                         commands.end(),
-                        whitelist.begin(),
-                        whitelist.end(),
+                        allowlist.begin(),
+                        allowlist.end(),
                         std::back_inserter(unsupported));
 
     if (!missing.empty()) {
@@ -664,8 +649,8 @@ TEST_F(MongodbCAPITest, RunListCommands) {
         std::cout << cmd << "\n";
     }
 
-    ASSERT(missing.empty());
-    ASSERT(unsupported.empty());
+    ASSERT(missing.empty()) << mongo::StringSplitter::join(missing, ", ");
+    ASSERT(unsupported.empty()) << mongo::StringSplitter::join(unsupported, ", ");
 }
 
 // This test is temporary to make sure that only one database can be created
@@ -694,9 +679,8 @@ int main(const int argc, const char* const* const argv) {
         return EXIT_FAILURE;
     }
 
-    std::map<std::string, std::string> env;
     ret = moe::OptionsParser().run(
-        options, std::vector<std::string>(argv, argv + argc), env, &environment);
+        options, std::vector<std::string>(argv, argv + argc), &environment);
     if (!ret.isOK()) {
         std::cerr << options.helpString();
         return EXIT_FAILURE;
@@ -719,8 +703,7 @@ int main(const int argc, const char* const* const argv) {
     // The reason this works is that the unittest system relies on other systems being initialized
     // through global init and deinitialize just deinitializes systems that explicitly supports
     // deinit leaving the systems unittest needs initialized.
-    const char* null_argv[1] = {nullptr};
-    ret = mongo::runGlobalInitializers(0, null_argv, nullptr);
+    ret = mongo::runGlobalInitializers(std::vector<std::string>{argv, argv + argc});
     if (!ret.isOK()) {
         std::cerr << "Global initilization failed";
         return EXIT_FAILURE;
@@ -765,6 +748,16 @@ int main(const int argc, const char* const* const argv) {
     };
     params.log_user_data = &receivedCallback;
 
+    YAML::Emitter yaml;
+    yaml << YAML::BeginMap;
+    yaml << YAML::Key << "storage";
+    yaml << YAML::Value << YAML::BeginMap;
+    yaml << YAML::Key << "dbPath";
+    yaml << YAML::Value << getGlobalTempDir()->path();
+    yaml << YAML::EndMap;  // storage
+    yaml << YAML::EndMap;
+    params.yaml_config = yaml.c_str();
+
     lib = mongo_embedded_v1_lib_init(&params, nullptr);
     if (lib == nullptr) {
         std::cerr << "mongo_embedded_v1_init() failed with "
@@ -774,7 +767,8 @@ int main(const int argc, const char* const* const argv) {
 
     // Attempt to create an embedded instance to make sure something gets logged. This will probably
     // fail but that's fine.
-    mongo_embedded_v1_instance* instance = mongo_embedded_v1_instance_create(lib, nullptr, nullptr);
+    mongo_embedded_v1_instance* instance =
+        mongo_embedded_v1_instance_create(lib, yaml.c_str(), nullptr);
     if (instance) {
         mongo_embedded_v1_instance_destroy(instance, nullptr);
     }
@@ -790,8 +784,8 @@ int main(const int argc, const char* const* const argv) {
         return EXIT_FAILURE;
     }
 
-    const auto result = ::mongo::unittest::Suite::run(std::vector<std::string>(), "", 1);
+    const auto result = ::mongo::unittest::Suite::run(std::vector<std::string>(), "", "", 1);
 
-    globalTempDir.reset();
+    getGlobalTempDir().reset();
     mongo::quickExit(result);
 }

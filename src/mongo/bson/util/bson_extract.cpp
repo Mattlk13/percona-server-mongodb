@@ -65,10 +65,9 @@ Status bsonExtractTypedFieldImpl(const BSONObj& object,
         return status;
     if (type != outElement->type()) {
         return Status(ErrorCodes::TypeMismatch,
-                      str::stream() << "\"" << fieldName << "\" had the wrong type. Expected "
-                                    << typeName(type)
-                                    << ", found "
-                                    << typeName(outElement->type()));
+                      str::stream()
+                          << "\"" << fieldName << "\" had the wrong type. Expected "
+                          << typeName(type) << ", found " << typeName(outElement->type()));
     }
     return status;
 }
@@ -83,9 +82,9 @@ Status bsonExtractIntegerFieldImpl(const BSONObj& object,
         return status;
     if (!element.isNumber()) {
         return Status(ErrorCodes::TypeMismatch,
-                      str::stream() << "Expected field \"" << fieldName
-                                    << "\" to have numeric type, but found "
-                                    << typeName(element.type()));
+                      str::stream()
+                          << "Expected field \"" << fieldName
+                          << "\" to have numeric type, but found " << typeName(element.type()));
     }
     long long result = element.safeNumberLong();
     if (result != element.numberDouble()) {
@@ -109,9 +108,9 @@ Status bsonExtractDoubleFieldImpl(const BSONObj& object,
         return status;
     if (!element.isNumber()) {
         return Status(ErrorCodes::TypeMismatch,
-                      str::stream() << "Expected field \"" << fieldName
-                                    << "\" to have numeric type, but found "
-                                    << typeName(element.type()));
+                      str::stream()
+                          << "Expected field \"" << fieldName
+                          << "\" to have numeric type, but found " << typeName(element.type()));
     }
     *out = element.numberDouble();
     return status;
@@ -155,8 +154,7 @@ Status bsonExtractBooleanFieldWithDefault(const BSONObj& object,
     if (!element.isNumber() && !element.isBoolean()) {
         return Status(ErrorCodes::TypeMismatch,
                       str::stream() << "Expected boolean or number type for field \"" << fieldName
-                                    << "\", found "
-                                    << typeName(element.type()));
+                                    << "\", found " << typeName(element.type()));
     }
     *out = element.trueValue();
     return status;
@@ -251,7 +249,7 @@ Status bsonExtractIntegerFieldWithDefault(const BSONObj& object,
 Status bsonExtractIntegerFieldWithDefaultIf(const BSONObj& object,
                                             StringData fieldName,
                                             long long defaultValue,
-                                            stdx::function<bool(long long)> pred,
+                                            std::function<bool(long long)> pred,
                                             const std::string& predDescription,
                                             long long* out) {
     Status status = bsonExtractIntegerFieldWithDefault(object, fieldName, defaultValue, out);
@@ -261,8 +259,7 @@ Status bsonExtractIntegerFieldWithDefaultIf(const BSONObj& object,
     if (!pred(*out)) {
         return Status(ErrorCodes::BadValue,
                       str::stream() << "Invalid value in field \"" << fieldName << "\": " << *out
-                                    << ": "
-                                    << predDescription);
+                                    << ": " << predDescription);
     }
     return status;
 }
@@ -270,7 +267,7 @@ Status bsonExtractIntegerFieldWithDefaultIf(const BSONObj& object,
 Status bsonExtractIntegerFieldWithDefaultIf(const BSONObj& object,
                                             StringData fieldName,
                                             long long defaultValue,
-                                            stdx::function<bool(long long)> pred,
+                                            std::function<bool(long long)> pred,
                                             long long* out) {
     return bsonExtractIntegerFieldWithDefaultIf(
         object, fieldName, defaultValue, pred, "constraint failed", out);

@@ -15,7 +15,7 @@ if inmemory:
             'inmemory_global_options.cpp',
             'inmemory_init.cpp',
             'inmemory_options_init.cpp',
-            env.Idlc('inmemory_global_options.idl')[0],
+            'inmemory_global_options.idl',
             ],
         LIBDEPS=[
             '$BUILD_DIR/mongo/db/storage/wiredtiger/storage_wiredtiger_core',
@@ -43,11 +43,9 @@ if inmemory:
                 ],
         LIBDEPS=[
             '$BUILD_DIR/mongo/db/auth/authmocks',
-            '$BUILD_DIR/mongo/db/storage/wiredtiger/storage_wiredtiger_mock',
+            '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
+            '$BUILD_DIR/mongo/db/repl/replmocks',
             '$BUILD_DIR/mongo/db/storage/kv/kv_engine_test_harness',
-            ],
-            LIBDEPS_PRIVATE=[
-                '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
-                '$BUILD_DIR/mongo/db/repl/replmocks',
+            '$BUILD_DIR/mongo/db/storage/wiredtiger/storage_wiredtiger_core',
             ],
         )

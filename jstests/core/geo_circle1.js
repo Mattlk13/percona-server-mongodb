@@ -1,4 +1,7 @@
-// @tags: [requires_fastcount, assumes_balancer_off]
+// @tags: [
+//   assumes_balancer_off,
+//   requires_fastcount,
+// ]
 
 t = db.geo_circle1;
 t.drop();
@@ -25,7 +28,7 @@ for (x = 0; x <= 20; x++) {
     }
 }
 
-t.ensureIndex({loc: "2d"});
+t.createIndex({loc: "2d"});
 
 for (i = 0; i < searches.length; i++) {
     // print( tojson( searches[i] ) + "\t" + correct[i].length )

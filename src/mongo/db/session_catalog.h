@@ -37,14 +37,16 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/session.h"
 #include "mongo/db/session_killer.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/util/concurrency/with_lock.h"
+#include "mongo/util/hierarchical_acquisition.h"
 
 namespace mongo {
 
 class ObservableSession;
+class ScopedBlockSessionCheckouts;
 
 /**
  * Keeps track of the transaction runtime state for every active session on this instance.
@@ -98,7 +100,7 @@ public:
      * Iterates through the SessionCatalog and applies 'workerFn' to each Session. This locks the
      * SessionCatalog.
      */
-    using ScanSessionsCallbackFn = stdx::function<void(ObservableSession&)>;
+    using ScanSessionsCallbackFn = std::function<void(ObservableSession&)>;
     void scanSession(const LogicalSessionId& lsid, const ScanSessionsCallbackFn& workerFn);
     void scanSessions(const SessionKiller::Matcher& matcher,
                       const ScanSessionsCallbackFn& workerFn);
@@ -115,6 +117,7 @@ public:
     size_t size() const;
 
 private:
+    friend ScopedBlockSessionCheckouts;
     struct SessionRuntimeInfo {
         SessionRuntimeInfo(LogicalSessionId lsid) : session(std::move(lsid)) {}
         ~SessionRuntimeInfo();
@@ -152,11 +155,27 @@ private:
      */
     void _releaseSession(SessionRuntimeInfo* sri, boost::optional<KillToken> killToken);
 
+    /**
+     * Disallow checkouts that are not for killing.
+     */
+    void _disallowCheckoutsExceptForKilling();
+
+    /**
+     * Re-enable checkouts if it was disallowed earlier.
+     */
+    void _allowCheckouts();
+
     // Protects the state below
-    mutable stdx::mutex _mutex;
+    mutable Mutex _mutex =
+        MONGO_MAKE_LATCH(HierarchicalAcquisitionLevel(0), "SessionCatalog::_mutex");
 
     // Owns the Session objects for all current Sessions.
     SessionRuntimeInfoMap _sessions;
+
+    // If false no new sessions can be checked out. Reasons why this could be true is because step
+    // down is in progress and we should not allow new sessions to get checked out in order to
+    // prevent deadlocks.
+    bool _checkoutAllowed{true};
 };
 
 /**
@@ -205,6 +224,8 @@ private:
     boost::optional<SessionCatalog::KillToken> _killToken;
 };
 
+class OperationContextSession;
+
 /**
  * RAII type returned by SessionCatalog::checkOutSessionForKill.
  *
@@ -229,6 +250,8 @@ public:
     }
 
 private:
+    friend OperationContextSession;
+
     ScopedCheckedOutSession _scos;
 };
 using SessionToKill = SessionCatalog::SessionToKill;
@@ -339,6 +362,13 @@ public:
      * for the desired session to be checked in by another user.
      */
     OperationContextSession(OperationContext* opCtx);
+
+    /**
+     * Same as constructor above, but takes the session id from the killToken and uses
+     * checkoutSessionForKill instead, placing the checked-out session on the operation context.
+     * Must not be called if the operation context contains a session.
+     */
+    OperationContextSession(OperationContext* opCtx, SessionCatalog::KillToken killToken);
     ~OperationContextSession();
 
     /**
@@ -356,6 +386,21 @@ public:
      */
     static void checkIn(OperationContext* opCtx);
     static void checkOut(OperationContext* opCtx);
+
+private:
+    OperationContext* const _opCtx;
+};
+
+/**
+ * Scoped object, while active will prevent the checkout of sessions except for killing.
+ */
+class ScopedBlockSessionCheckouts {
+    ScopedBlockSessionCheckouts(const ScopedBlockSessionCheckouts&) = delete;
+    ScopedBlockSessionCheckouts& operator=(const ScopedBlockSessionCheckouts&) = delete;
+
+public:
+    ScopedBlockSessionCheckouts(OperationContext* opCtx);
+    ~ScopedBlockSessionCheckouts();
 
 private:
     OperationContext* const _opCtx;

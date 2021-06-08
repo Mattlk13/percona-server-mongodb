@@ -33,12 +33,11 @@
 #include <string>
 
 #include "mongo/db/service_context.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 
 namespace mongo {
 /**
- * This class is for use with non-MMAPv1 storage engines that track record store sizes in catalog
- * metadata.
+ * This class is for use with storage engines that track record store sizes in catalog metadata.
  *
  * During normal server operation, we adjust the size metadata for all record stores. But when
  * performing replication recovery, we avoid doing so, as we trust that the size metadata on disk is
@@ -81,8 +80,8 @@ public:
     void clearStateBeforeRecovery();
 
 private:
-    mutable stdx::mutex _mutex;
-    std::set<std::string> _collectionsAlwaysNeedingSizeAdjustment;
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("SizeRecoveryState::_mutex");
+    StringSet _collectionsAlwaysNeedingSizeAdjustment;
 };
 
 /**

@@ -2,45 +2,83 @@
 // Utility functions for multi-version replica sets
 //
 
+ReplSetTest.prototype._stablePrimaryOnRestarts = function() {
+    // In a 2-node replica set the secondary can step up after a restart. In fact while the
+    // secondary is being restarted, the primary may end up stepping down (due to heartbeats not
+    // being received) and for the restarted node to run for and win the election.
+    return this.nodes.length > 2;
+};
+
 /**
+ * Upgrade or downgrade replica sets.
+ *
  * @param options {Object} see ReplSetTest.start & MongoRunner.runMongod.
  * @param user {string} optional, user name for authentication.
  * @param pwd {string} optional, password for authentication. Must be set if user is set.
  */
 ReplSetTest.prototype.upgradeSet = function(options, user, pwd) {
+    this.awaitNodesAgreeOnPrimary();
     let primary = this.getPrimary();
 
-    // Upgrade secondaries first.
-    this.upgradeSecondaries(primary, options, user, pwd);
+    this.upgradeSecondaries(Object.assign({}, options), user, pwd);
+    this.upgradeArbiters(Object.assign({}, options), user, pwd);
 
-    // Then upgrade the primary after stepping down.
-    this.upgradePrimary(primary, options, user, pwd);
+    if (!this._stablePrimaryOnRestarts()) {
+        this.awaitNodesAgreeOnPrimary();
+        if (this.getPrimary() != primary) {
+            this.upgradeMembers([primary], Object.assign({}, options), user, pwd);
+            return;
+        }
+    }
 
+    assert.eq(
+        this.getPrimary(), primary, "Primary changed unexpectedly after upgrading secondaries");
+    this.upgradePrimary(primary, Object.assign({}, options), user, pwd);
 };
 
-ReplSetTest.prototype.upgradeSecondaries = function(primary, options, user, pwd) {
-    const noDowntimePossible = this.nodes.length > 2;
+function mergeNodeOptions(nodeOptions, options) {
+    for (let nodeName in nodeOptions) {
+        nodeOptions[nodeName] = Object.merge(nodeOptions[nodeName], options);
+    }
+    return nodeOptions;
+}
 
+ReplSetTest.prototype.upgradeMembers = function(members, options, user, pwd) {
     // Merge new options into node settings.
-    for (let nodeName in this.nodeOptions) {
-        this.nodeOptions[nodeName] = Object.merge(this.nodeOptions[nodeName], options);
-    }
+    this.nodeOptions = mergeNodeOptions(this.nodeOptions, options);
 
-    for (let secondary of this.getSecondaries()) {
-        this.upgradeNode(secondary, options, user, pwd);
-
-        if (noDowntimePossible)
-            assert.eq(this.getPrimary(), primary);
+    for (let member of members) {
+        this.upgradeNode(member, options, user, pwd);
     }
+};
+
+ReplSetTest.prototype.getNonArbiterSecondaries = function() {
+    let secs = this.getSecondaries();
+    let arbiters = this.getArbiters();
+    let nonArbiters = secs.filter(x => !arbiters.includes(x));
+    return nonArbiters;
+};
+
+ReplSetTest.prototype.upgradeSecondaries = function(options, user, pwd) {
+    this.upgradeMembers(this.getNonArbiterSecondaries(), options, user, pwd);
+};
+
+ReplSetTest.prototype.upgradeArbiters = function(options, user, pwd) {
+    // We don't support downgrading data files for arbiters. We need to instead delete the dbpath.
+    const oldStartClean = {startClean: (options && !!options["startClean"])};
+    if (options && options.binVersion == "last-lts") {
+        options["startClean"] = true;
+    }
+    this.upgradeMembers(this.getArbiters(), options, user, pwd);
+    // Make sure we don't set {startClean:true} on other nodes unless the user explicitly requested.
+    this.nodeOptions = mergeNodeOptions(this.nodeOptions, oldStartClean);
 };
 
 ReplSetTest.prototype.upgradePrimary = function(primary, options, user, pwd) {
-    const noDowntimePossible = this.nodes.length > 2;
-
     // Merge new options into node settings.
-    for (let nodeName in this.nodeOptions) {
-        this.nodeOptions[nodeName] = Object.merge(this.nodeOptions[nodeName], options);
-    }
+    this.nodeOptions = mergeNodeOptions(this.nodeOptions, options);
+
+    jsTest.authenticate(primary);
 
     let oldPrimary = this.stepdown(primary);
     this.waitForState(oldPrimary, ReplSetTest.State.SECONDARY);
@@ -52,6 +90,24 @@ ReplSetTest.prototype.upgradePrimary = function(primary, options, user, pwd) {
     }
     jsTest.authenticate(oldPrimary);
 
+    // waitForState() runs the logout command via asCluster() on either the current primary or the
+    // first node in the replica set so we re-authenticate on all connections before calling
+    // awaitNodesAgreeOnPrimary().
+    for (const node of this.nodes) {
+        const connStatus =
+            assert.commandWorked(node.adminCommand({connectionStatus: 1, showPrivileges: true}));
+
+        const connIsAuthenticated = connStatus.authInfo.authenticatedUsers.length > 0;
+        if (connIsAuthenticated) {
+            continue;
+        }
+
+        if (user != undefined) {
+            node.getDB('admin').auth(user, pwd);
+        }
+        jsTest.authenticate(node);
+    }
+
     this.awaitNodesAgreeOnPrimary();
     primary = this.getPrimary();
 
@@ -59,9 +115,10 @@ ReplSetTest.prototype.upgradePrimary = function(primary, options, user, pwd) {
 
     let newPrimary = this.getPrimary();
 
-    if (noDowntimePossible)
-        assert.eq(newPrimary, primary);
-
+    if (this._stablePrimaryOnRestarts()) {
+        assert.eq(
+            newPrimary, primary, "Primary changed unexpectedly after upgrading old primary node");
+    }
     return newPrimary;
 };
 
@@ -98,7 +155,7 @@ ReplSetTest.prototype.upgradeNode = function(node, opts = {}, user, pwd) {
 
 ReplSetTest.prototype.stepdown = function(nodeId) {
     nodeId = this.getNodeId(nodeId);
-    assert.eq(this.getNodeId(this.getPrimary()), nodeId);
+    assert.eq(this.getNodeId(this.getPrimary()), nodeId, "Trying to stepdown a non primary node");
     var node = this.nodes[nodeId];
 
     assert.soonNoExcept(function() {
@@ -123,9 +180,16 @@ ReplSetTest.prototype.stepdown = function(nodeId) {
 ReplSetTest.prototype.reconnect = function(node) {
     var nodeId = this.getNodeId(node);
     this.nodes[nodeId] = new Mongo(node.host);
-    var except = {};
+    // Skip the 'authenticated' property because the new connection hasn't been authenticated even
+    // if the original one was. This ensures Mongo.prototype.getDB() will attempt to authenticate
+    // automatically if TestData is configured appropriately.
+    //
+    // Skip the '_defaultSession' property because the DriverSession object is bound to the original
+    // connection object. Copying the '_defaultSession' property would cause commands to go through
+    // the original connection despite methods being called on DB objects from the new connection.
+    const except = new Set(["authenticated", "_defaultSession"]);
     for (var i in node) {
-        if (typeof(node[i]) == "function")
+        if (typeof (node[i]) == "function" || except.has(i))
             continue;
         this.nodes[nodeId][i] = node[i];
     }
@@ -142,7 +206,7 @@ ReplSetTest.prototype.conf = function() {
         return resp.config;
 
     else if (resp.errmsg && resp.errmsg.startsWith("no such cmd"))
-        return admin.getSisterDB("local").system.replset.findOne();
+        return admin.getSiblingDB("local").system.replset.findOne();
 
     throw new Error("Could not retrieve replica set config: " + tojson(resp));
 };

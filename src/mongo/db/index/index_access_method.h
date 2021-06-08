@@ -47,11 +47,8 @@ namespace mongo {
 
 class BSONObjBuilder;
 class MatchExpression;
-class UpdateTicket;
-struct InsertResult;
+struct UpdateTicket;
 struct InsertDeleteOptions;
-
-bool failIndexKeyTooLongParam();
 
 /**
  * An IndexAccessMethod is the interface through which all the mutation, lookup, and
@@ -68,6 +65,9 @@ class IndexAccessMethod {
     IndexAccessMethod& operator=(const IndexAccessMethod&) = delete;
 
 public:
+    using KeyHandlerFn = std::function<Status(const KeyString::Value&)>;
+    using RecordIdHandlerFn = std::function<Status(const RecordId&)>;
+
     IndexAccessMethod() = default;
     virtual ~IndexAccessMethod() = default;
 
@@ -87,58 +87,69 @@ public:
      * The behavior of the insertion can be specified through 'options'.
      */
     virtual Status insert(OperationContext* opCtx,
+                          const CollectionPtr& coll,
                           const BSONObj& obj,
                           const RecordId& loc,
                           const InsertDeleteOptions& options,
-                          InsertResult* result) = 0;
-
-    virtual Status insertKeys(OperationContext* opCtx,
-                              const BSONObjSet& keys,
-                              const BSONObjSet& multikeyMetadataKeys,
-                              const MultikeyPaths& multikeyPaths,
-                              const RecordId& loc,
-                              const InsertDeleteOptions& options,
-                              InsertResult* result) = 0;
+                          KeyHandlerFn&& onDuplicateKey,
+                          int64_t* numInserted) = 0;
 
     /**
-     * Analogous to above, but remove the records instead of inserting them.
-     * 'numDeleted' will be set to the number of keys removed from the index for the document.
+     * Inserts the specified keys into the index. and determines whether these keys should cause the
+     * index to become multikey. If so, this method also handles the task of marking the index as
+     * multikey in the catalog, and sets the path-level multikey information if applicable.
      */
-    virtual Status remove(OperationContext* opCtx,
-                          const BSONObj& obj,
-                          const RecordId& loc,
-                          const InsertDeleteOptions& options,
-                          int64_t* numDeleted) = 0;
+    virtual Status insertKeysAndUpdateMultikeyPaths(OperationContext* opCtx,
+                                                    const CollectionPtr& coll,
+                                                    const KeyStringSet& keys,
+                                                    const KeyStringSet& multikeyMetadataKeys,
+                                                    const MultikeyPaths& multikeyPaths,
+                                                    const RecordId& loc,
+                                                    const InsertDeleteOptions& options,
+                                                    KeyHandlerFn&& onDuplicateKey,
+                                                    int64_t* numInserted) = 0;
 
+    /**
+     * Inserts the specified keys into the index. Does not attempt to determine whether the
+     * insertion of these keys should cause the index to become multikey. The 'numInserted' output
+     * parameter, if non-nullptr, will be reset to the number of keys inserted by this function
+     * call, or to zero in the case of either a non-OK return Status or an empty 'keys' argument.
+     */
+    virtual Status insertKeys(OperationContext* opCtx,
+                              const CollectionPtr& coll,
+                              const KeyStringSet& keys,
+                              const RecordId& loc,
+                              const InsertDeleteOptions& options,
+                              KeyHandlerFn&& onDuplicateKey,
+                              int64_t* numInserted) = 0;
+
+    /**
+     * Analogous to insertKeys above, but remove the keys instead of inserting them.
+     * 'numDeleted' will be set to the number of keys removed from the index for the provided keys.
+     */
     virtual Status removeKeys(OperationContext* opCtx,
-                              const BSONObjSet& keys,
+                              const KeyStringSet& keys,
                               const RecordId& loc,
                               const InsertDeleteOptions& options,
                               int64_t* numDeleted) = 0;
 
     /**
-     * Checks whether the index entries for the document 'from', which is placed at location
-     * 'loc' on disk, can be changed to the index entries for the doc 'to'. Provides a ticket
-     * for actually performing the update.
-     *
-     * Returns an error if the update is invalid.  The ticket will also be marked as invalid.
-     * Returns OK if the update should proceed without error.  The ticket is marked as valid.
-     *
-     * There is no obligation to perform the update after performing validation.
+     * Gets the keys of the documents 'from' and 'to' and prepares them for the update.
+     * Provides a ticket for actually performing the update.
      */
-    virtual Status validateUpdate(OperationContext* opCtx,
-                                  const BSONObj& from,
-                                  const BSONObj& to,
-                                  const RecordId& loc,
-                                  const InsertDeleteOptions& options,
-                                  UpdateTicket* ticket,
-                                  const MatchExpression* indexFilter) = 0;
+    virtual void prepareUpdate(OperationContext* opCtx,
+                               IndexCatalogEntry* index,
+                               const BSONObj& from,
+                               const BSONObj& to,
+                               const RecordId& loc,
+                               const InsertDeleteOptions& options,
+                               UpdateTicket* ticket) const = 0;
 
     /**
      * Perform a validated update.  The keys for the 'from' object will be removed, and the keys
      * for the object 'to' will be added.  Returns OK if the update succeeded, failure if it did
      * not.  If an update does not succeed, the index will be unmodified, and the keys for
-     * 'from' will remain.  Assumes that the index has not changed since validateUpdate was
+     * 'from' will remain.  Assumes that the index has not changed since prepareUpdate was
      * called.  If the index was changed, we may return an error, as our ticket may have been
      * invalidated.
      *
@@ -146,6 +157,7 @@ public:
      * 'numDeleted' will be set to the number of keys removed from the index for the document.
      */
     virtual Status update(OperationContext* opCtx,
+                          const CollectionPtr& coll,
                           const UpdateTicket& ticket,
                           int64_t* numInserted,
                           int64_t* numDeleted) = 0;
@@ -169,25 +181,12 @@ public:
     virtual Status initializeAsEmpty(OperationContext* opCtx) = 0;
 
     /**
-     * Try to page-in the pages that contain the keys generated from 'obj'.
-     * This can be used to speed up future accesses to an index by trying to ensure the
-     * appropriate pages are not swapped out.
-     * See prefetch.cpp.
-     */
-    virtual Status touch(OperationContext* opCtx, const BSONObj& obj) = 0;
-
-    /**
-     * this pages in the entire index
-     */
-    virtual Status touch(OperationContext* opCtx) const = 0;
-
-    /**
      * Walk the entire index, checking the internal structure for consistency.
      * Set numKeys to the number of keys in the index.
      */
     virtual void validate(OperationContext* opCtx,
                           int64_t* numKeys,
-                          ValidateResults* fullResults) const = 0;
+                          IndexValidateResults* fullResults) const = 0;
 
     /**
      * Add custom statistics about this index to BSON object builder, for display.
@@ -206,6 +205,11 @@ public:
      */
     virtual long long getSpaceUsedBytes(OperationContext* opCtx) const = 0;
 
+    /**
+     * The number of unused free bytes consumed by this index on disk.
+     */
+    virtual long long getFreeStorageBytes(OperationContext* opCtx) const = 0;
+
     virtual RecordId findSingle(OperationContext* opCtx, const BSONObj& key) const = 0;
 
     /**
@@ -217,7 +221,10 @@ public:
     /**
      * Sets this index as multikey with the provided paths.
      */
-    virtual void setIndexIsMultikey(OperationContext* opCtx, MultikeyPaths paths) = 0;
+    virtual void setIndexIsMultikey(OperationContext* opCtx,
+                                    const CollectionPtr& collection,
+                                    KeyStringSet multikeyMetadataKeys,
+                                    MultikeyPaths paths) = 0;
 
     //
     // Bulk operations support
@@ -225,7 +232,7 @@ public:
 
     class BulkBuilder {
     public:
-        using Sorter = mongo::Sorter<BSONObj, RecordId>;
+        using Sorter = mongo::Sorter<KeyString::Value, mongo::NullValue>;
 
         virtual ~BulkBuilder() = default;
 
@@ -251,6 +258,12 @@ public:
          * Returns number of keys inserted using this BulkBuilder.
          */
         virtual int64_t getKeysInserted() const = 0;
+
+        /**
+         * Persists on disk the keys that have been inserted using this BulkBuilder. Returns the
+         * state of the underlying Sorter.
+         */
+        virtual Sorter::PersistedState persistDataForShutdown() = 0;
     };
 
     /**
@@ -258,12 +271,18 @@ public:
      * You work on the returned BulkBuilder and then call commitBulk.
      * This can return NULL, meaning bulk mode is not available.
      *
-     * It is only legal to initiate bulk when the index is new and empty.
+     * It is only legal to initiate bulk when the index is new and empty, or when resuming an index
+     * build.
      *
      * maxMemoryUsageBytes: amount of memory consumed before the external sorter starts spilling to
      *                      disk
+     * stateInfo: the information to use to resume the index build, or boost::none if starting a
+     * new index build.
      */
-    virtual std::unique_ptr<BulkBuilder> initiateBulk(size_t maxMemoryUsageBytes) = 0;
+    virtual std::unique_ptr<BulkBuilder> initiateBulk(
+        size_t maxMemoryUsageBytes,
+        const boost::optional<IndexStateInfo>& stateInfo,
+        StringData dbName) = 0;
 
     /**
      * Call this when you are ready to finish your bulk work.
@@ -272,22 +291,16 @@ public:
      * @param mayInterrupt - Is this commit interruptible (will cancel)
      * @param dupsAllowed - If false and 'dupRecords' is not null, append with the RecordIds of
      *                      the uninserted duplicates.
-     *                      If true and 'dupKeys' is not null, append with the keys of the inserted
-     *                      duplicates.
-     * @param dupRecords - If not null, is filled with the RecordIds of uninserted duplicate keys.
-     *                     If null, duplicate keys will return errors.
-     * @param dupKeys - If not null and 'dupsAllowed' is true, is filled with the keys of inserted
-     *                  duplicates.
-     *                  If null, duplicates are inserted but not recorded.
-     *
-     * It is invalid and contradictory to pass both 'dupRecords' and 'dupKeys'.
+     * @param onDuplicateKeyInserted - Will be called for each duplicate key inserted into the
+     * index.
+     * @param onDuplicateRecord - If not nullptr, will be called for each RecordId of uninserted
+     * duplicate keys.
      */
-
     virtual Status commitBulk(OperationContext* opCtx,
                               BulkBuilder* bulk,
                               bool dupsAllowed,
-                              std::set<RecordId>* dupRecords,
-                              std::vector<BSONObj>* dupKeys) = 0;
+                              const KeyHandlerFn& onDuplicateKeyInserted,
+                              const RecordIdHandlerFn& onDuplicateRecord) = 0;
 
     /**
      * Specifies whether getKeys should relax the index constraints or not, in order of most
@@ -301,6 +314,12 @@ public:
         // Enforce all constraints.
         kEnforceConstraints
     };
+
+    /**
+     * Specifies whether getKeys is being used in the context of creating new keys, deleting
+     * or validating existing keys.
+     */
+    enum class GetKeysContext { kRemovingKeys, kAddingKeys, kValidatingKeys };
 
     /**
      * Fills 'keys' with the keys that should be generated for 'obj' on this index.
@@ -318,43 +337,31 @@ public:
      * BSONObjSet with any multikey metadata keys generated while processing the document. These
      * keys are not associated with the document itself, but instead represent multi-key path
      * information that must be stored in a reserved keyspace within the index.
+     *
+     * If any key generation errors are encountered and suppressed due to the provided GetKeysMode,
+     * 'onSuppressedErrorFn' is called.
      */
-    virtual void getKeys(const BSONObj& obj,
+    using OnSuppressedErrorFn =
+        std::function<void(Status status, const BSONObj& obj, boost::optional<RecordId> loc)>;
+    virtual void getKeys(SharedBufferFragmentBuilder& pooledBufferBuilder,
+                         const BSONObj& obj,
                          GetKeysMode mode,
-                         BSONObjSet* keys,
-                         BSONObjSet* multikeyMetadataKeys,
-                         MultikeyPaths* multikeyPaths) const = 0;
+                         GetKeysContext context,
+                         KeyStringSet* keys,
+                         KeyStringSet* multikeyMetadataKeys,
+                         MultikeyPaths* multikeyPaths,
+                         boost::optional<RecordId> id,
+                         OnSuppressedErrorFn onSuppressedError) const = 0;
+
+    static OnSuppressedErrorFn kNoopOnSuppressedErrorFn;
 
     /**
      * Given the set of keys, multikeyMetadataKeys and multikeyPaths generated by a particular
      * document, return 'true' if the index should be marked as multikey and 'false' otherwise.
      */
-    virtual bool shouldMarkIndexAsMultikey(const BSONObjSet& keys,
-                                           const BSONObjSet& multikeyMetadataKeys,
+    virtual bool shouldMarkIndexAsMultikey(size_t numberOfKeys,
+                                           const KeyStringSet& multikeyMetadataKeys,
                                            const MultikeyPaths& multikeyPaths) const = 0;
-
-    /**
-     * Returns the intersection of 'fields' and the set of multikey metadata paths stored in the
-     * index. Only index types which can store metadata describing an arbitrarily large set of
-     * multikey paths need to override this method. Statistics reporting index seeks and keys
-     * examined are written to 'stats'.
-     */
-    virtual std::set<FieldRef> getMultikeyPathSet(OperationContext*,
-                                                  const stdx::unordered_set<std::string>& fields,
-                                                  MultikeyMetadataAccessStats* stats) const {
-        return {};
-    }
-
-    /**
-     * Returns the set of all paths for which the index has multikey metadata keys. Only index types
-     * which can store metadata describing an arbitrarily large set of multikey paths need to
-     * override this method. Statistics reporting index seeks and keys examined are written to
-     * 'stats'.
-     */
-    virtual std::set<FieldRef> getMultikeyPathSet(OperationContext* opCtx,
-                                                  MultikeyMetadataAccessStats* stats) const {
-        return {};
-    }
 
     /**
      * Provides direct access to the SortedDataInterface. This should not be used to insert
@@ -364,37 +371,36 @@ public:
 };
 
 /**
- * Records number of keys inserted and duplicate keys inserted, if applicable.
+ * Factory class that constructs an IndexAccessMethod depending on the type of index.
  */
-struct InsertResult {
+class IndexAccessMethodFactory {
 public:
-    std::int64_t numInserted{0};
-    std::vector<BSONObj> dupsInserted;
+    IndexAccessMethodFactory() = default;
+    virtual ~IndexAccessMethodFactory() = default;
+
+    static IndexAccessMethodFactory* get(ServiceContext* service);
+    static IndexAccessMethodFactory* get(OperationContext* opCtx);
+    static void set(ServiceContext* service,
+                    std::unique_ptr<IndexAccessMethodFactory> collectionFactory);
+
+    virtual std::unique_ptr<IndexAccessMethod> make(
+        IndexCatalogEntry* entry, std::unique_ptr<SortedDataInterface> sortedDataInterface) = 0;
 };
 
 /**
  * Updates are two steps: verify that it's a valid update, and perform it.
- * validateUpdate fills out the UpdateStatus and update actually applies it.
+ * prepareUpdate fills out the UpdateStatus and update actually applies it.
  */
-class UpdateTicket {
-public:
-    UpdateTicket()
-        : oldKeys(SimpleBSONObjComparator::kInstance.makeBSONObjSet()),
-          newKeys(oldKeys),
-          newMultikeyMetadataKeys(newKeys) {}
-
-private:
-    friend class AbstractIndexAccessMethod;
-
+struct UpdateTicket {
     bool _isValid{false};
 
-    BSONObjSet oldKeys;
-    BSONObjSet newKeys;
+    KeyStringSet oldKeys;
+    KeyStringSet newKeys;
 
-    BSONObjSet newMultikeyMetadataKeys;
+    KeyStringSet newMultikeyMetadataKeys;
 
-    std::vector<BSONObj> removed;
-    std::vector<BSONObj> added;
+    KeyStringSet removed;
+    KeyStringSet added;
 
     RecordId loc;
     bool dupsAllowed;
@@ -438,53 +444,61 @@ class AbstractIndexAccessMethod : public IndexAccessMethod {
 
 public:
     /**
-     * Splits the sets 'left' and 'right' into two vectors, the first containing the elements that
+     * Splits the sets 'left' and 'right' into two sets, the first containing the elements that
      * only appeared in 'left', and the second containing only elements that appeared in 'right'.
      *
      * Note this considers objects which are not identical as distinct objects. For example,
      * setDifference({BSON("a" << 0.0)}, {BSON("a" << 0LL)}) would result in the pair
      * ( {BSON("a" << 0.0)}, {BSON("a" << 0LL)} ).
      */
-    static std::pair<std::vector<BSONObj>, std::vector<BSONObj>> setDifference(
-        const BSONObjSet& left, const BSONObjSet& right);
+    static std::pair<KeyStringSet, KeyStringSet> setDifference(const KeyStringSet& left,
+                                                               const KeyStringSet& right);
 
-    AbstractIndexAccessMethod(IndexCatalogEntry* btreeState, SortedDataInterface* btree);
+    AbstractIndexAccessMethod(IndexCatalogEntry* btreeState,
+                              std::unique_ptr<SortedDataInterface> btree);
 
     Status insert(OperationContext* opCtx,
+                  const CollectionPtr& coll,
                   const BSONObj& obj,
                   const RecordId& loc,
                   const InsertDeleteOptions& options,
-                  InsertResult* result) final;
+                  KeyHandlerFn&& onDuplicateKey,
+                  int64_t* numInserted) final;
 
     Status insertKeys(OperationContext* opCtx,
-                      const BSONObjSet& keys,
-                      const BSONObjSet& multikeyMetadataKeys,
-                      const MultikeyPaths& multikeyPaths,
+                      const CollectionPtr& coll,
+                      const KeyStringSet& keys,
                       const RecordId& loc,
                       const InsertDeleteOptions& options,
-                      InsertResult* result) final;
+                      KeyHandlerFn&& onDuplicateKey,
+                      int64_t* numInserted) final;
 
-    Status remove(OperationContext* opCtx,
-                  const BSONObj& obj,
-                  const RecordId& loc,
-                  const InsertDeleteOptions& options,
-                  int64_t* numDeleted) final;
+    Status insertKeysAndUpdateMultikeyPaths(OperationContext* opCtx,
+                                            const CollectionPtr& coll,
+                                            const KeyStringSet& keys,
+                                            const KeyStringSet& multikeyMetadataKeys,
+                                            const MultikeyPaths& multikeyPaths,
+                                            const RecordId& loc,
+                                            const InsertDeleteOptions& options,
+                                            KeyHandlerFn&& onDuplicateKey,
+                                            int64_t* numInserted) final;
 
     Status removeKeys(OperationContext* opCtx,
-                      const BSONObjSet& keys,
+                      const KeyStringSet& keys,
                       const RecordId& loc,
                       const InsertDeleteOptions& options,
                       int64_t* numDeleted) final;
 
-    Status validateUpdate(OperationContext* opCtx,
-                          const BSONObj& from,
-                          const BSONObj& to,
-                          const RecordId& loc,
-                          const InsertDeleteOptions& options,
-                          UpdateTicket* ticket,
-                          const MatchExpression* indexFilter) final;
+    void prepareUpdate(OperationContext* opCtx,
+                       IndexCatalogEntry* index,
+                       const BSONObj& from,
+                       const BSONObj& to,
+                       const RecordId& loc,
+                       const InsertDeleteOptions& options,
+                       UpdateTicket* ticket) const final;
 
     Status update(OperationContext* opCtx,
+                  const CollectionPtr& coll,
                   const UpdateTicket& ticket,
                   int64_t* numInserted,
                   int64_t* numDeleted) final;
@@ -495,13 +509,9 @@ public:
 
     Status initializeAsEmpty(OperationContext* opCtx) final;
 
-    Status touch(OperationContext* opCtx, const BSONObj& obj) final;
-
-    Status touch(OperationContext* opCtx) const final;
-
     void validate(OperationContext* opCtx,
                   int64_t* numKeys,
-                  ValidateResults* fullResults) const final;
+                  IndexValidateResults* fullResults) const final;
 
     bool appendCustomStats(OperationContext* opCtx,
                            BSONObjBuilder* result,
@@ -509,28 +519,39 @@ public:
 
     long long getSpaceUsedBytes(OperationContext* opCtx) const final;
 
+    long long getFreeStorageBytes(OperationContext* opCtx) const final;
+
     RecordId findSingle(OperationContext* opCtx, const BSONObj& key) const final;
 
     Status compact(OperationContext* opCtx) final;
 
-    void setIndexIsMultikey(OperationContext* opCtx, MultikeyPaths paths) final;
+    void setIndexIsMultikey(OperationContext* opCtx,
+                            const CollectionPtr& collection,
+                            KeyStringSet multikeyMetadataKeys,
+                            MultikeyPaths paths) final;
 
-    std::unique_ptr<BulkBuilder> initiateBulk(size_t maxMemoryUsageBytes) final;
+    std::unique_ptr<BulkBuilder> initiateBulk(size_t maxMemoryUsageBytes,
+                                              const boost::optional<IndexStateInfo>& stateInfo,
+                                              StringData dbName) final;
 
     Status commitBulk(OperationContext* opCtx,
                       BulkBuilder* bulk,
                       bool dupsAllowed,
-                      std::set<RecordId>* dupRecords,
-                      std::vector<BSONObj>* dupKeys) final;
+                      const KeyHandlerFn& onDuplicateKeyInserted,
+                      const RecordIdHandlerFn& onDuplicateRecord) final;
 
-    void getKeys(const BSONObj& obj,
+    void getKeys(SharedBufferFragmentBuilder& pooledBufferBuilder,
+                 const BSONObj& obj,
                  GetKeysMode mode,
-                 BSONObjSet* keys,
-                 BSONObjSet* multikeyMetadataKeys,
-                 MultikeyPaths* multikeyPaths) const final;
+                 GetKeysContext context,
+                 KeyStringSet* keys,
+                 KeyStringSet* multikeyMetadataKeys,
+                 MultikeyPaths* multikeyPaths,
+                 boost::optional<RecordId> id,
+                 OnSuppressedErrorFn onSuppressedError) const final;
 
-    bool shouldMarkIndexAsMultikey(const BSONObjSet& keys,
-                                   const BSONObjSet& multikeyMetadataKeys,
+    bool shouldMarkIndexAsMultikey(size_t numberOfKeys,
+                                   const KeyStringSet& multikeyMetadataKeys,
                                    const MultikeyPaths& multikeyPaths) const override;
 
     SortedDataInterface* getSortedDataInterface() const override final;
@@ -550,36 +571,19 @@ protected:
      * keys are not associated with the document itself, but instead represent multi-key path
      * information that must be stored in a reserved keyspace within the index.
      */
-    virtual void doGetKeys(const BSONObj& obj,
-                           BSONObjSet* keys,
-                           BSONObjSet* multikeyMetadataKeys,
-                           MultikeyPaths* multikeyPaths) const = 0;
+    virtual void doGetKeys(SharedBufferFragmentBuilder& pooledBufferBuilder,
+                           const BSONObj& obj,
+                           GetKeysContext context,
+                           KeyStringSet* keys,
+                           KeyStringSet* multikeyMetadataKeys,
+                           MultikeyPaths* multikeyPaths,
+                           boost::optional<RecordId> id) const = 0;
 
-    IndexCatalogEntry* const _btreeState;  // owned by IndexCatalogEntry
+    IndexCatalogEntry* const _indexCatalogEntry;  // owned by IndexCatalog
     const IndexDescriptor* const _descriptor;
 
 private:
     class BulkBuilderImpl;
-
-    /**
-     * Determine whether the given Status represents an exception that should cause the indexing
-     * process to abort. The 'key' argument is passed in to allow the offending entry to be logged
-     * in the event that a non-fatal 'ErrorCodes::DuplicateKeyValue' is encountered during a
-     * background index build.
-     */
-    bool isFatalError(OperationContext* opCtx, Status status, BSONObj key);
-
-    /**
-     * Determines whether it's OK to ignore ErrorCodes::KeyTooLong for this OperationContext
-     * TODO SERVER-36385: Remove this function.
-     */
-    bool ignoreKeyTooLong();
-
-    /**
-     * If true, we should check whether the index key exceeds the hardcoded limit.
-     * TODO SERVER-36385: Remove this function.
-     */
-    bool shouldCheckIndexKeySize(OperationContext* opCtx);
 
     /**
      * Removes a single key from the index.
@@ -587,9 +591,17 @@ private:
      * Used by remove() only.
      */
     void removeOneKey(OperationContext* opCtx,
-                      const BSONObj& key,
+                      const KeyString::Value& keyString,
                       const RecordId& loc,
                       bool dupsAllowed);
+    /**
+     * While inserting keys into index (from external sorter), if a duplicate key is detected
+     * (when duplicates are not allowed), 'onDuplicateRecord' will be called if passed, otherwise a
+     * DuplicateKey error will be returned.
+     */
+    Status _handleDuplicateKey(OperationContext* opCtx,
+                               const KeyString::Value& dataKey,
+                               const RecordIdHandlerFn& onDuplicateRecord);
 
     const std::unique_ptr<SortedDataInterface> _newInterface;
 };

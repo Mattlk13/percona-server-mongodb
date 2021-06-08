@@ -29,12 +29,13 @@
 
 #include "mongo/platform/basic.h"
 
+#include <memory>
+
 #include "mongo/crypto/sha1_block.h"
 #include "mongo/crypto/sha256_block.h"
 #include "mongo/crypto/sha512_block.h"
 
 #include "mongo/config.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/assert_util.h"
 
 #ifndef MONGO_CONFIG_SSL
@@ -90,21 +91,20 @@ namespace {
  * Computes a SHA hash of 'input'.
  */
 template <typename HashType>
-HashType computeHashImpl(const EVP_MD* md, std::initializer_list<ConstDataRange> input) {
-    HashType output;
-
+void computeHashImpl(const EVP_MD* md,
+                     std::initializer_list<ConstDataRange> input,
+                     HashType* const output) {
     std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> digestCtx(EVP_MD_CTX_new(),
                                                                       EVP_MD_CTX_free);
 
     fassert(40379,
-            EVP_DigestInit_ex(digestCtx.get(), md, NULL) == 1 &&
+            EVP_DigestInit_ex(digestCtx.get(), md, nullptr) == 1 &&
                 std::all_of(begin(input),
                             end(input),
                             [&](const auto& i) {
                                 return EVP_DigestUpdate(digestCtx.get(), i.data(), i.length()) == 1;
                             }) &&
-                EVP_DigestFinal_ex(digestCtx.get(), output.data(), NULL) == 1);
-    return output;
+                EVP_DigestFinal_ex(digestCtx.get(), output->data(), nullptr) == 1);
 }
 
 template <typename HashType>
@@ -116,7 +116,7 @@ void computeHmacImpl(const EVP_MD* md,
     std::unique_ptr<HMAC_CTX, decltype(&HMAC_CTX_free)> digestCtx(HMAC_CTX_new(), HMAC_CTX_free);
 
     fassert(40380,
-            HMAC_Init_ex(digestCtx.get(), key, keyLen, md, NULL) == 1 &&
+            HMAC_Init_ex(digestCtx.get(), key, keyLen, md, nullptr) == 1 &&
                 std::all_of(begin(input),
                             end(input),
                             [&](const auto& i) {
@@ -124,24 +124,24 @@ void computeHmacImpl(const EVP_MD* md,
                                                    reinterpret_cast<const unsigned char*>(i.data()),
                                                    i.length()) == 1;
                             }) &&
-                HMAC_Final(digestCtx.get(), output->data(), NULL) == 1);
+                HMAC_Final(digestCtx.get(), output->data(), nullptr) == 1);
 }
 
 }  // namespace
 
-SHA1BlockTraits::HashType SHA1BlockTraits::computeHash(
-    std::initializer_list<ConstDataRange> input) {
-    return computeHashImpl<SHA1BlockTraits::HashType>(EVP_sha1(), input);
+void SHA1BlockTraits::computeHash(std::initializer_list<ConstDataRange> input,
+                                  HashType* const output) {
+    computeHashImpl<SHA1BlockTraits::HashType>(EVP_sha1(), input, output);
 }
 
-SHA256BlockTraits::HashType SHA256BlockTraits::computeHash(
-    std::initializer_list<ConstDataRange> input) {
-    return computeHashImpl<SHA256BlockTraits::HashType>(EVP_sha256(), input);
+void SHA256BlockTraits::computeHash(std::initializer_list<ConstDataRange> input,
+                                    HashType* const output) {
+    computeHashImpl<SHA256BlockTraits::HashType>(EVP_sha256(), input, output);
 }
 
-SHA512BlockTraits::HashType SHA512BlockTraits::computeHash(
-    std::initializer_list<ConstDataRange> input) {
-    return computeHashImpl<SHA512BlockTraits::HashType>(EVP_sha512(), input);
+void SHA512BlockTraits::computeHash(std::initializer_list<ConstDataRange> input,
+                                    HashType* const output) {
+    computeHashImpl<SHA512BlockTraits::HashType>(EVP_sha512(), input, output);
 }
 
 void SHA1BlockTraits::computeHmac(const uint8_t* key,

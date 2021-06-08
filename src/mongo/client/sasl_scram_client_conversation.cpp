@@ -43,8 +43,8 @@
 
 namespace mongo {
 
-using std::unique_ptr;
 using std::string;
+using std::unique_ptr;
 
 StatusWith<bool> SaslSCRAMClientConversation::step(StringData inputData, std::string* outputData) {
     _step++;
@@ -58,8 +58,8 @@ StatusWith<bool> SaslSCRAMClientConversation::step(StringData inputData, std::st
             return _thirdStep(inputData, outputData);
         default:
             return StatusWith<bool>(ErrorCodes::AuthenticationFailed,
-                                    str::stream() << "Invalid SCRAM authentication step: "
-                                                  << _step);
+                                    str::stream()
+                                        << "Invalid SCRAM authentication step: " << _step);
     }
 }
 
@@ -82,20 +82,17 @@ StatusWith<bool> SaslSCRAMClientConversation::_firstStep(std::string* outputData
     }
 
     // Create text-based nonce as base64 encoding of a binary blob of length multiple of 3
-    const int nonceLenQWords = 3;
+    static constexpr size_t nonceLenQWords = 3;
     uint64_t binaryNonce[nonceLenQWords];
 
-    unique_ptr<SecureRandom> sr(SecureRandom::create());
-
-    binaryNonce[0] = sr->nextInt64();
-    binaryNonce[1] = sr->nextInt64();
-    binaryNonce[2] = sr->nextInt64();
+    SecureRandom().fill(binaryNonce, sizeof(binaryNonce));
 
     std::string user =
         _saslClientSession->getParameter(SaslClientSession::parameterUser).toString();
 
     encodeSCRAMUsername(user);
-    _clientNonce = base64::encode(reinterpret_cast<char*>(binaryNonce), sizeof(binaryNonce));
+    _clientNonce =
+        base64::encode(StringData(reinterpret_cast<char*>(binaryNonce), sizeof(binaryNonce)));
 
     // Append client-first-message-bare to authMessage
     _authMessage = "n=" + user + ",r=" + _clientNonce;
@@ -126,8 +123,7 @@ StatusWith<bool> SaslSCRAMClientConversation::_secondStep(StringData inputData,
         return Status(ErrorCodes::BadValue,
                       str::stream()
                           << "Incorrect number of arguments for first SCRAM server message, got "
-                          << input.size()
-                          << " expected at least 3");
+                          << input.size() << " expected at least 3");
     }
 
     if (!str::startsWith(input[0], "r=") || input[0].size() < 3) {
@@ -151,7 +147,7 @@ StatusWith<bool> SaslSCRAMClientConversation::_secondStep(StringData inputData,
                       str::stream() << "Incorrect SCRAM iteration count: " << input[2]);
     }
     size_t iterationCount;
-    Status status = parseNumberFromStringWithBase(input[2].substr(2), 10, &iterationCount);
+    Status status = NumberParser().base(10)(input[2].substr(2), &iterationCount);
     if (!status.isOK()) {
         return Status(ErrorCodes::BadValue,
                       str::stream() << "Failed to parse SCRAM iteration count: " << input[2]);

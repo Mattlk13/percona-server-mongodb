@@ -56,18 +56,17 @@ public:
     }
 
     /**
-     * DEPRECATED Constructor that builds a Timestamp from a Date_t by using the
-     * high-order 4 bytes of "date" for the "secs" field and the low-order 4 bytes
-     * for the "i" field.
+     * Constructor that builds a Timestamp from a Date_t by using the high-order 4 bytes of "date"
+     * for the "secs" field and the low-order 4 bytes for the "i" field.
      */
     explicit Timestamp(Date_t date) : Timestamp(date.toULL()) {}
 
     /**
-     * DEPRECATED Constructor that builds a Timestamp from a 64-bit unsigned integer by using
+     * Constructor that builds a Timestamp from a 64-bit unsigned integer by using
      * the high-order 4 bytes of "v" for the "secs" field and the low-order 4 bytes for the "i"
      * field.
      */
-    explicit Timestamp(unsigned long long v) : Timestamp(v >> 32, v) {}
+    explicit Timestamp(unsigned long long val) : Timestamp(val >> 32, val) {}
 
     Timestamp(Seconds s, unsigned increment) : Timestamp(s.count(), increment) {}
 
@@ -120,9 +119,25 @@ public:
         return tie() >= r.tie();
     }
 
+    Timestamp operator+(unsigned long long inc) const {
+        return Timestamp(asULL() + inc);
+    }
+
+    Timestamp operator-(unsigned long long inc) const {
+        return Timestamp(asULL() - inc);
+    }
+
     // Append the BSON representation of this Timestamp to the given BufBuilder with the given
     // name. This lives here because Timestamp manages its own serialization format.
-    void append(BufBuilder& builder, const StringData& fieldName) const;
+
+    template <class Builder>
+    void append(Builder& builder, const StringData& fieldName) const {
+        // No endian conversions needed, since we store in-memory representation
+        // in little endian format, regardless of target endian.
+        builder.appendNum(static_cast<char>(bsonTimestamp));
+        builder.appendStr(fieldName);
+        builder.appendNum(asULL());
+    }
     BSONObj toBSON() const;
 
 private:

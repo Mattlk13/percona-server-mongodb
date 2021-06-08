@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kFTDC
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
@@ -39,7 +39,6 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -178,22 +177,22 @@ TEST(FTDCPerfCollector, TestBadCollectionInput) {
     ASSERT_NOT_OK(collection.addCountersGroup("cpu", {"\\Processor(0)\\% Idle Time"}));
 
     // Duplicate counter
-    ASSERT_NOT_OK(collection.addCountersGroup(
-        "cpu2",
-        {
-            "\\Processor(0)\\% Idle Time", "\\Processor(0)\\% Idle Time",
-        }));
+    ASSERT_NOT_OK(collection.addCountersGroup("cpu2",
+                                              {
+                                                  "\\Processor(0)\\% Idle Time",
+                                                  "\\Processor(0)\\% Idle Time",
+                                              }));
 
     // Duplicate group
     ASSERT_NOT_OK(
         collection.addCountersGroupedByInstanceName("cpu", {"\\Processor(0)\\% Idle Time"}));
 
     // Duplicate counter
-    ASSERT_NOT_OK(collection.addCountersGroupedByInstanceName(
-        "cpu2",
-        {
-            "\\Processor(0)\\% Idle Time", "\\Processor(0)\\% Idle Time",
-        }));
+    ASSERT_NOT_OK(collection.addCountersGroupedByInstanceName("cpu2",
+                                                              {
+                                                                  "\\Processor(0)\\% Idle Time",
+                                                                  "\\Processor(0)\\% Idle Time",
+                                                              }));
 }
 
 // Test negative collector input

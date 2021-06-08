@@ -69,6 +69,12 @@ configs:
         hidden: true
         default: 30
 
+    'net.port':
+        description:
+            expr: 'ServerGlobalParams::getPortSettingHelpText()'
+            is_constexpr: false
+        short_name: port
+        arg_vartype: Int
     'net.ipv6':
         description: 'Enable IPv6 support (disabled by default)'
         short_name: ipv6
@@ -84,7 +90,7 @@ configs:
         arg_vartype: Int
         default: { expr: 'static_cast<int>(DEFAULT_MAX_CONN)' }
     'net.maxIncomingConnectionsOverride':
-        description: 'CIDR ranges that do not count towards the maxIncomingConnections limit'
+        description: 'CIDR ranges that are exempt from the maxIncomingConnections limit'
         arg_vartype: StringVector
         source: yaml
         hidden: true
@@ -98,12 +104,6 @@ configs:
         short_name: transportLayer
         arg_vartype: String
         default: asio
-        hidden: true
-    'net.serviceExecutor':
-        description: 'Sets the service executor implementation'
-        short_name: serviceExecutor
-        arg_vartype: String
-        default: synchronous
         hidden: true
     'security.redactClientLogData':
         description: 'Redact client data written to the diagnostics log'
@@ -182,4 +182,3 @@ configs:
         arg_vartype: Switch
         source: [ cli, ini ]
         hidden: true
-

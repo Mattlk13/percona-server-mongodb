@@ -11,9 +11,10 @@ env.Library(
         'element.cpp',
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/util/safe_num',
         '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/util/safe_num',
     ],
+    MONGO_API_NAME='mutable_bson',
 )
 
 env.Library(
@@ -29,19 +30,9 @@ env.Library(
 )
 
 env.CppUnitTest(
-    target='mutable_bson_test',
+    target='bson_mutable_test',
     source=[
-        'mutable_bson_test.cpp'
-    ],
-    LIBDEPS=[
-        'mutable_bson',
-        'mutable_bson_test_utils',
-    ],
-)
-
-env.CppUnitTest(
-    target='mutable_bson_algo_test',
-    source=[
+        'mutable_bson_test.cpp',
         'mutable_bson_algo_test.cpp',
     ],
     LIBDEPS=[
@@ -50,4 +41,3 @@ env.CppUnitTest(
         'mutable_bson_test_utils',
     ],
 )
-

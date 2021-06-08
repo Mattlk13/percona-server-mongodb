@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kBridge
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kBridge
 
 #include "mongo/tools/mongobridge_options.h"
 
@@ -35,9 +35,11 @@
 #include <iostream>
 
 #include "mongo/base/status.h"
+#include "mongo/logv2/log.h"
 #include "mongo/platform/random.h"
-#include "mongo/util/log.h"
 #include "mongo/util/options_parser/startup_options.h"
+#include "mongo/util/version.h"
+#include "mongo/util/version_constants.h"
 
 namespace mongo {
 
@@ -51,9 +53,19 @@ void printMongoBridgeHelp(std::ostream* out) {
     *out << std::flush;
 }
 
+void printMongoBridgeVersion(std::ostream* out) {
+    *out << "mongobridge version v" << version::kVersion << std::endl;
+    *out << "git version: " << version::kGitVersion << std::endl;
+    *out << std::flush;
+}
+
 bool handlePreValidationMongoBridgeOptions(const moe::Environment& params) {
     if (params.count("help")) {
         printMongoBridgeHelp(&std::cout);
+        return false;
+    }
+    if (params.count("version")) {
+        printMongoBridgeVersion(&std::cout);
         return false;
     }
     return true;
@@ -70,8 +82,7 @@ Status storeMongoBridgeOptions(const moe::Environment& params,
     }
 
     if (!params.count("seed")) {
-        std::unique_ptr<SecureRandom> seedSource{SecureRandom::create()};
-        mongoBridgeGlobalParams.seed = seedSource->nextInt64();
+        mongoBridgeGlobalParams.seed = SecureRandom().nextInt64();
     } else {
         mongoBridgeGlobalParams.seed = static_cast<int64_t>(params["seed"].as<long>());
     }
@@ -82,8 +93,9 @@ Status storeMongoBridgeOptions(const moe::Environment& params,
             return {ErrorCodes::BadValue,
                     "The string for the --verbose option cannot contain characters other than 'v'"};
         }
-        logger::globalLogDomain()->setMinimumLoggedSeverity(
-            logger::LogSeverity::Debug(verbosity.length()));
+
+        logv2::LogManager::global().getGlobalSettings().setMinimumLoggedSeverity(
+            mongo::logv2::LogComponent::kDefault, logv2::LogSeverity::Debug(verbosity.length()));
     }
 
     return Status::OK();

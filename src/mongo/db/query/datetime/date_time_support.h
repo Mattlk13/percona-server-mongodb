@@ -31,17 +31,53 @@
 
 #include <memory>
 #include <string>
+#include <utility>
 
+#include "mongo/base/status.h"
 #include "mongo/db/service_context.h"
 #include "mongo/util/string_map.h"
 #include "mongo/util/time_support.h"
 
 struct _timelib_error_container;
 struct _timelib_time;
+struct _timelib_rel_time;
 struct _timelib_tzdb;
 struct _timelib_tzinfo;
 
 namespace mongo {
+
+using namespace std::string_literals;
+static constexpr StringData kISOFormatString = "%Y-%m-%dT%H:%M:%S.%LZ"_sd;
+
+/**
+ * A set of standard measures of time used to express a length of time interval.
+ */
+enum class TimeUnit {
+    year,
+    quarter,  // A quarter of a year.
+    month,
+    week,
+    day,
+    hour,
+    minute,
+    second,
+    millisecond
+};
+
+/**
+ * Day of a week.
+ */
+enum class DayOfWeek : uint8_t {
+    monday = 1,
+    tuesday,
+    wednesday,
+    thursday,
+    friday,
+    saturday,
+    sunday
+};
+
+static constexpr DayOfWeek kStartOfWeekDefault{DayOfWeek::sunday};
 
 /**
  * A TimeZone object represents one way of formatting/reading dates to compute things like the day
@@ -167,6 +203,11 @@ public:
     int dayOfYear(Date_t) const;
 
     /**
+     * Returns the day of the month, ranging from 1 to 31.
+     */
+    int dayOfMonth(Date_t) const;
+
+    /**
      * Returns the week number for a date as a number between 0 (the partial week that precedes the
      * first Sunday of the year) and 53.
      */
@@ -192,15 +233,15 @@ public:
      * Converts a date object to a string according to 'format'. 'format' can be any string literal,
      * containing 0 or more format specifiers like %Y (year) or %d (day of month). Callers must pass
      * a valid format string for 'format', i.e. one that has already been passed to
-     * validateFormat().
+     * validateFormat(). May return a Status indicating that the date value is an unprintable range.
      */
-    std::string formatDate(StringData format, Date_t) const;
+    StatusWith<std::string> formatDate(StringData format, Date_t) const;
 
     /**
      * Like formatDate, except outputs to an output stream like a std::ostream or a StringBuilder.
      */
     template <typename OutputStream>
-    void outputDateWithFormat(OutputStream& os, StringData format, Date_t date) const {
+    auto outputDateWithFormat(OutputStream& os, StringData format, Date_t date) const {
         auto parts = dateParts(date);
         for (auto&& it = format.begin(); it != format.end(); ++it) {
             if (*it != '%') {
@@ -217,51 +258,71 @@ public:
                     break;
                 case 'Y':  // Year
                 {
-                    insertPadded(os, parts.year, 4);
+                    if (auto status = insertPadded(os, parts.year, 4); status != Status::OK())
+                        return status;
                     break;
                 }
                 case 'm':  // Month
-                    insertPadded(os, parts.month, 2);
+                    if (auto status = insertPadded(os, parts.month, 2); status != Status::OK())
+                        return status;
                     break;
                 case 'd':  // Day of month
-                    insertPadded(os, parts.dayOfMonth, 2);
+                    if (auto status = insertPadded(os, parts.dayOfMonth, 2); status != Status::OK())
+                        return status;
                     break;
                 case 'H':  // Hour
-                    insertPadded(os, parts.hour, 2);
+                    if (auto status = insertPadded(os, parts.hour, 2); status != Status::OK())
+                        return status;
                     break;
                 case 'M':  // Minute
-                    insertPadded(os, parts.minute, 2);
+                    if (auto status = insertPadded(os, parts.minute, 2); status != Status::OK())
+                        return status;
                     break;
                 case 'S':  // Second
-                    insertPadded(os, parts.second, 2);
+                    if (auto status = insertPadded(os, parts.second, 2); status != Status::OK())
+                        return status;
                     break;
                 case 'L':  // Millisecond
-                    insertPadded(os, parts.millisecond, 3);
+                    if (auto status = insertPadded(os, parts.millisecond, 3);
+                        status != Status::OK())
+                        return status;
                     break;
                 case 'j':  // Day of year
-                    insertPadded(os, dayOfYear(date), 3);
+                    if (auto status = insertPadded(os, dayOfYear(date), 3); status != Status::OK())
+                        return status;
                     break;
                 case 'w':  // Day of week
-                    insertPadded(os, dayOfWeek(date), 1);
+                    if (auto status = insertPadded(os, dayOfWeek(date), 1); status != Status::OK())
+                        return status;
                     break;
                 case 'U':  // Week
-                    insertPadded(os, week(date), 2);
+                    if (auto status = insertPadded(os, week(date), 2); status != Status::OK())
+                        return status;
                     break;
                 case 'G':  // Iso year of week
-                    insertPadded(os, isoYear(date), 4);
+                    if (auto status = insertPadded(os, isoYear(date), 4); status != Status::OK())
+                        return status;
                     break;
                 case 'V':  // Iso week
-                    insertPadded(os, isoWeek(date), 2);
+                    if (auto status = insertPadded(os, isoWeek(date), 2); status != Status::OK())
+                        return status;
                     break;
                 case 'u':  // Iso day of week
-                    insertPadded(os, isoDayOfWeek(date), 1);
+                    if (auto status = insertPadded(os, isoDayOfWeek(date), 1);
+                        status != Status::OK())
+                        return status;
                     break;
                 case 'z':  // UTC offset as ±hhmm.
                 {
                     auto offset = utcOffset(date);
-                    os << ((offset.count() < 0) ? "-" : "+");                            // sign
-                    insertPadded(os, std::abs(durationCount<Hours>(offset)), 2);         // hh
-                    insertPadded(os, std::abs(durationCount<Minutes>(offset)) % 60, 2);  // mm
+                    os << ((offset.count() < 0) ? "-" : "+");  // sign
+                    if (auto status = insertPadded(os, std::abs(durationCount<Hours>(offset)), 2);
+                        status != Status::OK())  // hh
+                        return status;
+                    if (auto status =
+                            insertPadded(os, std::abs(durationCount<Minutes>(offset)) % 60, 2);
+                        status != Status::OK())  // mm
+                        return status;
                     break;
                 }
                 case 'Z':  // UTC offset in minutes.
@@ -272,6 +333,7 @@ public:
                     MONGO_UNREACHABLE;
             }
         }
+        return Status::OK();
     }
 
     /**
@@ -280,24 +342,27 @@ public:
      */
     static void validateToStringFormat(StringData format);
     static void validateFromStringFormat(StringData format);
-
-private:
     std::unique_ptr<_timelib_time, TimelibTimeDeleter> getTimelibTime(Date_t) const;
 
+    std::shared_ptr<_timelib_tzinfo> getTzInfo() const {
+        return _tzInfo;
+    }
+
+private:
     /**
      * Only works with 1 <= spaces <= 4 and 0 <= number <= 9999. If spaces is less than the digit
      * count of number we simply insert the number without padding.
      */
     template <typename OutputStream>
-    void insertPadded(OutputStream& os, int number, int width) const {
+    static auto insertPadded(OutputStream& os, int number, int width) {
         invariant(width >= 1);
         invariant(width <= 4);
 
-        uassert(18537,
-                str::stream() << "Could not convert date to string: date component was outside "
-                              << "the supported range of 0-9999: "
-                              << number,
-                (number >= 0) && (number <= 9999));
+        if ((number < 0) || (number > 9999))
+            return Status{ErrorCodes::Error{18537},
+                          "Could not convert date to string: date component was outside "
+                          "the supported range of 0-9999: "s +
+                              std::to_string(number)};
 
         int digits = 1;
 
@@ -313,6 +378,7 @@ private:
             os.write("0000", width - digits);
         }
         os << number;
+        return Status::OK();
     }
 
     struct TimelibTZInfoDeleter {
@@ -394,8 +460,13 @@ public:
     static TimeZone utcZone();
 
     /**
-     * Returns a TimeZone object representing the zone given by 'timeZoneId', or boost::none if it
-     * was not a recognized time zone.
+     * Returns a boolean based on if 'timeZoneId' represents a valid timezone.
+     */
+    bool isTimeZoneIdentifier(StringData timeZoneId) const;
+
+    /**
+     * Returns a TimeZone object representing the zone given by 'timeZoneId', or throws an exception
+     * if it is not a recognized time zone.
      */
     TimeZone getTimeZone(StringData timeZoneId) const;
 
@@ -409,6 +480,10 @@ public:
      * Creates a TimeZoneDatabase object using time zone rules given by 'timeZoneDatabase'.
      */
     TimeZoneDatabase(std::unique_ptr<_timelib_tzdb, TimeZoneDBDeleter> timeZoneDatabase);
+
+    std::vector<std::string> getTimeZoneStrings() const;
+
+    std::string toString() const;
 
 private:
     /**
@@ -431,4 +506,129 @@ private:
     std::unique_ptr<_timelib_tzdb, TimeZoneDBDeleter> _timeZoneDatabase;
 };
 
+/**
+ * Parses a string representation of an enumerator of TimeUnit type 'unitName' into a value of type
+ * TimeUnit. Throws an exception with error code ErrorCodes::FailedToParse when passed an invalid
+ * name.
+ */
+TimeUnit parseTimeUnit(StringData unitName);
+
+/**
+ * Returns true if 'unitName' is a valid time unit, meaning that it can be parsed by the
+ * 'parseTimeUnit()' function into one of the units represented by the 'TimeUnit' enum. Otherwise
+ * returns 'false'.
+ */
+bool isValidTimeUnit(StringData unitName);
+
+/**
+ * Inverse of parseTimeUnit.
+ */
+StringData serializeTimeUnit(TimeUnit unit);
+
+/**
+ * Parses a string 'dayOfWeek' to a DayOfWeek value. Supported day of week representations are
+ * case-insensitive full words or three letter abbreviations - for example, sunday, Sun. Throws an
+ * exception with error code ErrorCodes::FailedToParse when passed an invalid value.
+ */
+DayOfWeek parseDayOfWeek(StringData dayOfWeek);
+
+/**
+ * Returns true if 'dayOfWeek' is a valid representation of a day of a week, meaning that it can be
+ * parsed by the 'parseDayOfWeek()' function into one of the days represented by the 'DayOfWeek'
+ * enum. Otherwise returns 'false'.
+ */
+bool isValidDayOfWeek(StringData dayOfWeek);
+
+/**
+ * A custom-deleter which destructs a timelib_rel_time* when it goes out of scope.
+ */
+struct TimelibRelTimeDeleter {
+    TimelibRelTimeDeleter() = default;
+    void operator()(_timelib_rel_time* relTime);
+};
+
+/**
+ * Creates and sets a timelib_rel_time structure representing a time interval
+ * of 'amount' number of time 'units'.
+ */
+std::unique_ptr<_timelib_rel_time, TimelibRelTimeDeleter> getTimelibRelTime(TimeUnit unit,
+                                                                            long long amount);
+
+/**
+ * Determines the number of upper boundaries of time intervals crossed when moving from time instant
+ * 'startDate' to time instant 'endDate' in time zone 'timezone'. The time intervals are of length
+ * equal to one 'unit' and aligned so that the lower/upper bound is located in time axis at instant
+ * n*'unit', where n is an integer.
+ *
+ * If 'endDate' < 'startDate', then the returned number of crossed boundaries is negative.
+ *
+ * For 'unit' values 'hour' and smaller, when there is a transition from Daylight Saving Time to
+ * standard time the function behaves as if standard time intervals overlap Daylight Saving Time
+ * intervals. When there is a transition from standard time to Daylight Saving Time the function
+ * behaves as if the last interval in standard time is longer by one hour.
+ *
+ * An example: if startDate=2011-01-31T00:00:00 (in 'timezone'), endDate=2011-02-01T00:00:00 (in
+ * 'timezone'), unit='month', then the function returns 1, since a month boundary at
+ * 2011-02-01T00:00:00 was crossed.
+ *
+ * The function operates in the Gregorian calendar. The function does not account for leap seconds.
+ * For time instants before year 1583 the proleptic Gregorian calendar is used.
+ *
+ * startDate - starting time instant in UTC time zone.
+ * endDate - ending time instant in UTC time zone.
+ * unit - length of time intervals.
+ * timezone - determines the timezone used for counting the boundaries as well as Daylight Saving
+ * Time rules.
+ * startOfWeek - the first day of a week used, to determine week boundaries when 'unit' is
+ * TimeUnit::week. Otherwise, this parameter is ignored.
+ */
+long long dateDiff(Date_t startDate,
+                   Date_t endDate,
+                   TimeUnit unit,
+                   const TimeZone& timezone,
+                   DayOfWeek startOfWeek = kStartOfWeekDefault);
+
+/**
+ * Add time interval to a date. The interval duration is given in 'amount' number of 'units'.
+ * The amount can be a negative number in which case the interval is subtracted from the date.
+ * The result date is always in UTC.
+ *
+ * startDate - starting time instant
+ * unit - length of time intervals, defined in the TimeUnit enumeration
+ * amount - the amount of time units to be added
+ * timezone - the timezone in which the start date is interpreted
+ */
+Date_t dateAdd(Date_t date, TimeUnit unit, long long amount, const TimeZone& timezone);
+
+/**
+ * Convert (approximately) a TimeUnit to a number of milliseconds.
+ *
+ * The answer is approximate because TimeUnit represents an amount of calendar time:
+ * for example, some calendar days are 23 or 25 hours long due to daylight savings time.
+ * This function assumes everything is "typical": days are 24 hours, minutes are 60 seconds.
+ *
+ * Large time units, 'month' or longer, are so variable that we don't try to pick a value: we
+ * return a non-OK Status.
+ */
+StatusWith<long long> timeUnitTypicalMilliseconds(TimeUnit unit);
+
+/**
+ * Returns the lower bound of a bin the 'date' falls into in the time axis, or, in other words,
+ * truncates the 'date' value. Bins are (1) uniformly spaced (in time unit sense); (2) do not
+ * overlap; (3) bin size is 'binSize' 'unit''s; (4) defined in a timezone specified by 'timezone';
+ * (5) one bin has a lower bound at 2000-01-01T00:00:00.000 (also called a reference point) in the
+ * specified timezone, except for "week" time unit when the given 'startOfWeek' does not coincide
+ * with the first of January, 2000. For weeks [exception to (5)] the bin is aligned to the earliest
+ * first day of the week after the first of January, 2000.
+ *
+ * binSize - must be larger than 0.
+ * timezone - determines boundaries of the bins as well as Daylight Saving Time rules.
+ * startOfWeek - the first day of a week used to determine week boundaries when 'unit' is
+ * TimeUnit::week. Otherwise, this parameter is ignored.
+ */
+Date_t truncateDate(Date_t date,
+                    TimeUnit unit,
+                    unsigned long long binSize,
+                    const TimeZone& timezone,
+                    DayOfWeek startOfWeek = kStartOfWeekDefault);
 }  // namespace mongo

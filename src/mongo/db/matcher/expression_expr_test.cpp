@@ -29,6 +29,7 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/base/checked_cast.h"
 #include "mongo/bson/json.h"
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/expression_expr.h"
@@ -59,8 +60,8 @@ public:
         _matchExpression = MatchExpression::optimize(std::move(_matchExpression));
     }
 
-    void setCollator(CollatorInterface* collator) {
-        _expCtx->setCollator(collator);
+    void setCollator(std::unique_ptr<CollatorInterface> collator) {
+        _expCtx->setCollator(std::move(collator));
         if (_matchExpression) {
             _matchExpression->setCollator(_expCtx->getCollator());
         }
@@ -74,6 +75,10 @@ public:
     bool matches(const BSONObj& doc) {
         invariant(_matchExpression);
         return _matchExpression->matchesBSON(doc);
+    }
+
+    ExprMatchExpression* getExprMatchExpression() {
+        return checked_cast<ExprMatchExpression*>(_matchExpression.get());
     }
 
 private:
@@ -547,8 +552,8 @@ TEST_F(ExprMatchTest,
 
 TEST_F(ExprMatchTest, InitialCollationUsedForComparisons) {
     auto collator =
-        stdx::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kToLowerString);
-    setCollator(collator.get());
+        std::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kToLowerString);
+    setCollator(std::move(collator));
     createMatcher(fromjson("{$expr: {$eq: ['$x', 'abc']}}"));
 
     ASSERT_TRUE(matches(BSON("x"
@@ -562,8 +567,8 @@ TEST_F(ExprMatchTest, SetCollatorChangesCollationUsedForComparisons) {
     createMatcher(fromjson("{$expr: {$eq: ['$x', 'abc']}}"));
 
     auto collator =
-        stdx::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kToLowerString);
-    setCollator(collator.get());
+        std::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kToLowerString);
+    setCollator(std::move(collator));
 
     ASSERT_TRUE(matches(BSON("x"
                              << "AbC")));
@@ -592,7 +597,7 @@ TEST_F(ExprMatchTest, FailGracefullyOnInvalidExpression) {
 
 TEST_F(ExprMatchTest, ReturnsFalseInsteadOfErrorWithFailpointSet) {
     createMatcher(fromjson("{$expr: {$divide: [10, '$divisor']}}"));
-    ASSERT_THROWS_CODE(matches(BSON("divisor" << 0)), AssertionException, 16608);
+    ASSERT_THROWS_CODE(matches(BSON("divisor" << 0)), AssertionException, ErrorCodes::BadValue);
 
     FailPointEnableBlock scopedFailpoint("ExprMatchExpressionMatchesReturnsFalseOnException");
     createMatcher(fromjson("{$expr: {$divide: [10, '$divisor']}}"));
@@ -607,7 +612,7 @@ TEST(ExprMatchTest, IdenticalPostOptimizedExpressionsAreEquivalent) {
     // Create and optimize an ExprMatchExpression.
     const boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
     std::unique_ptr<MatchExpression> matchExpr =
-        stdx::make_unique<ExprMatchExpression>(expression.firstElement(), expCtx);
+        std::make_unique<ExprMatchExpression>(expression.firstElement(), expCtx);
     matchExpr = MatchExpression::optimize(std::move(matchExpr));
 
     // We expect that the optimized 'matchExpr' is still an ExprMatchExpression.
@@ -636,7 +641,7 @@ TEST(ExprMatchTest, ExpressionOptimizeRewritesVariableDereferenceAsConstant) {
 
     // Create and optimize an ExprMatchExpression.
     std::unique_ptr<MatchExpression> matchExpr =
-        stdx::make_unique<ExprMatchExpression>(expression.firstElement(), expCtx);
+        std::make_unique<ExprMatchExpression>(expression.firstElement(), expCtx);
     matchExpr = MatchExpression::optimize(std::move(matchExpr));
 
     // We expect that the optimized 'matchExpr' is still an ExprMatchExpression.
@@ -656,7 +661,7 @@ TEST(ExprMatchTest, OptimizingIsANoopWhenAlreadyOptimized) {
 
     // Create and optimize an ExprMatchExpression.
     std::unique_ptr<MatchExpression> singlyOptimized =
-        stdx::make_unique<ExprMatchExpression>(expression.firstElement(), expCtx);
+        std::make_unique<ExprMatchExpression>(expression.firstElement(), expCtx);
     singlyOptimized = MatchExpression::optimize(std::move(singlyOptimized));
 
     // We expect that the optimized 'matchExpr' is now an $and.
@@ -664,7 +669,7 @@ TEST(ExprMatchTest, OptimizingIsANoopWhenAlreadyOptimized) {
 
     // We expect the twice-optimized match expression to be equivalent to the once-optimized one.
     std::unique_ptr<MatchExpression> doublyOptimized =
-        stdx::make_unique<ExprMatchExpression>(expression.firstElement(), expCtx);
+        std::make_unique<ExprMatchExpression>(expression.firstElement(), expCtx);
     for (size_t i = 0; i < 2u; ++i) {
         doublyOptimized = MatchExpression::optimize(std::move(doublyOptimized));
     }
@@ -677,7 +682,7 @@ TEST(ExprMatchTest, OptimizingAnAlreadyOptimizedCloneIsANoop) {
 
     // Create and optimize an ExprMatchExpression.
     std::unique_ptr<MatchExpression> singlyOptimized =
-        stdx::make_unique<ExprMatchExpression>(expression.firstElement(), expCtx);
+        std::make_unique<ExprMatchExpression>(expression.firstElement(), expCtx);
     singlyOptimized = MatchExpression::optimize(std::move(singlyOptimized));
 
     // We expect that the optimized 'matchExpr' is now an $and.
@@ -712,7 +717,7 @@ TEST(ExprMatchTest, OptimizingExprAbsorbsAndOfAnd) {
     BSONObj serialized;
     {
         BSONObjBuilder builder;
-        optimized->serialize(&builder);
+        optimized->serialize(&builder, true);
         serialized = builder.obj();
     }
 
@@ -720,6 +725,14 @@ TEST(ExprMatchTest, OptimizingExprAbsorbsAndOfAnd) {
         "{$and: [{$expr: {$and: [{$eq: ['$a', {$const: 1}]}, {$eq: ['$b', {$const: 2}]}]}},"
         "{a: {$_internalExprEq: 1}}, {b: {$_internalExprEq: 2}}]}");
     ASSERT_BSONOBJ_EQ(serialized, expectedSerialization);
+}
+
+TEST_F(ExprMatchTest, ExpressionEvaluationReturnsResultsCorrectly) {
+    createMatcher(fromjson("{$expr: -2}"));
+    BSONMatchableDocument document{BSONObj{}};
+    auto expressionResult = getExprMatchExpression()->evaluateExpression(&document);
+    ASSERT_TRUE(expressionResult.integral());
+    ASSERT_EQUALS(-2, expressionResult.coerceToInt());
 }
 
 }  // namespace

@@ -37,7 +37,7 @@
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/client.h"
-#include "mongo/db/pipeline/document.h"
+#include "mongo/db/exec/document_value/document.h"
 #include "mongo/s/query/cluster_aggregate.h"
 
 namespace mongo {
@@ -71,8 +71,8 @@ private:
     }
 
     virtual StatusWith<CursorResponse> runAggregation(
-        OperationContext* opCtx, const AggregationRequest& request) const final {
-        auto nss = request.getNamespaceString();
+        OperationContext* opCtx, const AggregateCommandRequest& request) const final {
+        auto nss = request.getNamespace();
 
         BSONObjBuilder responseBuilder;
 
@@ -80,6 +80,7 @@ private:
             opCtx,
             ClusterAggregate::Namespaces{nss, nss},
             request,
+            {request},
             {Privilege(ResourcePattern::forClusterResource(), ActionType::inprog)},
             &responseBuilder);
 

@@ -46,16 +46,16 @@ namespace mongo {
  */
 class ActionSet {
 public:
-    ActionSet() : _actions(0) {}
+    ActionSet() = default;
     ActionSet(std::initializer_list<ActionType> actions);
 
-    void addAction(const ActionType& action);
+    void addAction(ActionType action);
     void addAllActionsFromSet(const ActionSet& actionSet);
     void addAllActions();
 
     // Removes action from the set.  Also removes the "anyAction" action, if present.
     // Note: removing the "anyAction" action does *not* remove all other actions.
-    void removeAction(const ActionType& action);
+    void removeAction(ActionType action);
     void removeAllActionsFromSet(const ActionSet& actionSet);
     void removeAllActions();
 
@@ -67,7 +67,10 @@ public:
         return this->_actions == other._actions;
     }
 
-    bool contains(const ActionType& action) const;
+    bool contains(ActionType action) const;
+
+    // Returns true if this action set contains the entire other action set
+    bool contains(const ActionSet& other) const;
 
     // Returns true only if this ActionSet contains all the actions present in the 'other'
     // ActionSet.
@@ -91,13 +94,13 @@ public:
                                                  ActionSet* result,
                                                  std::vector<std::string>* unrecognizedActions);
 
+    friend bool operator==(const ActionSet& lhs, const ActionSet& rhs) {
+        return lhs.equals(rhs);
+    }
+
 private:
     // bitmask of actions this privilege grants
-    std::bitset<ActionType::NUM_ACTION_TYPES> _actions;
+    std::bitset<kNumActionTypes> _actions;
 };
-
-static inline bool operator==(const ActionSet& lhs, const ActionSet& rhs) {
-    return lhs.equals(rhs);
-}
 
 }  // namespace mongo
