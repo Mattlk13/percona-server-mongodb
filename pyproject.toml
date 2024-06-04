@@ -51,7 +51,7 @@ psutil = "5.8.0"
 pymongo = "4.3.3"
 PyYAML = "5.3.1"
 types-PyYAML = "~6.0.12.10"
-requests = "^2.26.0"
+requests = "^2.32.2"
 typing-extensions = "^4.7.1"
 
 [tool.poetry.group.export.dependencies]
